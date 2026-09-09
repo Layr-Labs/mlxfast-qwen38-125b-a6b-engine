@@ -2965,6 +2965,10 @@ ensure_engine_submodule() {
   # Preserve an initialized checkout, including local edits. Only a plain
   # clone's missing dependency needs checkout; never reset an existing one.
   [[ -f "${engine_path}/Package.swift" ]] && return 0
+  if [[ -e "${engine_path}/.git" ]]; then
+    echo "${SETUP_LOG_LABEL}: initialized engine checkout is missing ${engine_path}/Package.swift; inspect its HEAD and local edits before repairing it (setup will not reset it)" >&2
+    return 1
+  fi
   if ! command -v git >/dev/null 2>&1 \
       || ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "${SETUP_LOG_LABEL}: ${engine_path}/Package.swift is missing; use a git clone so setup can initialize the pinned engine submodule" >&2
@@ -3454,14 +3458,9 @@ transform_reference_weights() {
   # Run the freshly built transform each time, including on a reference-cache
   # hit: Sources/MLXFastTransform is editable, so an old weights tree cannot
   # establish that the current candidate has been prepared. SwiftTransform
-  # stages and atomically installs its output, preserving the old tree on error.
+  # stages its output; the helper publishes only a newly produced weights tree.
   echo "${SETUP_LOG_LABEL}: transforming the verified reference checkpoint into ${WEIGHTS_PATH}"
-  "${SWIFT_BIN}" transform --reference "${REFERENCE_DIR}" --output "${WEIGHTS_PATH}" || return 1
-  if [[ ! -f "${WEIGHTS_PATH}/config.json" \
-      || ! -f "${WEIGHTS_PATH}/model.safetensors.index.json" ]]; then
-    echo "${SETUP_LOG_LABEL}: transform did not produce config.json and model.safetensors.index.json in ${WEIGHTS_PATH}" >&2
-    return 1
-  fi
+  tools/prepare-runtime-weights.sh "${SWIFT_BIN}" "${REFERENCE_DIR}" "${WEIGHTS_PATH}" || return 1
 }
 
 check_yukon_cli() {

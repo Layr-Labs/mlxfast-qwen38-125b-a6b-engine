@@ -112,7 +112,10 @@ builds and stages the Swift binaries and `mlx.metallib`, downloads and verifies
 the target model, and transforms it into the `weights/` tree the engine loads.
 Set `MLXFAST_WEIGHTS_PATH` to choose another output directory. Setup reruns the
 current transform even when the reference download is cached; it reports
-success only after the transform succeeds. The emitted `config.json` declares
+success only after the transform produces a fresh output tree. A failed transform
+leaves previous weights in place. Run setup while the engine is idle, because
+publishing a replacement directory briefly moves the previous tree aside.
+The emitted `config.json` declares
 `rms_norm_weight_offset`, so the tree carries this checkpoint's RMSNorm
 convention to any consumer that reads the file, and transform verification
 refuses a tree that does not declare it.

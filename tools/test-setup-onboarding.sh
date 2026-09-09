@@ -23,6 +23,7 @@ git -C "${WORK}/seed" init -q
 git -C "${WORK}/seed" submodule add -q "${WORK}/engine" Vendor/mlx-swift-lm
 cp "${ROOT}/setup.sh" "${WORK}/seed/setup.sh"
 cp "${ROOT}/tools/stage-bench-worker.sh" "${WORK}/seed/tools/"
+cp "${ROOT}/tools/prepare-runtime-weights.sh" "${WORK}/seed/tools/"
 printf '// fixture package\n' > "${WORK}/seed/Package.swift"
 printf '{}\n' > "${WORK}/seed/Package.resolved"
 git -C "${WORK}/seed" add .
@@ -71,6 +72,15 @@ set -euo pipefail
 args=("$@")
 [[ "${args[${#args[@]}-1]}" == file://* ]] || { echo 'non-local URL refused by test' >&2; exit 1; }
 exec /usr/bin/curl "$@"
+SH
+cat > "${WORK}/bin/mv" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${TEST_PUBLISH_FAIL:-0}" == 1 && "$1" == */prepared ]]; then
+  echo 'fixture publication failure' >&2
+  exit 1
+fi
+exec /bin/mv "$@"
 SH
 chmod +x "${WORK}/bin/"* "${WORK}/cli"
 printf '{}\n' > "${WORK}/upstream/config.json"
@@ -129,6 +139,29 @@ reject "${CASE_ROOT}/setup.log" 'initializing the pinned engine submodule'
 expect "${CASE_ROOT}/Vendor/mlx-swift-lm/Package.swift" '// local edit'
 [[ "$(grep -c '^transform ' "${TEST_EVENTS}")" == 2 ]] || fail 'cached reference skipped current transform'
 echo 'test-setup-onboarding: PASS -- cached setup retransforms and preserves submodule edits'
+
+printf 'keep previous output\n' > "${MLXFAST_WEIGHTS_PATH}/previous-output"
+if TEST_TRANSFORM_EMPTY=1 run_setup; then fail 'no-output transform reused cached weights'; fi
+expect "${CASE_ROOT}/setup.log" 'transform did not produce config.json'
+reject "${CASE_ROOT}/setup.log" 'setup complete'
+expect "${MLXFAST_WEIGHTS_PATH}/previous-output" 'keep previous output'
+[[ ! -e "${MLXFAST_WEIGHTS_PATH}.setup-lock" ]] || fail 'failed transform left its lock'
+echo 'test-setup-onboarding: PASS -- no-output transform cannot reuse cached weights and preserves them'
+
+if TEST_PUBLISH_FAIL=1 run_setup; then fail 'publication failure was accepted'; fi
+expect "${CASE_ROOT}/setup.log" 'fixture publication failure'
+reject "${CASE_ROOT}/setup.log" 'setup complete'
+expect "${MLXFAST_WEIGHTS_PATH}/previous-output" 'keep previous output'
+[[ ! -e "${MLXFAST_WEIGHTS_PATH}.setup-lock" ]] || fail 'failed publication left its lock'
+echo 'test-setup-onboarding: PASS -- publication failure restores the previous output'
+
+git -C "${CASE_ROOT}/Vendor/mlx-swift-lm" rm -q -f Package.swift
+git -C "${CASE_ROOT}/Vendor/mlx-swift-lm" -c user.name=Test -c user.email=test@example.invalid commit -qm 'Alternate engine without manifest'
+alternate_head="$(git -C "${CASE_ROOT}/Vendor/mlx-swift-lm" rev-parse HEAD)"
+if run_setup; then fail 'initialized engine without manifest was accepted'; fi
+expect "${CASE_ROOT}/setup.log" 'setup will not reset it'
+[[ "$(git -C "${CASE_ROOT}/Vendor/mlx-swift-lm" rev-parse HEAD)" == "${alternate_head}" ]] || fail 'setup reset initialized engine HEAD'
+echo 'test-setup-onboarding: PASS -- initialized engine missing its manifest is refused without reset'
 
 new_clone wrapper
 MLXFAST_SETUP_LOG_LABEL=yukon run_setup || { cat "${CASE_ROOT}/setup.log" >&2; fail 'wrapper-labelled setup failed'; }
