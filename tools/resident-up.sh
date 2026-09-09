@@ -460,24 +460,35 @@ log "resident healthy on ${SOCKET_PATH} after $(( $(date +%s) - start ))s; every
 HELLO_JSON="$(probe_resident "${SOCKET_PATH}")" || die "the resident stopped answering before the run started"
 
 # --- the window's identity ---------------------------------------------------
-python3 - "${IDENTITY_FILE}" "${HELLO_JSON}" <<PY
+# Every value crosses as an argv element, never as text spliced into the Python
+# source: a socket path or a weights directory holding a quote would otherwise
+# be shell string interpolation inside a program, and the file this run is
+# identified by would stop parsing (or stop meaning what it says).
+python3 - "${IDENTITY_FILE}" "${HELLO_JSON}" \
+    "${SOCKET_PATH}" "${RESIDENT_PID}" "${RESIDENT_PGID}" \
+    "${BENCH_WORKER}" "${WEIGHTS_DIR}" "${NGRAM_DIR}" \
+    "${HELLO_IDENTITY}" "${MODE}" "${SPEC:-unset}" "${DRAFT_LEN:-unset}" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <<'PY'
 import json, sys
+(identity_file, hello_json, socket_path, resident_pid, resident_pgid,
+ bench_worker, weights_dir, ngram_dir, hello_identity, mode, spec, draft_len,
+ started) = sys.argv[1:14]
 json.dump({
     "engine": "bench-worker",
     "weight_owner": "bench-worker-resident",
-    "resident_socket": "${SOCKET_PATH}",
-    "resident_pid": ${RESIDENT_PID},
-    "resident_pgid": ${RESIDENT_PGID},
-    "bench_worker": "${BENCH_WORKER}",
-    "weights_dir": "${WEIGHTS_DIR}",
-    "ngram_dir": "${NGRAM_DIR}",
-    "hello_identity": ${HELLO_IDENTITY},
-    "mode": "${MODE}",
-    "spec": "${SPEC:-unset}",
-    "draft_len": "${DRAFT_LEN:-unset}",
-    "hello": json.loads(sys.argv[2]),
-    "started": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-}, open(sys.argv[1], "w"), indent=2)
+    "resident_socket": socket_path,
+    "resident_pid": int(resident_pid),
+    "resident_pgid": int(resident_pgid),
+    "bench_worker": bench_worker,
+    "weights_dir": weights_dir,
+    "ngram_dir": ngram_dir,
+    "hello_identity": int(hello_identity),
+    "mode": mode,
+    "spec": spec,
+    "draft_len": draft_len,
+    "hello": json.loads(hello_json),
+    "started": started,
+}, open(identity_file, "w"), indent=2)
 PY
 
 # --- --boot ends here, with the resident STILL RUNNING -----------------------

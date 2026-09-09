@@ -424,7 +424,6 @@ if [[ "${OFFICIAL}" == "1" ]]; then
   # official_scoring_enabled arms scoring. benchd refuses to seal an official artifact unless the
   # fixture declares official_scoring_enabled: true, so this is the fail-closed arm surface. The
   # fixture is fixtures/qwen3_8_125b_a6b_track.json (the scoring-semantics authority per CLAUDE.md).
-  # It is false today, so official runs refuse until the arming change flips it true.
   CONTRACT_FIXTURE="${FACADE_DIR}/../fixtures/qwen3_8_125b_a6b_track.json"
   if [[ ! -f "${CONTRACT_FIXTURE}" ]]; then
     echo "benchmark.sh: official runs require the track contract fixture at ${CONTRACT_FIXTURE}" >&2

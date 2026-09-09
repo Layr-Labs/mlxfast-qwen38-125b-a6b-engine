@@ -55,10 +55,11 @@ FMT_SOURCE="${MLX_SWIFT_VENDOR}/Source/Cmlx/fmt"
 # changed file that does not feed the metallib merely forces a rebuild,
 # while any under-approximation would let a cached mlx.metallib mask a
 # participant kernel edit. The recipe (per-file sha256 lines over
-# byte-sorted relative paths, hashed again) is mirrored bit-for-bit by
-# VendoredMetalFingerprint in Sources/MLXFastTrustedHarness, which the
-# trusted CLI uses to re-verify the published fingerprint sidecar before
-# spawning the participant worker. Keep the two implementations in sync.
+# byte-sorted relative paths, hashed again) lives HERE ONLY, and
+# `--print-fingerprint` is how everything else asks for it: the ranked
+# workflow (.github/workflows/benchmark.yml) awk-reads the published
+# mlx.metallib.fingerprint sidecar and compares it against this script's
+# answer before it reuses a cached build or adopts a pre-staged library.
 FINGERPRINT_RECORD_PREFIX="mlxfast-metallib-fingerprint-v1"
 compute_vendored_metal_fingerprint() {
   local cmlx_root="${MLX_SWIFT_VENDOR}/Source/Cmlx"

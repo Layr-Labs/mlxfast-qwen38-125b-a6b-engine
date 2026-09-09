@@ -127,7 +127,7 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
                     + "'\(rawSource)'; expected one of "
                     + Source.allCases.map(\.rawValue).joined(separator: ", "))
         }
-        let maxBytes = (root["max_bytes"] as? NSNumber)?.intValue
+        let maxBytes = try integerField(root["max_bytes"], named: "max_bytes", origin: origin)
             ?? defaultMaxBytes
         guard maxBytes > 0, maxBytes <= defaultMaxBytes else {
             throw MLXFastError.invalidInput(
@@ -138,7 +138,7 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
         let sourceURL = root["source_url"] as? String
         let path = root["path"] as? String
         let sha256 = (root["sha256"] as? String)?.lowercased()
-        let bytes = (root["bytes"] as? NSNumber)?.intValue ?? 0
+        let bytes = try integerField(root["bytes"], named: "bytes", origin: origin) ?? 0
 
         // REQUANT-ONLY (David ruling, 2026-08-26). `pinned` is the ONLY source
         // this track accepts. The head is the organizer's own weights; a
@@ -201,6 +201,33 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
             bytes: bytes,
             maxBytes: maxBytes
         )
+    }
+
+    /// A STATED NUMBER MUST BE A JSON INTEGER. `(root[key] as? NSNumber)?.intValue`
+    /// drops a string or an array back onto the default -- so a declaration that
+    /// says `"max_bytes": "2 GiB"` reads as the full track cap instead of
+    /// refusing -- and it reads JSON `true` as 1, which walks straight into the
+    /// one-byte size gate. An absent key still means "not stated" and keeps its
+    /// default; a present key that is not a whole number in `Int` range refuses
+    /// by name.
+    private static func integerField(
+        _ raw: Any?,
+        named name: String,
+        origin: String
+    ) throws -> Int? {
+        guard let raw, !(raw is NSNull) else {
+            return nil
+        }
+        guard let number = raw as? NSNumber,
+            CFGetTypeID(number) != CFBooleanGetTypeID(),
+            let value = number as? Int
+        else {
+            throw MLXFastError.invalidInput(
+                "the \(declarationNoun) head declaration at \(origin) sets \(name) to "
+                    + "a value that is not a JSON integer; \(name) must be a whole "
+                    + "number")
+        }
+        return value
     }
 
     /// Read the declaration next to a contract root, treating ABSENCE as the
