@@ -1521,7 +1521,6 @@ METAL_FUNC void qmm_t_impl(
   }
 
   // Store results to device memory
-  threadgroup_barrier(mem_flags::mem_threadgroup);
   if (num_els < BM || num_outs < BN) {
     mma_op.store_result_safe(y, N, short2(num_outs, num_els));
   } else {

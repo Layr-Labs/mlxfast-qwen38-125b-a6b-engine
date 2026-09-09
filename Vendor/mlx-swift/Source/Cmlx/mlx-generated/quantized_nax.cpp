@@ -1077,7 +1077,6 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
       }
 
       // Store results to device memory
-      threadgroup_barrier(mem_flags::mem_threadgroup);
 
       if constexpr (kAlignedM.value && kAlignedN.value) {
         Dtile.store(y + tm * N + tn, N);
