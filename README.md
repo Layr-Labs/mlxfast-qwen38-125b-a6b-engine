@@ -819,21 +819,40 @@ swift build -c release --force-resolved-versions
 This command builds the trusted CLI into `.build/release`.
 
 ```bash
-swift build -c release --force-resolved-versions --scratch-path .build-worker \
-  --product bench-worker
+tools/build-bench-worker.sh
 ```
 
-This command builds the scored engine into `.build-worker/release`. The engine
-is the fork's generic `bench-worker`, and this package builds it as a
-dependency product, so the build reads `Vendor/mlx-swift` and your kernel edits
-reach it.
+After initial setup, this command rebuilds the release track worker and Metal
+library, checks that the worker links the editable `TrackRunner`, and stages
+the set where benchd resolves it. It downloads and loads no model weights.
+It records the source/toolchain key, worker SHA-256, Metal SHA-256, and Metal
+fingerprint-sidecar SHA-256 in `.build/release/bench-worker.build.json`.
+
+Run `tools/build-bench-worker.sh --check` before reusing a staged build. It
+refuses missing provenance, source changes (including new files under
+`Runner/`), or changed staged artifacts. The record detects local stale builds;
+it is not a signed attestation or a substitute for benchd's runtime checks.
+
+The equivalent manual worker build selects this package's unique product:
+
+```bash
+swift build -c release --force-resolved-versions --scratch-path .build-worker \
+  --product track-bench-worker
+```
+
+This command builds `.build-worker/release/track-bench-worker`, which registers
+the editable `Runner/` and compiles against `Vendor/mlx-swift`. The dependency
+also exports a product named `bench-worker`; building that product omits this
+repository's `Runner/` edits.
 
 ```bash
 tools/stage-bench-worker.sh
 ```
 
-This command copies the engine and its `mlx.metallib` into `.build/release`,
-where the benchmarker resolves them.
+After `tools/build-mlx-metallib.sh`, this command copies `track-bench-worker`
+to `.build/release/bench-worker`, with `mlx.metallib` and its fingerprint
+sidecar beside it. Direct staging copies existing bytes and clears the
+combined build command's provenance record; it does not prove freshness.
 
 > **WARNING — always pass `--force-resolved-versions`.**
 > The dependency graph is frozen. A bare `swift build` or `swift test` can

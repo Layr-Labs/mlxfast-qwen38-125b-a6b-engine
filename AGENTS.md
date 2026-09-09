@@ -262,13 +262,28 @@ swift build -c release --force-resolved-versions
 This command builds the trusted CLI into `.build/release`.
 
 ```bash
-swift build -c release --force-resolved-versions --scratch-path .build-worker \
-  --product bench-worker
+tools/build-bench-worker.sh
 ```
 
-This command builds the scored engine into `.build-worker/release`. The engine
-is the fork's generic `bench-worker`, built as a dependency product of this
-package, so it reads `Vendor/mlx-swift` and your kernel edits reach it.
+This command rebuilds the release `track-bench-worker`, builds `mlx.metallib`,
+checks that the executable links this package's editable `TrackRunner`, and
+stages the set into `.build/release`. It records source/toolchain and artifact
+hashes in `.build/release/bench-worker.build.json`. Before measuring an existing
+build, run `tools/build-bench-worker.sh --check`; it refuses missing provenance,
+changed sources (including new files under `Runner/`), or changed staged bytes.
+This is a local freshness check; benchd still verifies runtime behavior.
+
+For a manual build, the product name is explicit:
+
+```bash
+swift build -c release --force-resolved-versions --scratch-path .build-worker \
+  --product track-bench-worker
+```
+
+This command builds this package's scored engine into `.build-worker/release`.
+It registers the editable `Runner/` implementation and uses `Vendor/mlx-swift`.
+The dependency also exports `bench-worker`; selecting that product builds the
+fork's runner and omits edits to this repository's `Runner/`.
 
 The engine builds under its own scratch root so a participant compile can never
 write into the trusted tree.
@@ -277,11 +292,15 @@ write into the trusted tree.
 tools/stage-bench-worker.sh
 ```
 
-This command copies the finished engine and its `mlx.metallib` into
-`.build/release`.
+This command only copies an already-built `track-bench-worker`, its sibling
+`mlx.metallib`, and the Metal fingerprint sidecar into `.build/release`. Build
+Metal first with `tools/build-mlx-metallib.sh`. Direct staging clears the combined
+build command's provenance record because copying alone cannot establish
+whether a binary includes the current source edits.
 
 > **WARNING — a bare `swift build -c release` is not enough.**
-> The scored binary is `.build-worker/release/bench-worker`. Metal loads
+> The built product is `.build-worker/release/track-bench-worker`, staged as
+> `.build/release/bench-worker`. Metal loads
 > `mlx.metallib` from the directory of the running binary. The staging step
 > puts the pair where the benchmarker resolves them. `./setup.sh` runs that
 > step for you.

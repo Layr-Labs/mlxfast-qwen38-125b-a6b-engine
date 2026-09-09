@@ -39,7 +39,7 @@ PUBLISH_ALL_BUILD_ROOTS=0
 
 BUILD_CONFIGURATION="${MLXFAST_SWIFT_CONFIGURATION:-release}"
 BENCH_WORKER_BIN="$(repository_path \
-  "${MLXFAST_BENCH_WORKER_EXECUTABLE:-.build-worker/${BUILD_CONFIGURATION}/bench-worker}")"
+  "${MLXFAST_BENCH_WORKER_EXECUTABLE:-.build-worker/${BUILD_CONFIGURATION}/track-bench-worker}")"
 OUTPUT_PATH="$(repository_path \
   "${MLXFAST_MLX_METALLIB:-$(dirname "${BENCH_WORKER_BIN}")/mlx.metallib}")"
 

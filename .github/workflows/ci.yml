@@ -192,6 +192,10 @@ jobs:
         # staging regression.
         run: tools/test-bench-worker-staging.sh
 
+      - name: Track worker build and stale-artifact detection
+        # Real build/stage/key scripts with stub compilers; no model or GPU.
+        run: tools/test-build-bench-worker.sh
+
       - name: Benchmark facade exports the track id
         # Drives the REAL tools/benchmark.sh with a stub benchd and asserts
         # that MLXFAST_QWEN_MTP_TRACK_ID reaches benchd equal to
