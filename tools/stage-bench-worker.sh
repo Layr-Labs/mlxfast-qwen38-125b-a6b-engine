@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage the scored engine -- the fork's generic `bench-worker` -- and its
+# Stage this package's `track-bench-worker` (which links the editable Runner) and its
 # mlx.metallib into the location benchd resolves.
 #
 # WHY THIS EXISTS. benchd resolves the scored engine at a FIXED
@@ -49,7 +49,7 @@ BUILD_CONFIGURATION="${MLXFAST_SWIFT_CONFIGURATION:-release}"
 # setup.sh and tools/build-mlx-metallib.sh resolve them, so an operator
 # override is honoured identically across all three.
 BENCH_WORKER_BIN="$(repository_path \
-  "${MLXFAST_BENCH_WORKER_EXECUTABLE:-.build-worker/${BUILD_CONFIGURATION}/bench-worker}")"
+  "${MLXFAST_BENCH_WORKER_EXECUTABLE:-.build-worker/${BUILD_CONFIGURATION}/track-bench-worker}")"
 MLX_METALLIB="$(repository_path \
   "${MLXFAST_MLX_METALLIB:-$(dirname "${BENCH_WORKER_BIN}")/mlx.metallib}")"
 
@@ -62,11 +62,28 @@ STAGED_METALLIB_FINGERPRINT="${STAGED_METALLIB}.fingerprint"
 
 if [[ ! -x "${BENCH_WORKER_BIN}" ]]; then
   echo "stage-bench-worker.sh: scored engine missing or not executable: ${BENCH_WORKER_BIN}" >&2
-  echo "stage-bench-worker.sh: build it first (setup.sh, or swift build -c ${BUILD_CONFIGURATION} --scratch-path .build-worker --product bench-worker)" >&2
+  echo "stage-bench-worker.sh: build and stage it with tools/build-bench-worker.sh, or build manually with swift build -c ${BUILD_CONFIGURATION} --force-resolved-versions --scratch-path .build-worker --product track-bench-worker" >&2
   exit 1
 fi
 
+# Check the complete input set before replacing a previously staged worker.
+if [[ "${MLXFAST_SKIP_MLX_METALLIB:-0}" != "1" ]]; then
+  if [[ ! -f "${MLX_METALLIB}" ]]; then
+    echo "stage-bench-worker.sh: mlx.metallib missing next to the scored engine: ${MLX_METALLIB}" >&2
+    echo "stage-bench-worker.sh: build it first (tools/build-mlx-metallib.sh)" >&2
+    exit 1
+  fi
+  if [[ ! -f "${MLX_METALLIB_FINGERPRINT}" ]]; then
+    echo "stage-bench-worker.sh: the metallib fingerprint sidecar is missing beside the scored engine: ${MLX_METALLIB_FINGERPRINT}" >&2
+    echo "stage-bench-worker.sh: rebuild with tools/build-mlx-metallib.sh, which publishes both" >&2
+    exit 1
+  fi
+fi
+
 mkdir -p "$(dirname "${STAGED_WORKER_BIN}")"
+# A direct staging operation has no build provenance. The combined build
+# command writes a fresh record after this copy and its consistency checks.
+rm -f "${STAGED_WORKER_BIN}.build.json"
 
 # `-ef` is true only when both paths already resolve to the same file, which
 # happens when an operator override points the source straight at the benchd
@@ -84,16 +101,6 @@ if [[ "${MLXFAST_SKIP_MLX_METALLIB:-0}" == "1" ]]; then
   # the operator has accepted that a real GPU run cannot succeed without it.
   metallib_staged=0
 else
-  if [[ ! -f "${MLX_METALLIB}" ]]; then
-    echo "stage-bench-worker.sh: mlx.metallib missing next to the scored engine: ${MLX_METALLIB}" >&2
-    echo "stage-bench-worker.sh: build it first (tools/build-mlx-metallib.sh)" >&2
-    exit 1
-  fi
-  if [[ ! -f "${MLX_METALLIB_FINGERPRINT}" ]]; then
-    echo "stage-bench-worker.sh: the metallib fingerprint sidecar is missing beside the scored engine: ${MLX_METALLIB_FINGERPRINT}" >&2
-    echo "stage-bench-worker.sh: the harness reads it at <staged metallib>.fingerprint, and a metallib with no sidecar fails that check; rebuild the metallib (tools/build-mlx-metallib.sh), which publishes both" >&2
-    exit 1
-  fi
   if [[ ! "${MLX_METALLIB}" -ef "${STAGED_METALLIB}" ]]; then
     cp -f "${MLX_METALLIB}" "${STAGED_METALLIB}"
     cp -f "${MLX_METALLIB_FINGERPRINT}" "${STAGED_METALLIB_FINGERPRINT}"

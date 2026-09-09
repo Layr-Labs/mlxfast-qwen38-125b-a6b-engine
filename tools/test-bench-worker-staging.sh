@@ -32,7 +32,7 @@ VERBOSE=0
 # Non-vacuity floor: a case deleted or short-circuited leaves the survivors green,
 # so exit status alone cannot notice the suite shrinking. Raise this in the same
 # commit that adds assertions.
-EXPECTED_MIN_ASSERTIONS=14
+EXPECTED_MIN_ASSERTIONS=19
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/rtw-staging.XXXXXX")"
 trap 'rm -rf "${WORK}"' EXIT
@@ -83,8 +83,8 @@ FAKE_FINGERPRINT='mlxfast-metallib-fingerprint-v1 000000000000000000000000000000
 seed_source_pair() {
   local root="$1"
   mkdir -p "${root}/.build-worker/release"
-  printf '#!/bin/sh\nexit 0\n' > "${root}/.build-worker/release/bench-worker"
-  chmod +x "${root}/.build-worker/release/bench-worker"
+  printf '#!/bin/sh\nexit 0\n' > "${root}/.build-worker/release/track-bench-worker"
+  chmod +x "${root}/.build-worker/release/track-bench-worker"
   printf 'FAKE-METALLIB\n' > "${root}/.build-worker/release/mlx.metallib"
   printf '%s\n' "${FAKE_FINGERPRINT}" > "${root}/.build-worker/release/mlx.metallib.fingerprint"
 }
@@ -121,7 +121,7 @@ else
   fail "the staged fingerprint record carries the source sidecar's bytes (got: $(cat "${staged_fingerprint}" 2>/dev/null))"
 fi
 # The source scratch root is untouched (isolation preserved).
-assert_file "${root}/.build-worker/release/bench-worker" \
+assert_file "${root}/.build-worker/release/track-bench-worker" \
   "scratch-root worker is left in place (build isolation preserved)"
 
 # ---------------------------------------------------------------------------
@@ -142,8 +142,8 @@ assert_absent "${root}/.build/release/bench-worker" \
 # ---------------------------------------------------------------------------
 root="$(make_fake_root)"
 mkdir -p "${root}/.build-worker/release"
-printf '#!/bin/sh\nexit 0\n' > "${root}/.build-worker/release/bench-worker"
-chmod +x "${root}/.build-worker/release/bench-worker"
+printf '#!/bin/sh\nexit 0\n' > "${root}/.build-worker/release/track-bench-worker"
+chmod +x "${root}/.build-worker/release/track-bench-worker"
 if "${root}/tools/stage-bench-worker.sh" >/dev/null 2>&1; then
   fail "staging fails when mlx.metallib is missing"
 else
@@ -173,6 +173,20 @@ else
 fi
 assert_absent "${root}/.build/release/mlx.metallib" \
   "no metallib is staged when its fingerprint sidecar is missing"
+assert_absent "${root}/.build/release/bench-worker" \
+  "no worker is staged when its fingerprint sidecar is missing"
+
+# A leftover dependency product cannot satisfy the corrected default.
+root="$(make_fake_root)"
+seed_source_pair "${root}"
+mv "${root}/.build-worker/release/track-bench-worker" "${root}/.build-worker/release/bench-worker"
+if "${root}/tools/stage-bench-worker.sh" >/dev/null 2>&1; then
+  fail "a fork bench-worker alone cannot satisfy the default source path"
+else
+  pass "a fork bench-worker alone cannot satisfy the default source path"
+fi
+assert_absent "${root}/.build/release/bench-worker" \
+  "a leftover fork product is never staged by default"
 
 # ---------------------------------------------------------------------------
 # Case 5: setup.sh invokes the staging step on BOTH exit paths, after the

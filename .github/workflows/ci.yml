@@ -255,6 +255,10 @@ jobs:
         # products: key stability, key change on a source change, empty-cache
         # miss, save/restore round trip, corrupted-artefact refusal. Hermetic.
         run: tools/test-build-cache.sh
+      - name: Track worker build and stale-artifact detection
+        # Real build/stage/key scripts with stub compilers; no model or GPU.
+        run: tools/test-build-bench-worker.sh
+
       - name: spec declaration envelope (tools/test-spec-declaration.sh)
         run: tools/test-spec-declaration.sh
 
