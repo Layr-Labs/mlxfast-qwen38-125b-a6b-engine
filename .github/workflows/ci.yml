@@ -192,6 +192,11 @@ jobs:
         # staging regression.
         run: tools/test-bench-worker-staging.sh
 
+      - name: Fresh-clone setup prepares runtime weights
+        # Local git remotes and tiny file:// checkpoint fixtures exercise the
+        # real setup script with a stub Swift toolchain. No weights or network.
+        run: tools/test-setup-onboarding.sh
+
       - name: Benchmark facade exports the track id
         # Drives the REAL tools/benchmark.sh with a stub benchd and asserts
         # that MLXFAST_QWEN_MTP_TRACK_ID reaches benchd equal to

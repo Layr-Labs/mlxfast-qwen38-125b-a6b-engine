@@ -507,11 +507,10 @@ jobs:
         run: tools/build-cache.sh save
 
       - name: Transform the reference checkpoint with the candidate's transform
-        # The documented path runs `mlxfast-swift transform` as its own command
-        # after setup.sh, and the measure script refuses without the weights/
-        # tree it writes (run 34029529034). Sources/MLXFastTransform is on the
-        # editable surface, so the job must run THE CANDIDATE'S transform, never
-        # reuse a tree another tree produced. It is cheap: the transform clones
+        # Setup prepares local runtime weights. The ranked path deliberately
+        # reruns the candidate's editable transform into a fresh output tree:
+        # a transform that exits without writing must not reuse an old tree.
+        # It is cheap: the transform clones
         # the verified reference on APFS (1 s, no extra blocks on the box), and
         # benchd seals the tree's weights_hash into the artifact, so provenance
         # needs no cache and no box-staged tree.

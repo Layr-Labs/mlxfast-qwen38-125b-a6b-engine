@@ -94,8 +94,9 @@ depth. The batched cohort path is not part of this track.
 > **WARNING — the engine is a submodule pinned to an unmerged fork branch.**
 > `Vendor/mlx-swift-lm` is a git submodule at `449f2d0`, on branch
 > `feat/qwen38-flash-next-runner` of the fork. Re-pin the submodule when that
-> branch merges to the fork's `main`. Clone with `--recurse-submodules`, or run
-> `git submodule update --init`.
+> branch merges to the fork's `main`. `./setup.sh` initializes the submodule
+> after a plain clone. For a direct Swift build before setup, clone with
+> `--recurse-submodules`, or run `git submodule update --init`.
 
 ## Notes for autonomous agents
 
