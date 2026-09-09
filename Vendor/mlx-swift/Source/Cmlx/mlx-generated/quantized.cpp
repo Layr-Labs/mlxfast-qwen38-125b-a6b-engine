@@ -246,13 +246,32 @@ inline U qdot(
   }
 
   else if (bits == 4) {
-    const device uint16_t* ws = (const device uint16_t*)w;
-    for (int i = 0; i < (values_per_thread / 4); i++) {
-      accum +=
-          (x_thread[4 * i] * (ws[i] & 0x000f) +
-           x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-           x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-           x_thread[4 * i + 3] * (ws[i] & 0xf000));
+    if constexpr ((values_per_thread % 8) == 0) {
+      const device uint32_t* ws = (const device uint32_t*)w;
+      for (int i = 0; i < (values_per_thread / 8); i++) {
+        const uint32_t packed = ws[i];
+        const uint16_t w0 = static_cast<uint16_t>(packed & 0xffffu);
+        const uint16_t w1 = static_cast<uint16_t>(packed >> 16);
+        accum +=
+            (x_thread[8 * i] * (w0 & 0x000f) +
+             x_thread[8 * i + 1] * (w0 & 0x00f0) +
+             x_thread[8 * i + 2] * (w0 & 0x0f00) +
+             x_thread[8 * i + 3] * (w0 & 0xf000));
+        accum +=
+            (x_thread[8 * i + 4] * (w1 & 0x000f) +
+             x_thread[8 * i + 5] * (w1 & 0x00f0) +
+             x_thread[8 * i + 6] * (w1 & 0x0f00) +
+             x_thread[8 * i + 7] * (w1 & 0xf000));
+      }
+    } else {
+      const device uint16_t* ws = (const device uint16_t*)w;
+      for (int i = 0; i < (values_per_thread / 4); i++) {
+        accum +=
+            (x_thread[4 * i] * (ws[i] & 0x000f) +
+             x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+             x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+             x_thread[4 * i + 3] * (ws[i] & 0xf000));
+      }
     }
   }
 
