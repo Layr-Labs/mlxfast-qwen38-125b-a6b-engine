@@ -74,7 +74,8 @@ source_key() {
   # key, adding files SwiftPM can discover without a git add (including ignored
   # files under these source directories) and this command's own recipe.
   cache_key="$(tools/build-cache.sh key)" || return 1
-  extra_sources="$(find Runner Sources Plugins \( -type f -o -type l \) -print0 \
+  extra_sources="$(find Runner Sources Plugins Vendor/mlx-swift/Source Vendor/mlx-swift/Plugins \
+    \( -type f -o -type l \) -print0 \
     | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}')" || return 1
   printf '%s\n' "${cache_key}" "${extra_sources}" "$(sha256 tools/build-bench-worker.sh)" \
     | shasum -a 256 | awk '{print $1}'

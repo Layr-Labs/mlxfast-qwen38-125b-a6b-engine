@@ -8,7 +8,8 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 ROOT="${WORK}/checkout with spaces"
 mkdir -p "${ROOT}/tools" "${ROOT}/Runner" "${ROOT}/Sources" "${ROOT}/Plugins" \
-  "${ROOT}/Vendor/mlx-swift-lm" "${ROOT}/Vendor/mlx-swift" "${WORK}/bin"
+  "${ROOT}/Vendor/mlx-swift-lm" "${ROOT}/Vendor/mlx-swift/Source/MLX" \
+  "${ROOT}/Vendor/mlx-swift/Plugins" "${WORK}/bin"
 cp "${REPO_ROOT}/tools/"{build-bench-worker,stage-bench-worker,build-cache}.sh "${ROOT}/tools/"
 printf 'editable runner\n' > "${ROOT}/Runner/Model.swift"
 printf 'fixed package\n' > "${ROOT}/Package.swift"
@@ -96,6 +97,19 @@ printf 'new source\n' > "${ROOT}/Runner/Untracked.swift"
 run_build "${BUILD}" --check
 check test "${rc}" -eq 1
 rm "${ROOT}/Runner/Untracked.swift"
+
+# SwiftPM also discovers files in the vendored MLX targets. Neither the
+# tracked cache key nor Cmlx's Metal fingerprint covers a new MLX Swift file.
+printf 'new vendored source\n' > "${ROOT}/Vendor/mlx-swift/Source/MLX/Added.swift"
+run_build "${BUILD}" --check
+check test "${rc}" -eq 1
+rm "${ROOT}/Vendor/mlx-swift/Source/MLX/Added.swift"
+printf 'Vendor/mlx-swift/Source/MLX/Ignored.swift\n' >> "${ROOT}/.git/info/exclude"
+printf 'ignored source still compiles\n' > "${ROOT}/Vendor/mlx-swift/Source/MLX/Ignored.swift"
+check git -C "${ROOT}" check-ignore -q Vendor/mlx-swift/Source/MLX/Ignored.swift
+run_build "${BUILD}" --check
+check test "${rc}" -eq 1
+rm "${ROOT}/Vendor/mlx-swift/Source/MLX/Ignored.swift"
 
 cp "${STAGED}" "${WORK}/saved-worker"
 printf 'tampered\n' >> "${STAGED}"
