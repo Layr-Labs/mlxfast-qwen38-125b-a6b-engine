@@ -1273,17 +1273,17 @@ baseline seconds-per-token were the last file-held baseline PAIR in the tree,
 which `docs/participant-contract.md` section 5.1.0 says must not exist: a ranked
 run measures its own control leg on the box (David ruling 2026-09-08).
 
-One stored timing value stays: `gemma4MTPOfficialBaselinePrefillSecondsPerToken`,
-the `qwen3.8-27b-mtp-v1` prefill calibration record. It is a single value for
-ANOTHER track, not a pair for this one, it is labelled UNSCORED, and nothing in
-`Sources/` reads it. It is kept as that track's record.
-
-Its decode partner `gemma4MTPOfficialBaselineDecodeSecondsPerToken` is DELETED
-(2026-09-09). It was labelled SCORED and described as "the serial denominator of
-this track's paired ratio", but a grep over `Sources/`, `Runner/`, `Tests/` and
-`tools/` found its only occurrence to be its own declaration: it was a stored
-decode baseline for another track that nothing read, which is what section 5.1.0
-forbids. No test asserted its value, so nothing else moved with it.
+NO STORED TIMING VALUE REMAINS. The last two,
+`gemma4MTPOfficialBaselineDecodeSecondsPerToken` and
+`gemma4MTPOfficialBaselinePrefillSecondsPerToken`, are DELETED (2026-09-09,
+David ruling). They were `qwen3.8-27b-mtp-v1` calibration records -- ANOTHER
+track -- carried in this tree; the decode one was even labelled SCORED and
+described as "the serial denominator of this track's paired ratio". A grep over
+`Sources/`, `Runner/`, `Tests/` and `tools/` found each one's only occurrence to
+be its own declaration, so no test asserted either value and nothing else moved
+with them. `Sources/MLXFastCore/Constants.swift` now holds no seconds-per-token
+at all: a ranked run measures its own control leg on the box, and section 5.1.0
+of `docs/participant-contract.md` says a stored baseline must not exist.
 
 ### 9.2 Single-stream only (RULED)
 

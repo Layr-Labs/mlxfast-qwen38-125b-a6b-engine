@@ -529,34 +529,6 @@ public enum MLXFastConstants {
     /// speculative-depth-1 diagnostic and is never the denominator.
     public static let gemma4MTPSerialControlDepth = 0
 
-    /// UNSCORED — informational / historical tracking only.
-    ///
-    /// This track's score has NO PREFILL COMPONENT. `mtp_decode_speedup` is a
-    /// decode-only ratio-of-means; the seed prefill is charged *inside* the
-    /// decode measurement window, identically on both legs of every pair; and
-    /// `measure-qwen-mtp-job.sh` seals `prefill_component: "none"` in the
-    /// `results.json` it signs. Nothing reads this constant to compute a score,
-    /// and a future reader who assumes it participates will mis-tune the track.
-    ///
-    /// Provenance: RUNBOOK section 3.4, measured in the gated calibration
-    /// sessions on box 3 of 2026-08-13, over the same 512-token prefill window
-    /// the ranked workflow pins (`benchmarkPrefillPromptTokens`). 3
-    /// observations, spread 0.17%.
-    ///
-    /// It is deliberately NOT wired into the local-mode estimate. The Qwen-MTP
-    /// local path (`benchmark-qwen-mtp.sh`, `mtp-timed`) consumes no pinned
-    /// baseline constant at all: it reports a same-session paired ratio, timing
-    /// both legs in the run. There is therefore no seam to redirect, and
-    /// introducing one would replace a self-normalising measurement with a
-    /// hardware-absolute one — changing what the local number MEANS rather than
-    /// improving it.
-    /// QWEN38-VERIFY-AT-RELEASE. This is a QWEN 3.6 MEASUREMENT taken on box 3
-    /// in gated calibration sessions. It does not describe Qwen 3.8 27B and
-    /// must be re-derived on the 3.8 baseline before any 3.8 score is
-    /// published; the ranked track is held closed by
-    /// MLXFAST_QWEN_MTP_CALIBRATION_READY="0" until it is.
-    public static let gemma4MTPOfficialBaselinePrefillSecondsPerToken = 0.00115714
-
     /// Semantic GPQA min-pass for THIS track, derived per NEW-MODEL-BRINGUP 7.4
     /// as `min(observed) - 1` over the four baseline-equivalent ranked
     /// calibration dispatches of 2026-08-13 (31712368539, 31715555814,
