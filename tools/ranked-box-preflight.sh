@@ -318,23 +318,24 @@ else
   ok "MLXFAST_CORRECTNESS_GOLDEN_PATH unset; benchd resolves the oracle from the contract"
 fi
 
-# --- 4b. the live golden the single-leg run scores over is staged -----------
-# Single-leg reads exactly ONE golden: the fixture's live_golden, resolved by
-# tools/qwen38-125b-a6b-measure-and-score.sh as <live_golden>.golden.json. The
-# loop above already pin-verified it AS a pool member; this asserts the
+# --- 4b. the live golden the ranked run scores over is staged ---------------
+# The ranked run reads exactly ONE golden: the fixture's live_golden, resolved
+# by tools/qwen38-125b-a6b-measure-and-score.sh as <live_golden>.golden.json --
+# every leg of every pair scores over that one prompt. The loop above already
+# pin-verified it AS a pool member; this asserts the
 # fixture's live_golden actually NAMES a pinned pool entry and is staged, so a
 # live_golden rotation that points at a golden absent from the pool -- or a box
 # that staged the pool but not the live golden -- is caught here, pre-GPU,
 # rather than at measure time.
 LIVE_GOLDEN_NAME="$(jq -r '.live_golden // ""' "${CONTRACT}")"
 [[ -n "${LIVE_GOLDEN_NAME}" ]] \
-  || fail "the fixture declares no live_golden; there is no golden for the single-leg run to score over"
+  || fail "the fixture declares no live_golden; there is no golden for the ranked run to score over"
 live_golden_base="${LIVE_GOLDEN_NAME}.golden.json"
 printf '%s' "${expected_list}" | grep -Fxq "${live_golden_base}" \
   || fail "live_golden '${LIVE_GOLDEN_NAME}' names no timed_prompt_pool entry (looked for ${live_golden_base}); it carries no pin and cannot be pin-verified"
 [[ -f "${GOLDEN_DIR}/${live_golden_base}" ]] \
-  || fail "the live golden ${live_golden_base} is not staged in ${GOLDEN_DIR}; it is the one golden the single-leg run scores over"
-ok "live golden ${live_golden_base} is pinned and staged (the single-leg scored golden)"
+  || fail "the live golden ${live_golden_base} is not staged in ${GOLDEN_DIR}; it is the one golden the ranked run scores over"
+ok "live golden ${live_golden_base} is pinned and staged (the one scored golden)"
 
 # --- 5. the fixture is armed for official scoring ---------------------------
 # benchd refuses, pre-GPU, to seal an official artifact unless the fixture
