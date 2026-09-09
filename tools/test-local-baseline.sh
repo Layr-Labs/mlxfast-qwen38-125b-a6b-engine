@@ -4,7 +4,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-WORK="$(mktemp -d)"
+# Canonical (pwd -P): on macOS mktemp answers under /var, a symlink to /private/var, and
+# the helper records its cwd resolved, so the comparison below needs the resolved path too.
+WORK="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'rm -rf "${WORK}"' EXIT
 TEST_ROOT="${WORK}/checkout with spaces"
 mkdir -p "${TEST_ROOT}/tools" "${TEST_ROOT}/fixtures" "${TEST_ROOT}/correctness_prompts" "${TEST_ROOT}/.build/release"
