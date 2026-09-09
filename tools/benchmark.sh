@@ -73,7 +73,7 @@ for arg in "$@"; do
   case "${arg}" in
     --weights|--weights=*|--golden|--golden=*|--score-path|--score-path=*)
       echo "benchmark.sh: use MLXFAST_WEIGHTS_PATH, MLXFAST_CORRECTNESS_GOLDEN_PATH, or MLXFAST_SCORE_PATH for shell path overrides" >&2
-      echo "benchmark.sh: pass --weights/--golden/--score-path only to .build/release/mlxfast-swift benchmark" >&2
+      echo "benchmark.sh: there is no --weights/--golden/--score-path flag here; this facade forwards its arguments to benchd iterate" >&2
       exit 1
       ;;
     --official)
