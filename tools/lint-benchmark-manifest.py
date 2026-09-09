@@ -1188,7 +1188,12 @@ class Linter:
         # survive this check and come back on the next re-pin. The walk is
         # RECURSIVE over the whole correctness_prompts/ root rather than a flat
         # listdir of each pinned file's own directory, because a per-track or
-        # per-depth subdirectory would otherwise be invisible here.
+        # per-depth subdirectory would otherwise be invisible here. It takes
+        # EVERY .json file, not only the `.golden.json` spelling: the checked-in
+        # public gate files carry the same top-level `benchmark` object under a
+        # plain .json name, and a stale pair hides there just as well. A file
+        # with no `benchmark` key is scanned and passes, which is already how
+        # this check treats a golden that carries neither field.
         roots = {GOLDEN_ROOT}
         for rel in sorted(rels):
             # The pinned goldens live under correctness_prompts/, but a track
@@ -1202,7 +1207,7 @@ class Linter:
                 continue
             for dirpath, _dirnames, filenames in os.walk(root_abs):
                 for name in filenames:
-                    if name.endswith(".golden.json"):
+                    if name.endswith(".json"):
                         rels.add(
                             os.path.relpath(os.path.join(dirpath, name), self.root)
                         )

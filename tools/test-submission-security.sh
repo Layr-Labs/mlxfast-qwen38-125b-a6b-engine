@@ -427,6 +427,32 @@ assert_exit "overlay/editable path that IS a symlink rejected" 1 \
   "must not contain symlinks" "${fx}/trusted" \
   env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
 
+# Other non-regular shapes (issue #32). The pre-copy check was symlink-ONLY, so
+# a FIFO at an editable root got past it, `rm -rf` had already deleted the
+# trusted copy, and `cp` then blocked on the FIFO instead of overlaying
+# anything -- validate_overlay_tree is a POST-copy check and never runs. The
+# refusal has to happen before the trusted copy goes.
+fx="$(new_fixture)"
+mkdir -p "${fx}/sub/src"
+printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
+mkfifo "${fx}/sub/config.txt"
+assert_exit "overlay/FIFO at an editable root rejected before the trusted copy is deleted" 1 \
+  "must contain only regular files and directories" "${fx}/trusted" \
+  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
+
+# Nested git metadata (issue #46). A `.git` directory inside an editable path
+# lands its config, hooks and objects in the TRUSTED checkout, where a later git
+# read would honour them -- the vector hardened-git.sh neutralizes on the
+# submission side, planted on the trusted side instead.
+fx="$(new_fixture)"
+mkdir -p "${fx}/sub/src/.git"
+printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
+printf '[core]\n\thooksPath = /tmp/attacker-hooks\n' > "${fx}/sub/src/.git/config"
+printf 'submitted config\n' > "${fx}/sub/config.txt"
+assert_exit "overlay/nested .git metadata inside an editable path rejected" 1 \
+  "must not contain .git metadata" "${fx}/trusted" \
+  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
+
 # Setuid smuggling. The asserted guarantee is that a setuid bit never LANDS in
 # the trusted checkout, not which layer stops it: the unprivileged tar/cp the
 # overlay uses already drops setuid/setgid on extraction, and
@@ -520,6 +546,25 @@ PY
     "measurement-harness surface" "${fx}/trusted" \
     env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
 done
+
+# The engine fork is the OTHER live gitlink (issue #31): `Vendor/mlx-swift-lm`
+# is a submodule, so an editable entry reaching it would overlay the pinned fork
+# with whatever the archive carries. lint-benchmark-manifest.py always refused
+# the spelling and the two shell layers did not; this asserts the lockstep.
+fx="$(new_fixture)"
+python3 - "${fx}/trusted/benchmark.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+c = json.load(open(p))
+c["editablePaths"] = ["src", "Vendor/mlx-swift-lm"]
+json.dump(c, open(p, "w"))
+PY
+mkdir -p "${fx}/sub/src" "${fx}/sub/Vendor/mlx-swift-lm"
+printf 'x\n' > "${fx}/sub/src/kernel.txt"
+printf 'attacker engine\n' > "${fx}/sub/Vendor/mlx-swift-lm/Package.swift"
+assert_exit "overlay/engine fork submodule entry 'Vendor/mlx-swift-lm' refused" 1 \
+  "measurement-harness surface" "${fx}/trusted" \
+  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
 
 # And with the real (gitlink-free) contract, an archive that merely CONTAINS a
 # replacement benchd/.gitmodules cannot land it.
@@ -794,6 +839,37 @@ assert_exit "static-review/ordinary optimization diff passes" 0 \
   "deterministic checks passed" "${gdir}" \
   env CONTRACT_PATH=benchmark.json MLXFAST_SUBMISSION_REVIEW_BASE_SHA="${base}" \
   "${SCRIPTS}/submission-static-review-checks.sh"
+
+# A repo-local diff driver must never run (issue #23). hardened-git.sh drops the
+# global and system config layers, but the untrusted checkout's OWN .git/config
+# still applies, and the one git read here that PRODUCES A PATCH would honour a
+# diff.external (or textconv) driver planted there and execute it as the
+# invoking uid. --no-ext-diff --no-textconv is the refusal.
+#
+# The positive control is what makes this non-vacuous: a plain `git diff` in the
+# same fixture DOES run the driver, so the marker's absence under the review is
+# the flags binding rather than a driver that was never wired up.
+gdir="$(git_fixture)"
+base="$(git -C "${gdir}" rev-parse HEAD)"
+ext_driver="${WORK}/ext-diff-driver.sh"
+ext_marker="${WORK}/ext-diff-driver-ran"
+printf '#!/bin/sh\ntouch "%s"\nexit 0\n' "${ext_marker}" > "${ext_driver}"
+chmod +x "${ext_driver}"
+git -C "${gdir}" config diff.external "${ext_driver}"
+printf 'a slightly better kernel\n' > "${gdir}/src/kernel.txt"
+git -C "${gdir}" add -A
+git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m planted-diff-driver
+rm -f "${ext_marker}"
+git -C "${gdir}" diff "${base}" HEAD -- src >/dev/null 2>&1 || true
+assert_equal "static-review/positive control: the planted diff.external driver does run for a plain git diff" \
+  "$([ -e "${ext_marker}" ] && echo ran || echo inert)" "ran"
+rm -f "${ext_marker}"
+assert_exit "static-review/diff mode: review with a planted diff.external driver still passes" 0 \
+  "deterministic checks passed" "${gdir}" \
+  env CONTRACT_PATH=benchmark.json MLXFAST_SUBMISSION_REVIEW_BASE_SHA="${base}" \
+  "${SCRIPTS}/submission-static-review-checks.sh"
+assert_equal "static-review/diff mode: the repo-local diff.external driver never ran" \
+  "$([ -e "${ext_marker}" ] && echo ran || echo inert)" "inert"
 
 # --- B1: in diff mode every rule comes from the review BASE ------------------
 #
@@ -1092,6 +1168,21 @@ git -C "${gdir}" add -A
 git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m repoint-pointer
 head_sha="$(git -C "${gdir}" rev-parse HEAD)"
 assert_exit "surface-gate/.gitmodules write refused even when the base contract lists it" 1 \
+  "reaches the measurement-harness surface" "${gdir}" \
+  env BASE_SHA="${base}" HEAD_SHA="${head_sha}" CONTRACT_PATH=benchmark.json \
+  "${SCRIPTS}/enforce-modifiable-surface.sh"
+
+# The engine fork gitlink (issue #31), on the same drifted-base fixture: a write
+# inside Vendor/mlx-swift-lm repoints the fork the ranked run builds, so the
+# gate must refuse it exactly as the manifest linter already does.
+gdir="$(drifted_base_fixture Vendor/mlx-swift-lm)"
+base="$(git -C "${gdir}" rev-parse HEAD)"
+mkdir -p "${gdir}/Vendor/mlx-swift-lm"
+printf 'attacker engine\n' > "${gdir}/Vendor/mlx-swift-lm/Package.swift"
+git -C "${gdir}" add -A
+git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m repoint-engine-fork
+head_sha="$(git -C "${gdir}" rev-parse HEAD)"
+assert_exit "surface-gate/engine fork write refused even when the base contract lists it" 1 \
   "reaches the measurement-harness surface" "${gdir}" \
   env BASE_SHA="${base}" HEAD_SHA="${head_sha}" CONTRACT_PATH=benchmark.json \
   "${SCRIPTS}/enforce-modifiable-surface.sh"

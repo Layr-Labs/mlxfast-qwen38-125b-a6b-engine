@@ -35,6 +35,9 @@ import MLX
 import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
+// ADDED to the fork's copy: `adoptMTPHead` reads and applies quantization
+// geometry, which is MLXNN's `Quantized` and `quantize`.
+import MLXNN
 // ADDED to the fork's copy: this file used to live INSIDE MLXRunners, so
 // the runner boundary -- `Runner`, `RunnerManifest`, `RunnerCheckpoint`,
 // `RunnerError`, `RunnerEngineAssembly`, `CBv2SingleRowStepper` -- needed no
@@ -184,10 +187,20 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
                     options.resources[ngramRowSourceResource], for: model))
         }
 
-        // The head is already in memory as part of the module: the drafter
-        // BINDS to it. A checkpoint loaded without the `mtp.*` block has none
-        // and is serial only.
-        let drafter = Qwen4ExpInlineMTPAssistant(target: model)
+        // ADOPT THE HEAD INTO THIS REPOSITORY. The loader builds the fork's
+        // head from the checkpoint's `mtp.*` block; adoption rebuilds it as
+        // `TrackQwen4ExpMTPModule`, which is editable here, and hands the
+        // loaded tensors over. A checkpoint without the `mtp.*` block has no
+        // head and is serial only.
+        let head = try model.mtp.map {
+            try Self.adoptMTPHead($0, configuration: model.configuration)
+        }
+        // ONE head is served. The fork's module held the same tensors the
+        // track head now holds, so releasing it frees a duplicate structure,
+        // not a duplicate copy of the weights — and it removes the second
+        // head that a later reader could mistake for the one in service.
+        model.mtp = nil
+        let drafter = head.map { TrackQwen4ExpInlineMTPAssistant(target: model, mtp: $0) }
         // §12c: the one embedded-head rule, in the one shared helper. It
         // hashes the shards carrying the `mtp.*` tensors, not the whole
         // checkpoint.
@@ -277,6 +290,46 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
             options.resources[Self.ngramRowSourceResource] == nil
                 ? "none" : Self.ngramRowSourceResource)
         return summary
+    }
+
+    /// Rebuild the checkpoint's `mtp.*` head as this repository's own module
+    /// and move the loaded tensors into it.
+    ///
+    /// THIS IS THE HEAD RE-QUANTIZATION SEAM, and it is code, not
+    /// configuration. `geometry` below is the ONE place that decides what
+    /// quantization the served head carries.
+    ///
+    /// The default is the CHECKPOINT'S OWN geometry: every projection the
+    /// loader quantized is quantized here with that projection's group size,
+    /// bit width and mode, and the loaded arrays are then bound unchanged. So
+    /// the served head is bit-exact with the head the pinned fork builds —
+    /// same tensors, same dtypes, same scales and biases — and the default
+    /// path changes nothing a run can measure.
+    ///
+    /// TO RE-QUANTIZE THE HEAD, change the geometry this call selects. A
+    /// participant who wants a different group size, bit width or mode
+    /// dequantizes the loaded projection and quantizes it again here, at this
+    /// call, before the parameters are bound. The head weights are the
+    /// checkpoint's and stay the checkpoint's: this seam re-encodes what the
+    /// checkpoint carries, it does not replace it and it does not ship a head.
+    public static func adoptMTPHead(
+        _ loaded: Qwen4ExpMTPModule, configuration: Qwen4ExpTextConfiguration
+    ) throws -> TrackQwen4ExpMTPModule {
+        let head = TrackQwen4ExpMTPModule(configuration, layerCount: loaded.layerCount)
+
+        // The geometry the served head carries. Read off the loaded head, so
+        // the default is the checkpoint's own.
+        var geometry: [String: (groupSize: Int, bits: Int, mode: QuantizationMode)] = [:]
+        for (path, module) in loaded.leafModules().flattened() {
+            guard let quantized = module as? Quantized else { continue }
+            geometry[path] = (quantized.groupSize, quantized.bits, quantized.mode)
+        }
+        quantize(model: head) { path, _ in geometry[path] }
+
+        // Verified in full: a head that took only part of the checkpoint's
+        // tensors would still draft, and would draft something else.
+        try head.update(parameters: loaded.parameters(), verify: .all)
+        return head
     }
 
     /// Refuse a module whose loaded norm weights contradict the offset it

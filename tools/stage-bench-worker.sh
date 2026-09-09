@@ -20,14 +20,15 @@
 #
 # THE FINGERPRINT SIDECAR TRAVELS WITH THE METALLIB. tools/build-mlx-metallib.sh
 # writes mlx.metallib.fingerprint beside every metallib it publishes, and the
-# harness check (Sources/MLXFastTrustedHarness/VendoredMetalFingerprint.swift,
-# verifyMetallibFingerprintRecord) reads it at <metallib path>.fingerprint --
-# i.e. next to the metallib the worker actually loads, which is the STAGED one.
-# Staging the metallib without its sidecar therefore turns a passing check into
-# a `mismatch` ("no fingerprint record at ..."), which an official run treats as
-# fatal. So the sidecar is copied with the pair, and a metallib that arrives
-# without one is a REFUSAL, not a skip: a silently absent sidecar is
-# indistinguishable at the check from a tampered one.
+# ranked workflow (.github/workflows/benchmark.yml) awk-reads the record out of
+# that sidecar and compares it against `tools/build-mlx-metallib.sh
+# --print-fingerprint` for this checkout, both on the build-cache hit and when
+# it adopts a pre-staged library; setup.sh requires the sidecar to be present
+# beside a pre-staged metallib before it skips the Metal toolchain. Staging the
+# metallib without its sidecar therefore turns a passing compare into a hard
+# refusal in both places. So the sidecar is copied with the pair, and a metallib
+# that arrives without one is a REFUSAL, not a skip: a silently absent sidecar
+# is indistinguishable there from a tampered one.
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"

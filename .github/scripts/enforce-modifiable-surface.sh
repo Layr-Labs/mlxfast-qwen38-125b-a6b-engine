@@ -96,7 +96,11 @@ changed="$("${HARDENED_GIT}" -c core.quotePath=false diff --name-only "${BASE_SH
 #       surface gate did not, so under trusted-contract drift a spelling the
 #       filesystem resolves to the submodule could pass HERE while the other two
 #       refused it.
-FORBIDDEN_SURFACE_PATHS=("benchd" ".gitmodules" "benchd.pin" "benchd-bin")
+# `Vendor/mlx-swift-lm` is the LIVE gitlink: the engine fork is a submodule, so a
+# diff reaching it repoints the pinned fork the run builds. The manifest linter
+# has always refused the spelling; the two shell layers did not, and lockstep is
+# the property this list exists for.
+FORBIDDEN_SURFACE_PATHS=("benchd" ".gitmodules" "benchd.pin" "benchd-bin" "Vendor/mlx-swift-lm")
 fold_case() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
 # Filesystem identity of an existing path, as device:inode. Empty (status 1)
@@ -139,7 +143,7 @@ bad=0
 while IFS= read -r f; do
   [[ -z "${f}" ]] && continue
   if reaches_forbidden_path "${f}"; then
-    echo "::error file=${f}::${f} reaches the measurement-harness surface (benchd-bin, or the retired benchd.pin spelling) or a retired submodule spelling; a submission must never be able to change what scores it"
+    echo "::error file=${f}::${f} reaches the measurement-harness surface (benchd-bin, or the retired benchd.pin spelling), a retired submodule spelling, or the engine fork submodule (Vendor/mlx-swift-lm); a submission must never be able to change what scores it or which fork builds it"
     bad=1
     continue
   fi

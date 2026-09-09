@@ -577,10 +577,10 @@ jobs:
         run: |
           set -euo pipefail
           MLXFAST_MACMON=""
-          if command -v macmon >/dev/null 2>&1; then MLXFAST_MACMON="$(command -v macmon)"; fi
-          if [[ -z "${MLXFAST_MACMON}" ]]; then
-            IFS=: read -r -a candidates <<< "${MLXFAST_MACMON_CANDIDATES}:${HOME}/bin/macmon"
-            for c in "${candidates[@]}"; do [[ -x "${c}" ]] && { MLXFAST_MACMON="${c}"; break; }; done
+          IFS=: read -r -a candidates <<< "${MLXFAST_MACMON_CANDIDATES}:${HOME}/bin/macmon"
+          for c in "${candidates[@]}"; do [[ -x "${c}" ]] && { MLXFAST_MACMON="${c}"; break; }; done
+          if [[ -z "${MLXFAST_MACMON}" ]] && command -v macmon >/dev/null 2>&1; then
+            MLXFAST_MACMON="$(command -v macmon)"
           fi
           if [[ -z "${MLXFAST_MACMON}" ]]; then
             echo "::error::macmon was not found (PATH, ${MLXFAST_MACMON_CANDIDATES}, ${HOME}/bin/macmon); the cool gate needs its GPU temperature reader" >&2

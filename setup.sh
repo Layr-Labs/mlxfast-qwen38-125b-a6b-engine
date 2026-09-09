@@ -556,8 +556,8 @@ ensure_swift_toolchain() {
   # the Xcode Metal toolchain: the Swift build itself runs on the Command Line
   # Tools. The caller (the ranked workflow's prestaged_metallib input, or an
   # operator) verifies the sidecar against tools/build-mlx-metallib.sh
-  # --print-fingerprint before naming the file here; the trusted harness
-  # re-verifies it before every worker spawn.
+  # --print-fingerprint before naming the file here; nothing downstream of this
+  # point re-computes it, so the sidecar must be present beside the metallib.
   if [[ "${MLXFAST_SKIP_MLX_METALLIB:-0}" == "1" && -n "${MLXFAST_MLX_METALLIB:-}" \
       && -f "${MLXFAST_MLX_METALLIB}" && -f "${MLXFAST_MLX_METALLIB}.fingerprint" ]]; then
     echo "${SETUP_LOG_LABEL}: Metal library pre-staged at ${MLXFAST_MLX_METALLIB} with its fingerprint sidecar; the Command Line Tools' Swift is sufficient (xcodebuild not required)"

@@ -173,6 +173,32 @@ func maxBytesAboveTrackCapStillRefused() throws {
     }
 }
 
+// --- A stated number must be a JSON integer ---------------------------------
+
+@Test
+func stringMaxBytesIsRefused() throws {
+    // `(root["max_bytes"] as? NSNumber)?.intValue` used to drop a string back
+    // onto the default, so a declaration that spelled the cap out silently ran
+    // at the full 2 GiB track cap instead of refusing.
+    let message = refusalMessage(#"{"source":"pinned","max_bytes":"2 GiB"}"#)
+    #expect(message.contains("max_bytes"), "the refusal must name the field: \(message)")
+}
+
+@Test
+func booleanBytesIsRefused() throws {
+    // JSON `true` bridges to NSNumber 1, which used to pass the size gate as a
+    // one-byte head.
+    let message = refusalMessage(#"{"source":"pinned","bytes":true}"#)
+    #expect(message.contains("bytes"), "the refusal must name the field: \(message)")
+}
+
+@Test
+func fractionalBytesIsRefused() throws {
+    // A byte count is a whole number; 1024.5 used to truncate to 1024.
+    let message = refusalMessage(#"{"source":"pinned","bytes":1024.5}"#)
+    #expect(message.contains("bytes"), "the refusal must name the field: \(message)")
+}
+
 // --- Declared-digest passthrough is UNCHANGED (regression) ------------------
 
 @Test

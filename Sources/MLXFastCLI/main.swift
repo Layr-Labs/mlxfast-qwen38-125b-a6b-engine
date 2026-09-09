@@ -447,13 +447,15 @@ private enum MLXFastCLI {
     // the uid, workspace-write-confinement, and PF-egress layers remain the
     // filesystem boundary.
     //
-    // Trigger + fail-closed policy: the trusted workflow sets
-    // MLXFAST_SANDBOX_PARENT_TOOLS=1 on exactly the transform/attach steps (and
-    // MLXFAST_OFFICIAL_BENCHMARK_RUN=1 also arms it). When armed, a missing
-    // sandbox-exec or MLXFAST_NO_SANDBOX=1 aborts the run rather than executing
-    // unsandboxed. Local invocations set neither, so participant workflows are
-    // unchanged. MLXFAST_PARENT_SANDBOX_ACTIVE=1 is set on the re-exec so the
-    // sandboxed child does not recurse.
+    // Trigger + fail-closed policy: the re-exec is OPT-IN, armed by either
+    // MLXFAST_SANDBOX_PARENT_TOOLS=1 or MLXFAST_OFFICIAL_BENCHMARK_RUN=1 in the
+    // environment. NOTHING IN THIS TRACK ARMS IT TODAY: the ranked workflow
+    // (.github/workflows/benchmark.yml) sets neither name, so the confinement
+    // below is available to an operator who exports one and is otherwise
+    // inert. When it IS armed, a missing sandbox-exec or MLXFAST_NO_SANDBOX=1
+    // aborts the run rather than executing unsandboxed.
+    // MLXFAST_PARENT_SANDBOX_ACTIVE=1 is set on the re-exec so the sandboxed
+    // child does not recurse.
     private static func reexecUnderParentToolSandboxIfRequested(subcommand: String) throws {
         if environmentValue("MLXFAST_PARENT_SANDBOX_ACTIVE", fallback: "0") == "1" {
             return
