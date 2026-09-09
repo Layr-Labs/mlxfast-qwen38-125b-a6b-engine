@@ -133,11 +133,11 @@ unranked measurement: a `null` score is expected without paired ranked scoring;
 check the run's exit status, correctness result, and timing metrics. The command
 also works when called from outside the checkout.
 
-After `yukon clone`, change to the printed work directory and run `yukon setup`,
-the transform command above, and `./tools/local-baseline.sh`. `yukon run` is the
-ranked entry point for this challenge and requires organizer-staged goldens,
-the reference workspace, and the box calibration. Those assets are unnecessary
-for this public local baseline.
+After `yukon clone`, change to the printed work directory. `yukon setup` runs
+the repository's setup command. Once `weights/` is prepared as described above,
+run `./tools/local-baseline.sh`. `yukon run` is the ranked entry point for this
+challenge and requires organizer-staged goldens, the reference workspace, and
+the box calibration. Those assets are unnecessary for this public local baseline.
 
 The helper clears inherited `MLXFAST_BASELINE_WORKSPACE` and
 `MLXFAST_BASELINE_CALIBRATION` for its child process, so an operator shell's
