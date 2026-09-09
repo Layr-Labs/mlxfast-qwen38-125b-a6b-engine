@@ -37,6 +37,7 @@ templating, wire fixtures, and request validation.
 | `lint` | `ubuntu-latest` | `tools/ci-workflow-egress-scan.sh` — nothing in `.github/` matches a credential-or-egress tripwire pattern (see [Deliberate non-goals](#deliberate-non-goals) for the exact set) |
 | `lint` | `ubuntu-latest` | `actionlint` over `.github/workflows/`, with the ranked runner's label declared in `.github/actionlint.yaml` |
 | `lint` | `ubuntu-latest` | shell syntax (`bash -n` / `sh -n`) over every tracked `*.sh` |
+| `lint` | `ubuntu-latest` | `tools/test-benchmark-facade-spec.sh` — the real local facade forwards every permitted declared MTP depth, keeps serial declarations serial, refuses unsupported or invalid requests before engine work, preserves the local cool gate and reports the request and worker fingerprint |
 | `lint` | `ubuntu-latest` | `tools/lint-benchmark-manifest.py --gitlink-targets report` — the Yukon track manifest at rest |
 | `lint` | `ubuntu-latest` | `tools/ci-box-only-inventory.sh --check` — the inventory below matches the sources |
 | `lint` | `ubuntu-latest` | `tools/test-benchmark-facade-env.sh` — the real `tools/benchmark.sh`, driven with a stub `benchd`, exports `MLXFAST_QWEN_MTP_TRACK_ID` equal to `benchmark.json`'s `trackId` in every mode, and refuses when the manifest carries none |

@@ -87,7 +87,7 @@ cat > "${STUB}" <<'STUBEOF'
 # nothing for the probe.
 for arg in "$@"; do
   if [[ "${arg}" == "--help" ]]; then
-    echo "usage: benchd iterate --engine <bin> --engine-resource <k=v>"
+    echo "usage: benchd iterate --engine <bin> --engine-resource <k=v> --mtp-depth <N>"
     exit 0
   fi
 done
