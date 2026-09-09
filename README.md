@@ -293,7 +293,8 @@ The editable surface has four groups.
 
 The Runner in `Runner/` is editable. It is the model family's code: it loads
 the checkpoint, it declares the manifest, and it builds the engine and the
-one-row stepper. `Sources/BenchWorker/` registers it in `RunnerRegistry`
+one-row stepper. It also holds the MTP head and the assistant that drives it,
+in `Runner/Qwen4ExpMTP.swift` and `Runner/Qwen4ExpMTPDrafter.swift`. `Sources/BenchWorker/` registers it in `RunnerRegistry`
 before the engine resolves a runner, so it SHADOWS the fork's built-in runner
 for `qwen4_exp` and `qwen4_exp_text`. The `Vendor/mlx-swift-lm` submodule is
 not editable: it holds the engine core, a gitlink names a commit and not
@@ -325,10 +326,14 @@ optional, and the runner does not verify it against the head bytes.
 `docs/participant-contract.md` section 4.3 states that limit plainly.
 
 A re-quantization happens ON LOAD, in memory. Nothing on disk changes. The head
-loader is in the `Vendor/mlx-swift-lm` submodule. That submodule is pinned and
-it is not editable. No editable path holds the loader today, so a head
-re-quantization is not shippable through the editable surface.
-`docs/participant-contract.md` section 4.4 is the authority.
+module and the assistant that drives it are in `Runner/`, which is editable:
+`Runner/Qwen4ExpMTP.swift` and `Runner/Qwen4ExpMTPDrafter.swift`. The seam is
+`TrackQwen4ExpRunner.adoptMTPHead` in `Runner/Qwen4ExpRunner.swift`, which
+selects the quantization geometry of the served head. By default it selects the
+checkpoint's own geometry, so the served head is bit-exact with the head the
+pinned fork builds. To re-quantize, change the geometry that function selects.
+A replacement of the head is still refused, and head weights of your own are
+still refused. `docs/participant-contract.md` section 4.4 is the authority.
 
 A head only **proposes** tokens. The pinned target model decides every emitted
 token. The serial control leg always runs the embedded head.

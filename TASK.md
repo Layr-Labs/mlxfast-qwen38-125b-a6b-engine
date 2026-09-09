@@ -36,6 +36,7 @@ groups.
 
 The Runner in `Runner/` is editable. `Sources/BenchWorker/` registers it
 before the engine resolves a runner, so it shadows the fork's built-in runner.
+`Runner/` also holds the MTP head and the assistant that drives it.
 The engine core is the `Vendor/mlx-swift-lm` submodule and it is not editable:
 a gitlink names a commit, not bytes.
 
@@ -59,10 +60,15 @@ declaration. A declared `sha256` is optional, and the runner does not verify it.
 A re-quantization happens ON LOAD, in memory. Nothing on disk changes, and no
 artifact travels in a submission.
 
-The head loader is in the `Vendor/mlx-swift-lm` submodule. That submodule is
-pinned and it is not editable. No editable path holds the loader today, so a
-head re-quantization is not shippable through the editable surface.
-`docs/participant-contract.md` section 4.4 is the authority.
+The head module and the assistant that drives it are in `Runner/`, which is
+editable: `Runner/Qwen4ExpMTP.swift` and `Runner/Qwen4ExpMTPDrafter.swift`. The
+seam is `TrackQwen4ExpRunner.adoptMTPHead` in `Runner/Qwen4ExpRunner.swift`,
+which selects the quantization geometry of the served head. By default it
+selects the checkpoint's own geometry, so the served head is bit-exact with the
+head the pinned fork builds. To re-quantize, change the geometry that function
+selects. A replacement of the head is still refused, and head weights of your
+own are still refused. `docs/participant-contract.md` section 4.4 is the
+authority.
 
 > **WARNING — the target quantization is frozen.**
 > Do not re-quantize any target weight. Do not re-represent one. Do not change

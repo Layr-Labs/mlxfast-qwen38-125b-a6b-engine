@@ -279,9 +279,27 @@ only read.
 
 #### Where the seam is
 
-The head loader is in the `Vendor/mlx-swift-lm` submodule. That submodule is
-pinned and it is not editable. No editable path holds the loader today, so a
-head re-quantization is not shippable through the editable surface.
+The head is in `Runner/`, which is an editable path.
+`Runner/Qwen4ExpMTP.swift` holds the head module.
+`Runner/Qwen4ExpMTPDrafter.swift` holds the assistant that drives it.
+
+The seam is `TrackQwen4ExpRunner.adoptMTPHead` in `Runner/Qwen4ExpRunner.swift`.
+The function builds the head as the track's own module, selects the
+quantization geometry, and then binds the tensors the loader read from the
+checkpoint.
+
+By default the function selects the CHECKPOINT'S OWN geometry. It reads the
+group size, the bit width and the mode of each loaded projection, and it
+applies the same values to the head it builds. The served head is therefore
+bit-exact with the head the pinned fork builds: the same tensors, the same data
+types and the same quantization parameters. The default path changes nothing a
+run can measure.
+
+To re-quantize the head, change the geometry that this function selects. Select
+a different group size, a different bit width or a different mode, and quantize
+the loaded projection again at that point. This is CODE, in an editable path,
+and it travels in a submission as code. There is no configuration key, no
+environment variable and no manifest key for it.
 
 The policy stays as written. A re-quantization of the pinned head is permitted.
 A replacement of the head is not, and head weights of your own are not. The
@@ -849,10 +867,12 @@ Your drafter code sets the depth. That code is an editable path, so the depth is
 a free lever. A request above the ceiling is clamped to the ceiling. It is not
 refused.
 
-The permitted values are 1 to 6. The engine limits the depth to 6. The limit is
-in the pinned fork, which is not an editable path: the embedded head is served
-at depth 1 to 6 (`Qwen4ExpInlineMTPAssistant.maximumDepth`), and the depth
-policy table has the same size. The runner's manifest declares depth `[1, 6]`.
+The permitted values are 1 to 6. The engine limits the depth to 6. The embedded
+head is served at depth 1 to 6
+(`TrackQwen4ExpInlineMTPAssistant.maximumDepth`, in `Runner/`), and the depth
+policy table has the same size. The runner's manifest declares depth `[1, 6]`,
+and that manifest digest is a benchd conformance input, so the declared ceiling
+does not move.
 
 An absent depth does not mean 1. Two layers supply a depth when a request does
 not name one. Do not confuse them.
@@ -956,9 +976,9 @@ The engine constructs, gates, loads and runs `qwen4_exp_text`. The geometry in
 target's, and they move as ONE SET: a gate holding some fields of one model and
 some of another rejects every checkpoint and explains none of them.
 
-The model itself, the runner and the n-gram row source are in the
-`Vendor/mlx-swift-lm` submodule. They are not editable paths in this
-repository; see section 3.
+The model tower and the n-gram row source are in the `Vendor/mlx-swift-lm`
+submodule. They are not editable paths in this repository; see section 3. The
+Runner and the MTP head are in `Runner/`, which is editable.
 
 What remains is named in 11.4 and 11.5: the cohort path refuses, and the
 speculative arm is correct but not yet fast.

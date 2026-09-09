@@ -407,10 +407,14 @@ flip a near-tie greedy argmax.
 > not replace it and do not upload head weights. The head is embedded in the
 > pinned target checkpoint, and `mtp-head.manifest.json` accepts
 > `"source": "pinned"` only. A head re-quantization happens ON LOAD, in memory,
-> and nothing on disk changes. The head loader is in the pinned
-> `Vendor/mlx-swift-lm` submodule, which is not editable, so a head
-> re-quantization is not shippable through the editable surface today
-> (`docs/participant-contract.md` section 4.4).
+> and nothing on disk changes. The head module and the assistant that drives it
+> are in `Runner/`, which is editable (`Runner/Qwen4ExpMTP.swift`,
+> `Runner/Qwen4ExpMTPDrafter.swift`). The seam is
+> `TrackQwen4ExpRunner.adoptMTPHead` in `Runner/Qwen4ExpRunner.swift`, which
+> selects the quantization geometry of the served head; by default it selects
+> the checkpoint's own geometry, so the served head is bit-exact with the head
+> the pinned fork builds. To re-quantize, change the geometry that function
+> selects (`docs/participant-contract.md` section 4.4).
 > The head only proposes tokens; the pinned target decides every emitted token.
 > The target's own quantization is verified on the LOADED model TWICE: once at
 > worker startup, and again at the top of every window that gets measured,

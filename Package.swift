@@ -167,6 +167,14 @@ let package = Package(
                 "MLXFastCore",
                 "MLXFastTransform",
                 "MLXFastHarness",
+                // The head adoption seam lives in the editable Runner, so the
+                // test that proves its default is bit-exact links the Runner
+                // and the model family it rebuilds.
+                "TrackRunner",
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
             ]
         ),
     ]
