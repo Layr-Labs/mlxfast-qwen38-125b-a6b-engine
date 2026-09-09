@@ -22,10 +22,17 @@ CONTRACT_PATH="${CONTRACT_PATH:-benchmark.json}"
 # to have caught it. The two submodule spellings are KEPT so a reintroduced
 # gitlink is covered on arrival. The original had nothing here to protect.
 #
+# `Vendor/mlx-swift-lm` is the LIVE gitlink: the engine fork is a submodule, and
+# a gitlink is not an editable path -- overlaying one would replace the pinned
+# fork with whatever the archive carries. The manifest linter has always refused
+# the spelling; the two shell layers did not, which is the disagreement this
+# entry closes.
+#
 # Kept in lockstep with enforce-modifiable-surface.sh FORBIDDEN_SURFACE_PATHS
 # and lint-benchmark-manifest.py FORBIDDEN_EDITABLE: the three layers that read
-# this editable surface must not disagree about which spellings reach the scorer.
-FORBIDDEN_OVERLAY_PATHS=("benchd" ".gitmodules" "benchd.pin" "benchd-bin")
+# this editable surface must not disagree about which spellings reach the scorer
+# or the pinned fork.
+FORBIDDEN_OVERLAY_PATHS=("benchd" ".gitmodules" "benchd.pin" "benchd-bin" "Vendor/mlx-swift-lm")
 
 # CASE FOLDING. The ranked box is macOS and APFS is case-INSENSITIVE by
 # default, so `BENCHD.PIN` names the same file as `benchd.pin`. A byte-comparison
@@ -102,7 +109,7 @@ validate_contract_path() {
       ;;
   esac
   if reaches_forbidden_path "${path}"; then
-    echo "::error::editable path '${path}' in ${CONTRACT_PATH} covers the measurement-harness surface (benchd-bin, or the retired benchd.pin spelling) or a retired submodule spelling; refusing to overlay it" >&2
+    echo "::error::editable path '${path}' in ${CONTRACT_PATH} covers the measurement-harness surface (benchd-bin, or the retired benchd.pin spelling), a retired submodule spelling, or the engine fork submodule (Vendor/mlx-swift-lm); refusing to overlay it" >&2
     exit 1
   fi
 }
@@ -261,6 +268,27 @@ for editable_path in "${EDITABLE_PATHS[@]}"; do
   fi
   if find "${source_path}" -type l -print -quit | grep -q .; then
     echo "::error file=${editable_path}::submitted editable paths must not contain symlinks" >&2
+    exit 1
+  fi
+  # The pre-copy check used to look for symlinks only, so any OTHER non-regular
+  # shape reached the copy below with the trusted copy already deleted: a FIFO
+  # at an editable root blocks `cp` outright, and validate_overlay_tree is a
+  # POST-copy check that never gets to run. Refuse the shape here, before
+  # `rm -rf` touches the trusted checkout.
+  if [[ ! -f "${source_path}" && ! -d "${source_path}" ]] \
+     || find "${source_path}" ! -type f ! -type d -print -quit | grep -q .; then
+    echo "::error file=${editable_path}::submitted editable paths must contain only regular files and directories" >&2
+    exit 1
+  fi
+  # Nested git metadata. A `.git` directory (or file) inside an editable path
+  # carries its own config, hooks and objects into the TRUSTED checkout, where a
+  # later git read run there would honour them -- the vector hardened-git.sh
+  # exists to neutralize, planted on the trusted side instead of the submission
+  # side. The find covers a `.git` at the root of the entry too; the basename
+  # test also covers an entry the contract spells with a trailing slash.
+  if [[ "$(basename -- "${editable_path}")" == ".git" ]] \
+     || find "${source_path}" -name .git -print -quit | grep -q .; then
+    echo "::error file=${editable_path}::submitted editable paths must not contain .git metadata" >&2
     exit 1
   fi
 

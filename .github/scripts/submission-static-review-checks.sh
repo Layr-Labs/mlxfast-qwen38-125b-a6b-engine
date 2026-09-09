@@ -476,7 +476,15 @@ if [[ -n "${review_base}" ]]; then
   # Also capture the unified diff: changed FILES are collected whole (context),
   # but a verdict must be about what this submission CHANGED. It counts against
   # the same total cap.
-  "${HARDENED_GIT}" diff "${review_base}" "${review_head}" -- "${reviewed_paths[@]}" > "${submission_diff_path}"
+  #
+  # --no-ext-diff --no-textconv because this is the one git read here that
+  # PRODUCES A PATCH, and patch generation is where a repo-local diff.external
+  # or a textconv driver in the untrusted checkout's .git/config would execute
+  # as the invoking uid. hardened-git.sh neutralizes the config layers it can
+  # (fsmonitor, hooks, pager) but repo-local config still applies, so the two
+  # flags are the refusal for this vector; the --name-only reads above generate
+  # no patch and reach neither driver.
+  "${HARDENED_GIT}" diff --no-ext-diff --no-textconv "${review_base}" "${review_head}" -- "${reviewed_paths[@]}" > "${submission_diff_path}"
   diff_bytes="$(wc -c < "${submission_diff_path}" | tr -d ' ')"
   if ! [[ "${diff_bytes}" =~ ^[0-9]+$ ]]; then
     echo "::error::could not determine submission diff size" >&2
