@@ -393,8 +393,10 @@ The score is serial-anchored. A faster candidate scores above 1.
 ### 5.1.0 The pair is measured on the box, and no file stores it
 
 **DAVID RULING 2026-09-08: EACH RANKED MACHINE HAS ITS OWN BASELINE.** A ranked
-run measures TWO legs. It measures them on the SAME box, in the SAME job, over
-the ONE prompt the fixture names in `live_golden`:
+run measures PAIRS OF LEGS. It measures them on the SAME box, in the SAME job,
+over the ONE prompt the fixture names in `live_golden`. The fixture's
+`official_pairs` sets the count, and it is 2 (David ruling 2026-09-09). Every
+pair is the same two legs in the same order:
 
 1. The **serial-control leg**. It runs on the organizer's reference tree, which
    `MLXFAST_BASELINE_WORKSPACE` names. That tree is a build of this repository
@@ -410,7 +412,16 @@ score = (ref_prefill_spt / cand_prefill_spt) ^ 0.25
       * (ref_decode_spt  / cand_decode_spt ) ^ 0.75
 ```
 
-The floors do not change.
+The legs run STRICTLY ONE AFTER THE OTHER, and each leg loads the model once.
+Per role the per-token times are SUMMED over the pairs, and each gain is the
+ratio of those two sums. The floors, the ceiling and the acceptance bands apply
+to that aggregate, not to one pair. Every control leg is checked against this
+box's own baseline calibration (section 5.1.0.1).
+
+**BOTH SPEEDUP FLOORS ARE 0.95** (David ruling 2026-09-09). A candidate that
+regresses prefill or decode by more than 5 percent is refused. The fixture
+declares them as `decode_speedup_floor` and `prefill_speedup_floor`, and the
+benchmarker enforces the fixture's values. The ceiling stays 5.0.
 
 **NO STORED PAIR EXISTS ANYWHERE.** Not in the scoring constants. Not in the
 fixture. Not in a golden. A golden that carries
@@ -490,18 +501,13 @@ recording.
 Each refusal names the failing thing.
 
 **THE SCORED SHAPE IS SINGLE-STREAM.** David ruling 2026-08-27, relayed by
-orchestrator: this track scores a PAIRED serial-against-MTP comparison over the
-pinned prompt pool, ONE stream at a time, at `scored_batch_size` 1. The batch-8
-cohort adaptation is NOT pursued. Section 11.4 states why: the batched path
-cannot run this model.
+orchestrator: this track scores a PAIRED serial-against-MTP comparison, ONE
+stream at a time, at `scored_batch_size` 1. The batched cohort adaptation is NOT
+pursued. Section 11.4 states why: the batched path cannot run this model.
 
-Where a run times the whole pinned pool, `aggregate` is the **per-prompt sum**.
-Run each of the 8 pinned prompts in its own single-stream window and add the 8
-elapsed times together. Do this for prefill and for decode separately. Do it on
-the baseline leg and on the candidate leg, over the same 8 prompts. Each gain is
-therefore a RATIO OF SUMS over the accepted pairs, not a mean of per-pair
-ratios. The scored ranked run times the ONE prompt `live_golden` names, on both
-legs.
+`aggregate` is a **sum over the pairs**, per role. Each gain is therefore a
+RATIO OF SUMS, not a mean of per-pair ratios. The scored ranked run times the
+ONE prompt `live_golden` names, on every leg.
 
 The ruling this track is scored under, verbatim, dated 2026-08-27, and carried
 in the fixture's `scoring_semantics.ruling_verbatim`: "score the qwen 3.8
@@ -556,16 +562,6 @@ its forward count legitimately exceeds N, and what must hold is that its
 offsets land exactly on `seed + N` -- rollback took back the drafts and nothing
 else, and never re-prefilled.
 
-**NO SCORED RUN IS POSSIBLE ON THIS TRACK TODAY**, and section 11.4 states the
-full reason. The short form is that the benchmarker has to catch up with the
-ruling: at the published channel tip it certifies B = 8 as the ONE scored width
-and computes the composite only on the batched regime, so this fixture's
-`scored_batch_size` 1 refuses at its width certification. A separate bench lane
-carries the single-stream regime -- the certified width, the prefill window on
-the single-stream free-run verbs, and the exponent pair certified on the B = 1
-point. Until that lands, the refusal is the correct behavior, not a defect in
-this repository.
-
 ### 5.2 The measured window
 
 | Quantity | Value |
@@ -577,23 +573,24 @@ this repository.
 | Timed prompts per leg | 1 (the fixture's `live_golden`) |
 | Prompts in the pinned correctness pool | 8 |
 | Prefill tokens per correctness-pool pass | 8 x 1024 |
-| Legs per ranked job | 2 (serial control, then candidate) |
+| Pairs per ranked job | 2 (the fixture's `official_pairs`) |
+| Legs per ranked job | 4 (each pair is serial control, then candidate) |
 
-The last two rows are the CORRECTNESS pool, not the scored timing. The box
-stages all 8 pinned prompts and `tools/ranked-box-preflight.sh` verifies all 8
-against the fixture pins. Each timed leg runs the ONE prompt `live_golden`
-names, and section 5.1.0 states the pair that timing produces.
+The correctness-pool rows are not the scored timing. The box stages all 8 pinned
+prompts and `tools/ranked-box-preflight.sh` verifies all 8 against the fixture
+pins. Each timed leg runs the ONE prompt `live_golden` names, and section 5.1.0
+states what that timing produces.
 
-The two legs run one after the other, in one job. Each leg loads the weights
-once, and each leg gets its own worker residency. The unmeasured warm-up prefill
-pass stays at 1 pass on MLX, and it applies to both legs in the same way.
+The legs run one after the other, in one job. Each leg loads the weights once,
+and each leg gets its own worker residency. The unmeasured warm-up prefill pass
+stays at 1 pass on MLX, and it applies to every leg in the same way.
 
 `MLXFastConstants.correctnessPromptTokens`, `benchmarkPrefillPromptTokens`, and
 `benchmarkDecodeSeedTokens` all equal 1024. `benchmarkDecodeSteps` is 128.
 
 Every timed leg runs on a cool, quiescent box. The ranked job waits for the
 machine to go idle before the clock starts, and the benchmarker holds each timed
-phase behind the fixed 40 C cool-down gate. The job refuses to measure at all
+phase behind the fixed 40 C cool-down gate, which waits up to 900 s. The job refuses to measure at all
 when the box has no GPU temperature reader, or when that reader returns a frozen
 or implausible value. Only pairs accepted under that gate feed the composite.
 
@@ -606,17 +603,17 @@ or implausible value. Only pairs accepted under that gate feed the composite.
 | `decodeGainExponent` | 0.75 |
 | `pairsPerCohort` | 2 |
 | `minPairsPerCohort` | 2 |
-| `decodeSpeedupFloor` | 0.90 |
+| `decodeSpeedupFloor` | 0.95 |
+| `prefillSpeedupFloor` | 0.95 |
 | `decodeSpeedupCeiling` | 5.0 |
 | `kvBackend` | `contiguous` |
 
-The pinned 8-prompt pool runs ONE prompt at a time. There is no sweep and no
-per-run choice of width. A width the benchmarker has not certified has no
-series tag, and the benchmarker refuses that width rather than run it.
+The scored run times ONE prompt at a time. There is no sweep and no per-run
+choice of width. A width the benchmarker has not certified has no series tag,
+and the benchmarker refuses that width rather than run it.
 
-The even-n median over the 4 paired ratios is the mean of the two central
-order statistics -- the fastest and the slowest of the four scored windows do
-not enter the published number.
+There is NO MEDIAN on this track. Each role's per-token times are summed over
+the 2 pairs, and each gain is the ratio of those sums.
 
 ### 5.4 Token fidelity
 
@@ -638,19 +635,14 @@ refuses while the flag is absent, because it treats an absent flag as unarmed
 rather than armed. No submission can publish an official score until that flag
 flips.
 
-The benchmarker, not the engine, produces the composite. It computes
-`per_cohort[].composite` from benchd's own parent-clocked prefill and decode
-windows, summed over the accepted pairs, at the certified exponent pair. No
+The benchmarker, not the engine, produces the composite. It computes it from
+benchd's own parent-clocked prefill and decode windows, summed over the pairs,
+at the certified exponent pair. No
 engine-reported value feeds it, and it does not depend on per-stream
 instrumentation. Each record seals exactly one of `composite` and
 `composite_absent_reason`. A composite is absent only when the record accepted
-no pair, or when a window is degenerate, and the reason names which. At the
-published channel tip that computation runs on the batched cohort regime only;
-carrying it to the ruled single-stream series is the bench lane named in
-section 5.1.
+no pair, or when a window is degenerate, and the reason names which.
 
-What is missing is therefore the arm state, the goldens, and that bench lane,
-not this repository's score path.
 `tools/qwen38-125b-a6b-measure-and-score.sh` refuses with a non-zero exit
 rather than emit a score. It does not substitute the shared-window
 `raw_ratio_of_means` diagnostic for the ruled composite formula. Refuse, not
@@ -934,16 +926,13 @@ The checkpoint is a 4-bit MLX conversion of `Qwen/Qwen3.8-Flash-Next`.
 
 This repository distributes no model weights.
 
-## 11. What is not in place yet
+## 11. The state of the track
 
 Read this section before you conclude that something is broken.
 
-### 11.1 The track is not armed
+### 11.1 The bench channel
 
-Section 5.5 states the arm state. `official_scoring_enabled` is `false`, and
-the timed prompt pool and the hidden correctness oracle are the pending
-sentinel. No runner advertises the ranked label set
-`[self-hosted, macOS, qwen3.8-125b-a6b-mlx-v1]`, and the box is not staged.
+Section 5.5 states the arm state: the track IS armed.
 
 The bench release branch and dist channel are `qwen3.8-125b-a6b-v1`, which is
 the PROJECT name, not this track's id. David ruling 2026-08-27: the MLX and
@@ -980,7 +969,7 @@ The model tower and the n-gram row source are in the `Vendor/mlx-swift-lm`
 submodule. They are not editable paths in this repository; see section 3. The
 Runner and the MTP head are in `Runner/`, which is editable.
 
-What remains is named in 11.4 and 11.5: the cohort path refuses, and the
+What remains is named in 11.4 and 11.5: the batched path refuses, and the
 speculative arm is correct but not yet fast.
 
 ### 11.3 The checked-in goldens are REGENERATED and they load
@@ -996,9 +985,8 @@ So `./benchmark.sh --local-iterate` reaches a golden, and the local public
 drift gate can pass. The PROMPT file is unchanged; only the expected tokens and
 the provenance block moved.
 
-The HIDDEN correctness oracle is untouched and is still the pending sentinel:
-these are the PUBLIC goldens. Section 5.5 remains the authority on the arm
-state.
+These are the PUBLIC goldens. Section 5.5 remains the authority on the arm
+state and on the pinned hidden oracle.
 
 **A GOLDEN MUST CARRY `model_provenance`.** The block names the repository and
 the revision of the pinned model. `loadQwenGoldenFixture` is the loader that
@@ -1008,7 +996,7 @@ loader read the block when it was present and skipped the check when it was
 absent, so a golden that named no checkpoint passed. The model-agnostic
 `loadGoldenFixture` keeps the reference schema, which has no such key.
 
-### 11.4 The cohort path REFUSES, and no scored run is possible today
+### 11.4 The batched path REFUSES, and the ruling is single-stream
 
 **(a) The batched cohort path refuses by name.** `makeCohortEngine` throws.
 There are TWO blockers and the second is decisive:
@@ -1036,16 +1024,14 @@ ContinuousBatchingV2 adaptation is not pursued. The fixture therefore pins
 `qwen-native-mtp-paired-decode-only`, and section 5 describes a single-stream
 paired series.
 
-**The bench-side dependency is MET.** Bench pull request 217 merged at the
-release branch tip `56a9821a`. At that tip `effective_candidate_regime` keeps
+**The bench-side dependency is MET.** The benchmarker keeps
 `scored_batch_size` 1 on the single-stream regime (it never reaches the cohort
-width match), the composite is sealed on the single-stream series at the top
+width match), and it seals the composite on the single-stream series at the top
 level of the record beside `composite_scored_exponents`
-(`prefill_gain_exponent` / `decode_gain_exponent`), and the channel serves that
-lane or later -- `./tools/fetch-benchd.sh` resolves whatever the channel
-manifest names (section 11.1). The width certification no longer refuses the
-shape this fixture declares. What still stops a scored run is section 5.5: the sentinels,
-and the goldens.
+(`prefill_gain_exponent` / `decode_gain_exponent`). `./tools/fetch-benchd.sh`
+resolves whatever the channel manifest names (section 11.1). The width
+certification does not refuse the shape this fixture declares, and scored runs
+happen.
 
 **(c) The mtp arm can now be faster than serial, and whether it is depends on
 your drafter.** Its verify runs at the draft depth (see 11.5), so a round pays

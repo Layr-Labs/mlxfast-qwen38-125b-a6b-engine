@@ -88,8 +88,8 @@ enum TransformModelFamily: Equatable {
 /// - Poolside Laguna XS 2.1 NVFP4 (flat config, `model_type` "laguna"): the
 ///   ranked serial-track target. The source is already MLX NVFP4-quantized,
 ///   so the transform validates and passes through -- byte-for-byte, source
-///   tensor names unchanged -- the BF16/NVFP4 tensor set described by
-///   `docs/laguna-weight-contract.md`: attention
+///   tensor names unchanged -- the BF16/NVFP4 tensor set the Poolside
+///   contract describes: attention
 ///   q/k/v/o projections plus the per-head `g_proj` gates and q/k norms,
 ///   the layer-0 dense MLP, the SwitchGLU-STACKED `mlp.switch_mlp.*` NVFP4
 ///   expert tensors (leading experts axis; never split per expert), the raw
@@ -313,9 +313,9 @@ public enum SwiftTransform {
             // checkpoint's own affine-quantized tensors directly, so neither
             // the Gemma projection sidecar nor the tied-head packed13 sidecar
             // means anything on this family -- emit nothing beyond the
-            // pass-through tensor set. For Laguna,
-            // docs/laguna-weight-contract.md forbids derived layouts and
-            // metadata sidecars in the Poolside v2 contract, and the runtime loads exactly the
+            // pass-through tensor set. For Laguna, the Poolside v2
+            // contract forbids derived layouts and
+            // metadata sidecars, and the runtime loads exactly the
             // indexed checkpoint tensors (its untied lm_head makes the
             // Gemma tied-head packed13 sidecar meaningless anyway). Emit
             // nothing beyond the pass-through tensor set.
@@ -796,8 +796,8 @@ public enum SwiftTransform {
     /// `tokenizer_config.json`.
     ///
     /// Laguna: the source config is already the flat schema
-    /// `LagunaConfig.load` parses (per docs/laguna-weight-contract.md the
-    /// transform may copy the source fields directly), so it is passed
+    /// `LagunaConfig.load` parses (the Poolside contract lets the
+    /// transform copy the source fields directly), so it is passed
     /// through minus the empty multimodal `vision_config` stub. Its matching
     /// NVFP4 4-bit group-16 `quantization` and `quantization_config` blocks are
     /// both required and preserved.

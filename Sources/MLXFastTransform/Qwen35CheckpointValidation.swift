@@ -11,8 +11,7 @@ struct Qwen35TransformQuantizationSpec: Equatable {
     let mode: String
 }
 
-/// Transform-side structural validation of the Qwen 3.6 text-tower tensor set
-/// against `docs/qwen3.6-weight-contract.md`.
+/// Transform-side structural validation of the Qwen 3.6 text-tower tensor set.
 ///
 /// The source checkpoint (`mlx-community/Qwen3.6-27B-4bit`) is already MLX
 /// affine-quantized, so the transform passes tensors through unchanged. This

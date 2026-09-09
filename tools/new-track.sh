@@ -189,7 +189,7 @@ with open("${OLD_CONTRACT}", encoding="utf-8") as fh:
     c = json.load(fh)
 
 c["track_id"] = "${TRACK_ID}"
-c["track_name"] = "${TRACK_ID} -- composite cohort speedup"
+c["track_name"] = "${TRACK_ID} -- composite paired speedup"
 c["benchmark_name"] = "${NEW_NAME}"
 c["official_scoring_enabled"] = False
 c.pop("official_baseline", None)

@@ -438,55 +438,11 @@ public enum MLXFastConstants {
     public static let prefillBandDownTolerance = 0.03
     public static let decodeBandUpTolerance = 0.01
     public static let decodeBandDownTolerance = 0.025
-    // Gemma 4 26B A4B cached calibration as of 2026-08-25: the mean of the
-    // prefill/decode seconds-per-token published by four consecutive cool-gated
-    // (40C, read via macmon) runs of `./benchmark.sh --local-iterate` on the
-    // stock committed tree, on box 3 -- the RANKED box for this track per
-    // David's 2026-08-25 ruling -- with a fresh worker per phase and zero
-    // warmup (one timed run per phase). Identity: engine
-    // dec515a5748619954a1ea2d500f0c4a8e19c33fe, benchd
-    // c2327d156cedd98593b552b3d5323416c172fcfc, benchctl built from that same
-    // benchd commit, golden = the 1024_1024 public local-submit golden
-    // (29576 bytes). Artifact sha256s:
-    //   benchctl 395764ce38f1000372c6bfc45e1c4c95ea89a6b5ef6740a83d9191990d7f9d52
-    //   worker   48692dfa1268d0601f883f606f3acc07446271bca1628a9413a1178cfec0886b
-    //   golden   36290b93b1445f354b9b8e3d5ba592976830b40dd924324f822ec55a87140be4
-    // Evidence directory: calibration-20260825T102741Z.
-    // Prefill samples: 0.0003277473955078125, 0.00032697843359375,
-    // 0.00032883076953125, 0.000326931234375 (CV 0.2712%, spread 0.581%).
-    // Decode samples: 0.0123674462890625, 0.0123643369140625,
-    // 0.012390104164062499, 0.0123770774765625 (CV 0.0937%, spread 0.2084%).
-    //
-    // These constants are NOT the ranked scoring denominator. The ranked
-    // runner times the candidate and the pinned reference tree back to back in
-    // the same session behind the same 40C thermal gate; the paired ratio
-    // against that live same-session baseline is what the ranked pipeline
-    // folds into the final score. These constants keep two roles: local-mode
-    // score estimates (--local-iterate / --local-submit) and the gates-only
-    // pass's placeholder timing fields, which the paired-timing overlay
-    // replaces. See the paired-baseline section of
-    // docs/benchmark-window-freeze.md.
-    public static let officialBaselinePrefillSecondsPerToken = 0.0003276219582519531
-    public static let officialBaselineDecodeSecondsPerToken = 0.012374741210937498
-    public static let scorePrefillWeight = 0.25
-    public static let scoreDecodeWeight = 0.75
-    public static let scorePrefillSpeedupFloor = 0.95
-    public static let scoreDecodeSpeedupFloor = 0.95
     // The Poolside Laguna XS 2.1 NVFP4 text tower is ~21.6 GB; 25 GiB keeps ample
     // headroom for shard alignment/padding without approving a second full
     // copy of the model.
     public static let defaultMaxTransformedWeightsBytes = 25 * 1024 * 1024 * 1024
     public static let defaultMaxSubmissionSourceBytes = 256 * 1024 * 1024
-    // Diagnostic (non-ranking) real-valued score fields are published rounded to
-    // this many significant figures. Submitted model code controls its own
-    // latency/memory, so every full-precision analog field it can influence
-    // (RAM, bandwidth, wall/preflight/correctness/TTFT seconds, hit rate) is a
-    // covert channel for exfiltrating the hidden prompt/golden it sees. Coarsening
-    // these -- which carry no ranking weight -- collapses each from ~30 bits to a
-    // few. The ranking fields (decode/prefill seconds-per-token and speedups) are
-    // left precise here on purpose; bounding that residual channel is a publishing/
-    // rate-limit decision on the scoring backend, not a repo-side change.
-    public static let publicDiagnosticSignificantFigures = 2
 
     // FREE-RUN / COHORT TOKEN CEILING. The largest `total_tokens` a configured
     // free-run or cohort request may ask a worker for, enforced by
@@ -572,68 +528,6 @@ public enum MLXFastConstants {
     /// token per target forward. Depth 1 remains available as a labelled
     /// speculative-depth-1 diagnostic and is never the denominator.
     public static let gemma4MTPSerialControlDepth = 0
-
-    /// SCORED. The serial denominator of this track's paired ratio: mean
-    /// depth-0 seconds/token of the pinned baseline at the ranked 512-token
-    /// window.
-    ///
-    /// Provenance: gated calibration sessions on box 3, 2026-08-13,
-    /// authored via `measure-qwen-mtp-job.sh --calibration-bootstrap` and
-    /// installed as the on-box calibration band for track
-    /// `qwen3.8-27b-mtp-v1`.
-    /// Reproduced by every ranked run since: the pooled serial means of the
-    /// four go-live calibration dispatches
-    /// (31712368539, 31715555814, 31718615518, 31721547429) band against this
-    /// value at ratios 1.001674 / 1.001795 / 1.000355 / 1.001264 — every one
-    /// inside `[0.95, 1.05]`, and all four within 0.18% of the pinned mean,
-    /// which is the evidence that this constant still describes the box.
-    ///
-    /// It is TRACK-SCOPED on purpose. The unprefixed
-    /// `officialBaselineDecodeSecondsPerToken` above is the Poolside/Laguna
-    /// serial calibration the SHARED scoring path (`Score.swift`,
-    /// `Golden.swift`, `Gemma4RuntimeBenchmark.swift`,
-    /// `Gemma4RuntimeLocalIterate.swift`) compiles against; this value is 2.74x
-    /// larger and overwriting the shared constant with it would silently retune
-    /// another live track's acceptance-band reference.
-    ///
-    /// The depth-0 leg does prompt-INDEPENDENT work (512 plain forwards), which
-    /// is why one pooled denominator serves all 8 timed prompts: the measured
-    /// pool spread lives entirely in the acceptance rate, which only the
-    /// numerator sees.
-    /// QWEN38-VERIFY-AT-RELEASE. This is a QWEN 3.6 MEASUREMENT taken on box 3
-    /// in gated calibration sessions. It does not describe Qwen 3.8 27B and
-    /// must be re-derived on the 3.8 baseline before any 3.8 score is
-    /// published; the ranked track is held closed by
-    /// MLXFAST_QWEN_MTP_CALIBRATION_READY="0" until it is.
-    public static let gemma4MTPOfficialBaselineDecodeSecondsPerToken = 0.037994794617407023
-
-    /// UNSCORED — informational / historical tracking only.
-    ///
-    /// This track's score has NO PREFILL COMPONENT. `mtp_decode_speedup` is a
-    /// decode-only ratio-of-means; the seed prefill is charged *inside* the
-    /// decode measurement window, identically on both legs of every pair; and
-    /// `measure-qwen-mtp-job.sh` seals `prefill_component: "none"` in the
-    /// `results.json` it signs. Nothing reads this constant to compute a score,
-    /// and a future reader who assumes it participates will mis-tune the track.
-    ///
-    /// Provenance: RUNBOOK section 3.4, measured in the same gated sessions and
-    /// the same thermal/fan regime as the decode figure above, over the same
-    /// 512-token prefill window the ranked workflow pins
-    /// (`benchmarkPrefillPromptTokens`). 3 observations, spread 0.17%.
-    ///
-    /// It is deliberately NOT wired into the local-mode estimate. The Qwen-MTP
-    /// local path (`benchmark-qwen-mtp.sh`, `mtp-timed`) consumes no pinned
-    /// baseline constant at all: it reports a same-session paired ratio, timing
-    /// both legs in the run. There is therefore no seam to redirect, and
-    /// introducing one would replace a self-normalising measurement with a
-    /// hardware-absolute one — changing what the local number MEANS rather than
-    /// improving it.
-    /// QWEN38-VERIFY-AT-RELEASE. This is a QWEN 3.6 MEASUREMENT taken on box 3
-    /// in gated calibration sessions. It does not describe Qwen 3.8 27B and
-    /// must be re-derived on the 3.8 baseline before any 3.8 score is
-    /// published; the ranked track is held closed by
-    /// MLXFAST_QWEN_MTP_CALIBRATION_READY="0" until it is.
-    public static let gemma4MTPOfficialBaselinePrefillSecondsPerToken = 0.00115714
 
     /// Semantic GPQA min-pass for THIS track, derived per NEW-MODEL-BRINGUP 7.4
     /// as `min(observed) - 1` over the four baseline-equivalent ranked

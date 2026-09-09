@@ -460,8 +460,8 @@ golden for `--local-iterate`. Use the 1024-token golden for `--local-submit`.
 > check. Neither one runs the ranked gates.
 
 The ranked run runs **one stream at a time**. David ruling 2026-08-27:
-"Single-stream only". The 8 pinned prompts run one after another, and their
-times are summed.
+"Single-stream only". It measures 2 pairs over the one prompt the fixture names
+in `live_golden`, and it sums each role's per-token times over the pairs.
 
 > **WARNING — the batched cohort path refuses BY NAME.**
 > Two reasons, and the second is decisive. The QSA sparse attention emits a
@@ -498,8 +498,10 @@ The score is serial-anchored. A faster candidate scores above 1.
 
 ### The pair is measured, not stored
 
-A ranked run measures TWO legs. It measures them on the SAME box, in the SAME
-job, over the ONE prompt the fixture names in `live_golden`:
+A ranked run measures PAIRS OF LEGS. It measures them on the SAME box, in the
+SAME job, over the ONE prompt the fixture names in `live_golden`. The fixture's
+`official_pairs` sets the count, and it is 2 (David ruling 2026-09-09). Every
+pair is the same two legs in the same order:
 
 1. The **serial-control leg**. It runs on the organizer's reference tree. That
    tree is a build of this repository at the commit the fixture names in
@@ -508,8 +510,10 @@ job, over the ONE prompt the fixture names in `live_golden`:
    a per-depth tape.
 2. The **candidate leg**. It runs on your tree, at the draft depth you declare.
 
-The score is the ratio of the two measurements. Both numbers come from the same
-machine, minutes apart.
+The legs run strictly one after the other, and each leg loads the model once.
+Per role the per-token times are summed over the pairs, and the score is the
+ratio of those sums. Every control leg is checked against this box's baseline
+calibration. All the numbers come from the same machine, minutes apart.
 
 **NO FILE HOLDS A BASELINE PAIR.** The scoring constants hold none. The fixture
 holds none. The goldens hold none. A golden that carries
@@ -547,12 +551,6 @@ The `box` value in the file must equal the runner name. The `reference_commit`
 value must equal the fixture's `baseline_reference_commit`.
 `tools/ranked-box-preflight.sh` refuses the run when either differs.
 
-> **NOTE — no scored run is possible yet.**
-> At the published channel tip the benchmarker certifies batch width 8 only and
-> computes the composite on the batched regime only, so a fixture declaring
-> width 1 is refused at that check. A separate bench lane carries the
-> single-stream regime. The refusal is fail-closed and correct.
-
 ### The measured window
 
 | Quantity | Value |
@@ -564,14 +562,15 @@ value must equal the fixture's `baseline_reference_commit`.
 | Timed prompts per leg | 1 (the fixture's `live_golden`) |
 | Prompts in the pinned correctness pool | 8 |
 | Prefill tokens per correctness-pool pass | 8 x 1024 |
-| Legs per ranked job | 2 (serial control, then candidate) |
+| Pairs per ranked job | 2 (the fixture's `official_pairs`) |
+| Legs per ranked job | 4 (each pair is serial control, then candidate) |
 
-The last two rows are the CORRECTNESS pool, not the scored timing. The box
-stages all 8 pinned prompts and the preflight verifies all 8. Each timed leg
-runs the one prompt `live_golden` names.
+The correctness-pool rows are not the scored timing. The box stages all 8 pinned
+prompts and the preflight verifies all 8. Each timed leg runs the one prompt
+`live_golden` names.
 
-The two legs run one after the other. Each leg loads the weights once. The
-unmeasured warm-up prefill pass stays at 1 pass, and it applies to both legs in
+The legs run one after the other. Each leg loads the weights once. The
+unmeasured warm-up prefill pass stays at 1 pass, and it applies to every leg in
 the same way.
 
 The serial-control leg runs entirely inside the reference tree. It uses that
@@ -580,14 +579,14 @@ weights. Nothing you change can move it.
 
 ### One resident worker per LEG, booted by the benchmarker
 
-A ranked job has two legs on two trees. The weights load ONCE per leg.
+A ranked job has 2 pairs, so 4 legs on two trees. The weights load ONCE per leg.
 
 The benchmarker starts `bench-worker runtime-worker` once for each phase: the
 warmup, the timed prefill, the timed decode and the correctness pass. Each start
 used to load the whole checkpoint again. It no longer does: a resident owns the
 weights for the leg, and each per-phase worker attaches to it.
 
-**THE RESIDENT BELONGS TO THE LEG, NOT TO THE WINDOW.** The two legs run
+**THE RESIDENT BELONGS TO THE LEG, NOT TO THE WINDOW.** The two roles run
 different trees with different weights, so one resident cannot serve both. The
 benchmarker knows where a leg begins and ends, so the benchmarker boots it. For
 each leg it calls that leg's OWN copy of `tools/resident-up.sh`:
@@ -643,15 +642,22 @@ and halts the resident when the command ends. The ranked path does not use it.
 | `decodeGainExponent` | 0.75 |
 | `pairsPerCohort` | 2 |
 | `minPairsPerCohort` | 2 |
-| `decodeSpeedupFloor` | 0.90 |
+| `decodeSpeedupFloor` | 0.95 |
+| `prefillSpeedupFloor` | 0.95 |
 | `decodeSpeedupCeiling` | 5.0 |
 | `kvBackend` | `contiguous` |
 
 The scored width is fixed. A width the benchmarker has not certified has no
 series tag, and the benchmarker refuses that width rather than run it.
 
-The median over the 4 paired ratios is the mean of the two central
-values, so the fastest and slowest windows do not enter the score.
+**BOTH FLOORS ARE 0.95** (David ruling 2026-09-09). A candidate that regresses
+prefill or decode by more than 5 percent is refused. The floors and the ceiling
+apply to the aggregate over the 2 pairs, not to one pair. The fixture declares
+them as `decode_speedup_floor` and `prefill_speedup_floor`, and the benchmarker
+enforces the fixture's values.
+
+There is no median. Each role's per-token times are summed over the pairs, and
+each gain is the ratio of those sums.
 
 `kvBackend` is pinned `contiguous` on both legs. The benchmarker refuses when
 it cannot honour the pinned backend. It does not degrade to another backend.

@@ -11,7 +11,7 @@ behind the rules.
 
 You optimize the engine. The engine is the MLX runner, the offline transform,
 and the vendored MLX Metal kernels that the forward pass dispatches. You also
-optimize the batching engine and the speculative-decode arm.
+optimize the speculative-decode arm.
 
 The target model is `Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`. It is a sparse
 MoE model. The text tower is 48 layers on a four-layer repeat, with 512 routed
@@ -133,12 +133,20 @@ gain      = baseline_aggregate / candidate_aggregate
 
 The score is serial-anchored. A faster candidate scores above 1.
 
-`aggregate` is the per-stream sum. Add each stream's own elapsed time
-together. Do this for prefill and for decode separately, on both legs.
+The ranked run is paired and per box (David ruling 2026-09-08). It measures one
+stream at a time over a 1024-token seed and a 128-step decode window, on the one
+prompt the fixture names in `live_golden`. It runs 2 pairs (David ruling
+2026-09-09). Each pair is one serial-control leg on the organizer-staged
+reference tree and one candidate leg. The legs run strictly one after the other,
+and each leg loads the model once.
 
-The ranked run measures one stream at a time over a 1024-token seed and a
-128-step decode window. It runs 4 pairs. The floor is 0.90. The ceiling is
-5.0. The KV backend is pinned `contiguous`.
+`aggregate` is the per-role sum over the pairs. Add each leg's own elapsed time
+together, for prefill and for decode separately, on each role. Each gain is the
+ratio of those two sums.
+
+Both floors are 0.95: a candidate that regresses prefill or decode by more than
+5 percent is refused. The ceiling is 5.0. They apply to the aggregate, not to
+one pair. The scored batch size is 1. The KV backend is pinned `contiguous`.
 
 The benchmarker applies a per-stream token-tolerance gate with a 10% budget.
 
@@ -148,23 +156,15 @@ The benchmarker applies a per-stream token-tolerance gate with a 10% budget.
 
 ## The current state
 
-> **NOTE — the track is NOT armed.**
-> `fixtures/qwen3_8_125b_a6b_track.json` sets `official_scoring_enabled` to
-> `false`, and the benchmarker refuses to seal an official scoring artifact
-> while it is. The timed prompt pool and the hidden correctness oracle carry the
-> pending sentinel `QWEN38-125B-A6B-MLX-PENDING-ORGANIZER`. No ORGANIZER
-> goldens exist for this track, no runner advertises the ranked label, and the
-> bench release branch and its dist channel are not published.
+Official scoring is armed. `fixtures/qwen3_8_125b_a6b_track.json` sets
+`official_scoring_enabled` to `true`, pins the timed pool and the correctness
+oracle by sha256 and bytes, and names the live golden. A runner advertises the
+ranked label, and the bench dist channel is published.
 
 > **NOTE — the engine is pinned to an unmerged fork branch.**
 > `Vendor/mlx-swift-lm` is a git submodule at `449f2d0`, on branch
 > `feat/qwen38-flash-next-runner`. Re-pin it to the fork's `main` after that
-> branch merges. The batched cohort path needs a ContinuousBatchingV2
-> adaptation, because the QSA sparse attention emits a custom array mask that
-> the CBv2 path discards by contract. `docs/qwen38-125b-a6b-port-notes.md` holds the
-> detail.
-
-The repositories stay private until launch.
+> branch merges. `docs/qwen38-125b-a6b-port-notes.md` holds the detail.
 
 ## Local runs are directional
 

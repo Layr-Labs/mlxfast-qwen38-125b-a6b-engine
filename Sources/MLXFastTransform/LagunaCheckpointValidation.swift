@@ -28,7 +28,7 @@ struct LagunaTransformQuantizationSpec: Equatable {
 }
 
 /// Transform-side structural validation of the Laguna text-tower tensor set
-/// against `docs/laguna-weight-contract.md`. The source
+/// against the Poolside NVFP4 weight contract. The source
 /// checkpoint (`poolside/Laguna-XS-2.1-NVFP4-mlx`) is already MLX
 /// NVFP4-quantized, so the transform passes tensors through unchanged; this
 /// pass fails fast -- before the multi-GB copy -- when the set it would copy
