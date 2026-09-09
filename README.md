@@ -139,6 +139,10 @@ ranked entry point for this challenge and requires organizer-staged goldens,
 the reference workspace, and the box calibration. Those assets are unnecessary
 for this public local baseline.
 
+The helper clears inherited `MLXFAST_BASELINE_WORKSPACE` and
+`MLXFAST_BASELINE_CALIBRATION` for its child process, so an operator shell's
+ranked settings cannot select paired scoring here.
+
 There is no head-staging step. The MTP head ships inside the pinned target
 checkpoint. See [The MTP head is embedded](#the-mtp-head-is-embedded).
 
