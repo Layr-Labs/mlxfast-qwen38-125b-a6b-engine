@@ -107,17 +107,12 @@ This command resolves the benchmarker binary from the dist channel into
 ./setup.sh
 ```
 
-This command checks your toolchain, builds the two Swift binaries, builds
-`mlx.metallib`, and downloads and verifies the target model.
-
-```bash
-.build/release/mlxfast-swift transform \
-  --reference reference_weights/Qwen3.8-Flash-Next-MLX-4bit-MTP \
-  --output weights
-```
-
-This command converts the downloaded checkpoint into the `weights/` tree that
-the engine loads. The emitted `config.json` declares
+This command checks your toolchain, initializes the pinned engine submodule,
+builds and stages the Swift binaries and `mlx.metallib`, downloads and verifies
+the target model, and transforms it into the `weights/` tree the engine loads.
+Set `MLXFAST_WEIGHTS_PATH` to choose another output directory. Setup reruns the
+current transform even when the reference download is cached; it reports
+success only after the transform succeeds. The emitted `config.json` declares
 `rms_norm_weight_offset`, so the tree carries this checkpoint's RMSNorm
 convention to any consumer that reads the file, and transform verification
 refuses a tree that does not declare it.

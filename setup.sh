@@ -80,7 +80,11 @@ if [[ ! "${SETUP_LOG_LABEL}" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "setup.sh: MLXFAST_SETUP_LOG_LABEL must match ^[A-Za-z0-9._-]+$" >&2
   exit 1
 fi
+# Parallel shard downloads run under `bash -c`, not in a subshell. Export the
+# validated label so their nounset-enabled programs can print progress too.
+export SETUP_LOG_LABEL
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
+WEIGHTS_PATH="${MLXFAST_WEIGHTS_PATH:-weights}"
 # The participant runtime worker builds under its own SwiftPM scratch root
 # (.build-worker) so a participant-code build never writes into the trusted
 # CLI's build tree (.build). mlx.metallib is a participant artifact and lives
@@ -151,12 +155,15 @@ print_help() {
   cat <<EOF
 Usage: ./setup.sh
 
-Checks the local macOS/Apple Silicon toolchain, builds the Swift harness,
-builds mlx.metallib, and downloads the Qwen 3.8 125B A6B MLX 4-bit reference
-checkpoint (${REFERENCE_MODEL_REPO}) when it is not already present.
+Checks the local macOS/Apple Silicon toolchain, initializes the engine submodule,
+builds the Swift harness and mlx.metallib, downloads and verifies the Qwen 3.8
+125B A6B MLX 4-bit reference checkpoint (${REFERENCE_MODEL_REPO}), and transforms
+it into the weights tree the engine loads.
 The download is anonymous: the pinned repository is public.
 
 Important environment variables:
+  MLXFAST_WEIGHTS_PATH              Transformed checkpoint directory.
+                                     Default: ${WEIGHTS_PATH}
   MLXFAST_REFERENCE_DIR              Reference checkpoint directory.
                                      Default: ${REFERENCE_DIR}
   MLXFAST_REFERENCE_CACHE_DIR        Shared Hugging Face-style cache path (under
@@ -239,7 +246,7 @@ Important environment variables:
                                      Homebrew.
 
 After setup:
-  .build/release/mlxfast-swift transform --output weights
+  MLXFAST_CORRECTNESS_GOLDEN_PATH=correctness_prompts/public_longcopy_gate_english_1024_256.json ./benchmark.sh --local-iterate
   # Benchmarking/grading lives in benchd, resolved from its release channel by ./tools/fetch-benchd.sh
 EOF
 }
@@ -289,9 +296,11 @@ print_setup_summary() {
   local elapsed="$((SECONDS - SETUP_STARTED_SECONDS))"
   local reference_line
   local metallib_line
+  local weights_line="${WEIGHTS_PATH}"
 
   if [[ "${reference_status}" == "skipped" ]]; then
     reference_line="skipped (${REFERENCE_DIR})"
+    weights_line="not prepared (reference download skipped)"
   elif [[ -f "${REFERENCE_DIR}/config.json" ]]; then
     reference_line="${REFERENCE_DIR} ($(path_size_gib "${REFERENCE_DIR}") GiB)"
   else
@@ -312,11 +321,16 @@ ${SETUP_LOG_LABEL}: summary
   mlx.metallib: ${metallib_line}
   benchd engine: $(dirname "${SWIFT_BIN}")/bench-worker (+ sibling mlx.metallib)
   reference checkpoint: ${reference_line}
+  transformed weights: ${weights_line}
 EOF
 
+  if [[ "${reference_status}" == "skipped" ]]; then
+    echo "  next: rerun ./setup.sh without MLXFAST_SKIP_WEIGHTS_DOWNLOAD or SKIP_MODEL_DOWNLOAD to prepare weights"
+    return 0
+  fi
   cat <<EOF
   next:
-    ${SWIFT_BIN} transform --reference "${REFERENCE_DIR}" --output weights
+    MLXFAST_WEIGHTS_PATH="${WEIGHTS_PATH}" MLXFAST_CORRECTNESS_GOLDEN_PATH=correctness_prompts/public_longcopy_gate_english_1024_256.json ./benchmark.sh --local-iterate
     # Benchmarking/grading lives in benchd, resolved from its release channel:
     # ./tools/fetch-benchd.sh
 EOF
@@ -2946,6 +2960,24 @@ assert_frozen_dependency_graph() {
   done
 }
 
+ensure_engine_submodule() {
+  local engine_path="Vendor/mlx-swift-lm"
+  # Preserve an initialized checkout, including local edits. Only a plain
+  # clone's missing dependency needs checkout; never reset an existing one.
+  [[ -f "${engine_path}/Package.swift" ]] && return 0
+  if ! command -v git >/dev/null 2>&1 \
+      || ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "${SETUP_LOG_LABEL}: ${engine_path}/Package.swift is missing; use a git clone so setup can initialize the pinned engine submodule" >&2
+    return 1
+  fi
+  echo "${SETUP_LOG_LABEL}: initializing the pinned engine submodule at ${engine_path}"
+  git submodule update --init --recursive -- "${engine_path}" || return 1
+  if [[ ! -f "${engine_path}/Package.swift" ]]; then
+    echo "${SETUP_LOG_LABEL}: engine submodule initialized without ${engine_path}/Package.swift" >&2
+    return 1
+  fi
+}
+
 build_swift_harness() {
   # MLXFAST_SKIP_SWIFT_BUILD=1 reuses binaries a previous run already produced.
   # A wrapper that delegates its download to this script would otherwise repeat
@@ -3417,6 +3449,20 @@ EOF
   return "${operation_status}"
 }
 
+transform_reference_weights() {
+  # Run the freshly built transform each time, including on a reference-cache
+  # hit: Sources/MLXFastTransform is editable, so an old weights tree cannot
+  # establish that the current candidate has been prepared. SwiftTransform
+  # stages and atomically installs its output, preserving the old tree on error.
+  echo "${SETUP_LOG_LABEL}: transforming the verified reference checkpoint into ${WEIGHTS_PATH}"
+  "${SWIFT_BIN}" transform --reference "${REFERENCE_DIR}" --output "${WEIGHTS_PATH}" || return 1
+  if [[ ! -f "${WEIGHTS_PATH}/config.json" \
+      || ! -f "${WEIGHTS_PATH}/model.safetensors.index.json" ]]; then
+    echo "${SETUP_LOG_LABEL}: transform did not produce config.json and model.safetensors.index.json in ${WEIGHTS_PATH}" >&2
+    return 1
+  fi
+}
+
 check_yukon_cli() {
   # Submissions use the Yukon CLI (`yukon`) for login/clone/submit (see
   # README.md "Submitting"). That CLI is distributed by the external Yukon
@@ -3455,6 +3501,7 @@ EOF
 }
 
 ensure_swift_toolchain
+ensure_engine_submodule
 ensure_macmon
 trap cleanup_background_builds EXIT
 
@@ -3474,5 +3521,6 @@ start_mlx_metallib_build
 download_reference_weights "${REFERENCE_DIR}"
 wait_for_mlx_metallib_build
 stage_bench_worker_for_benchd
+transform_reference_weights
 check_yukon_cli
 print_setup_summary "ready"

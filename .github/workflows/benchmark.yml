@@ -506,20 +506,13 @@ jobs:
         if: env.MLXFAST_BUILD_CACHE_HIT != '1'
         run: tools/build-cache.sh save
 
-      - name: Transform the reference checkpoint with the candidate's transform
-        # The documented path runs `mlxfast-swift transform` as its own command
-        # after setup.sh, and the measure script refuses without the weights/
-        # tree it writes (run 34029529034). Sources/MLXFastTransform is on the
-        # editable surface, so the job must run THE CANDIDATE'S transform, never
-        # reuse a tree another tree produced. It is cheap: the transform clones
-        # the verified reference on APFS (1 s, no extra blocks on the box), and
-        # benchd seals the tree's weights_hash into the artifact, so provenance
-        # needs no cache and no box-staged tree.
+      - name: Check the candidate weights prepared by setup
+        # setup.sh now runs the freshly built candidate's transform after
+        # reference verification, including on a build-cache hit. Keep the
+        # output check and digest here, without rebuilding the same tree twice.
         run: |
           set -euo pipefail
           [[ -d "${MLXFAST_REFERENCE_DIR}" ]] || { echo "::error::MLXFAST_REFERENCE_DIR=${MLXFAST_REFERENCE_DIR} is not a directory" >&2; exit 1; }
-          rm -rf weights
-          .build/release/mlxfast-swift transform --reference "${MLXFAST_REFERENCE_DIR}" --output weights
           [[ -f weights/config.json ]] || { echo "::error::the transform wrote no weights/config.json" >&2; exit 1; }
           echo "transformed tree: $(find weights -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ') files; digest $("${BENCHD_BIN_DIR}/benchd" weights-digest --weights weights 2>/dev/null || echo unavailable)"
 
