@@ -205,6 +205,11 @@ jobs:
         # Hermetic: no toolchain, weights, GPU, or network.
         run: tools/test-benchmark-facade-env.sh
 
+      - name: Local facade honors the declared MTP mode
+        # Real wrapper, stub benchd: every permitted depth, serial declarations,
+        # unsupported-benchd refusals, thermal flags and pre-run identity.
+        run: tools/test-benchmark-facade-spec.sh
+
       - name: fetch-benchd resolves the renamed channel pair
         # Hermetic: a stub benchd + a manifest in the post-rename dist format
         # (top-level fields, then the `binaries` map) through BENCHD_DIST_LOCAL;

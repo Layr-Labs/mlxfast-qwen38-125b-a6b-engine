@@ -368,6 +368,18 @@ token. The serial control leg always runs the embedded head.
 > Every run seals what actually ran: `effective_spec` for the declared depth,
 > `effective_mean_draft_len` for the realized draft length.
 
+The local modes (`./benchmark.sh --local-iterate` and `--local-submit`) read
+the same declaration as the ranked entrypoint. They request that depth for
+the timed decode window and refuse a benchmarker that cannot honor it. Before
+dispatch, the wrapper prints the requested mode, draft depth, single-stream
+batch size, worker SHA-256 and checkout revision. The checkout revision is
+not the worker's build revision; benchd records the latter at runtime and
+verifies the worker's `effective_spec` echo.
+
+The public local fixture still checks teacher-forced correctness. Selecting
+MTP locally does not add the organizer's per-depth oracle or produce a ranked
+score. Compare timings from the same effective mode and depth.
+
 The rectangular cap is `B * (1 + k) <= 8` on M3 and later.
 
 ### The byte budget

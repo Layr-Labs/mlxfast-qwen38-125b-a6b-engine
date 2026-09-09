@@ -6,11 +6,9 @@
 # PREBUILT benchd (./tools/fetch-benchd.sh, channel-resolved), so there is no
 # benchd/ checkout for the facade to live in and it is vendored here instead.
 # Its UPSTREAM is mlxfast-bench scripts/benchmark.sh at the pinned commit
-# (the dist manifest's `source_commit`); the body below is that file verbatim apart from two
-# edits near "Dispatch to benchd": the BENCHD resolution, which now resolves the
-# pinned binary instead of trusting whatever `benchd` is on PATH, and the
-# MLXFAST_QWEN_MTP_TRACK_ID export, which benchd iterate requires and which this
-# engine repository exported nowhere. Port changes from
+# (the dist manifest's `source_commit`); the track-specific dispatch below resolves
+# the pinned binary, exports MLXFAST_QWEN_MTP_TRACK_ID, and requests the declared
+# MTP depth through the same reader the ranked entrypoint uses. Port changes from
 # upstream rather than diverging here — the reference-parity comments below cite
 # the Swift reference by line and are only true of the upstream bytes.
 #
@@ -434,6 +432,37 @@ else
   benchd_args+=(--cool-gate)
 fi
 
+# The declaration governs local timing too. Omitting --mtp-depth means SERIAL
+# to benchd, even when the worker has an embedded MTP head and the manifest
+# enables it. Use the ranked entrypoint's reader and refuse an older benchd
+# rather than silently measuring a different algorithm.
+DECLARED_DEPTH="$("${FACADE_DIR}/spec-declaration.sh" draft-len)"
+# Capture the complete usage once. Piping a multi-write help response into
+# grep -q under pipefail can mistake the writer's SIGPIPE for a missing flag.
+if ! BENCHD_ITERATE_HELP="$("${BENCHD}" iterate --help 2>&1)"; then
+  echo "benchmark.sh: cannot inspect benchd iterate --help; refusing before engine work." >&2
+  exit 1
+fi
+DECODE_MODE="serial"
+if [[ "${DECLARED_DEPTH}" != "0" ]]; then
+  if grep -q -- '--mtp-depth' <<< "${BENCHD_ITERATE_HELP}"; then
+    benchd_args+=(--mtp-depth "${DECLARED_DEPTH}")
+    DECODE_MODE="mtp"
+  else
+    echo "benchmark.sh: REFUSING -- the declaration requests MTP depth ${DECLARED_DEPTH} but this benchd has no --mtp-depth; the run would silently measure serial decode. Update benchd with tools/fetch-benchd.sh." >&2
+    exit 1
+  fi
+fi
+
+# iterate's candidate leg is single-stream; it has no batch-size switch. Do
+# not print a changed fixture's batch size as though this wrapper selected it.
+TRACK_FIXTURE="${FACADE_DIR}/../fixtures/qwen3_8_125b_a6b_track.json"
+SCORED_BATCH_SIZE="$(jq -r '.scored_batch_size // empty' "${TRACK_FIXTURE}")"
+if [[ "${SCORED_BATCH_SIZE}" != "1" ]]; then
+  echo "benchmark.sh: this single-stream iterate wrapper requires scored_batch_size=1 in ${TRACK_FIXTURE} (got '${SCORED_BATCH_SIZE}'); refusing to guess a batch size." >&2
+  exit 1
+fi
+
 # THE N-GRAM ROW SOURCE, on every mode. The n-gram / PLE table is not model
 # parameters: the fork's Qwen4ExpRunner reads it from disk through the
 # `qwen4exp.ngramRowSource` resource, whose value is the DIRECTORY the offline
@@ -454,13 +483,22 @@ if [[ -z "${BENCH_WORKER_RESIDENT_SOCKET:-}" ]]; then
   if [[ "${NGRAM_SHARD_DIR}" != /* ]]; then
     NGRAM_SHARD_DIR="$(cd "${FACADE_DIR}/.." && pwd)/${NGRAM_SHARD_DIR}"
   fi
-  if "${BENCHD}" iterate --help 2>&1 | grep -q -- '--engine-resource'; then
+  if grep -q -- '--engine-resource' <<< "${BENCHD_ITERATE_HELP}"; then
     benchd_args+=(--engine-resource "qwen4exp.ngramRowSource=${NGRAM_SHARD_DIR}")
   else
     echo "benchmark.sh: this benchd has no --engine-resource; the worker cannot receive qwen4exp.ngramRowSource and will refuse at load" >&2
     exit 1
   fi
 fi
+
+# Pre-run diagnostics describe the request, not proof of worker execution.
+# benchd checks the worker's effective_spec echo and seals the runtime build
+# revision. The checkout may have moved since the executable was built, so
+# identify its actual bytes separately and never call HEAD the worker revision.
+checkout_revision="$(git -C "${FACADE_DIR}/.." rev-parse --verify HEAD 2>/dev/null || true)"
+worker_sha256="$(shasum -a 256 "${MLXFAST_ENGINE_BIN}" 2>/dev/null | awk '{print $1}' || true)"
+echo "benchmark.sh: requested run: mode=${MODE}, decode=${DECODE_MODE}, mtp_depth=${DECLARED_DEPTH}, batch_size=${SCORED_BATCH_SIZE}; benchd verifies the worker's effective_spec." >&2
+echo "benchmark.sh: worker=${MLXFAST_ENGINE_BIN}, worker_sha256=${worker_sha256:-unavailable}, checkout_revision=${checkout_revision:-unavailable}; worker build revision is recorded by benchd at runtime." >&2
 
 # Run benchd. Do NOT redirect its stdout: benchd emits the sealed JSON payload on
 # stdout and the facade passes it through untouched (no cat / re-emit / re-seal).
