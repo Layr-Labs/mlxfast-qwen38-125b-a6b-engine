@@ -17,6 +17,8 @@
   "kv_backend": "contiguous",
   "ngram_shard_dir": "weights",
   "scored_batch_size": 1,
+  "decode_speedup_floor": 0.95,
+  "prefill_speedup_floor": 0.95,
   "scored_exponents": {
     "prefill_gain_exponent": 0.25,
     "decode_gain_exponent": 0.75
