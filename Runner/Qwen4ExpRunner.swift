@@ -195,11 +195,11 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         let head = try model.mtp.map {
             try Self.adoptMTPHead($0, configuration: model.configuration)
         }
-        // ONE head is served. The fork's module held the same tensors the
-        // track head now holds, so releasing it frees a duplicate structure,
-        // not a duplicate copy of the weights — and it removes the second
-        // head that a later reader could mistake for the one in service.
-        model.mtp = nil
+        // The fork's `mtp` module stays bound to the model: a Module property
+        // may only change through `update(modules:)`, and there is nothing to
+        // gain from removing it — the track head holds the SAME arrays, not a
+        // copy. The drafter below is the only reader of a head; it serves the
+        // track head.
         let drafter = head.map { TrackQwen4ExpInlineMTPAssistant(target: model, mtp: $0) }
         // §12c: the one embedded-head rule, in the one shared helper. It
         // hashes the shards carrying the `mtp.*` tensors, not the whole
