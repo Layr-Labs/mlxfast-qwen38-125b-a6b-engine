@@ -205,6 +205,10 @@ jobs:
         # Hermetic: no toolchain, weights, GPU, or network.
         run: tools/test-benchmark-facade-env.sh
 
+      - name: Public local baseline entry point
+        # Real proxy and facade with a stub benchd; no model or GPU.
+        run: tools/test-local-baseline.sh
+
       - name: fetch-benchd resolves the renamed channel pair
         # Hermetic: a stub benchd + a manifest in the post-rename dist format
         # (top-level fields, then the `binaries` map) through BENCHD_DIST_LOCAL;

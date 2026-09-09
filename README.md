@@ -123,19 +123,30 @@ convention to any consumer that reads the file, and transform verification
 refuses a tree that does not declare it.
 
 ```bash
-MLXFAST_ENGINE_BIN=.build/release/bench-worker \
-MLXFAST_CORRECTNESS_GOLDEN_PATH=correctness_prompts/public_longcopy_gate_english_1024_256.json \
-  ./benchmark.sh --local-iterate
+./tools/local-baseline.sh
 ```
 
-This command runs the local test against the checked-in public golden.
+This command runs correctness and local timing against the checked-in public
+golden through `./benchmark.sh --local-iterate`, with the normal cool gate.
+It selects the staged worker and writes `score.local-iterate.json`. This is an
+unranked measurement: a `null` score is expected without paired ranked scoring;
+check the run's exit status, correctness result, and timing metrics. The command
+also works when called from outside the checkout.
+
+After `yukon clone`, change to the printed work directory and run `yukon setup`,
+the transform command above, and `./tools/local-baseline.sh`. `yukon run` is the
+ranked entry point for this challenge and requires organizer-staged goldens,
+the reference workspace, and the box calibration. Those assets are unnecessary
+for this public local baseline.
 
 There is no head-staging step. The MTP head ships inside the pinned target
 checkpoint. See [The MTP head is embedded](#the-mtp-head-is-embedded).
 
-> **WARNING — set `MLXFAST_CORRECTNESS_GOLDEN_PATH` yourself.**
-> The local test has no default golden. It stops with an error when the
-> variable is empty.
+`tools/local-baseline.sh --help` lists the optional environment overrides for
+the worker, golden, weights, and result path. Relative overrides resolve from
+the checkout. Direct `./benchmark.sh` calls still require an explicit
+`MLXFAST_CORRECTNESS_GOLDEN_PATH` and `MLXFAST_ENGINE_BIN`; the local helper
+supplies their documented defaults.
 
 > **WARNING — do not pass `--golden`, `--weights`, or `--score-path` to
 > `./benchmark.sh`.**
