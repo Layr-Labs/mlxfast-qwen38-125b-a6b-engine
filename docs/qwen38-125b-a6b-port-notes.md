@@ -1273,10 +1273,17 @@ baseline seconds-per-token were the last file-held baseline PAIR in the tree,
 which `docs/participant-contract.md` section 5.1.0 says must not exist: a ranked
 run measures its own control leg on the box (David ruling 2026-09-08).
 
-One stored timing value stays: `gemma4MTPOfficialBaselineDecodeSecondsPerToken`,
-the `qwen3.8-27b-mtp-v1` decode calibration record. It is a single value for
-ANOTHER track, not a pair for this one, and nothing in `Sources/` reads it
-either. It is kept as that track's record, not deleted with this path.
+One stored timing value stays: `gemma4MTPOfficialBaselinePrefillSecondsPerToken`,
+the `qwen3.8-27b-mtp-v1` prefill calibration record. It is a single value for
+ANOTHER track, not a pair for this one, it is labelled UNSCORED, and nothing in
+`Sources/` reads it. It is kept as that track's record.
+
+Its decode partner `gemma4MTPOfficialBaselineDecodeSecondsPerToken` is DELETED
+(2026-09-09). It was labelled SCORED and described as "the serial denominator of
+this track's paired ratio", but a grep over `Sources/`, `Runner/`, `Tests/` and
+`tools/` found its only occurrence to be its own declaration: it was a stored
+decode baseline for another track that nothing read, which is what section 5.1.0
+forbids. No test asserted its value, so nothing else moved with it.
 
 ### 9.2 Single-stream only (RULED)
 

@@ -529,41 +529,6 @@ public enum MLXFastConstants {
     /// speculative-depth-1 diagnostic and is never the denominator.
     public static let gemma4MTPSerialControlDepth = 0
 
-    /// SCORED. The serial denominator of this track's paired ratio: mean
-    /// depth-0 seconds/token of the pinned baseline at the ranked 512-token
-    /// window.
-    ///
-    /// Provenance: gated calibration sessions on box 3, 2026-08-13,
-    /// authored via `measure-qwen-mtp-job.sh --calibration-bootstrap` and
-    /// installed as the on-box calibration band for track
-    /// `qwen3.8-27b-mtp-v1`.
-    /// Reproduced by every ranked run since: the pooled serial means of the
-    /// four go-live calibration dispatches
-    /// (31712368539, 31715555814, 31718615518, 31721547429) band against this
-    /// value at ratios 1.001674 / 1.001795 / 1.000355 / 1.001264 — every one
-    /// inside `[0.95, 1.05]`, and all four within 0.18% of the pinned mean,
-    /// which is the evidence that this constant still describes the box.
-    ///
-    /// It is TRACK-SCOPED on purpose, and it is the ONLY stored timing baseline
-    /// left in this file. The unprefixed Gemma-era pair it used to contrast
-    /// with (`officialBaselinePrefillSecondsPerToken` /
-    /// `officialBaselineDecodeSecondsPerToken`) is DELETED, together with the
-    /// Swift score-estimate path that read it: on THIS track a ranked run
-    /// measures its own control leg and no file stores a baseline pair (David
-    /// ruling 2026-09-08). Nothing in `Sources/` reads the value below either;
-    /// it stays as the `qwen3.8-27b-mtp-v1` calibration record.
-    ///
-    /// The depth-0 leg does prompt-INDEPENDENT work (512 plain forwards), which
-    /// is why one pooled denominator serves all 8 timed prompts: the measured
-    /// pool spread lives entirely in the acceptance rate, which only the
-    /// numerator sees.
-    /// QWEN38-VERIFY-AT-RELEASE. This is a QWEN 3.6 MEASUREMENT taken on box 3
-    /// in gated calibration sessions. It does not describe Qwen 3.8 27B and
-    /// must be re-derived on the 3.8 baseline before any 3.8 score is
-    /// published; the ranked track is held closed by
-    /// MLXFAST_QWEN_MTP_CALIBRATION_READY="0" until it is.
-    public static let gemma4MTPOfficialBaselineDecodeSecondsPerToken = 0.037994794617407023
-
     /// UNSCORED — informational / historical tracking only.
     ///
     /// This track's score has NO PREFILL COMPONENT. `mtp_decode_speedup` is a
@@ -573,10 +538,10 @@ public enum MLXFastConstants {
     /// `results.json` it signs. Nothing reads this constant to compute a score,
     /// and a future reader who assumes it participates will mis-tune the track.
     ///
-    /// Provenance: RUNBOOK section 3.4, measured in the same gated sessions and
-    /// the same thermal/fan regime as the decode figure above, over the same
-    /// 512-token prefill window the ranked workflow pins
-    /// (`benchmarkPrefillPromptTokens`). 3 observations, spread 0.17%.
+    /// Provenance: RUNBOOK section 3.4, measured in the gated calibration
+    /// sessions on box 3 of 2026-08-13, over the same 512-token prefill window
+    /// the ranked workflow pins (`benchmarkPrefillPromptTokens`). 3
+    /// observations, spread 0.17%.
     ///
     /// It is deliberately NOT wired into the local-mode estimate. The Qwen-MTP
     /// local path (`benchmark-qwen-mtp.sh`, `mtp-timed`) consumes no pinned
