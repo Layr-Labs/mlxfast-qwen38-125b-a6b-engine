@@ -115,6 +115,7 @@ expect "${CASE_ROOT}/setup.log" 'with 2 parallel job(s)'
 expect "${CASE_ROOT}/setup.log" 'setup.sh: downloaded shard 1/2:'
 expect "${CASE_ROOT}/setup.log" 'setup.sh: downloaded shard 2/2:'
 expect "${CASE_ROOT}/setup.log" 'setup complete'
+expect "${CASE_ROOT}/setup.log" 'MLXFAST_ENGINE_BIN=.build/release/bench-worker'
 expect "${CASE_ROOT}/setup.log" "transformed weights: ${MLXFAST_WEIGHTS_PATH}"
 [[ -f "${MLXFAST_WEIGHTS_PATH}/config.json" ]] || fail 'runtime weights missing'
 [[ "$(tail -1 "${TEST_EVENTS}")" == transform* ]] || fail 'transform did not follow builds'
@@ -162,4 +163,15 @@ reject "${TEST_EVENTS}" 'transform '
 expect "${CASE_ROOT}/setup.log" 'transformed weights: not prepared'
 [[ ! -e "${MLXFAST_REFERENCE_DIR}" ]] || fail 'build-only setup downloaded weights'
 echo 'test-setup-onboarding: PASS -- explicit build-only setup reports weights as unprepared'
+
+# Prebuilt deployments may intentionally carry no dependency checkout. Reusing
+# both products must not add a source download that the skipped build avoids.
+git -C "${CASE_ROOT}" submodule deinit -q -f -- Vendor/mlx-swift-lm
+MLXFAST_SKIP_SWIFT_BUILD=1 MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 run_setup || {
+  cat "${CASE_ROOT}/setup.log" >&2; fail 'prebuilt setup required an engine checkout';
+}
+expect "${CASE_ROOT}/setup.log" 'both products are present; reusing'
+reject "${CASE_ROOT}/setup.log" 'initializing the pinned engine submodule'
+[[ ! -f "${CASE_ROOT}/Vendor/mlx-swift-lm/Package.swift" ]] || fail 'prebuilt setup fetched dependency sources'
+echo 'test-setup-onboarding: PASS -- prebuilt setup does not require a source checkout'
 echo 'test-setup-onboarding: all cases pass'

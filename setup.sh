@@ -246,7 +246,7 @@ Important environment variables:
                                      Homebrew.
 
 After setup:
-  MLXFAST_CORRECTNESS_GOLDEN_PATH=correctness_prompts/public_longcopy_gate_english_1024_256.json ./benchmark.sh --local-iterate
+  MLXFAST_ENGINE_BIN=.build/release/bench-worker MLXFAST_WEIGHTS_PATH="${WEIGHTS_PATH}" MLXFAST_CORRECTNESS_GOLDEN_PATH=correctness_prompts/public_longcopy_gate_english_1024_256.json ./benchmark.sh --local-iterate
   # Benchmarking/grading lives in benchd, resolved from its release channel by ./tools/fetch-benchd.sh
 EOF
 }
@@ -330,7 +330,7 @@ EOF
   fi
   cat <<EOF
   next:
-    MLXFAST_WEIGHTS_PATH="${WEIGHTS_PATH}" MLXFAST_CORRECTNESS_GOLDEN_PATH=correctness_prompts/public_longcopy_gate_english_1024_256.json ./benchmark.sh --local-iterate
+    MLXFAST_ENGINE_BIN=.build/release/bench-worker MLXFAST_WEIGHTS_PATH="${WEIGHTS_PATH}" MLXFAST_CORRECTNESS_GOLDEN_PATH=correctness_prompts/public_longcopy_gate_english_1024_256.json ./benchmark.sh --local-iterate
     # Benchmarking/grading lives in benchd, resolved from its release channel:
     # ./tools/fetch-benchd.sh
 EOF
@@ -2997,6 +2997,7 @@ build_swift_harness() {
     fi
     echo "${SETUP_LOG_LABEL}: MLXFAST_SKIP_SWIFT_BUILD=1 but a product is missing; building anyway"
   fi
+  ensure_engine_submodule || return 1
   echo "${SETUP_LOG_LABEL}: building trusted Swift harness and the scored bench-worker engine"
   assert_frozen_dependency_graph || return 1
   # Independent SwiftPM build/cache roots: the trusted CLI builds in .build
@@ -3501,7 +3502,6 @@ EOF
 }
 
 ensure_swift_toolchain
-ensure_engine_submodule
 ensure_macmon
 trap cleanup_background_builds EXIT
 
