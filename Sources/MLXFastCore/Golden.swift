@@ -179,12 +179,12 @@ public struct BenchmarkGolden: Codable, Equatable {
     public let decodeSeedTokens: [Int]
     public let expectedDecodeSeedToken: Int
     public let expectedDecodeTokens: [Int]
-    // Per-prompt baselines for prompt-pool rotation. A pool golden carries the seconds-per-
-    // token the baseline reference measured for THIS prompt on the official
-    // runner, so rotating prompts of different intrinsic difficulty keeps
-    // speedups comparable. Both must be present together or absent together;
-    // absent means "score against the calibrated defaults in MLXFastConstants"
-    // (the pre-pool behavior, used by all public fixtures).
+    // Schema fields of the reference golden format, carried so a golden written
+    // elsewhere still decodes. NOTHING IN THIS TREE SCORES AGAINST THEM: a
+    // ranked run measures its own control leg on the box (David ruling
+    // 2026-09-08), and `tools/lint-benchmark-manifest.py` check 5b keeps a
+    // golden carrying either field out of this repository. They stay optional
+    // and all-or-nothing (see validateBenchmarkGoldenBaselines).
     public let baselinePrefillSecondsPerToken: Double?
     public let baselineDecodeSecondsPerToken: Double?
 
@@ -214,14 +214,6 @@ public struct BenchmarkGolden: Codable, Equatable {
         self.expectedDecodeTokens = expectedDecodeTokens
         self.baselinePrefillSecondsPerToken = baselinePrefillSecondsPerToken
         self.baselineDecodeSecondsPerToken = baselineDecodeSecondsPerToken
-    }
-
-    public var resolvedBaselinePrefillSecondsPerToken: Double {
-        baselinePrefillSecondsPerToken ?? MLXFastConstants.officialBaselinePrefillSecondsPerToken
-    }
-
-    public var resolvedBaselineDecodeSecondsPerToken: Double {
-        baselineDecodeSecondsPerToken ?? MLXFastConstants.officialBaselineDecodeSecondsPerToken
     }
 }
 
@@ -686,9 +678,8 @@ public func validateBenchmarkGolden(_ benchmark: BenchmarkGolden) throws {
 }
 
 private func validateBenchmarkGoldenBaselines(_ benchmark: BenchmarkGolden) throws {
-    // A half-calibrated oracle (one axis carried, one falling back to the
-    // constants) would silently mix two calibration regimes in one score, so
-    // the pair is all-or-nothing.
+    // A half-carried oracle (one axis present, one absent) would state a
+    // calibration it does not hold, so the pair is all-or-nothing.
     switch (benchmark.baselinePrefillSecondsPerToken, benchmark.baselineDecodeSecondsPerToken) {
     case (nil, nil):
         return
@@ -869,9 +860,8 @@ private func validateGoldenBenchmarkKeys(_ benchmark: Any) throws {
     guard let object = benchmark as? [String: Any] else {
         throw MLXFastError.invalidInput("benchmark must be a JSON object")
     }
-    // The baseline_* fields are scoring-critical: JSONDecoder silently drops
-    // unknown keys, so a typo'd baseline key would make the run fall back to
-    // the calibrated constants and score against the wrong baseline. Reject
+    // JSONDecoder silently drops unknown keys, so a typo'd key would decode as
+    // an absent field and the golden would read as a shape it is not. Reject
     // anything not in the benchmark oracle contract.
     try rejectUnknownKeys(
         Set(object.keys),

@@ -589,17 +589,9 @@ func loadGoldenFixtureAcceptsBenchmarkOracle() throws {
     #expect(fixture.benchmark?.decodeSeedTokens == seed)
     #expect(fixture.benchmark?.expectedDecodeSeedToken == 5)
     #expect(fixture.benchmark?.expectedDecodeTokens == decode)
-    // No per-prompt baselines carried: scoring resolves to the calibrated constants.
+    // No baselines carried, and this tree stores none to fall back on.
     #expect(fixture.benchmark?.baselinePrefillSecondsPerToken == nil)
     #expect(fixture.benchmark?.baselineDecodeSecondsPerToken == nil)
-    #expect(
-        fixture.benchmark?.resolvedBaselinePrefillSecondsPerToken
-            == MLXFastConstants.officialBaselinePrefillSecondsPerToken
-    )
-    #expect(
-        fixture.benchmark?.resolvedBaselineDecodeSecondsPerToken
-            == MLXFastConstants.officialBaselineDecodeSecondsPerToken
-    )
 }
 
 private func benchmarkOracleGoldenJSON(baselineFieldsJSON: String) -> String {
@@ -643,19 +635,15 @@ func loadGoldenFixtureAcceptsPerPromptBenchmarkBaselines() throws {
 
     #expect(fixture.benchmark?.baselinePrefillSecondsPerToken == 0.25)
     #expect(fixture.benchmark?.baselineDecodeSecondsPerToken == 4.5)
-    // Carried baselines win over the calibrated constants.
-    #expect(fixture.benchmark?.resolvedBaselinePrefillSecondsPerToken == 0.25)
-    #expect(fixture.benchmark?.resolvedBaselineDecodeSecondsPerToken == 4.5)
 }
 
 @Test
 func loadGoldenFixtureRejectsUnknownBenchmarkKeys() throws {
     let directory = try temporaryDirectory()
     let path = directory.appendingPathComponent("golden.json")
-    // A typo'd scoring-critical key must fail loudly. Without strict nested
-    // key validation, JSONDecoder drops the unknown key, both baselines decode
-    // as nil, and the run silently scores against the calibrated constants
-    // instead of the intended per-prompt baseline.
+    // A typo'd key must fail loudly. Without strict nested key validation,
+    // JSONDecoder drops the unknown key and both baselines decode as nil, so a
+    // golden that states a baseline pair would read as one that carries none.
     let json = benchmarkOracleGoldenJSON(baselineFieldsJSON: """
     ,
         "baseline_decode_second_per_token": 4.5
@@ -1144,19 +1132,10 @@ func attachDerivedBenchmarkOracleCarriesNoPerPromptBaselines() throws {
     let merged = try goldenDocumentAttachingDerivedBenchmarkOracle(oracleSourceDocument())
 
     let oracle = try #require(merged.benchmark)
-    // A hidden correctness golden is not a prompt-pool golden, so it must not
-    // carry pool-rotation baselines; scoring resolves to the calibrated
-    // constants exactly as the DFlash precedent does.
+    // The derived oracle must carry NO baseline pair: no file in this tree
+    // holds one, and check 5b of the manifest lint refuses a golden that does.
     #expect(oracle.baselinePrefillSecondsPerToken == nil)
     #expect(oracle.baselineDecodeSecondsPerToken == nil)
-    #expect(
-        oracle.resolvedBaselinePrefillSecondsPerToken
-            == MLXFastConstants.officialBaselinePrefillSecondsPerToken
-    )
-    #expect(
-        oracle.resolvedBaselineDecodeSecondsPerToken
-            == MLXFastConstants.officialBaselineDecodeSecondsPerToken
-    )
 }
 
 @Test

@@ -1248,9 +1248,35 @@ too, and the enforced values live in the fixture as `decode_speedup_floor` and
 `prefill_speedup_floor`; `benchmark.json` carries the same two numbers and the
 lint cross-checks them. The ceiling stays 5.0. Before 2026-09-09 this repository
 declared a decode floor of 0.90 and no prefill floor at all. Both were authoring
-errors: 0.90 is the `qwen3.8-27b-mtp-v1` free-run constant, and the engine's own
-`MLXFastConstants.scoreDecodeSpeedupFloor` / `scorePrefillSpeedupFloor` have
-read 0.95 throughout.
+errors: 0.90 is the `qwen3.8-27b-mtp-v1` free-run constant, and the Gemma-era
+Swift score constants this repository still carried at the time had read 0.95
+throughout. Those Swift constants are now DELETED (section 9.1.1): the fixture
+is the only place a floor is stated.
+
+### 9.1.1 No Swift scoring path, and no stored baseline pair
+
+This engine computes NO score. benchd measures, scores and seals; the engine
+reports raw timings. The tree used to carry a second, unused scoring path from
+the Gemma era: `Sources/MLXFastCore/Score.swift` (the `BenchmarkScore` estimate,
+the `ScorePayload`/`ScoreMetrics` score.json writer and its diagnostic
+coarsening) plus the constants it read --
+`officialBaselinePrefillSecondsPerToken`, `officialBaselineDecodeSecondsPerToken`,
+`scorePrefillWeight`, `scoreDecodeWeight`, `scorePrefillSpeedupFloor`,
+`scoreDecodeSpeedupFloor` and `publicDiagnosticSignificantFigures` -- and the
+`BenchmarkGolden.resolvedBaseline*` accessors that fell back to the stored pair.
+
+NOTHING CALLED ANY OF IT. The CLI verbs are `transform`, `verify-transform`,
+`attach-benchmark-oracle`, `analyze-ngram-similarity`, `checkpoint-shards` and
+`mtp-verify`; `tools/*.sh` and the workflows call benchd for every score. The
+only callers were the path's own tests. All of it is DELETED. The two stored
+baseline seconds-per-token were the last file-held baseline PAIR in the tree,
+which `docs/participant-contract.md` section 5.1.0 says must not exist: a ranked
+run measures its own control leg on the box (David ruling 2026-09-08).
+
+One stored timing value stays: `gemma4MTPOfficialBaselineDecodeSecondsPerToken`,
+the `qwen3.8-27b-mtp-v1` decode calibration record. It is a single value for
+ANOTHER track, not a pair for this one, and nothing in `Sources/` reads it
+either. It is kept as that track's record, not deleted with this path.
 
 ### 9.2 Single-stream only (RULED)
 
