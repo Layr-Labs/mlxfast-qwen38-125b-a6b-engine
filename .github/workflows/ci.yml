@@ -227,6 +227,10 @@ jobs:
         # toolchain, weights, GPU, or network.
         run: tools/test-new-track.sh
 
+      - name: Public local baseline entry point
+        # Real proxy and facade with a stub benchd; no model or GPU.
+        run: tools/test-local-baseline.sh
+
       - name: Resident boots per leg, serves, refuses and halts
         # Drives the REAL tools/resident-up.sh with a stub bench-worker that
         # binds its socket after a delay. The wrapper form: the contract argv,
