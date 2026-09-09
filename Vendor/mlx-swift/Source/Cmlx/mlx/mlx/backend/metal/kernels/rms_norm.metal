@@ -42,39 +42,49 @@ template <typename T, int N_READS = RMS_N_READS>
     }
   }
   acc = simd_sum(acc);
-  //  Initialize shared memory
-  if (simd_group_id == 0) {
-    local_sums[simd_lane_id] = 0;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  // Write simd accumulations into shared memory
-  if (simd_lane_id == 0) {
-    local_sums[simd_group_id] = acc;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  // Accumulate over simd groups
-  if (simd_group_id == 0) {
-    acc = simd_sum(local_sums[simd_lane_id]);
+  float inv_mean = 0.0f;
+  if (axis_size <= N_READS * SIMD_SIZE) {
+    acc = simd_sum(simd_lane_id == 0 ? acc : 0.0f);
     if (simd_lane_id == 0) {
-      local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+      inv_mean = metal::precise::rsqrt(acc / axis_size + eps);
     }
+    inv_mean = simd_broadcast(inv_mean, 0);
+  } else {
+    //  Initialize shared memory
+    if (simd_group_id == 0) {
+      local_sums[simd_lane_id] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Write simd accumulations into shared memory
+    if (simd_lane_id == 0) {
+      local_sums[simd_group_id] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Accumulate over simd groups
+    if (simd_group_id == 0) {
+      acc = simd_sum(local_sums[simd_lane_id]);
+      if (simd_lane_id == 0) {
+        local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    inv_mean = local_inv_mean[0];
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // Write the outputs using cached x values
   out += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
       out[i] =
-          w[w_stride * i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+          w[w_stride * i] * static_cast<T>(thread_x[i] * inv_mean);
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
         out[i] =
-            w[w_stride * i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+            w[w_stride * i] * static_cast<T>(thread_x[i] * inv_mean);
       }
     }
   }
