@@ -42,7 +42,7 @@ templating, wire fixtures, and request validation.
 | `lint` | `ubuntu-latest` | `tools/test-benchmark-facade-env.sh` — the real `tools/benchmark.sh`, driven with a stub `benchd`, exports `MLXFAST_QWEN_MTP_TRACK_ID` equal to `benchmark.json`'s `trackId` in every mode, and refuses when the manifest carries none |
 | `lint` | `ubuntu-latest` | `tools/test-new-track.sh` — the real `tools/new-track.sh` stamps a seeded copy of this tree into a new track against a stub Hugging Face tree API on `127.0.0.1`: the manifest, the contract fixture, the checkpoint file list, the runner label, the gitlink and the benchd channel all name the new track, the result still passes the manifest linter, and a dirty tree, a malformed track id and a checkpoint file with no published sha256 are refused |
 | `swift` | `macos-26` | toolchain preflight: a full Xcode is selected, Swift >= 6.3 |
-| `swift` | `macos-26` | `tools/test-submission-security.sh` — the submission-restriction HARD GATE, every hostile-archive assertion in the suite (the declared floor is 287). It sits in the `swift` job because it compiles the real byte-budget enforcer with `swiftc`. Nothing in it is box-dependent, so no assertion is gated off. See [What "hard gate" does and does not mean](#what-hard-gate-does-and-does-not-mean) |
+| `swift` | `macos-26` | `tools/test-submission-security.sh` — the submission-restriction HARD GATE, every hostile-archive assertion in the suite (the declared floor is `EXPECTED_MIN_ASSERTIONS` in the suite itself). It sits in the `swift` job because it compiles the real byte-budget enforcer with `swiftc`. Nothing in it is box-dependent, so no assertion is gated off. See [What "hard gate" does and does not mean](#what-hard-gate-does-and-does-not-mean) |
 | `swift` | `macos-26` | the suite's **non-vacuity floor**, restated workflow-side against its printed trailer — the run reds if the suite stopped short, reported any failure, or ran fewer assertions than `CI_MIN_ASSERTIONS`, and reds again if that number has drifted from the suite's own `EXPECTED_MIN_ASSERTIONS` |
 | `swift` | `macos-26` | `swift build --build-tests --force-resolved-versions` — `MLXFastCore`/`Transform`/`Model`/`Harness`, both executables, and the test bundle |
 | `swift` | `macos-26` | `tools/ci-swift-warning-gate.sh` — a warning in `Sources/` or `Tests/` fails the run |
@@ -116,7 +116,7 @@ accepted fix. Fix the cause.
 ### Test files behind an opt-in environment gate
 
 These run on an Apple Silicon box. Not every gated file needs the full box
-provisioning: the runtime-worker, cohort, and correctness suites need the
+provisioning: the runtime-worker and correctness suites need the
 checkpoint staged (`./setup.sh`), while the quantization-bind and kernel suites
 are fixture-scale and weights-free -- they need only the built MLX runtime
 (`tools/build-mlx-metallib.sh`), which hosted runners cannot provide either.

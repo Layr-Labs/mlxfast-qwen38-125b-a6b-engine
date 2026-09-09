@@ -4,7 +4,7 @@ import Testing
 @testable import MLXFastTransform
 
 // Direct unit coverage for `LagunaConfig.load` (the runtime side of the
-// transformed-weights contract in docs/laguna-weight-contract.md). The
+// Poolside transformed-weights contract). The
 // runtime worker's pinned-configuration gate is covered separately in
 // BenchmarkSupportTests; these tests pin the LagunaConfig parse/validation
 // behavior itself, including the exact Poolside NVFP4 contract.

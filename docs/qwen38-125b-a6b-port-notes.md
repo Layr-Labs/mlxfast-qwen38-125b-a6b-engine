@@ -1026,8 +1026,8 @@ loader refused.
 **WHAT IT DOES NOT.** The HIDDEN correctness oracle in the track fixture stays
 the `QWEN38-125B-A6B-MLX-PENDING-ORGANIZER` sentinel -- these are the PUBLIC
 goldens, and section 5.4 still governs the arm state. The frozen-window
-calibration record in `Sources/MLXFastCore/Constants.swift` and
-`docs/benchmark-window-freeze.md` still names the OLD golden's digest and byte
+calibration record in `Sources/MLXFastCore/Constants.swift`
+still names the OLD golden's digest and byte
 count, and is deliberately left alone: it is a record of which artifacts a past
 measurement actually used, and rewriting it to match today's files would
 falsify it. Those Gemma-era baseline constants describe a run against the old
@@ -1242,16 +1242,29 @@ the declared depth; per role the per-token times are summed over the pairs and
 the score is the ratio of the sums. `benchmark.json` carries the same number
 for readers, and the lint fails when the two disagree.
 
+The speedup floors are 0.95 on BOTH axes (David 2026-09-09): a candidate that
+regresses prefill or decode by more than 5 % is refused. They are track settings
+too, and the enforced values live in the fixture as `decode_speedup_floor` and
+`prefill_speedup_floor`; `benchmark.json` carries the same two numbers and the
+lint cross-checks them. The ceiling stays 5.0. Before 2026-09-09 this repository
+declared a decode floor of 0.90 and no prefill floor at all. Both were authoring
+errors: 0.90 is the `qwen3.8-27b-mtp-v1` free-run constant, and the engine's own
+`MLXFastConstants.scoreDecodeSpeedupFloor` / `scorePrefillSpeedupFloor` have
+read 0.95 throughout.
+
 ### 9.2 Single-stream only (RULED)
 
 David ruling 2026-08-27, relayed by orchestrator: "Single-stream only". The
-scored value is a PAIRED serial-against-MTP comparison over the pinned
-8-prompt pool, run ONE STREAM AT A TIME, at `scored_batch_size` 1. The batch-8
-ContinuousBatchingV2 adaptation is NOT pursued. Section 5.2 states why the
-batched path cannot drive this tower.
+scored value is a PAIRED serial-against-MTP comparison, run ONE STREAM AT A
+TIME, at `scored_batch_size` 1. The batched ContinuousBatchingV2 adaptation is
+NOT pursued. Section 5.2 states why the batched path cannot drive this tower.
 
-Each of the 8 prompts runs in its own window, and the 8 elapsed times are
-summed for prefill and for decode separately, on each leg.
+SUPERSEDED 2026-09-08. The sentence that stood here said each of the 8 pinned
+prompts runs in its own window and the 8 elapsed times are summed. That was the
+pool-timing shape. The ranked run has been the paired per-box shape since David's
+2026-09-08 ruling: it times the ONE prompt `live_golden` names, over
+`official_pairs` pairs, and it sums each role's per-token times over the pairs.
+The pinned 8-prompt pool is the CORRECTNESS pool.
 
 THE QUOTE IN THE FIXTURE IS NOW THIS TRACK'S OWN. It used to be the Gemma-era
 ruling, which opened "we want to score gemma's benchmark" and described a sum
@@ -1280,12 +1293,13 @@ benchd's own single-stream paired regime name: `overlay::SCORING_MODE`, the
 same string as `measure_job::MEASURE_JOB_MODE`, read off the bench repository at
 `a7be295b`.
 
-WHAT THIS LEAVES TO THE BENCH LANE. At the PUBLISHED channel tip,
-`ScoredBatchPoint::certify` certifies B = 8 and nothing else, so a fixture
-declaring `scored_batch_size` 1 is refused at width certification, and the
-composite is computed on the batched cohort regime only. So this repository
-declares a shape the published benchmarker refuses. That is deliberate and it
-is fail-closed.
+WHAT THIS LEFT TO THE BENCH LANE, as of 2026-08-27. At the channel tip of that
+day, `ScoredBatchPoint::certify` certified B = 8 and nothing else, so a fixture
+declaring `scored_batch_size` 1 was refused at width certification, and the
+composite was computed on the batched cohort regime only. This repository
+declared a shape the published benchmarker refused. That was deliberate and
+fail-closed. It is history: the lane below has since merged, and scored runs
+happen.
 
 THE BENCH LANE HAS MERGED, and this is verified, not assumed. At the release
 branch tip `56a9821a` (pull request 217 on the development bench repository,

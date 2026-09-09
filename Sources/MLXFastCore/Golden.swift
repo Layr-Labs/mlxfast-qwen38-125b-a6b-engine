@@ -179,8 +179,7 @@ public struct BenchmarkGolden: Codable, Equatable {
     public let decodeSeedTokens: [Int]
     public let expectedDecodeSeedToken: Int
     public let expectedDecodeTokens: [Int]
-    // Per-prompt baselines for prompt-pool rotation (see
-    // docs/benchmark-window-freeze.md). A pool golden carries the seconds-per-
+    // Per-prompt baselines for prompt-pool rotation. A pool golden carries the seconds-per-
     // token the baseline reference measured for THIS prompt on the official
     // runner, so rotating prompts of different intrinsic difficulty keeps
     // speedups comparable. Both must be present together or absent together;

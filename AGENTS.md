@@ -57,10 +57,16 @@ its runner service exports as `MLXFAST_QWEN38_GOLDEN_DIR`. They are never in
 git.
 
 Scoring is paired, with a per-box baseline (David ruling 2026-09-08). A ranked
-run measures two legs on the same box in the same job, over the one live
-golden: a serial-control leg on the organizer's reference tree
-(`MLXFAST_BASELINE_WORKSPACE`) and the candidate leg at its declared draft
-depth. The score is the live ratio. **NO FILE STORES A BASELINE PAIR.** No
+run measures the number of pairs the fixture declares in `official_pairs`, which
+is 2 (David ruling 2026-09-09), on the same box in the same job, over the one
+live golden. Each pair is a serial-control leg on the organizer's reference tree
+(`MLXFAST_BASELINE_WORKSPACE`) and a candidate leg at its declared draft depth.
+The legs run strictly one after the other and each leg loads the model once. Per
+role the per-token times are summed over the pairs, and the score is the live
+ratio of those sums:
+`composite = prefill_gain^0.25 * decode_gain^0.75`. Both speedup floors are 0.95
+and the ceiling is 5.0, applied to that aggregate. **NO FILE STORES A BASELINE
+PAIR.** No
 golden carries `benchmark.baseline_prefill_seconds_per_token` or
 `benchmark.baseline_decode_seconds_per_token`, and
 `tools/lint-benchmark-manifest.py` check 5b keeps both fields out of the tree.

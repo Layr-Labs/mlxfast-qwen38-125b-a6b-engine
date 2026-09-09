@@ -70,7 +70,7 @@
 #   4. Hash mismatch on a staged asset, in either half of the pin, on any tape
 #      or on a box-named MLXFAST_CORRECTNESS_GOLDEN_PATH. An unpinned extra
 #      *.json in the staging directory is also refused: every *.json there is
-#      passed as a --golden, so one more file is one more cohort member.
+#      passed as a --golden, so one more file is one more timed golden.
 #   5. Credential or override in the job environment. R2 keys, an R2 signer, a
 #      dist token, BENCHD (which bypasses the benchd manifest check),
 #      MLXFAST_SKIP_WEIGHTS_DOWNLOAD / SKIP_MODEL_DOWNLOAD,

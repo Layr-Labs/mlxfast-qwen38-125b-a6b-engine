@@ -464,8 +464,9 @@ public enum MLXFastConstants {
     // folds into the final score. These constants keep two roles: local-mode
     // score estimates (--local-iterate / --local-submit) and the gates-only
     // pass's placeholder timing fields, which the paired-timing overlay
-    // replaces. See the paired-baseline section of
-    // docs/benchmark-window-freeze.md.
+    // replaces. They are a record of a past measurement, not the ranked
+    // denominator: a ranked run measures its own control leg (David ruling
+    // 2026-09-08) and no file stores a baseline pair.
     public static let officialBaselinePrefillSecondsPerToken = 0.0003276219582519531
     public static let officialBaselineDecodeSecondsPerToken = 0.012374741210937498
     public static let scorePrefillWeight = 0.25
