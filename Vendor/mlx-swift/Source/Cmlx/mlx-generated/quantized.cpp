@@ -1072,7 +1072,7 @@ METAL_FUNC void qmv_wide_impl(
   // terms in ascending element order, and the group partials still reach
   // result[v] in ascending group order, so the arithmetic is bit identical.
   if (bits == 4) {
-    constexpr int g_unroll = 3;
+    constexpr int g_unroll = 2;
     constexpr int packs_per_group = group_size / sub;
     int g = g_first;
     for (; g + (g_unroll - 1) * g_stride < in_vec_size_g;
