@@ -95,6 +95,7 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
     public let loadedDecoders: [DecoderID]
     public let headProvenance: HeadProvenance?
     public let loadedModelType: String
+    public let earlyDispatchReplacements: Int
 
     private let model: Qwen4ExpModel
     private let drafter: (any CBv2MTPDrafter)?
@@ -103,23 +104,24 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
 
     private init(
         model: Qwen4ExpModel,
-        serving: any LanguageModel,
         tokenizer: any MLXLMCommon.Tokenizer,
         eosTokenIDs: Set<Int>,
         loadedModelType: String,
         drafter: (any CBv2MTPDrafter)?,
         headProvenance: HeadProvenance?,
+        earlyDispatchReplacements: Int,
         kvBytesCapacity: Int,
         maxSequenceLength: Int
     ) {
         self.model = model
-        self.servingModel = serving
+        self.servingModel = model
         self.layerKinds = model.cbv2LayerKinds
         self.tokenizer = tokenizer
         self.eosTokenIDs = eosTokenIDs
         self.loadedModelType = loadedModelType
         self.drafter = drafter
         self.headProvenance = headProvenance
+        self.earlyDispatchReplacements = earlyDispatchReplacements
         self.kvBytesCapacity = kvBytesCapacity
         self.maxSequenceLength = maxSequenceLength
         self.loadedDecoders = drafter == nil ? [.serial] : [.serial, .mtp]
@@ -196,6 +198,13 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         let head = try model.mtp.map {
             try Self.adoptMTPHead($0, configuration: model.configuration)
         }
+
+        // The target decoder loop is inside the pinned MLXLLM module. Install
+        // the Runner-owned late-projection seam after loading so the exact
+        // quantized operations can submit decode/verify rows early. Prefill
+        // rows are rejected by the helper's 64-row bound.
+        let earlyDispatchReplacements = TrackQwen4ExpEarlyDispatch.install(on: model)
+
         // The fork's `mtp` module stays bound to the model: a Module property
         // may only change through `update(modules:)`, and there is nothing to
         // gain from removing it — the track head holds the SAME arrays, not a
@@ -209,21 +218,14 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
             drafter == nil
             ? nil : try RunnerCheckpoint.provenance(ofEmbeddedHeadAt: directory)
 
-        // THE FAST FORWARD. The engine drives `TrackQwen4ExpFastModel`, which
-        // serves the SAME loaded tensors through a leaner graph (see
-        // FastModel/TrackFastModel.swift). TRACK_FAST_FORWARD=0 serves the
-        // fork's module directly, for A/B.
-        let serving: any LanguageModel =
-            TrackQwen4ExpFastModel.enabled ? TrackQwen4ExpFastModel(base: model) : model
-
         return TrackQwen4ExpRunner(
             model: model,
-            serving: serving,
             tokenizer: tokenizer,
             eosTokenIDs: eosTokenIDs,
             loadedModelType: modelType,
             drafter: drafter,
             headProvenance: provenance,
+            earlyDispatchReplacements: earlyDispatchReplacements,
             kvBytesCapacity: options.kvBytesCapacity,
             maxSequenceLength: options.maxSequenceLength)
     }
@@ -293,6 +295,7 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
             quantizationCounts["quantized", default: 0] += 1
         }
         summary.add("quantized_projections", quantizationCounts["quantized"] ?? 0)
+        summary.add("early_dispatch_replacements", earlyDispatchReplacements)
 
         summary.add(
             "resources_accepted",
