@@ -111,8 +111,8 @@ and under what repository allowlist, is not ruled yet.
 A submission archive has REPLACE semantics over `editablePaths`. An absent head
 declaration means the embedded head. The overlay therefore skips a missing
 optional path instead of failing closed.
-`.github/scripts/overlay-editable-paths.sh` reads this list from the trusted
-contract, never from the submission.
+Yukon's overlay reads this list from the trusted contract, never from the
+submission.
 
 ### 3.2 The byte budget
 
@@ -239,10 +239,9 @@ but broken is a refusal. The runner never falls back silently.
 
 You may not ship head weights. No path in the editable surface can hold them,
 so a submission that carries a weight file is refused before any measurement.
-`.github/scripts/enforce-modifiable-surface.sh` names the file and refuses.
-`.github/scripts/overlay-editable-paths.sh` never copies it. The benchmarker's
-own write-divergence gate refuses any content that differs from the trusted
-baseline outside the editable surface.
+Yukon archives and overlays only `editablePaths`, so the file never reaches
+the measured tree, and the benchmarker's own write-divergence gate refuses any
+content that differs from the trusted baseline outside the editable surface.
 
 You may not edit the checkpoint's head tensors. The checkpoint is not an
 editable path, so any change to it is outside the surface.

@@ -420,7 +420,7 @@ jobs:
         # a sufficiently deliberate forgery of both is not in scope. What is in
         # scope is accident and drift, which is what actually happens.
         env:
-          CI_MIN_ASSERTIONS: "236"
+          CI_MIN_ASSERTIONS: "170"
         run: |
           set -euo pipefail
 
