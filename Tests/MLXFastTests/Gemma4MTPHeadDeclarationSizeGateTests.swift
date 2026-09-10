@@ -193,6 +193,20 @@ func booleanBytesIsRefused() throws {
 }
 
 @Test
+func nullMaxBytesIsRefused() throws {
+    // JSON `null` is a present key that is not an integer. It used to read as
+    // "not stated" and fall back onto the full track cap.
+    let message = refusalMessage(#"{"source":"pinned","max_bytes":null,"bytes":1001}"#)
+    #expect(message.contains("max_bytes"), "the refusal must name the field: \(message)")
+}
+
+@Test
+func nullBytesIsRefused() throws {
+    let message = refusalMessage(#"{"source":"pinned","max_bytes":1000,"bytes":null}"#)
+    #expect(message.contains("bytes"), "the refusal must name the field: \(message)")
+}
+
+@Test
 func fractionalBytesIsRefused() throws {
     // A byte count is a whole number; 1024.5 used to truncate to 1024.
     let message = refusalMessage(#"{"source":"pinned","bytes":1024.5}"#)
