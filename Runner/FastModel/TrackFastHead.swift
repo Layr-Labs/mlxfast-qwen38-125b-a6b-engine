@@ -62,6 +62,7 @@ final class TrackFastHead {
     }
 
     private func hcMix(_ hc: TrackHC, normed: MLXArray) -> (MLXArray, MLXArray) {
+        if normed.dim(1) <= 8, let compiled = hc.compiledMix { return compiled(normed) }
         let lo = hc.down.apply(normed)
         let act: MLXArray, inj: MLXArray
         if normed.dim(1) == 1, hc.hasInject, case .quant(let iq)? = hc.inject, let ib = iq.biases {

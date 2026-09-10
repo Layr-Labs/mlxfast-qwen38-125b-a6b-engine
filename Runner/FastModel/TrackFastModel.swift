@@ -166,6 +166,7 @@ struct TrackMultiProj {
 // MARK: - Bound layers
 
 struct TrackHC {
+    var compiledMix: (@Sendable (MLXArray) -> (MLXArray, MLXArray))? = nil
     /// hc_norm scale, pre-divided by hc_count (exact: power of two).
     let normScaleQ: MLXArray
     /// input_mix_weight_down (320 rows: the fast GEMV) and block_inject_weight
@@ -180,6 +181,8 @@ struct TrackHC {
 }
 
 struct TrackGDN {
+    var compiledPlain: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+    var compiledCaptured: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
     let proj: TrackMultiProj  // qkv | z | b | a
     let convW: MLXArray  // [convDim, KC]
     let negExpALog: MLXArray  // [Hv] float32
@@ -208,6 +211,7 @@ struct TrackAttn {
 }
 
 struct TrackMoE {
+    var compiledForward: (@Sendable (MLXArray) -> MLXArray)? = nil
     let routerW32: MLXArray  // [E, H] float32
     let switchMLP: SwitchGLU
     /// The routed experts' quantized arrays, for the custom gather path.
@@ -313,9 +317,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let up = TrackProj(m.trackChild("input_mix_weight_up"))
         let inject = m.children()[unwrapping: "block_inject_weight"].map { TrackProj($0) }
         let q = (scale * MLXArray(Float(1) / Float(cfg.hcCount), dtype: scale.dtype))
-        return TrackHC(
+        var bound = TrackHC(
             normScaleQ: q, down: down, inject: inject, up: up, lowrank: cfg.hcLowrank,
             hasInject: inject != nil)
+        if TrackFastGraph.enabled {
+            let raw = bound
+            bound.compiledMix = compile { x in
+                TrackFastGraph.mixer(raw, x, hcCount: cfg.hcCount, hidden: cfg.hiddenSize)
+            }
+        }
+        return bound
     }
 
     static func bindGDN(_ m: Module, cfg: Qwen4ExpTextConfiguration) -> TrackGDN {
@@ -341,9 +352,19 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             projWidth: proj.width, convDim: convDim, convKernel: kc,
             hk: hk, hv: hv, dk: dk, dv: dv,
             bOffset: proj.offsets[2], aOffset: proj.offsets[3])
-        return TrackGDN(
+        var bound = TrackGDN(
             proj: proj, convW: convW, negExpALog: negExpALog, dtBias: dtBias, normW: normW,
             out: out, geometry: geometry, zOffset: proj.offsets[1], valueDim: valueDim)
+        if TrackFastGraph.enabled {
+            let raw = bound
+            bound.compiledPlain = compile { args in
+                TrackFastGraph.recurrent(raw, args, capture: false)
+            }
+            bound.compiledCaptured = compile { args in
+                TrackFastGraph.recurrent(raw, args, capture: true)
+            }
+        }
+        return bound
     }
 
     static func bindAttn(_ m: Module, cfg: Qwen4ExpTextConfiguration) -> TrackAttn {
@@ -410,13 +431,18 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let su = TrackProj(shared.trackChild("up_proj"))
         let sd = TrackProj(shared.trackChild("down_proj"))
         let sharedGate = TrackProj(m.trackChild("shared_expert_gate"))
-        return TrackMoE(
+        var bound = TrackMoE(
             routerW32: routerW, switchMLP: switchMLP,
             expertGate: expert("gate_proj"), expertUp: expert("up_proj"), expertDown: expert("down_proj"),
             expertGroupSize: qdown.groupSize, expertBits: qdown.bits,
             sharedGateUp: TrackMultiProj([sg, su]),
             sharedDown: sd, sharedGate: sharedGate, topK: cfg.numExpertsPerTok,
             sharedHidden: sg.rows)
+        if TrackFastGraph.enabled {
+            let raw = bound
+            bound.compiledForward = compile { x in Self.moeForwardShared(raw, x) }
+        }
+        return bound
     }
 
     static func bindPLE(_ ple: Qwen4ExpPLELayer, ordinal: Int, cfg: Qwen4ExpTextConfiguration)
@@ -467,6 +493,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// Hyper-connection mixer over an already-normalized stream: returns the
     /// block input `[B,S,H]` and the inject weights `[B,S,hc]`.
     private func hcMix(_ hc: TrackHC, normed: MLXArray, tag: String = "") -> (MLXArray, MLXArray) {
+        if normed.dim(1) <= 8, Self.debugTaps == nil, let compiled = hc.compiledMix {
+            return compiled(normed)
+        }
         let lo = hc.down.apply(normed)  // [B,S,lowrank]
         let act: MLXArray, inj: MLXArray
         // One-token windows: MLX routes the 4-row inject GEMV to `qmv`, a
@@ -501,28 +530,32 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let geo = g.geometry
-        let proj = g.proj.apply(x)  // [B,S,PROJ_W]
         let state = evaluation.inputState(modelLayerIndex: layerIndex)
         let convState =
             state?.conv ?? MLXArray.zeros([B, geo.convKernel - 1, geo.convDim], dtype: x.dtype)
         let ssm =
             state?.ssm ?? MLXArray.zeros([B, geo.hv, geo.dv, geo.dk], dtype: .float32)
-        let r = TrackFastKernels.gdn(
-            proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
-            dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo)
-        let gated = TrackFastKernels.gatedRMS(
-            y: r.y, proj: proj, w: g.normW, zOffset: g.zOffset, eps: 1e-6)
+        let result: [MLXArray]
+        // A single uncaptured recurrent step is faster eager on the local
+        // release probe; retain that path while compiling verify windows.
+        if S <= 8, (capture || S > 1),
+            let compiled = capture ? g.compiledCaptured : g.compiledPlain
+        {
+            result = compiled([x, convState, ssm])
+        } else {
+            result = TrackFastGraph.recurrent(g, [x, convState, ssm], capture: capture)
+        }
         do {
             if capture {
                 try evaluation.stageCaptured(
-                    modelLayerIndex: layerIndex, conv: r.convOut, ssm: r.stateOut, positions: S)
+                    modelLayerIndex: layerIndex, conv: result[1], ssm: result[2], positions: S)
             } else {
-                try evaluation.stage(modelLayerIndex: layerIndex, conv: r.convOut, ssm: r.stateOut)
+                try evaluation.stage(modelLayerIndex: layerIndex, conv: result[1], ssm: result[2])
             }
         } catch {
             preconditionFailure("TrackFastModel: recurrent stage failed at layer \(layerIndex): \(error)")
         }
-        return g.out.apply(gated)
+        return result[0]
     }
 
     /// The reference's rope tables for this forward, cast to the activation
@@ -564,6 +597,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     }
 
     static func moeForwardShared(_ m: TrackMoE, _ x: MLXArray) -> MLXArray {
+        if x.dim(1) <= 8, let compiled = m.compiledForward { return compiled(x) }
         let logits = matmul(x.asType(.float32), m.routerW32.transposed())
         let idx = argPartition(-logits, kth: m.topK - 1, axis: -1)[.ellipsis, ..<m.topK]
         let weights = softmax(takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
