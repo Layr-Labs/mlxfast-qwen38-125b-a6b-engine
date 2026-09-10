@@ -96,14 +96,17 @@ public final class TrackQwen4ExpMTPModule: Module {
     ///   - cache: the head's own caches, one per head layer.
     ///   - stepIndex: which head layer runs, for a multi-layer head. A
     ///     single-layer head ignores it.
+    ///   - lastOnly: when true, mix and return only the final sequence row.
     /// - Returns: `sample` `[B, S, H]` for the target head, and `multi`
-    ///   `[B, S, hc * H]` for the next draft step.
+    ///   `[B, S, hc * H]` for the next draft step, or one final row when
+    ///   `lastOnly` is true.
     public func callAsFunction(
         nextTokenIds: MLXArray,
         multiStream: MLXArray,
         embedTokens: Embedding,
         cache: [KVCache],
-        stepIndex: Int = 0
+        stepIndex: Int = 0,
+        lastOnly: Bool = false
     ) -> (sample: MLXArray, multi: MLXArray) {
         let B = nextTokenIds.dim(0)
         let S = nextTokenIds.dim(1)
@@ -126,6 +129,13 @@ public final class TrackQwen4ExpMTPModule: Module {
             ids: nextTokenIds,
             previousContext: nil
         )
-        return (hyperConnectionMixer(hyper), hyper)
+        let mixedInput: MLXArray
+        if lastOnly {
+            let last = hyper.dim(1) - 1
+            mixedInput = hyper[0..., last ..< last + 1, 0...]
+        } else {
+            mixedInput = hyper
+        }
+        return (hyperConnectionMixer(mixedInput), mixedInput)
     }
 }

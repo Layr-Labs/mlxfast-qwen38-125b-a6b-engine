@@ -103,7 +103,6 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
 
     private init(
         model: Qwen4ExpModel,
-        serving: any LanguageModel,
         tokenizer: any MLXLMCommon.Tokenizer,
         eosTokenIDs: Set<Int>,
         loadedModelType: String,
@@ -113,7 +112,7 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         maxSequenceLength: Int
     ) {
         self.model = model
-        self.servingModel = serving
+        self.servingModel = model
         self.layerKinds = model.cbv2LayerKinds
         self.tokenizer = tokenizer
         self.eosTokenIDs = eosTokenIDs
@@ -209,16 +208,8 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
             drafter == nil
             ? nil : try RunnerCheckpoint.provenance(ofEmbeddedHeadAt: directory)
 
-        // THE FAST FORWARD. The engine drives `TrackQwen4ExpFastModel`, which
-        // serves the SAME loaded tensors through a leaner graph (see
-        // FastModel/TrackFastModel.swift). TRACK_FAST_FORWARD=0 serves the
-        // fork's module directly, for A/B.
-        let serving: any LanguageModel =
-            TrackQwen4ExpFastModel.enabled ? TrackQwen4ExpFastModel(base: model) : model
-
         return TrackQwen4ExpRunner(
             model: model,
-            serving: serving,
             tokenizer: tokenizer,
             eosTokenIDs: eosTokenIDs,
             loadedModelType: modelType,

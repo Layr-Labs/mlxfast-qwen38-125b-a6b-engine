@@ -106,6 +106,11 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 
 template <typename T, typename U, int values_per_thread, int bits>
 inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
+  // MLXFAST-WORDLOAD: complete 4-bit tail lanes use the full-load path.
+  if (bits == 4 && N == values_per_thread) {
+    return load_vector<T, U, values_per_thread, bits>(x, x_thread);
+  }
+
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -233,13 +238,30 @@ inline U qdot(
   }
 
   else if (bits == 4) {
-    const device uint16_t* ws = (const device uint16_t*)w;
-    for (int i = 0; i < (values_per_thread / 4); i++) {
-      accum +=
-          (x_thread[4 * i] * (ws[i] & 0x000f) +
-           x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-           x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-           x_thread[4 * i + 3] * (ws[i] & 0xf000));
+    // MLXFAST-WORDLOAD: packed QMV rows and eight-value lanes are uint-aligned.
+    if (values_per_thread % 8 == 0) {
+      const device uint32_t* words = (const device uint32_t*)w;
+      for (int i = 0; i < (values_per_thread / 8); i++) {
+        const uint32_t packed = words[i];
+        for (int j = 0; j < 2; j++) {
+          const uint16_t half_word = uint16_t(packed >> (16 * j));
+          const int k = 8 * i + 4 * j;
+          accum +=
+              (x_thread[k] * (half_word & 0x000f) +
+               x_thread[k + 1] * (half_word & 0x00f0) +
+               x_thread[k + 2] * (half_word & 0x0f00) +
+               x_thread[k + 3] * (half_word & 0xf000));
+        }
+      }
+    } else {
+      const device uint16_t* ws = (const device uint16_t*)w;
+      for (int i = 0; i < (values_per_thread / 4); i++) {
+        accum +=
+            (x_thread[4 * i] * (ws[i] & 0x000f) +
+             x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+             x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+             x_thread[4 * i + 3] * (ws[i] & 0xf000));
+      }
     }
   }
 
@@ -297,6 +319,11 @@ inline U qdot_safe(
     U bias,
     U sum,
     int N) {
+  // MLXFAST-WORDLOAD: retain the safe dot for partial lane packets.
+  if (bits == 4 && N == values_per_thread) {
+    return qdot<U, values_per_thread, bits>(w, x_thread, scale, bias, sum);
+  }
+
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -640,6 +667,24 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
+    // MLXFAST-WORDLOAD: combine complete transposed packets; keep dequant math.
+    if (bits == 4 && reduction_dim == 1 && BCOLS % 8 == 0 &&
+        (n_reads == 4 || n_reads == 8) && src_ld % 8 == 0) {
+      const float s = float(scale);
+      const float b = float(bias);
+      float sc[2] = {s, s / 16.0f};
+      const device uint32_t* words = (const device uint32_t*)src;
+      for (int i = 0; i < n_reads / 4; i++) {
+        const uint32_t packed = words[i];
+        for (int j = 0; j < 4; j++) {
+          const uint8_t wbyte = uint8_t(packed >> (8 * j));
+          dst[8 * i + 2 * j] = static_cast<T>(sc[0] * (wbyte & 0x0f) + b);
+          dst[8 * i + 2 * j + 1] =
+              static_cast<T>(sc[1] * (wbyte & 0xf0) + b);
+        }
+      }
+      return;
+    }
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
