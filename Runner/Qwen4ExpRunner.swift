@@ -103,7 +103,6 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
 
     private init(
         model: Qwen4ExpModel,
-        serving: any LanguageModel,
         tokenizer: any MLXLMCommon.Tokenizer,
         eosTokenIDs: Set<Int>,
         loadedModelType: String,
@@ -113,7 +112,7 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         maxSequenceLength: Int
     ) {
         self.model = model
-        self.servingModel = serving
+        self.servingModel = model
         self.layerKinds = model.cbv2LayerKinds
         self.tokenizer = tokenizer
         self.eosTokenIDs = eosTokenIDs
@@ -201,6 +200,20 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         // gain from removing it — the track head holds the SAME arrays, not a
         // copy. The drafter below is the only reader of a head; it serves the
         // track head.
+        // ROUTED GATE/UP FUSION. `SwitchGLU` already serves a fused
+        // `gate_up_proj` layout with ONE gathered projection where the split
+        // layout issues two, and the engine ships the whole mechanism --
+        // `fusingGateUp()`, `setSwitchGLUGateUpFused` -- plus the sibling
+        // families that use it. Qwen4Exp's `sanitize` simply never asks for
+        // it, so this tower loads split and pays two calls per layer.
+        //
+        // The fused rows are the SAME quantized bytes in the SAME groups: the
+        // quantization groups run along the CONTRACTION axis, so concatenating
+        // gate above up along the OUTPUT-row axis leaves every row's scales,
+        // biases and dot product untouched. `projectExperts` slices the halves
+        // straight back out at `hiddenDims`, which is the order built here.
+        Self.fuseRoutedGateUp(model)
+
         let drafter = head.map { TrackQwen4ExpInlineMTPAssistant(target: model, mtp: $0) }
         // §12c: the one embedded-head rule, in the one shared helper. It
         // hashes the shards carrying the `mtp.*` tensors, not the whole
@@ -209,16 +222,8 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
             drafter == nil
             ? nil : try RunnerCheckpoint.provenance(ofEmbeddedHeadAt: directory)
 
-        // THE FAST FORWARD. The engine drives `TrackQwen4ExpFastModel`, which
-        // serves the SAME loaded tensors through a leaner graph (see
-        // FastModel/TrackFastModel.swift). TRACK_FAST_FORWARD=0 serves the
-        // fork's module directly, for A/B.
-        let serving: any LanguageModel =
-            TrackQwen4ExpFastModel.enabled ? TrackQwen4ExpFastModel(base: model) : model
-
         return TrackQwen4ExpRunner(
             model: model,
-            serving: serving,
             tokenizer: tokenizer,
             eosTokenIDs: eosTokenIDs,
             loadedModelType: modelType,
@@ -413,4 +418,76 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
             kvBytesCapacity: kvBytesCapacity,
             maxLength: maxSequenceLength)
     }
+
+    /// Rebuild every split routed gate/up pair as the engine's fused
+    /// `gate_up_proj` layout, in place, preserving the checkpoint's own
+    /// quantization geometry.
+    ///
+    /// A pair is fused only when both halves are present and carry the SAME
+    /// geometry; a heterogeneous pair is left split, which is exactly the
+    /// condition the engine's own loader applies.
+    static func fuseRoutedGateUp(_ model: Qwen4ExpModel) {
+        let named = Dictionary(
+            model.namedModules().map { ($0.0, $0.1) }, uniquingKeysWith: { a, _ in a })
+        let splitPaths: [String] = named.compactMap { path, module in
+            guard let glu = module as? SwitchGLU, !glu.hasFusedGateUp else { return nil }
+            return path
+        }.sorted()
+
+        for path in splitPaths {
+            guard let glu = named[path] as? SwitchGLU else { continue }
+
+            // Geometry of the two halves, read off what was actually loaded.
+            var geometry: [String: (groupSize: Int, bits: Int, mode: QuantizationMode)] = [:]
+            for (leafPath, leaf) in glu.leafModules().flattened() {
+                guard let q = leaf as? Quantized else { continue }
+                geometry[leafPath] = (q.groupSize, q.bits, q.mode)
+            }
+            guard let gateGeometry = geometry["gate_proj"],
+                let upGeometry = geometry["up_proj"],
+                gateGeometry == upGeometry
+            else { continue }
+
+            // Concatenate gate ABOVE up on the output-row axis, for every
+            // tensor the halves carry.
+            let flat = Dictionary(uniqueKeysWithValues: glu.parameters().flattened())
+            var fused: [(String, MLXArray)] = []
+            var complete = true
+            for key in flat.keys.filter({ $0.hasPrefix("gate_proj.") }).sorted() {
+                let suffix = String(key.dropFirst("gate_proj.".count))
+                guard let gate = flat[key], let up = flat["up_proj.\(suffix)"] else {
+                    complete = false
+                    break
+                }
+                let axis = suffix == "bias" ? -1 : -2
+                fused.append(("gate_up_proj.\(suffix)", concatenated([gate, up], axis: axis)))
+            }
+            guard complete, !fused.isEmpty else { continue }
+            for (key, value) in flat where key.hasPrefix("down_proj.") {
+                fused.append((key, value))
+            }
+
+            // Swap the fused twin in through its PARENT: a root-relative
+            // update walks `layers` as a dictionary and the tower holds an
+            // array there, which `Module.update(modules:)` refuses.
+            let twin = glu.fusingGateUp()
+            guard let cut = path.lastIndex(of: ".") else { continue }
+            let parentPath = String(path[path.startIndex ..< cut])
+            let childKey = String(path[path.index(after: cut)...])
+            guard let parent = named[parentPath] else { continue }
+            parent.update(modules: ModuleChildren.unflattened([(childKey, twin)]))
+
+            quantize(model: twin) { leafPath, _ in
+                leafPath == "gate_up_proj" ? gateGeometry : nil
+            }
+            do {
+                try twin.update(
+                    parameters: ModuleParameters.unflattened(fused), verify: .all)
+            } catch {
+                // Restore the split module rather than serve a half-bound one.
+                parent.update(modules: ModuleChildren.unflattened([(childKey, glu)]))
+            }
+        }
+    }
+
 }
