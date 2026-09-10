@@ -42,6 +42,7 @@ template <typename T, int D, int V = D>
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int BN = 32;
   constexpr int BD = 32;
+  constexpr int output_stride = V == 256 ? BD + 1 : BD;
   constexpr int qk_per_thread = D / BD;
   constexpr int v_per_thread = V / BD;
   int inner_k_stride = BN * int(k_seq_stride);
@@ -53,7 +54,7 @@ template <typename T, int D, int V = D>
   thread U k[qk_per_thread];
   thread U o[v_per_thread];
 
-  threadgroup U outputs[BN * BD];
+  threadgroup U outputs[BN * output_stride];
   threadgroup U max_scores[BN];
   threadgroup U sum_exp_scores[BN];
 
@@ -161,9 +162,9 @@ template <typename T, int D, int V = D>
 
   // Now we need to aggregate all the outputs
   for (int i = 0; i < v_per_thread; i++) {
-    outputs[simd_lid * BD + simd_gid] = o[i];
+    outputs[simd_lid * output_stride + simd_gid] = o[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+    o[i] = simd_sum(outputs[simd_gid * output_stride + simd_lid] * factor);
     o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
@@ -473,12 +474,13 @@ template <typename T, int D>
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int BN = 32;
   constexpr int BD = 32;
+  constexpr int output_stride = D == 256 ? BD + 1 : BD;
   constexpr int elem_per_thread = D / BD;
 
   typedef float U;
 
   thread U o[elem_per_thread] = {0};
-  threadgroup U outputs[BN * BD];
+  threadgroup U outputs[BN * output_stride];
 
   // Adjust positions
   const int head_idx = tid.x;
@@ -521,9 +523,9 @@ template <typename T, int D>
 
   // Use shared memory to transpose and reduce the final block
   for (int i = 0; i < elem_per_thread; i++) {
-    outputs[simd_lid * BD + simd_gid] = o[i];
+    outputs[simd_lid * output_stride + simd_gid] = o[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+    o[i] = simd_sum(outputs[simd_gid * output_stride + simd_lid]);
     o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
