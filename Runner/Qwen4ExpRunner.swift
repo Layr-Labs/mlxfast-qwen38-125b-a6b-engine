@@ -393,8 +393,17 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         try model.newCacheV2(makeLayerCache: make)
     }
 
+    /// Per-request event buffer. The bench worker builds a fresh engine per
+    /// free-run phase and drops the previous one without shutting it down; a
+    /// dropped request keeps decoding until its buffer fills, on the same GPU
+    /// as the live one. A small buffer parks it after a few rounds. The live
+    /// consumer drains continuously, so it never fills its own buffer.
+    nonisolated(unsafe) public static var eventBufferCapacity: Int = 8
+
     public func makeEngine(_ build: EngineBuild) throws -> any CBv2Engine {
-        try RunnerEngineAssembly.makeEngine(
+        var build = build
+        build.loopConfig.eventBufferCapacity = Self.eventBufferCapacity
+        return try RunnerEngineAssembly.makeEngine(
             manifest: Self.manifest,
             loadedDecoders: loadedDecoders,
             model: servingModel,

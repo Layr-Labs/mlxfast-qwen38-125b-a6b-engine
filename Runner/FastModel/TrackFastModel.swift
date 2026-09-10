@@ -563,33 +563,47 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         Self.moeForwardShared(m, x)
     }
 
+    /// Row index of each (token, expert) slot, one constant array per window size
+    /// (uploading it per step was one host copy per layer).
+    nonisolated(unsafe) private static var xrowTables: [Int: MLXArray] = [:]
+    private static let xrowLock = NSLock()
+    static func xrowTable(S: Int, K: Int) -> MLXArray {
+        xrowLock.lock(); defer { xrowLock.unlock() }
+        if let t = xrowTables[S * 1024 + K] { return t }
+        let t = MLXArray((0 ..< (S * K)).map { UInt32($0 / K) })
+        eval(t)
+        xrowTables[S * 1024 + K] = t
+        return t
+    }
+
     static func moeForwardShared(_ m: TrackMoE, _ x: MLXArray) -> MLXArray {
         let logits = matmul(x.asType(.float32), m.routerW32.transposed())
-        let idx = argPartition(-logits, kth: m.topK - 1, axis: -1)[.ellipsis, ..<m.topK]
-        let weights = softmax(takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
-        let routed: MLXArray
+        // Top-k + softmax in one launch (argpartition's stable order, softmax_single_row).
+        let (idx, weights) = TrackFastMoEKernels.route(logits: logits, topK: m.topK)  // uint32, f32
+        // The shared expert keeps MLX's launches: for 2-8 token windows those are
+        // `qmv_wide`, whose arithmetic differs from the per-row GEMV walks below.
+        let gu = m.sharedGateUp.apply(x)
+        let shared = m.sharedDown.apply(TrackFastKernels.swiglu(gu: gu))
+        let gate = m.sharedGate.apply(x)  // [B,S,1]
         if x.dim(0) == 1 && x.dim(1) <= 8 {
-            // Custom gather over MLX's own per-row GEMV arithmetic (bit-exact with
-            // SwitchGLU); the op's fixed per-call cost dominates at these shapes.
+            // Routed experts: gate|up + SwiGLU in one launch, down + combine in one
+            // launch, over MLX's own per-row GEMV arithmetic (bit-exact with SwitchGLU).
             let S = x.dim(1), K = m.topK, H = x.dim(2)
-            let flatIdx = idx.reshaped(S * K).asType(.uint32)
-            let xrow = MLXArray((0 ..< (S * K)).map { UInt32($0 / K) })
-            let gu = TrackFastMoEKernels.gateUp(
+            let flatIdx = idx.reshaped(S * K)
+            let xrow = Self.xrowTable(S: S, K: K)
+            let act = TrackFastMoEKernels.gateUpAct(
                 wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
                 wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b,
                 x: x.reshaped(S, H), idx: flatIdx, xrow: xrow,
                 groupSize: m.expertGroupSize, bits: m.expertBits)
-            let act = TrackFastKernels.swiglu2(gate: gu.gate, up: gu.up)
-            routed = TrackFastMoEKernels.single(
-                w: m.expertDown.w, scales: m.expertDown.s, biases: m.expertDown.b,
-                x: act, idx: flatIdx, groupSize: m.expertGroupSize, bits: m.expertBits
-            ).reshaped(1, S, K, H)
-        } else {
-            routed = m.switchMLP(x, idx)  // [B,S,K,H]
+            return TrackFastMoEKernels.downCombine(
+                wd: m.expertDown.w, sd: m.expertDown.s, bd: m.expertDown.b, act: act,
+                idx: flatIdx, w: weights.reshaped(S * K), shared: shared.reshaped(S, H),
+                gate: gate.reshaped(S), topK: K, groupSize: m.expertGroupSize,
+                bits: m.expertBits
+            ).reshaped(1, S, H)
         }
-        let gu = m.sharedGateUp.apply(x)
-        let shared = m.sharedDown.apply(TrackFastKernels.swiglu(gu: gu))
-        let gate = m.sharedGate.apply(x)  // [B,S,1]
+        let routed = m.switchMLP(x, idx.asType(.int32))  // [B,S,K,H]
         // The combine kernel folds the K products in the association MLX's small
         // column reduce uses (verified at float precision for every window size).
         return TrackFastKernels.moeCombine(routed: routed, w: weights, shared: shared, gate: gate)
