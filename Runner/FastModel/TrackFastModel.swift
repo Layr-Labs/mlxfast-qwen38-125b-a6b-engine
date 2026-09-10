@@ -573,11 +573,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // SwitchGLU); the op's fixed per-call cost dominates at these shapes.
             let S = x.dim(1), K = m.topK, H = x.dim(2)
             let flatIdx = idx.reshaped(S * K).asType(.uint32)
-            let xrow = MLXArray((0 ..< (S * K)).map { UInt32($0 / K) })
             let gu = TrackFastMoEKernels.gateUp(
                 wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
                 wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b,
-                x: x.reshaped(S, H), idx: flatIdx, xrow: xrow,
+                x: x.reshaped(S, H), idx: flatIdx, expertsPerToken: K,
                 groupSize: m.expertGroupSize, bits: m.expertBits)
             let act = TrackFastKernels.swiglu2(gate: gu.gate, up: gu.up)
             routed = TrackFastMoEKernels.single(

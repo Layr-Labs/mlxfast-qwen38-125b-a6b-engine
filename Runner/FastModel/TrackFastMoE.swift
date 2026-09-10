@@ -635,12 +635,12 @@ METAL_FUNC void qmv_impl(
     /// gate and up in one launch: y-blocks [0, NB) compute gate rows, [NB, 2NB) up rows,
     /// each threadgroup handling RB consecutive 8-row blocks. grid threads (32, NB*2*2, B), threadgroup (32, 2, 1),
     /// NB = ceil(N / (8*RB)).
-    ///   wg/sg/bg, wu/su/bu: [E, N, K/8] / [E, N, K/32]; x [R, K]; idx [B] uint32 expert; xrow [B] uint32 row
+    ///   wg/sg/bg, wu/su/bu: [E, N, K/8] / [E, N, K/32]; x [R, K]; idx [B] uint32 expert
     ///   -> gate [B, N], up [B, N]
     static let gateUpSource = """
         const uint b = threadgroup_position_in_grid.z;
         const uint e = idx[b];
-        const uint r = xrow[b];
+        const uint r = b / (uint)EXPERTS_PER_TOKEN;
         const uint kw = (uint)K / 8;
         const uint kg = (uint)K / GS;
         const uint nblocks = (uint)N / 8;
@@ -687,7 +687,7 @@ METAL_FUNC void qmv_impl(
 
     nonisolated(unsafe) static let gateUpKernel = MLXFast.metalKernel(
         name: "track_moe_gate_up",
-        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "x", "idx", "xrow", "K", "N"],
+        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "x", "idx", "K", "N"],
         outputNames: ["gate", "up"],
         source: gateUpSource, header: helpers, ensureRowContiguous: true)
 
@@ -703,18 +703,20 @@ METAL_FUNC void qmv_impl(
     /// at one block per threadgroup.
     static func rowBlocks(k: Int) -> Int { k % 512 == 0 ? 1 : 4 }
 
-    /// gate/up for `B` (row, expert) pairs.
+    /// gate/up for token-major pairs: pair `b` reads input row `b / expertsPerToken`.
     static func gateUp(
         wg: MLXArray, sg: MLXArray, bg: MLXArray, wu: MLXArray, su: MLXArray, bu: MLXArray,
-        x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int, rowBlocks: Int? = nil
+        x: MLXArray, idx: MLXArray, expertsPerToken: Int, groupSize: Int, bits: Int, rowBlocks: Int? = nil
     ) -> (gate: MLXArray, up: MLXArray) {
         let B = idx.dim(0), K = x.dim(1), N = wg.dim(1)
         precondition(N % 8 == 0 && bits == 4)
+        precondition(expertsPerToken > 0 && expertsPerToken <= Int(Int32.max))
+        precondition(B == x.dim(0) * expertsPerToken)
         let rb = rowBlocks ?? Self.rowBlocks(k: K)
         let nb = (N / 8 + rb - 1) / rb
         let outs = gateUpKernel(
-            [wg, sg, bg, wu, su, bu, x, idx, xrow, MLXArray(Int32(K)), MLXArray(Int32(N))],
-            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb)],
+            [wg, sg, bg, wu, su, bu, x, idx, MLXArray(Int32(K)), MLXArray(Int32(N))],
+            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb), ("EXPERTS_PER_TOKEN", expertsPerToken)],
             grid: (32, nb * 2 * 2, B), threadGroup: (32, 2, 1),
             outputShapes: [[B, N], [B, N]], outputDTypes: [x.dtype, x.dtype])
         return (outs[0], outs[1])
