@@ -91,7 +91,7 @@ public final class TrackQwen4ExpInlineMTPAssistant {
         if let fastHead, let attnCache = cache.first as? Qwen4ExpAttentionCache,
             let fast = fastHead.forward(
                 nextTokenIds: tokens, multiStream: multiStream, embedTokens: embedTokens,
-                cache: attnCache)
+                cache: attnCache, lastOnly: true)
         {
             step = fast
         } else {

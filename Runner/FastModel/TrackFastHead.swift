@@ -79,12 +79,12 @@ final class TrackFastHead {
             hasInject: hc.hasInject)
     }
 
-    /// One head application over `[1, S]` inputs; returns `sample` `[1,S,H]`
-    /// and the next multi stream `[1,S,hc*H]`. Nil when the fast path does
-    /// not serve the call (context past the indexer budget).
+    /// All input rows update attention history. When lastOnly is true,
+    /// the row-independent MoE and final mixer serve only the consumed row.
+    /// Nil when the fast path does not serve the context.
     func forward(
         nextTokenIds ids: MLXArray, multiStream multi: MLXArray, embedTokens: Embedding,
-        cache: Qwen4ExpAttentionCache
+        cache: Qwen4ExpAttentionCache, lastOnly: Bool = false
     ) -> (sample: MLXArray, multi: MLXArray)? {
         let B = ids.dim(0), S = ids.dim(1)
         guard Self.enabled, B == 1, cache.offset + S <= indexerBudget else { return nil }
@@ -104,7 +104,15 @@ final class TrackFastHead {
             residual: hyper, out: nil, inject: nil, scale: attnHC.normScaleQ,
             hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
         var (input, injectW) = hcMix(attnHC, normed: normed)
-        let attended = attention(input, cache: cache, offset: offset)
+        var attended = attention(input, cache: cache, offset: offset)
+        if lastOnly && S > 1 {
+            // Attention above populated every KV/indexer row. No later
+            // operation mixes sequence positions or mutates those caches.
+            // The drafter retains only this final multi stream and sample.
+            st = st[0..., (S - 1) ..< S, 0...]
+            attended = attended[0..., (S - 1) ..< S, 0...]
+            injectW = injectW[0..., (S - 1) ..< S, 0...]
+        }
         (st, normed) = TrackFastKernels.injectNorm(
             residual: st, out: attended, inject: injectW, scale: mlpHC.normScaleQ,
             hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
