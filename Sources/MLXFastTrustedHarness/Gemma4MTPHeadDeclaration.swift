@@ -209,13 +209,14 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
     /// refusing -- and it reads JSON `true` as 1, which walks straight into the
     /// one-byte size gate. An absent key still means "not stated" and keeps its
     /// default; a present key that is not a whole number in `Int` range refuses
-    /// by name.
+    /// by name. JSON `null` is a PRESENT key whose value is not an integer, so
+    /// it refuses too: only an absent key means "not stated".
     private static func integerField(
         _ raw: Any?,
         named name: String,
         origin: String
     ) throws -> Int? {
-        guard let raw, !(raw is NSNull) else {
+        guard let raw else {
             return nil
         }
         guard let number = raw as? NSNumber,

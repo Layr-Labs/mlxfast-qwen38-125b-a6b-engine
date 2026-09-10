@@ -285,9 +285,11 @@ for editable_path in "${EDITABLE_PATHS[@]}"; do
   # later git read run there would honour them -- the vector hardened-git.sh
   # exists to neutralize, planted on the trusted side instead of the submission
   # side. The find covers a `.git` at the root of the entry too; the basename
-  # test also covers an entry the contract spells with a trailing slash.
-  if [[ "$(basename -- "${editable_path}")" == ".git" ]] \
-     || find "${source_path}" -name .git -print -quit | grep -q .; then
+  # test also covers an entry the contract spells with a trailing slash. Both
+  # tests are case-insensitive: on the case-insensitive filesystem the ranked
+  # Mac runs, `.GIT` IS `.git` to git, so it is refused under any spelling.
+  if [[ "$(basename -- "${editable_path}")" == [.][gG][iI][tT] ]] \
+     || find "${source_path}" -iname .git -print -quit | grep -q .; then
     echo "::error file=${editable_path}::submitted editable paths must not contain .git metadata" >&2
     exit 1
   fi

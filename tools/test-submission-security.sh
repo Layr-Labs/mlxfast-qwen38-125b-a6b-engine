@@ -453,6 +453,19 @@ assert_exit "overlay/nested .git metadata inside an editable path rejected" 1 \
   "must not contain .git metadata" "${fx}/trusted" \
   env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
 
+# The same metadata under another spelling. On the case-insensitive filesystem
+# the ranked Mac runs, `.GIT` is `.git` to git, so a case-sensitive name test
+# admitted a nested repository that git would then honour. Refused under any
+# spelling, on every filesystem, and the trusted side stays intact.
+fx="$(new_fixture)"
+mkdir -p "${fx}/sub/src/.GIT"
+printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
+printf '[core]\n\thooksPath = /tmp/attacker-hooks\n' > "${fx}/sub/src/.GIT/config"
+printf 'submitted config\n' > "${fx}/sub/config.txt"
+assert_exit "overlay/nested .GIT metadata (other spelling) inside an editable path rejected" 1 \
+  "must not contain .git metadata" "${fx}/trusted" \
+  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
+
 # Setuid smuggling. The asserted guarantee is that a setuid bit never LANDS in
 # the trusted checkout, not which layer stops it: the unprivileged tar/cp the
 # overlay uses already drops setuid/setgid on extraction, and
