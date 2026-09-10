@@ -699,9 +699,20 @@ METAL_FUNC void qmv_impl(
 
     static func isFast(k: Int, n: Int) -> Bool { n % 8 == 0 && k % 512 == 0 }
 
-    /// 8-row blocks per threadgroup: the K=640 down projection is overhead-bound
-    /// at one block per threadgroup.
-    static func rowBlocks(k: Int) -> Int { k % 512 == 0 ? 1 : 4 }
+    /// 8-row blocks per threadgroup.
+    ///
+    /// One block per threadgroup on every shape. The routed path is only ever
+    /// entered from `moeForwardShared` with `B = window * topK`, so `B >= 10`
+    /// always; at those batch sizes four blocks per threadgroup divide the
+    /// threadgroup count by four and the machine loses more to the shorter
+    /// grid than it gains from the longer per-threadgroup run. Measured on the
+    /// K=640 down projection over 10 of 512 experts, uncached, median of 31,
+    /// three alternating runs: B=20 reads 336/337/339 GB/s at one block
+    /// against 326/326/326 at four, and B=30 reads 346/345/344 against
+    /// 330/329/330. The block count is a work partition only -- every output
+    /// row is still one accumulation -- and the outputs were checked
+    /// bit-identical at B = 10, 20 and 30 for gate, up and down.
+    static func rowBlocks(k: Int) -> Int { 1 }
 
     /// gate/up for `B` (row, expert) pairs.
     static func gateUp(
