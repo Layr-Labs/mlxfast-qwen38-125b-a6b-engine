@@ -143,20 +143,11 @@ fi
 
 budget() { "${BUDGET_BIN}" "$@"; }
 
-# --- the enforcers this suite drives must be there to be driven --------------
+# --- the enforcer this suite drives must be there to be driven ---------------
 #
-# A large family of assertions below is of the form "the trusted checkout was
-# NOT modified" -- the gitlink is intact, the sentinel above the root is
-# untouched, the setuid bit never landed. Every one of them is trivially true
-# when the enforcer never ran at all. Measured, with a driver moved aside:
-# FIFTEEN such assertions once went green on a run where nothing ran.
-#
-# Each of those does have a companion assert_exit on the same fixture that reds
-# in that state, so the suite as a whole notices. But a neighbouring assertion
-# failing is not the assertion in question binding -- the same distinction
-# check 3 had to be taught about check 3c -- and stating it once here is far
-# cheaper than fifteen individual guards. If this block passes, "untouched"
-# below means the enforcer ran and left it alone, rather than never having run.
+# An assertion of the form "the checkout was NOT modified" is trivially true
+# when the enforcer never ran at all. Stated once here: if this block passes,
+# a later "untouched" means the enforcer ran and left it alone.
 assert_equal "harness/submission-static-review-checks.sh is present and executable" \
   "$([ -x "${SCRIPTS}/submission-static-review-checks.sh" ] && echo executable || echo MISSING)" "executable"
 assert_equal "harness/the byte-budget enforcer compiled to an executable" \
@@ -1202,9 +1193,9 @@ done
 
 # 12. THE TWO DIVERGENT ROSTER ENTRIES, at the same depths as the inherited
 #     five. These are what the ruling actually bought: '.github' and 'tools'
-#     hold every gate in this repository -- the overlay, the static review, the
-#     surface gate, this linter, this suite, the CI tripwires -- so an entry
-#     reaching either of them is a submission proposing to edit its own judge.
+#     hold every gate in this repository -- the static review, this linter,
+#     this suite, the CI tripwires -- so an entry reaching either of them is a
+#     submission proposing to edit its own judge.
 #
 #     'contains' is not asserted for them because it is not reachable: both are
 #     single-segment paths at the repository root, so the only entry that could
@@ -1257,8 +1248,7 @@ done
 #   Sources/MLXFastCLI                   the trusted driver
 #   Sources/MLXFastCore                  the pins and constants it drives from
 #     (those five are upstream's own TRUSTED_SCOPE roster)
-#   .github                              the overlay, the static review, the
-#                                        surface gate, the CI tripwires
+#   .github                              the static review, the CI tripwires
 #   tools                                this linter, the hostile-archive
 #                                        suite, the fetch/verify scripts
 #     (those two are David's 2026-08-20 divergence: "parity doctrine governs
@@ -1354,8 +1344,8 @@ assert_equal "requant-only/exemptPaths is absent from the real budget block" \
 # What must NEVER appear is a head WEIGHTS directory in `editablePaths`.
 # `mtp-head/` and `dflash-head/` left that list under the 2026-08-26
 # requant-only ruling, and re-granting either one would reopen the custom-head
-# upload surface that ruling closed. Section F proves the surface gate refuses
-# smuggled head bytes; this proves the manifest still declines to invite them.
+# upload surface that ruling closed. Section F proves the manifest declines to
+# invite head bytes; Yukon archives only what the manifest lists.
 #
 # The model files that decide the head's geometry are NOT in this tree any
 # more: the engine is the Vendor/mlx-swift-lm submodule, and a gitlink is not

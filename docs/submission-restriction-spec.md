@@ -40,7 +40,7 @@ overlay and modifiable-surface gate that this document once extracted (R3, R4)
 were retired on 2026-09-09: neither had a caller on any scoring path. Yukon's
 service overlays the archive, and benchd enforces the surface at scoring (§1).
 
-**These four are not the whole submission-restriction surface upstream.** At
+**These files are not the whole submission-restriction surface upstream.** At
 least three further gates are load-bearing against a hostile submission and are
 NOT extracted here; §9 records each as not-ported, with what it would cost to
 be wrong about it:
