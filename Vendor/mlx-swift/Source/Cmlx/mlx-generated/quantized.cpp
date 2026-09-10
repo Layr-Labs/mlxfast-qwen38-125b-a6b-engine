@@ -1090,15 +1090,22 @@ METAL_FUNC void qmv_wide_impl(
           w_dq[2 * i] = static_cast<U>(s * (wbyte & 0x0fu) + b);
           w_dq[2 * i + 1] = static_cast<U>(s_hi * (wbyte & 0xf0u) + b);
         }
+        // Element-major over the sub-chunk: each dequantized weight is used by
+        // every streamed vector while it is live, and the vecs_per_tg
+        // accumulation chains interleave instead of running one after the
+        // other. Every vector still sums its terms in ascending element order
+        // and still adds exactly one partial to result[v] -- bit identical.
+        U accv[vecs_per_tg] = {0};
+#pragma unroll
+        for (int i = 0; i < sub; i++) {
+#pragma unroll
+          for (int v = 0; v < vecs_per_tg; v++) {
+            accv[v] += static_cast<U>(xv[v][k0 + i]) * w_dq[i];
+          }
+        }
 #pragma unroll
         for (int v = 0; v < vecs_per_tg; v++) {
-          const device T* xc = xv[v] + k0;
-          U acc = 0;
-#pragma unroll
-          for (int i = 0; i < sub; i++) {
-            acc += static_cast<U>(xc[i]) * w_dq[i];
-          }
-          result[v] += acc;
+          result[v] += accv[v];
         }
       }
     } else {
@@ -1108,15 +1115,22 @@ METAL_FUNC void qmv_wide_impl(
         const device uint8_t* wc = wrow + k0 * bits / 8;
         U w_dq[sub];
         dequantize<U, sub, bits>(wc, scale, bias, w_dq);
+        // Element-major over the sub-chunk: each dequantized weight is used by
+        // every streamed vector while it is live, and the vecs_per_tg
+        // accumulation chains interleave instead of running one after the
+        // other. Every vector still sums its terms in ascending element order
+        // and still adds exactly one partial to result[v] -- bit identical.
+        U accv[vecs_per_tg] = {0};
+#pragma unroll
+        for (int i = 0; i < sub; i++) {
+#pragma unroll
+          for (int v = 0; v < vecs_per_tg; v++) {
+            accv[v] += static_cast<U>(xv[v][k0 + i]) * w_dq[i];
+          }
+        }
 #pragma unroll
         for (int v = 0; v < vecs_per_tg; v++) {
-          const device T* xc = xv[v] + k0;
-          U acc = 0;
-#pragma unroll
-          for (int i = 0; i < sub; i++) {
-            acc += static_cast<U>(xc[i]) * w_dq[i];
-          }
-          result[v] += acc;
+          result[v] += accv[v];
         }
       }
     }
