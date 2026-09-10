@@ -88,12 +88,13 @@ public final class TrackQwen4ExpInlineMTPAssistant {
             multiStream: multiStream,
             embedTokens: embedTokens,
             cache: cache,
-            stepIndex: stepIndex)
-        let last = step.sample.dim(1) - 1
-        let lastSample = step.sample[0..., last..., 0...]
-        let lastMulti = step.multi[0..., last..., 0...]
-        let draft = argMax(target.head(lastSample)[0..., -1, 0...], axis: -1).asType(.int32)
-        return (draft, lastMulti)
+            stepIndex: stepIndex,
+            lastRowOnly: true)  // MLXFAST-MTPTAIL
+        // MLXFAST-MTPTAIL: The head returns the single row we consume, after
+        // inserting ALL input rows into KV/QSA history. Cache offsets and the
+        // begin/finalize/discard bookkeeping still count the full input feed.
+        let draft = argMax(target.head(step.sample)[0..., -1, 0...], axis: -1).asType(.int32)
+        return (draft, step.multi)
     }
 }
 

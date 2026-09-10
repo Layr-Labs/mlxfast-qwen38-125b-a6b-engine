@@ -56,6 +56,66 @@ public final class TrackQwen4ExpMTPModule: Module {
     let layers: [Qwen4ExpDecoderLayer]
     @ModuleInfo(key: "hyper_connection_mixer") var hyperConnectionMixer: Qwen4ExpGatedResidual
 
+    // MLXFAST-MTPTAIL: Keep typed references to the existing decoder children.
+    // A non-Module struct keeps these aliases out of Module's parameter tree;
+    // layers.N remains their only registered path. Head adoption replaces the
+    // projections INSIDE these modules, so the references see loaded weights.
+    private struct TailDecoder {
+        let attention: Qwen4ExpAttention
+        let attentionConnection: Qwen4ExpGatedResidual
+        let mlpConnection: Qwen4ExpGatedResidual
+        let mlp: Qwen4ExpSparseMoeBlock
+
+        init(_ layer: Qwen4ExpDecoderLayer) {
+            precondition(
+                !layer.isLinear && layer.ple == nil,
+                "MTP tail pruning requires full attention without PLE")
+            let children = layer.children()
+            guard let attention = children[unwrapping: "self_attn"] as? Qwen4ExpAttention,
+                let attentionConnection = children[unwrapping: "attn_hyper_connection"]
+                    as? Qwen4ExpGatedResidual,
+                let mlpConnection = children[unwrapping: "mlp_hyper_connection"]
+                    as? Qwen4ExpGatedResidual,
+                let mlp = children[unwrapping: "mlp"] as? Qwen4ExpSparseMoeBlock
+            else {
+                preconditionFailure("MTP tail pruning could not resolve decoder children")
+            }
+            self.attention = attention
+            self.attentionConnection = attentionConnection
+            self.mlpConnection = mlpConnection
+            self.mlp = mlp
+        }
+
+        func callAsFunction(
+            _ hyper: MLXArray,
+            rope: Qwen4ExpRotary,
+            mask: MLXFast.ScaledDotProductAttentionMaskMode,
+            cache: KVCache?
+        ) -> MLXArray {
+            // MLXFAST-MTPTAIL: Match Qwen4ExpDecoderLayer through ALL of
+            // attention, including QSA, RoPE, KV updates, gate and o_proj.
+            // Nothing before this boundary changes sequence length or offset.
+            let (input, residual, inject) = attentionConnection.mixWithInject(hyper)
+            let attended = attention(input, rope: rope, mask: mask, cache: cache)
+
+            // MLXFAST-MTPTAIL: Only the position-independent suffix is pruned.
+            // Slice axis 1 of all three tensors, preserving B and the row axis:
+            // attended [B,1,H], residual [B,1,hc*H], inject [B,1,hc].
+            // Smaller matrix/expert batches can select different kernels and
+            // rounding; row independence alone does not promise bit equality.
+            let tail = (hyper.dim(1) - 1) ..< hyper.dim(1)
+            let stream = qwen4ExpInject(
+                residual: residual[0..., tail, 0...],
+                output: attended[0..., tail, 0...],
+                inject: inject[0..., tail, 0...])
+            let (mlpInput, mlpResidual, mlpInject) = mlpConnection.mixWithInject(stream)
+            return qwen4ExpInject(
+                residual: mlpResidual, output: mlp(mlpInput), inject: mlpInject)
+        }
+    }
+
+    private let tailDecoders: [TailDecoder]  // MLXFAST-MTPTAIL
+
     let rope: Qwen4ExpRotary
     public let layerCount: Int
 
@@ -75,9 +135,12 @@ public final class TrackQwen4ExpMTPModule: Module {
             weightOffset: args.rmsNormWeightOffset)
         _fcEmbedding.wrappedValue = Linear(args.hiddenSize, args.hiddenSize, bias: false)
         _fcHidden.wrappedValue = Linear(args.hiddenSize, args.hiddenSize, bias: false)
-        self.layers = (0 ..< layerCount).map { _ in
+        // MLXFAST-MTPTAIL: Resolve aliases once; no reflection in a draft step.
+        let layers = (0 ..< layerCount).map { _ in
             Qwen4ExpDecoderLayer(args, isLinear: false, pleLayerIndex: nil)
         }
+        self.layers = layers
+        self.tailDecoders = layers.map { TailDecoder($0) }
         _hyperConnectionMixer.wrappedValue = Qwen4ExpGatedResidual(args, useInject: false)
         super.init()
     }
@@ -96,17 +159,25 @@ public final class TrackQwen4ExpMTPModule: Module {
     ///   - cache: the head's own caches, one per head layer.
     ///   - stepIndex: which head layer runs, for a multi-layer head. A
     ///     single-layer head ignores it.
-    /// - Returns: `sample` `[B, S, H]` for the target head, and `multi`
-    ///   `[B, S, hc * H]` for the next draft step.
+    ///   - lastRowOnly: prune the suffix after attention to the last position.
+    ///     All S inputs still enter attention and its caches.
+    /// - Returns: `sample` `[B, R, H]` for the target head, and `multi`
+    ///   `[B, R, hc * H]` for the next draft step, where R is 1 when
+    ///   `lastRowOnly` is true and S otherwise.
+    // MLXFAST-MTPTAIL: The default preserves the full-output API for callers
+    // that consume every row, and provides a comparison path for tail pruning.
     public func callAsFunction(
         nextTokenIds: MLXArray,
         multiStream: MLXArray,
         embedTokens: Embedding,
         cache: [KVCache],
-        stepIndex: Int = 0
+        stepIndex: Int = 0,
+        lastRowOnly: Bool = false  // MLXFAST-MTPTAIL
     ) -> (sample: MLXArray, multi: MLXArray) {
         let B = nextTokenIds.dim(0)
         let S = nextTokenIds.dim(1)
+        // MLXFAST-MTPTAIL: A last row requires a nonempty head input.
+        precondition(S > 0, "TrackQwen4ExpMTPModule needs at least one input row")
 
         let embedded = fcEmbedding(preFCNormEmbedding(embedTokens(nextTokenIds)))
         var stream = preFCNormHidden(multiStream).reshaped(B, S, hcCount, hiddenSize)
@@ -117,15 +188,22 @@ public final class TrackQwen4ExpMTPModule: Module {
         let index = layerCount == 1 ? 0 : stepIndex % layerCount
         let layerCache: KVCache? = index < cache.count ? cache[index] : nil
         let mask = makeAttentionMask(n: S, cache: layerCache)
-        hyper = layers[index](
-            hyper,
-            rope: rope,
-            mask: mask,
-            convMask: nil,
-            cache: layerCache,
-            ids: nextTokenIds,
-            previousContext: nil
-        )
+        // MLXFAST-MTPTAIL: Preserve the original S=1 path without slice ops.
+        // This head selects ONE layer per call, so no later layer needs the
+        // discarded suffix rows. The final mixer also sees only the tail.
+        if lastRowOnly && S > 1 {
+            hyper = tailDecoders[index](hyper, rope: rope, mask: mask, cache: layerCache)
+        } else {
+            hyper = layers[index](
+                hyper,
+                rope: rope,
+                mask: mask,
+                convMask: nil,
+                cache: layerCache,
+                ids: nextTokenIds,
+                previousContext: nil
+            )
+        }
         return (hyperConnectionMixer(hyper), hyper)
     }
 }
