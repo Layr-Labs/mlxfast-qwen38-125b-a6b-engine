@@ -128,7 +128,7 @@ enum TrackFastKernels {
                 ("CONV_DIM", g.convDim), ("B_OFF", g.bOffset), ("A_OFF", g.aOffset),
                 ("CAPTURE", capture),
             ],
-            grid: (32, g.convDim / 128, B * T), threadGroup: (32, 4, 1),
+            grid: (32, g.convDim / 128, B * T), threadGroup: (32, 1, 1),  // MLXFAST-OCC: 20->80 threadgroups; x stays one simdgroup, y is global
             outputShapes: [
                 [B, T, g.hk, g.dk], [B, T, g.hk, g.dk], [B, T, g.hv, g.dv],
                 [B, T, g.hv], [B, T, g.hv], [slots, g.convKernel - 1, g.convDim],

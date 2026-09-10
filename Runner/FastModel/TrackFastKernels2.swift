@@ -173,7 +173,7 @@ extension TrackFastKernels {
                 ("InT", w.dtype), ("H", hidden), ("W", hcCount * hidden), ("HC", hcCount),
                 ("LW", inj.dim(2)), ("HAS_INJECT", hasInject),
             ],
-            grid: (hidden, B * S, 1), threadGroup: (256, 1, 1),
+            grid: (hidden, B * S, 1), threadGroup: (64, 1, 1),  // MLXFAST-OCC: 10->40 threadgroups at S=1; per-thread channel ownership unchanged
             outputShapes: [[B, S, hidden], [B, S, hcCount]],
             outputDTypes: [w.dtype, w.dtype])
         return (outs[0], outs[1])
