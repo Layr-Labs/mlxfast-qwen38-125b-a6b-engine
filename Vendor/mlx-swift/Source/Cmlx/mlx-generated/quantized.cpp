@@ -1062,46 +1062,114 @@ METAL_FUNC void qmv_wide_impl(
   // 8-value sub-chunks and reuse each chunk across the streamed vectors.
   const int g_stride = k_lanes * k_folds;
   const int g_first = fold < k_folds ? k_lane + fold * k_lanes : in_vec_size_g;
-  // Group loop. The 4-bit path is unrolled by g_unroll: the scale, the bias
-  // and the packed weights of every group a trip covers are loaded before any
-  // of them is decoded, so g_unroll independent memory requests per thread are
-  // in flight at once. At the decode output widths only 40-80 threadgroups are
-  // resident on the whole GPU, so there is no other thread to hide a load
-  // behind and the stock loop paid one memory round trip per group. Every
-  // group is decoded by the same expression as before, every vector sums its
-  // terms in ascending element order, and the group partials still reach
-  // result[v] in ascending group order, so the arithmetic is bit identical.
-  if (bits == 4) {
-    constexpr int g_unroll = 3;
-    constexpr int packs_per_group = group_size / sub;
-    int g = g_first;
-    for (; g + (g_unroll - 1) * g_stride < in_vec_size_g;
-         g += g_unroll * g_stride) {
-      float su[g_unroll];
-      float bu[g_unroll];
-      uint32_t wpack[g_unroll][packs_per_group];
+  // MLXFAST-BASE: Keep three packed groups in a rolling queue. Refill each
+  // consumed word before its arithmetic; do not keep future dequantized groups.
+  if constexpr (bits == 4 && group_size == 32 && vecs_per_tg == 2) {
+    constexpr int lookahead = 3;
+    constexpr int chunks = group_size / sub;
+    uint32_t queued_w[lookahead][chunks];
+    T queued_s[lookahead];
+    T queued_b[lookahead];
+
 #pragma unroll
-      for (int u = 0; u < g_unroll; u++) {
-        const int gu = g + u * g_stride;
-        su[u] = static_cast<float>(srow[gu]);
-        bu[u] = static_cast<float>(brow[gu]);
+    for (int u = 0; u < lookahead; u++) {
+      const int g = g_first + u * g_stride;
+      if (g < in_vec_size_g) {
+        queued_s[u] = srow[g];
+        queued_b[u] = brow[g];
         const device uint32_t* wg =
-            (const device uint32_t*)(wrow + gu * (group_size * bits / 8));
+            (const device uint32_t*)(wrow + g * (group_size * bits / 8));
 #pragma unroll
-        for (int sc = 0; sc < packs_per_group; sc++) {
-          wpack[u][sc] = wg[sc];
+        for (int sc = 0; sc < chunks; sc++) {
+          queued_w[u][sc] = wg[sc];
         }
       }
+    }
+
+    // MLXFAST-BASE: Static queue indices permit scalar registers. Keep the
+    // outer loop rolled so lookahead does not grow with compiler unrolling.
+#pragma clang loop unroll(disable)
+    for (int g_base = g_first; g_base < in_vec_size_g;
+         g_base += lookahead * g_stride) {
 #pragma unroll
-      for (int u = 0; u < g_unroll; u++) {
-        const int gu = g + u * g_stride;
-        const float s = su[u];
-        const float b = bu[u];
+      for (int u = 0; u < lookahead; u++) {
+        const int g = g_base + u * g_stride;
+        if (g < in_vec_size_g) {
+          const float s = float(queued_s[u]);
+          const float b = float(queued_b[u]);
+          const float s_hi = s / 16.0f;
+          const int future = g + lookahead * g_stride;
+          const bool refill = future < in_vec_size_g;
+          if (refill) {
+            queued_s[u] = srow[future];
+            queued_b[u] = brow[future];
+          }
+#pragma unroll
+          for (int sc = 0; sc < chunks; sc++) {
+            const uint32_t p = queued_w[u][sc];
+            if (refill) {
+              const device uint32_t* wg = (const device uint32_t*)(
+                  wrow + future * (group_size * bits / 8));
+              queued_w[u][sc] = wg[sc];
+            }
+
+            const int k0 = g * group_size + sc * sub;
+            U accv[vecs_per_tg] = {0};
+            // MLXFAST-BASE: Stage four input values per vector in T. Scalar
+            // addresses also support views without vec<T, 4> alignment.
+#pragma unroll
+            for (int h = 0; h < sub / 4; h++) {
+              vec<T, 4> x4[vecs_per_tg];
+#pragma unroll
+              for (int v = 0; v < vecs_per_tg; v++) {
+                const device T* xp = xv[v] + k0 + 4 * h;
+                x4[v] = vec<T, 4>(xp[0], xp[1], xp[2], xp[3]);
+              }
+#pragma unroll
+              for (int i = 0; i < 4; i++) {
+                const uint32_t wbyte =
+                    (p >> (8 * (2 * h + i / 2))) & 0xffu;
+                const U w_dq = (i & 1)
+                    ? static_cast<U>(s_hi * (wbyte & 0xf0u) + b)
+                    : static_cast<U>(s * (wbyte & 0x0fu) + b);
+#pragma unroll
+                for (int v = 0; v < vecs_per_tg; v++) {
+                  accv[v] += static_cast<U>(x4[v][i]) * w_dq;
+                }
+              }
+            }
+            // MLXFAST-BASE: Both halves share one eight-term accumulator;
+            // result still receives one addition per original sub-chunk.
+#pragma unroll
+            for (int v = 0; v < vecs_per_tg; v++) {
+              result[v] += accv[v];
+            }
+          }
+        }
+      }
+    }
+  } else {
+    for (int g = g_first; g < in_vec_size_g; g += g_stride) {
+      U scale = srow[g];
+      U bias = brow[g];
+      if (bits == 4) {
+        // A 4-bit group is word aligned, so read it as one 32-bit load per
+        // sub-chunk and issue the whole group's loads together. Same bytes in the
+        // same order, same arithmetic as dequantize<U, sub, 4>.
+        const device uint32_t* wg =
+            (const device uint32_t*)(wrow + g * (group_size * bits / 8));
+        uint32_t wpack[group_size / sub];
+#pragma unroll
+        for (int sc = 0; sc < group_size / sub; sc++) {
+          wpack[sc] = wg[sc];
+        }
+        const float s = float(scale);
+        const float b = float(bias);
         const float s_hi = s / 16.0f;
 #pragma unroll
-        for (int sc = 0; sc < packs_per_group; sc++) {
-          const int k0 = gu * group_size + sc * sub;
-          const uint32_t p = wpack[u][sc];
+        for (int sc = 0; sc < group_size / sub; sc++) {
+          const int k0 = g * group_size + sc * sub;
+          const uint32_t p = wpack[sc];
           U w_dq[sub];
 #pragma unroll
           for (int i = 0; i < sub / 2; i++) {
@@ -1109,38 +1177,42 @@ METAL_FUNC void qmv_wide_impl(
             w_dq[2 * i] = static_cast<U>(s * (wbyte & 0x0fu) + b);
             w_dq[2 * i + 1] = static_cast<U>(s_hi * (wbyte & 0xf0u) + b);
           }
-          // The sub-chunk is `sub` contiguous activations and `sub` is a multiple
-          // of 4, so read them as vec<T, 4>: two loads per streamed vector instead
-          // of eight, issued before any product. The element-major order below is
-          // unchanged, so every vector still sums its terms in ascending element
-          // order -- bit identical.
-          vec<T, 4> xq[vecs_per_tg][sub / 4];
-#pragma unroll
-          for (int v = 0; v < vecs_per_tg; v++) {
-            const device vec<T, 4>* xc4 = (const device vec<T, 4>*)(xv[v] + k0);
-#pragma unroll
-            for (int c = 0; c < sub / 4; c++) {
-              xq[v][c] = xc4[c];
-            }
-          }
+          // Element-major over the sub-chunk: each dequantized weight is used by
+          // every streamed vector while it is live, and the vecs_per_tg
+          // accumulation chains interleave instead of running one after the
+          // other. Every vector still sums its terms in ascending element order
+          // and still adds exactly one partial to result[v] -- bit identical.
           U accv[vecs_per_tg] = {0};
 #pragma unroll
-          for (int c = 0; c < sub / 4; c++) {
+          for (int i = 0; i < sub; i++) {
 #pragma unroll
             for (int v = 0; v < vecs_per_tg; v++) {
-              accv[v] += static_cast<U>(xq[v][c].x) * w_dq[4 * c + 0];
+              accv[v] += static_cast<U>(xv[v][k0 + i]) * w_dq[i];
             }
+          }
+#pragma unroll
+          for (int v = 0; v < vecs_per_tg; v++) {
+            result[v] += accv[v];
+          }
+        }
+      } else {
+#pragma unroll
+        for (int sc = 0; sc < group_size / sub; sc++) {
+          const int k0 = g * group_size + sc * sub;
+          const device uint8_t* wc = wrow + k0 * bits / 8;
+          U w_dq[sub];
+          dequantize<U, sub, bits>(wc, scale, bias, w_dq);
+          // Element-major over the sub-chunk: each dequantized weight is used by
+          // every streamed vector while it is live, and the vecs_per_tg
+          // accumulation chains interleave instead of running one after the
+          // other. Every vector still sums its terms in ascending element order
+          // and still adds exactly one partial to result[v] -- bit identical.
+          U accv[vecs_per_tg] = {0};
+#pragma unroll
+          for (int i = 0; i < sub; i++) {
 #pragma unroll
             for (int v = 0; v < vecs_per_tg; v++) {
-              accv[v] += static_cast<U>(xq[v][c].y) * w_dq[4 * c + 1];
-            }
-#pragma unroll
-            for (int v = 0; v < vecs_per_tg; v++) {
-              accv[v] += static_cast<U>(xq[v][c].z) * w_dq[4 * c + 2];
-            }
-#pragma unroll
-            for (int v = 0; v < vecs_per_tg; v++) {
-              accv[v] += static_cast<U>(xq[v][c].w) * w_dq[4 * c + 3];
+              accv[v] += static_cast<U>(xv[v][k0 + i]) * w_dq[i];
             }
           }
 #pragma unroll
@@ -1150,121 +1222,8 @@ METAL_FUNC void qmv_wide_impl(
         }
       }
     }
-    // Groups left over when the row's group count is not a multiple of
-    // g_unroll, in the same ascending order.
-    for (; g < in_vec_size_g; g += g_stride) {
-      const float s = static_cast<float>(srow[g]);
-      const float b = static_cast<float>(brow[g]);
-      const float s_hi = s / 16.0f;
-      const device uint32_t* wg =
-          (const device uint32_t*)(wrow + g * (group_size * bits / 8));
-      uint32_t wpack[group_size / sub];
-#pragma unroll
-      for (int sc = 0; sc < group_size / sub; sc++) {
-        wpack[sc] = wg[sc];
-      }
-#pragma unroll
-      for (int sc = 0; sc < group_size / sub; sc++) {
-        const int k0 = g * group_size + sc * sub;
-        const uint32_t p = wpack[sc];
-        U w_dq[sub];
-#pragma unroll
-        for (int i = 0; i < sub / 2; i++) {
-          const uint32_t wbyte = (p >> (8 * i)) & 0xffu;
-          w_dq[2 * i] = static_cast<U>(s * (wbyte & 0x0fu) + b);
-          w_dq[2 * i + 1] = static_cast<U>(s_hi * (wbyte & 0xf0u) + b);
-        }
-        // The sub-chunk is `sub` contiguous activations and `sub` is a multiple
-        // of 4, so read them as vec<T, 4>: two loads per streamed vector instead
-        // of eight, issued before any product. The element-major order below is
-        // unchanged, so every vector still sums its terms in ascending element
-        // order -- bit identical.
-        vec<T, 4> xq[vecs_per_tg][sub / 4];
-#pragma unroll
-        for (int v = 0; v < vecs_per_tg; v++) {
-          const device vec<T, 4>* xc4 = (const device vec<T, 4>*)(xv[v] + k0);
-#pragma unroll
-          for (int c = 0; c < sub / 4; c++) {
-            xq[v][c] = xc4[c];
-          }
-        }
-        U accv[vecs_per_tg] = {0};
-#pragma unroll
-        for (int c = 0; c < sub / 4; c++) {
-#pragma unroll
-          for (int v = 0; v < vecs_per_tg; v++) {
-            accv[v] += static_cast<U>(xq[v][c].x) * w_dq[4 * c + 0];
-          }
-#pragma unroll
-          for (int v = 0; v < vecs_per_tg; v++) {
-            accv[v] += static_cast<U>(xq[v][c].y) * w_dq[4 * c + 1];
-          }
-#pragma unroll
-          for (int v = 0; v < vecs_per_tg; v++) {
-            accv[v] += static_cast<U>(xq[v][c].z) * w_dq[4 * c + 2];
-          }
-#pragma unroll
-          for (int v = 0; v < vecs_per_tg; v++) {
-            accv[v] += static_cast<U>(xq[v][c].w) * w_dq[4 * c + 3];
-          }
-        }
-#pragma unroll
-        for (int v = 0; v < vecs_per_tg; v++) {
-          result[v] += accv[v];
-        }
-      }
-    }
-  } else {
-    for (int g = g_first; g < in_vec_size_g; g += g_stride) {
-      U scale = srow[g];
-      U bias = brow[g];
-#pragma unroll
-      for (int sc = 0; sc < group_size / sub; sc++) {
-        const int k0 = g * group_size + sc * sub;
-        const device uint8_t* wc = wrow + k0 * bits / 8;
-        U w_dq[sub];
-        dequantize<U, sub, bits>(wc, scale, bias, w_dq);
-        // The sub-chunk is `sub` contiguous activations and `sub` is a multiple
-        // of 4, so read them as vec<T, 4>: two loads per streamed vector instead
-        // of eight, issued before any product. The element-major order below is
-        // unchanged, so every vector still sums its terms in ascending element
-        // order -- bit identical.
-        vec<T, 4> xq[vecs_per_tg][sub / 4];
-#pragma unroll
-        for (int v = 0; v < vecs_per_tg; v++) {
-          const device vec<T, 4>* xc4 = (const device vec<T, 4>*)(xv[v] + k0);
-#pragma unroll
-          for (int c = 0; c < sub / 4; c++) {
-            xq[v][c] = xc4[c];
-          }
-        }
-        U accv[vecs_per_tg] = {0};
-#pragma unroll
-        for (int c = 0; c < sub / 4; c++) {
-#pragma unroll
-          for (int v = 0; v < vecs_per_tg; v++) {
-            accv[v] += static_cast<U>(xq[v][c].x) * w_dq[4 * c + 0];
-          }
-#pragma unroll
-          for (int v = 0; v < vecs_per_tg; v++) {
-            accv[v] += static_cast<U>(xq[v][c].y) * w_dq[4 * c + 1];
-          }
-#pragma unroll
-          for (int v = 0; v < vecs_per_tg; v++) {
-            accv[v] += static_cast<U>(xq[v][c].z) * w_dq[4 * c + 2];
-          }
-#pragma unroll
-          for (int v = 0; v < vecs_per_tg; v++) {
-            accv[v] += static_cast<U>(xq[v][c].w) * w_dq[4 * c + 3];
-          }
-        }
-#pragma unroll
-        for (int v = 0; v < vecs_per_tg; v++) {
-          result[v] += accv[v];
-        }
-      }
-    }
   }
+
   // Reduce each vector's partial over its k_lanes with a shuffle ladder:
   // simd_sum would mix the results_per_simdgroup rows a simdgroup spans.
   for (int v = 0; v < vecs_per_tg; v++) {
