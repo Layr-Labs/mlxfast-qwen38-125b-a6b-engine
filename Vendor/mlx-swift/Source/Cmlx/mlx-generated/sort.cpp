@@ -195,14 +195,25 @@ struct BlockMergeSort {
     for (int merge_threads = 2; merge_threads <= BLOCK_THREADS;
          merge_threads *= 2) {
       // Update threadgroup memory
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // MLXFAST-TOPK: Finish prior reads before reuse; merges of <=32 threads
+      // MLXFAST-TOPK: stay within one aligned Apple GPU SIMD group.
+      if (merge_threads <= 32) {
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+      } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
       for (int i = 0; i < N_PER_THREAD; ++i) {
         tgp_vals[idx + i] = thread_vals[i];
         if (ARG_SORT) {
           tgp_idxs[idx + i] = thread_idxs[i];
         }
       }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // MLXFAST-TOPK: Publish writes to every thread in this merge group.
+      if (merge_threads <= 32) {
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+      } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
 
       // Find location in merge step
       int merge_group = lid.x / merge_threads;
