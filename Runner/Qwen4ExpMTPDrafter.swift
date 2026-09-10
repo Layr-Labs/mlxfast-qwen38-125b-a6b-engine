@@ -54,6 +54,8 @@ public final class TrackQwen4ExpInlineMTPAssistant {
     // the tower for the SAME child module through the public module API. It
     // is the instance the tower serves, not a copy: the head owns no table.
     private let embedTokens: Embedding
+    // ADDED: the head's forward over the fast kernels (nil when disabled).
+    private let fastHead: TrackFastHead?
 
     /// - Parameters:
     ///   - target: an already-loaded model. The head reads its embedding
@@ -69,6 +71,8 @@ public final class TrackQwen4ExpInlineMTPAssistant {
         self.target = target
         self.mtp = mtp
         self.embedTokens = embedTokens
+        self.fastHead = TrackFastHead.enabled
+            ? TrackFastHead(mtp, configuration: target.configuration) : nil
     }
 
     /// Head caches, one per head layer.
@@ -83,12 +87,21 @@ public final class TrackQwen4ExpInlineMTPAssistant {
     private func headStep(
         tokens: MLXArray, multiStream: MLXArray, cache: [KVCache], stepIndex: Int
     ) -> (draft: MLXArray, multi: MLXArray) {
-        let step = mtp(
-            nextTokenIds: tokens,
-            multiStream: multiStream,
-            embedTokens: embedTokens,
-            cache: cache,
-            stepIndex: stepIndex)
+        let step: (sample: MLXArray, multi: MLXArray)
+        if let fastHead, let attnCache = cache.first as? Qwen4ExpAttentionCache,
+            let fast = fastHead.forward(
+                nextTokenIds: tokens, multiStream: multiStream, embedTokens: embedTokens,
+                cache: attnCache)
+        {
+            step = fast
+        } else {
+            step = mtp(
+                nextTokenIds: tokens,
+                multiStream: multiStream,
+                embedTokens: embedTokens,
+                cache: cache,
+                stepIndex: stepIndex)
+        }
         let last = step.sample.dim(1) - 1
         let lastSample = step.sample[0..., last..., 0...]
         let lastMulti = step.multi[0..., last..., 0...]
