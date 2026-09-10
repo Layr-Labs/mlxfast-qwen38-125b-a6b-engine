@@ -54,6 +54,11 @@ public final class TrackQwen4ExpInlineMTPAssistant {
     // the tower for the SAME child module through the public module API. It
     // is the instance the tower serves, not a copy: the head owns no table.
     private let embedTokens: Embedding
+    // ADDED to the fork's copy: the fork reached the target's output head as
+    // `target.lmHead`, which is internal to MLXLLM. This copy asks the model
+    // for the SAME child module through the public module API. nil only for a
+    // tied-embedding checkpoint; this family is untied.
+    private let lmHead: Linear?
 
     /// - Parameters:
     ///   - target: an already-loaded model. The head reads its embedding
@@ -69,6 +74,7 @@ public final class TrackQwen4ExpInlineMTPAssistant {
         self.target = target
         self.mtp = mtp
         self.embedTokens = embedTokens
+        self.lmHead = target.children()[unwrapping: "lm_head"] as? Linear
     }
 
     /// Head caches, one per head layer.
@@ -81,20 +87,58 @@ public final class TrackQwen4ExpInlineMTPAssistant {
     /// head's key-value history in place, and projecting them would read the
     /// whole output head for tokens nothing consumes.
     private func headStep(
-        tokens: MLXArray, multiStream: MLXArray, cache: [KVCache], stepIndex: Int
+        tokens: MLXArray, multiStream: MLXArray, cache: [KVCache], stepIndex: Int,
+        shortlist: MLXArray?
     ) -> (draft: MLXArray, multi: MLXArray) {
         let step = mtp(
             nextTokenIds: tokens,
             multiStream: multiStream,
             embedTokens: embedTokens,
             cache: cache,
-            stepIndex: stepIndex,
-            lastOnly: true)
+            stepIndex: stepIndex)
         let last = step.sample.dim(1) - 1
         let lastSample = step.sample[0..., last..., 0...]
         let lastMulti = step.multi[0..., last..., 0...]
-        let draft = argMax(target.head(lastSample)[0..., -1, 0...], axis: -1).asType(.int32)
+        let draft: MLXArray
+        if let shortlist {
+            // The engine cleared its coverage threshold for these ids, so the
+            // draft argmax cannot leave them. Score the gathered head rows
+            // instead of streaming all 248,320.
+            let logits = shortlistLogits(hidden: lastSample, ids: shortlist)
+            draft = shortlist[argMax(logits[0..., -1, 0...], axis: -1)].asType(.int32)
+        } else {
+            draft = argMax(target.head(lastSample)[0..., -1, 0...], axis: -1).asType(.int32)
+        }
         return (draft, lastMulti)
+    }
+
+    /// Draft logits over the engine's shortlist of token ids.
+    ///
+    /// The draft needs only an argmax, and the target decides every emitted
+    /// token, so scoring `K` gathered rows of the target's output head is
+    /// exact for the argmax the engine asked for and reads `K/V` of the
+    /// bytes. The head stays the target's own: this reads its rows, it does
+    /// not re-quantize, re-represent or replace them.
+    private func shortlistLogits(hidden: MLXArray, ids: MLXArray) -> MLXArray {
+        guard let head = lmHead else {
+            // Tied embeddings: this family is untied, so this is the
+            // defensive path only. Fall back to the full projection.
+            return target.head(hidden)
+        }
+        if let quantized = head as? QuantizedLinear {
+            var logits = quantizedMM(
+                hidden, quantized.weight[ids],
+                scales: quantized.scales[ids],
+                biases: quantized.biases.map { $0[ids] },
+                transpose: true,
+                groupSize: quantized.groupSize, bits: quantized.bits,
+                mode: quantized.mode)
+            if let bias = quantized.bias { logits = logits + bias[ids] }
+            return logits
+        }
+        var logits = matmul(hidden, head.weight[ids].transposed(1, 0))
+        if let bias = head.bias { logits = logits + bias[ids] }
+        return logits
     }
 }
 
@@ -207,6 +251,31 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     public var maximumDraftTokens: Int? { Self.maximumDepth }
     public var maximumSpeculativeBatch: Int? { 1 }
 
+    /// Ask target verification to surface each verify position's top-K ids.
+    ///
+    /// Measured on this repository's kernels (M4 Max, release): the full
+    /// output-head draft projection costs 1.054 ms, while the engine's
+    /// shortlist production costs 0.233 ms per round at depth 1 and scoring
+    /// 16,384 gathered rows costs 0.219 ms -- so a shortlisted draft step
+    /// replaces 1.054 ms with 0.452 ms. K is large on purpose: the engine
+    /// only hands the ids over when their captured probability mass clears
+    /// its coverage threshold, and a wider shortlist clears it more often.
+    /// Below the threshold the engine passes nil and this drafter scores the
+    /// full head exactly as before, which bounds the downside to the
+    /// shortlist production alone.
+    public var draftShortlistSize: Int? { Self.shortlistSize }
+
+    /// `DARKBLOOM_QWEN4EXP_MTP_SHORTLIST=<K>` overrides the shortlist width;
+    /// `0` restores full-head draft scoring.
+    static let shortlistSize: Int? = {
+        guard
+            let raw = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_QWEN4EXP_MTP_SHORTLIST"],
+            let value = Int(raw)
+        else { return 16384 }
+        return value > 0 ? value : nil
+    }()
+
     /// Head key-value rows, the retained indexer tape, one multi-stream row
     /// and one token id, per input token.
     public var requestStateBytesPerToken: Int {
@@ -298,7 +367,7 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
         let step = headStep(
             tokens: feed.tokens, multiStream: feed.multi, cache: state.caches,
-            stepIndex: state.roundDraftSteps)
+            stepIndex: state.roundDraftSteps, shortlist: shortlist)
         state.roundRoots.append(contentsOf: [step.multi, step.draft])
         state.roundDraftSteps += 1
 
