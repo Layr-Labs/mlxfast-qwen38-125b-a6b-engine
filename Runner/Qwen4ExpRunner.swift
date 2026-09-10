@@ -338,6 +338,52 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         // Verified in full: a head that took only part of the checkpoint's
         // tensors would still draft, and would draft something else.
         try head.update(parameters: loaded.parameters(), verify: .all)
+
+        // --- HEAD RE-QUANTIZATION ------------------------------------------
+        // Draft precision. The head is a DRAFT model: it proposes tokens, and
+        // the pinned target decides every emitted one. A change here can lower
+        // the acceptance rate but can never change an emitted token, so it is
+        // safe by construction in a way a target change never is.
+        //
+        // The contract permits re-quantizing this head in memory (section 4.4;
+        // bits 2..8, code only). The target's own quantization is untouched and
+        // nothing is written to disk.
+        //
+        // Each QuantizedLinear now holds the checkpoint's own tensors. Take each
+        // back to float and quantize it again at a finer geometry: the head's
+        // 4-bit error is draft noise the target then rejects, and the scored
+        // prompt accepts only about 43% of drafts against a ceiling of 1.0.
+        // The routed expert stack is the only large tensor, and ten of its 512
+        // experts are read once per round, so the added bytes are ~0.2% of a
+        // decode round.
+        let requantGroupSize = 32
+        let requantBits = 8
+        quantize(
+            model: head,
+            filter: { path, _ in
+                // Two families stay at the checkpoint geometry. Both are consumed
+                // by custom kernels carrying a hard `bits == 4` precondition --
+                // the routed-expert stack by TrackFastMoE gateUp/single, and the
+                // hyper-connection inject weights by TrackFastKernels2
+                // mixerHead -- so re-quantizing them trips an assertion instead
+                // of drafting differently. Everything else runs through the
+                // generic quantized matmul, which carries no such assumption.
+                if path.contains("switch_mlp") || path.contains("block_inject_weight") {
+                    return nil
+                }
+                return geometry[path].map {
+                    (groupSize: requantGroupSize, bits: requantBits, mode: $0.mode)
+                }
+            }
+        ) { module, groupSize, bits, mode in
+            guard let quantized = module as? QuantizedLinear else { return nil }
+            let floatWeight = dequantized(
+                quantized.weight, scales: quantized.scales, biases: quantized.biases,
+                groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode)
+            return QuantizedLinear(
+                weight: floatWeight, bias: quantized.bias,
+                groupSize: groupSize, bits: bits, mode: mode)
+        }
         return head
     }
 
