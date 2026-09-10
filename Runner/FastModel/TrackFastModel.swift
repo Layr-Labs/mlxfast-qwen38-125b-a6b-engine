@@ -81,6 +81,18 @@ struct TrackQuantWeight {
             mode: first.mode)
     }
 
+    /// `count` all-zero rows carrying this weight's geometry. A zero scale and
+    /// a zero bias dequantize to zero for every packed value, so the rows
+    /// contribute nothing and only exist to keep a concatenation's row count a
+    /// multiple of the GEMV's output tile.
+    func zeroRows(_ count: Int) -> TrackQuantWeight {
+        TrackQuantWeight(
+            weight: MLXArray.zeros([count, weight.dim(1)], dtype: weight.dtype),
+            scales: MLXArray.zeros([count, scales.dim(1)], dtype: scales.dtype),
+            biases: biases.map { MLXArray.zeros([count, $0.dim(1)], dtype: $0.dtype) },
+            groupSize: groupSize, bits: bits, mode: mode)
+    }
+
     func rowsReordered(_ order: [Int32]) -> TrackQuantWeight {
         let idx = MLXArray(order)
         return TrackQuantWeight(
@@ -174,6 +186,17 @@ struct TrackHC {
     /// accumulation differs from the fast one in rare last-bit cases.
     let down: TrackProj
     let inject: TrackProj?
+    /// `down` and `inject` row-concatenated, zero-padded to a multiple of the
+    /// GEMV's 8-row output tile, with the inject rows LAST because
+    /// `TrackFastKernels.hcMix` reads its inject argument's final `hcCount`
+    /// columns. Wider windows can then take one launch instead of two and hand
+    /// the same array to both `siluHead` (which reads the leading `lowrank`
+    /// columns) and `hcMix`, with no slice and no copy in between. Row
+    /// concatenation is bit-exact on the GEMV paths: one row is one
+    /// accumulation regardless of N, and the padding keeps the 320 low-rank
+    /// rows in full tiles. nil when either part is not quantized or the two
+    /// geometries differ.
+    let downInject: TrackProj?
     let up: TrackProj
     let lowrank: Int
     let hasInject: Bool
@@ -313,9 +336,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let up = TrackProj(m.trackChild("input_mix_weight_up"))
         let inject = m.children()[unwrapping: "block_inject_weight"].map { TrackProj($0) }
         let q = (scale * MLXArray(Float(1) / Float(cfg.hcCount), dtype: scale.dtype))
+        var downInject: TrackProj? = nil
+        if case .quant(let dq) = down, let injected = inject,
+            case .quant(let iq) = injected, dq.compatible(iq)
+        {
+            let total = dq.rows + iq.rows
+            let padded = (total + 7) / 8 * 8
+            var parts = [dq]
+            if padded > total { parts.append(dq.zeroRows(padded - total)) }
+            parts.append(iq)
+            downInject = .quant(TrackQuantWeight.concat(parts))
+        }
         return TrackHC(
-            normScaleQ: q, down: down, inject: inject, up: up, lowrank: cfg.hcLowrank,
-            hasInject: inject != nil)
+            normScaleQ: q, down: down, inject: inject, downInject: downInject, up: up,
+            lowrank: cfg.hcLowrank, hasInject: inject != nil)
     }
 
     static func bindGDN(_ m: Module, cfg: Qwen4ExpTextConfiguration) -> TrackGDN {
@@ -467,6 +501,23 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// Hyper-connection mixer over an already-normalized stream: returns the
     /// block input `[B,S,H]` and the inject weights `[B,S,hc]`.
     private func hcMix(_ hc: TrackHC, normed: MLXArray, tag: String = "") -> (MLXArray, MLXArray) {
+        // Wider windows take the fused down+inject weight: one launch produces
+        // both, `siluHead` reads its leading `lowrank` columns and `hcMix` its
+        // trailing `hcCount` columns, so neither needs a slice.
+        if normed.dim(1) != 1, let fused = hc.downInject, hc.hasInject {
+            let both = fused.apply(normed)
+            let act = TrackFastKernels.siluHead(lo: both, width: hc.lowrank)
+            let w = hc.up.apply(act)
+            if Self.debugTaps != nil, !tag.isEmpty {
+                Self.debugTaps?.append((tag + ".normedQ", normed))
+                Self.debugTaps?.append((tag + ".lo", both))
+                Self.debugTaps?.append((tag + ".act", act))
+                Self.debugTaps?.append((tag + ".w", w))
+            }
+            return TrackFastKernels.hcMix(
+                w: w, normed: normed, inj: both, hcCount: hcCount, hidden: hidden,
+                hasInject: hc.hasInject)
+        }
         let lo = hc.down.apply(normed)  // [B,S,lowrank]
         let act: MLXArray, inj: MLXArray
         // One-token windows: MLX routes the 4-row inject GEMV to `qmv`, a
