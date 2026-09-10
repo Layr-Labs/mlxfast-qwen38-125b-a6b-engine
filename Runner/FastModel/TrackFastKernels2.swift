@@ -484,7 +484,8 @@ extension TrackFastKernels {
 //       the loads pipeline, with the accumulation order unchanged.
 
 extension TrackFastKernels {
-    static let mixerHeadHeader = TrackFastMoEKernels.helpers + exactHeader + #"""
+    static let mixerHeadHeader = TrackFastMoEKernels.helpers + exactHeader + mixerHeadHeaderTail
+    static let mixerHeadHeaderTail = #"""
 
         // `qmv_impl`'s `out_vec_size < num_simdgroups * results_per_simdgroup`
         // branch with compile-time sizes and the K walk unrolled. Same lanes,
