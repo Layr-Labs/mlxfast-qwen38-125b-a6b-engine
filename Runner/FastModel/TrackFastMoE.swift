@@ -4,9 +4,10 @@
 // MLX's `gather_qmm` op costs ~40 us of fixed time per call at decode shapes
 // regardless of bytes (measured 55 us for 10 experts x [640, 2560] against
 // 11 us for a dense GEMV of the same bytes). The kernels below take the
-// per-row functions of `mlx/backend/metal/kernels/quantized.h` VERBATIM
+// per-row arithmetic from `mlx/backend/metal/kernels/quantized.h`
 // (`qmv_fast_impl` for K % 512 == 0, `qmv_impl` otherwise -- the same choice
-// the op makes) and only replace the batch addressing, so every output
+// the op makes). Vector dimensions are template constants passed by value,
+// and batch addressing is handled here, so every output
 // element is the same accumulation the op computes. Verified bit-exact
 // against `SwitchGLU` at one- and multi-row windows.
 
@@ -405,8 +406,8 @@ METAL_FUNC void qmv_fast_impl(
     const device T* biases,
     const device T* x,
     device T* y,
-    const constant int& in_vec_size,
-    const constant int& out_vec_size,
+    const int in_vec_size,
+    const int out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -472,8 +473,8 @@ METAL_FUNC void qmv_impl(
     const device T* biases,
     const device T* x,
     device T* y,
-    const constant int& in_vec_size,
-    const constant int& out_vec_size,
+    const int in_vec_size,
+    const int out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -687,13 +688,13 @@ METAL_FUNC void qmv_impl(
 
     nonisolated(unsafe) static let gateUpKernel = MLXFast.metalKernel(
         name: "track_moe_gate_up",
-        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "x", "idx", "xrow", "K", "N", "order"],
+        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "x", "idx", "xrow", "order"],
         outputNames: ["gate", "up"],
         source: gateUpSource, header: helpers, ensureRowContiguous: true)
 
     nonisolated(unsafe) static let singleKernel = MLXFast.metalKernel(
         name: "track_moe_single",
-        inputNames: ["w", "scales", "biases", "x", "idx", "K", "N", "order"],
+        inputNames: ["w", "scales", "biases", "x", "idx", "order"],
         outputNames: ["out"],
         source: singleSource, header: helpers, ensureRowContiguous: true)
 
@@ -725,8 +726,8 @@ METAL_FUNC void qmv_impl(
         let rb = rowBlocks ?? Self.rowBlocks(k: K)
         let nb = (N / 8 + rb - 1) / rb
         let outs = gateUpKernel(
-            [wg, sg, bg, wu, su, bu, x, idx, xrow, MLXArray(Int32(K)), MLXArray(Int32(N)), pairOrder ?? idx],
-            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb), ("ORDERED", pairOrder != nil)],
+            [wg, sg, bg, wu, su, bu, x, idx, xrow, pairOrder ?? idx],
+            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb), ("K", K), ("N", N), ("ORDERED", pairOrder != nil)],
             grid: (32, nb * 2 * 2, B), threadGroup: (32, 2, 1),
             outputShapes: [[B, N], [B, N]], outputDTypes: [x.dtype, x.dtype])
         return (outs[0], outs[1])
@@ -741,8 +742,8 @@ METAL_FUNC void qmv_impl(
         let rb = rowBlocks ?? Self.rowBlocks(k: K)
         let nb = (N / 8 + rb - 1) / rb
         return singleKernel(
-            [w, scales, biases, x, idx, MLXArray(Int32(K)), MLXArray(Int32(N)), pairOrder ?? idx],
-            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb), ("ORDERED", pairOrder != nil)],
+            [w, scales, biases, x, idx, pairOrder ?? idx],
+            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb), ("K", K), ("N", N), ("ORDERED", pairOrder != nil)],
             grid: (32, nb * 2, B), threadGroup: (32, 2, 1),
             outputShapes: [[B, N]], outputDTypes: [x.dtype])[0]
     }
