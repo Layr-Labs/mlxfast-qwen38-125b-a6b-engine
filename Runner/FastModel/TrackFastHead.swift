@@ -62,6 +62,21 @@ final class TrackFastHead {
     }
 
     private func hcMix(_ hc: TrackHC, normed: MLXArray) -> (MLXArray, MLXArray) {
+        let S = normed.dim(1)
+        if normed.dim(0) == 1, S <= 8, case .quant(let dq) = hc.down, case .quant(let uq) = hc.up,
+            dq.biases != nil, uq.biases != nil
+        {
+            var injQ: TrackQuantWeight? = nil
+            if hc.hasInject, case .quant(let q)? = hc.inject, q.biases != nil { injQ = q }
+            if !hc.hasInject || injQ != nil {
+                let n2 = normed.reshaped(S, hcCount * hidden)
+                let d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
+                let u = TrackFastMixerKernels.upMix(
+                    act: d.act, normed: n2, up: uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
+                    hasInject: hc.hasInject)
+                return (u.input.reshaped(1, S, hidden), u.inject.reshaped(1, S, hcCount))
+            }
+        }
         let lo = hc.down.apply(normed)
         let act: MLXArray, inj: MLXArray
         if normed.dim(1) == 1, hc.hasInject, case .quant(let iq)? = hc.inject, let ib = iq.biases {

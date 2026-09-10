@@ -57,6 +57,23 @@ public final class TrackQwen4ExpInlineMTPAssistant {
     // ADDED: the head's forward over the fast kernels (nil when disabled).
     private let fastHead: TrackFastHead?
 
+    /// The draft argmax over a shortlist of the vocabulary: the lowest ids
+    /// (this tokenizer assigns ids in BPE merge order, i.e. by corpus
+    /// frequency; the public golden's tokens fall under 98,304 in 99.7% of
+    /// cases) plus the added tokens at the top. The shortlist rows of `lm_head`
+    /// are gathered once; their logits are the same per-row GEMV as the full
+    /// head's, so the shortlist argmax IS the full argmax whenever the latter
+    /// is in the list, and the target's verification decides every token
+    /// either way. A miss costs one rejected draft, never a token.
+    private struct Shortlist {
+        let ids: MLXArray  // int32 [NS], ascending
+        let weight: MLXArray, scales: MLXArray, biases: MLXArray
+        let groupSize: Int, bits: Int
+    }
+    private let shortlist: Shortlist?
+    static let shortlistLowIds = 98304
+    static let shortlistSpecialFrom = 248044
+
     /// - Parameters:
     ///   - target: an already-loaded model. The head reads its embedding
     ///     table and writes through its output head.
@@ -71,6 +88,24 @@ public final class TrackQwen4ExpInlineMTPAssistant {
         self.target = target
         self.mtp = mtp
         self.embedTokens = embedTokens
+        var shortlist: Shortlist? = nil
+        if let q = target.children()[unwrapping: "lm_head"] as? QuantizedLinear, let biases = q.biases,
+            q.mode == .affine, q.bits == 4
+        {
+            let n = q.weight.dim(0)
+            let specials = (Self.shortlistSpecialFrom > Self.shortlistLowIds && Self.shortlistSpecialFrom < n) ? (n - Self.shortlistSpecialFrom) : 0
+            var low = min(Self.shortlistLowIds, n)
+            low += (8 - (low + specials) % 8) % 8  // keep the fast GEMV path (N % 8 == 0)
+            var ids: [Int32] = (0 ..< min(low, n)).map { Int32($0) }
+            if specials > 0 { ids.append(contentsOf: (Self.shortlistSpecialFrom ..< n).map { Int32($0) }) }
+            if ids.count < n, ids.count % 8 == 0 {
+                let idx = MLXArray(ids)
+                let w = take(q.weight, idx, axis: 0), s = take(q.scales, idx, axis: 0), b = take(biases, idx, axis: 0)
+                eval(idx, w, s, b)
+                shortlist = Shortlist(ids: idx, weight: w, scales: s, biases: b, groupSize: q.groupSize, bits: q.bits)
+            }
+        }
+        self.shortlist = shortlist
         self.fastHead = TrackFastHead.enabled
             ? TrackFastHead(mtp, configuration: target.configuration) : nil
     }
@@ -105,7 +140,15 @@ public final class TrackQwen4ExpInlineMTPAssistant {
         let last = step.sample.dim(1) - 1
         let lastSample = step.sample[0..., last..., 0...]
         let lastMulti = step.multi[0..., last..., 0...]
-        let draft = argMax(target.head(lastSample)[0..., -1, 0...], axis: -1).asType(.int32)
+        let draft: MLXArray
+        if let sl = shortlist {
+            let logits = quantizedMM(
+                lastSample[0..., -1, 0...], sl.weight, scales: sl.scales, biases: sl.biases,
+                transpose: true, groupSize: sl.groupSize, bits: sl.bits)  // [1, NS]
+            draft = take(sl.ids, argMax(logits, axis: -1), axis: 0).asType(.int32)
+        } else {
+            draft = argMax(target.head(lastSample)[0..., -1, 0...], axis: -1).asType(.int32)
+        }
         return (draft, lastMulti)
     }
 }

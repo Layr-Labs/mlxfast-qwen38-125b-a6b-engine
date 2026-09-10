@@ -211,9 +211,12 @@ enum TrackFastKernels {
         let B = proj.dim(0)
         let slots = capture ? B * T : B
         precondition(g.dk == 128 && g.dv == 128 && g.convDim % 128 == 0)
+        let prof = TrackFastProfile.prefill != nil && T >= TrackFastProfile.minWindow
+        var pt = CFAbsoluteTimeGetCurrent()
         let prep = gdnPrep(
             proj: proj, convState: convState, convW: convW, negExpALog: negExpALog,
             dtBias: dtBias, T: T, capture: capture, geometry: g)
+        if prof { TrackFastProfile.tick("gdn.prep", &pt, prep) }
         let rec = leanKernel(
             [prep[0], prep[1], prep[2], prep[3], prep[4], stateIn, MLXArray(Int32(T))],
             template: [
@@ -223,6 +226,7 @@ enum TrackFastKernels {
             grid: (32, g.dv, B * g.hv), threadGroup: (32, 4, 1),
             outputShapes: [[B, T, g.hv, g.dv], [slots, g.hv, g.dv, g.dk]],
             outputDTypes: [proj.dtype, stateIn.dtype])
+        if prof { TrackFastProfile.tick("gdn.lean", &pt, rec) }
         return (rec[0], prep[5], rec[1])
     }
 }
