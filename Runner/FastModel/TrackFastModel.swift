@@ -47,47 +47,6 @@ extension Module {
 }
 
 /// An affine-quantized projection `[N, K]`.
-struct TrackQuantWeight {
-    let weight: MLXArray
-    let scales: MLXArray
-    let biases: MLXArray?
-    let groupSize: Int
-    let bits: Int
-    let mode: QuantizationMode
-
-    var rows: Int { weight.dim(0) }
-
-    func apply(_ x: MLXArray) -> MLXArray {
-        quantizedMM(
-            x, weight, scales: scales, biases: biases, transpose: true,
-            groupSize: groupSize, bits: bits, mode: mode)
-    }
-
-    func compatible(_ other: TrackQuantWeight) -> Bool {
-        groupSize == other.groupSize && bits == other.bits && mode == other.mode
-            && weight.dim(1) == other.weight.dim(1) && (biases == nil) == (other.biases == nil)
-            && weight.dtype == other.weight.dtype
-    }
-
-    static func concat(_ parts: [TrackQuantWeight]) -> TrackQuantWeight {
-        precondition(!parts.isEmpty)
-        let first = parts[0]
-        for p in parts.dropFirst() { precondition(first.compatible(p)) }
-        let w = concatenated(parts.map(\.weight), axis: 0)
-        let s = concatenated(parts.map(\.scales), axis: 0)
-        let b = first.biases == nil ? nil : concatenated(parts.map { $0.biases! }, axis: 0)
-        return TrackQuantWeight(
-            weight: w, scales: s, biases: b, groupSize: first.groupSize, bits: first.bits,
-            mode: first.mode)
-    }
-
-    func rowsReordered(_ order: [Int32]) -> TrackQuantWeight {
-        let idx = MLXArray(order)
-        return TrackQuantWeight(
-            weight: weight[idx], scales: scales[idx], biases: biases.map { $0[idx] },
-            groupSize: groupSize, bits: bits, mode: mode)
-    }
-}
 
 /// A projection that is either quantized or a dense `[N, K]` weight.
 enum TrackProj {
@@ -268,6 +227,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     nonisolated(unsafe) static var debugTaps: [(String, MLXArray)]? = nil
     /// Layers per partial dispatch inside a forward (0 = one dispatch per step).
     nonisolated(unsafe) public static var asyncChunk: Int = 6
+    /// Profiling: when set, wide windows (prefill) eval after every block and
+    /// accumulate wall time per block kind here (harness only).
+    nonisolated(unsafe) public static var prefillProfile: [String: Double]? = nil
+    static func profTick(_ key: String, _ t0: inout Double, _ arrays: [MLXArray]) {
+        guard prefillProfile != nil else { return }
+        eval(arrays)
+        let t = CFAbsoluteTimeGetCurrent()
+        prefillProfile![key, default: 0] += t - t0
+        t0 = t
+    }
 
     /// Kill switch for A/B: `TRACK_FAST_FORWARD=0` routes every forward to the
     /// wrapped model.
@@ -467,6 +436,26 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// Hyper-connection mixer over an already-normalized stream: returns the
     /// block input `[B,S,H]` and the inject weights `[B,S,hc]`.
     private func hcMix(_ hc: TrackHC, normed: MLXArray, tag: String = "") -> (MLXArray, MLXArray) {
+        let S = normed.dim(1)
+        if normed.dim(0) == 1, S <= 8, case .quant(let dq) = hc.down, case .quant(let uq) = hc.up,
+            dq.biases != nil, uq.biases != nil
+        {
+            var injQ: TrackQuantWeight? = nil
+            if hc.hasInject, case .quant(let q)? = hc.inject, q.biases != nil { injQ = q }
+            if !hc.hasInject || injQ != nil {
+                let n2 = normed.reshaped(S, hcCount * hidden)
+                let d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
+                let u = TrackFastMixerKernels.upMix(
+                    act: d.act, normed: n2, up: uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
+                    hasInject: hc.hasInject)
+                if Self.debugTaps != nil, !tag.isEmpty {
+                    Self.debugTaps?.append((tag + ".normedQ", normed))
+                    Self.debugTaps?.append((tag + ".lo", d.lo.reshaped(1, S, -1)))
+                    Self.debugTaps?.append((tag + ".inj", d.inj.reshaped(1, S, -1)))
+                }
+                return (u.input.reshaped(1, S, hidden), u.inject.reshaped(1, S, hcCount))
+            }
+        }
         let lo = hc.down.apply(normed)  // [B,S,lowrank]
         let act: MLXArray, inj: MLXArray
         // One-token windows: MLX routes the 4-row inject GEMV to `qmv`, a
@@ -501,7 +490,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let geo = g.geometry
+        let prof = Self.prefillProfile != nil && S > 8
+        var pt = CFAbsoluteTimeGetCurrent()
         let proj = g.proj.apply(x)  // [B,S,PROJ_W]
+        if prof { Self.profTick("gdn.proj", &pt, [proj]) }
         let state = evaluation.inputState(modelLayerIndex: layerIndex)
         let convState =
             state?.conv ?? MLXArray.zeros([B, geo.convKernel - 1, geo.convDim], dtype: x.dtype)
@@ -510,8 +502,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let r = TrackFastKernels.gdn(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
             dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo)
+        if prof { Self.profTick("gdn.prep+lean", &pt, [r.y, r.stateOut, r.convOut]) }
         let gated = TrackFastKernels.gatedRMS(
             y: r.y, proj: proj, w: g.normW, zOffset: g.zOffset, eps: 1e-6)
+        if prof { Self.profTick("gdn.gatedRMS", &pt, [gated]) }
         do {
             if capture {
                 try evaluation.stageCaptured(
@@ -522,7 +516,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } catch {
             preconditionFailure("TrackFastModel: recurrent stage failed at layer \(layerIndex): \(error)")
         }
-        return g.out.apply(gated)
+        let o = g.out.apply(gated)
+        if prof { Self.profTick("gdn.out", &pt, [o]) }
+        return o
     }
 
     /// The reference's rope tables for this forward, cast to the activation
@@ -563,33 +559,60 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         Self.moeForwardShared(m, x)
     }
 
+    /// Row index of each (token, expert) slot, one constant array per window size
+    /// (uploading it per step was one host copy per layer).
+    nonisolated(unsafe) private static var xrowTables: [Int: MLXArray] = [:]
+    private static let xrowLock = NSLock()
+    static func xrowTable(S: Int, K: Int) -> MLXArray {
+        xrowLock.lock(); defer { xrowLock.unlock() }
+        if let t = xrowTables[S * 1024 + K] { return t }
+        let t = MLXArray((0 ..< (S * K)).map { UInt32($0 / K) })
+        eval(t)
+        xrowTables[S * 1024 + K] = t
+        return t
+    }
+
     static func moeForwardShared(_ m: TrackMoE, _ x: MLXArray) -> MLXArray {
+        let prof = Self.prefillProfile != nil && x.dim(1) > 8
+        var pt = CFAbsoluteTimeGetCurrent()
         let logits = matmul(x.asType(.float32), m.routerW32.transposed())
+        if prof { Self.profTick("moe.router", &pt, [logits]) }
+        // Top-k + softmax in one launch (argpartition's stable order, softmax_single_row).
+        if x.dim(0) == 1, x.dim(1) <= 8,
+            case .quant(let gq) = m.sharedGate, case .quant(let guq) = m.sharedGateUp.fused ?? .dense(x),
+            case .quant(let dq) = m.sharedDown, gq.biases != nil, guq.biases != nil, dq.biases != nil
+        {
+            // Decode windows: three launches over MLX's own GEMV arithmetic for the
+            // window size (per-row `qmv_fast` / `qmv` for the gathered experts, `qmv`
+            // or `qmv_wide` for the shared expert): top-k + softmax + shared gate,
+            // gate|up + SwiGLU for the routed and the shared expert, down + combine.
+            let S = x.dim(1), K = m.topK, H = x.dim(2)
+            let x2 = x.reshaped(S, H)
+            let (idx, weights, gate) = TrackFastMoEKernels.route(
+                logits: logits.reshaped(S, -1), x: x2, sharedGate: gq, topK: K)
+            if prof { Self.profTick("moe.route", &pt, [idx, weights, gate]) }
+            let flatIdx = idx.reshaped(S * K)
+            let xrow = Self.xrowTable(S: S, K: K)
+            let act = TrackFastMoEKernels.gateUpAct(
+                wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
+                wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b, shared: guq,
+                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits)
+            return TrackFastMoEKernels.downCombine(
+                wd: m.expertDown.w, sd: m.expertDown.s, bd: m.expertDown.b, sharedDown: dq,
+                act: act, idx: flatIdx, w: weights.reshaped(S * K), gate: gate, topK: K,
+                groupSize: m.expertGroupSize, bits: m.expertBits
+            ).reshaped(1, S, H)
+        }
+        // Wide windows (prefill): MLX's own launches throughout.
         let idx = argPartition(-logits, kth: m.topK - 1, axis: -1)[.ellipsis, ..<m.topK]
         let weights = softmax(takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
-        let routed: MLXArray
-        if x.dim(0) == 1 && x.dim(1) <= 8 {
-            // Custom gather over MLX's own per-row GEMV arithmetic (bit-exact with
-            // SwitchGLU); the op's fixed per-call cost dominates at these shapes.
-            let S = x.dim(1), K = m.topK, H = x.dim(2)
-            let flatIdx = idx.reshaped(S * K).asType(.uint32)
-            let xrow = MLXArray((0 ..< (S * K)).map { UInt32($0 / K) })
-            let gu = TrackFastMoEKernels.gateUp(
-                wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
-                wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b,
-                x: x.reshaped(S, H), idx: flatIdx, xrow: xrow,
-                groupSize: m.expertGroupSize, bits: m.expertBits)
-            let act = TrackFastKernels.swiglu2(gate: gu.gate, up: gu.up)
-            routed = TrackFastMoEKernels.single(
-                w: m.expertDown.w, scales: m.expertDown.s, biases: m.expertDown.b,
-                x: act, idx: flatIdx, groupSize: m.expertGroupSize, bits: m.expertBits
-            ).reshaped(1, S, K, H)
-        } else {
-            routed = m.switchMLP(x, idx)  // [B,S,K,H]
-        }
+        if prof { Self.profTick("moe.route", &pt, [idx, weights]) }
         let gu = m.sharedGateUp.apply(x)
         let shared = m.sharedDown.apply(TrackFastKernels.swiglu(gu: gu))
         let gate = m.sharedGate.apply(x)  // [B,S,1]
+        if prof { Self.profTick("moe.shared", &pt, [shared, gate]) }
+        let routed = m.switchMLP(x, idx)  // [B,S,K,H]
+        if prof { Self.profTick("moe.switchMLP", &pt, [routed]) }
         // The combine kernel folds the K products in the association MLX's small
         // column reduce uses (verified at float precision for every window size).
         return TrackFastKernels.moeCombine(routed: routed, w: weights, shared: shared, gate: gate)
@@ -666,6 +689,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         var stream = residual
         let ropeTab = ropeTables(offset: offset, count: ids.dim(1), dtype: residual.dtype)
 
+        var profT = CFAbsoluteTimeGetCurrent()
+        let profiling = Self.prefillProfile != nil && ids.dim(1) > 8
+        if Self.prefillProfile != nil { print("[profile] fastStreams S=\(ids.dim(1)) profiling=\(profiling)") }
         for layer in layers {
             var normed: MLXArray
             if let ple = layer.ple {
@@ -689,7 +715,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     tile: tile)
             }
             tile = false
+            if profiling { Self.profTick(layer.ple != nil ? "norm+ple" : "norm", &profT, [stream, normed]) }
             var (input, injectW) = hcMix(layer.attnHC, normed: normed, tag: "L\(layer.index).attn.hc")
+            if profiling { Self.profTick("mixer", &profT, [input, injectW]) }
             Self.debugTaps?.append(("L\(layer.index).attn.stream_in", stream))
             Self.debugTaps?.append(("L\(layer.index).attn.input", input))
             let attended: MLXArray
@@ -702,14 +730,18 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 attended = attnForward(layer.attn!, input, cache: cache, rope: ropeTab)
             }
             Self.debugTaps?.append(("L\(layer.index).attn.out", attended))
+            if profiling { Self.profTick(layer.gdn != nil ? "gdn" : "attn", &profT, [attended]) }
             (stream, normed) = TrackFastKernels.injectNorm(
                 residual: stream, out: attended, inject: injectW,
                 scale: layer.mlpHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
                 tile: false)
+            if profiling { Self.profTick("norm", &profT, [stream, normed]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
             (input, injectW) = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc")
+            if profiling { Self.profTick("mixer", &profT, [input, injectW]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
             pendingOut = moeForward(layer.moe, input)
+            if profiling { Self.profTick("moe", &profT, [pendingOut!]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
             pendingInject = injectW
             residual = stream
@@ -866,6 +898,10 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentLanguageModelPrefillForwardable {
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
         requirement: CBv2PrefillRequirement
     ) -> MLXArray {
+        if Self.prefillProfile != nil {
+            let plan = fastPlan(tokens: inputs, caches: cache ?? [], recurrentState: recurrentState, positionIds: positionIds)
+            print("[profile] cbv2RecurrentPrefill S=\(inputs.dim(1)) posIds=\(positionIds != nil) caches=\(cache?.count ?? -1) fast=\(plan != nil) req=\(requirement)")
+        }
         if let s = streamsOrDelegate(
             inputs, inputEmbeddings: inputEmbedding, caches: cache ?? [],
             recurrentState: recurrentState, positionIds: positionIds, capture: false)
