@@ -1072,10 +1072,17 @@ METAL_FUNC void qmv_wide_impl(
   // terms in ascending element order, and the group partials still reach
   // result[v] in ascending group order, so the arithmetic is bit identical.
   if (bits == 4) {
-    constexpr int g_unroll = 3;
+    constexpr int g_unroll = 2;
     constexpr int packs_per_group = group_size / sub;
     int g = g_first;
-    for (; g + (g_unroll - 1) * g_stride < in_vec_size_g;
+    // Take the unrolled trip only on rows with enough groups for every lane to
+    // take it. A short row -- the K=320 hyper-connection up-projection carries
+    // ten groups against a stride of k_lanes -- would otherwise send the first
+    // lanes down the unrolled path while the rest fall straight through to the
+    // single-group loop, and the diverged simdgroup measures slower than
+    // letting every lane run the single-group loop.
+    const bool unrolled = in_vec_size_g >= 32;
+    for (; unrolled && g + (g_unroll - 1) * g_stride < in_vec_size_g;
          g += g_unroll * g_stride) {
       float su[g_unroll];
       float bu[g_unroll];
