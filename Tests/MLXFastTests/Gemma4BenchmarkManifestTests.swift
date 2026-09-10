@@ -280,10 +280,8 @@ struct Gemma4BenchmarkManifestTests {
         // The two speculative heads are the organizer's pinned weights. A
         // participant may declare a re-quantization of them; a participant may
         // not upload head weights. What makes that real is this list: with the
-        // directories out of editablePaths,
-        // .github/scripts/enforce-modifiable-surface.sh refuses any changed file
-        // under them, and .github/scripts/overlay-editable-paths.sh never copies
-        // one into the measured tree.
+        // directories out of editablePaths, Yukon never archives or overlays a
+        // file under them, and benchd refuses a candidate that diverges there.
         //
         // The DECLARATION files stay editable. They are the recipe surface, and
         // they carry no weights.

@@ -20,9 +20,7 @@
 #
 # Layers under test:
 #   Sources/MLXFastTrustedHarness/EditableSurfaceByteBudget.swift  (byte budget)
-#   .github/scripts/overlay-editable-paths.sh                     (REPLACE overlay)
 #   .github/scripts/submission-static-review-checks.sh            (static review)
-#   .github/scripts/enforce-modifiable-surface.sh                 (surface gate)
 #   benchmark.json                                                (single source)
 #
 # Usage: tools/test-submission-security.sh [-v]
@@ -74,7 +72,7 @@ unset GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STEP_SUMMARY
 # Vendor/mlx-swift-lm files are editablePaths entries; they are inside a
 # submodule, and a gitlink is not an editable path. Both subjects left the
 # tree, so both sets of assertions left with them.
-EXPECTED_MIN_ASSERTIONS=236
+EXPECTED_MIN_ASSERTIONS=170
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/submission-security.XXXXXX")"
 trap 'rm -rf "${WORK}"' EXIT
@@ -145,26 +143,13 @@ fi
 
 budget() { "${BUDGET_BIN}" "$@"; }
 
-# --- the enforcers this suite drives must be there to be driven --------------
+# --- the enforcer this suite drives must be there to be driven ---------------
 #
-# A large family of assertions below is of the form "the trusted checkout was
-# NOT modified" -- the gitlink is intact, the sentinel above the root is
-# untouched, the setuid bit never landed. Every one of them is trivially true
-# when the enforcer never ran at all. Measured, with
-# overlay-editable-paths.sh moved aside: FIFTEEN such assertions went green on a
-# run where no overlay happened.
-#
-# Each of those does have a companion assert_exit on the same fixture that reds
-# in that state, so the suite as a whole notices. But a neighbouring assertion
-# failing is not the assertion in question binding -- the same distinction
-# check 3 had to be taught about check 3c -- and stating it once here is far
-# cheaper than fifteen individual guards. If this block passes, "untouched"
-# below means the enforcer ran and left it alone, rather than never having run.
-for driver in overlay-editable-paths.sh submission-static-review-checks.sh \
-              enforce-modifiable-surface.sh; do
-  assert_equal "harness/${driver} is present and executable" \
-    "$([ -x "${SCRIPTS}/${driver}" ] && echo executable || echo MISSING)" "executable"
-done
+# An assertion of the form "the checkout was NOT modified" is trivially true
+# when the enforcer never ran at all. Stated once here: if this block passes,
+# a later "untouched" means the enforcer ran and left it alone.
+assert_equal "harness/submission-static-review-checks.sh is present and executable" \
+  "$([ -x "${SCRIPTS}/submission-static-review-checks.sh" ] && echo executable || echo MISSING)" "executable"
 assert_equal "harness/the byte-budget enforcer compiled to an executable" \
   "$([ -x "${BUDGET_BIN}" ] && echo executable || echo MISSING)" "executable"
 
@@ -209,12 +194,6 @@ new_fixture() { # -> echoes a fresh DIR containing trusted/ and sub/
   # be able to write here.
   printf 'untouched\n' > "${dir}/sentinel.txt"
   echo "${dir}"
-}
-
-overlay() { # overlay TRUSTED SUB [extra env assignments...]
-  local trusted="$1" sub="$2"
-  shift 2
-  (cd "${trusted}" && SUBMISSION_WORKTREE="${sub}" "$@" "${SCRIPTS}/overlay-editable-paths.sh")
 }
 
 echo
@@ -381,308 +360,6 @@ fill "${fx}/trusted/head/weights.bin" 6000
 fill "${fx}/trusted/head2/weights.bin" 6000
 assert_exit "budget/exempt aggregate overflow names the aggregate, not one path" 1 \
   "exempt editable paths total" "${fx}/trusted" budget verify benchmark.json
-
-echo
-echo "=== B. overlay REPLACE semantics (overlay-editable-paths.sh) ==============="
-
-# Benign: the archive's copy REPLACES the trusted copy, a file the archive does
-# not carry is GONE (replace, not merge), and non-editable trusted files stay.
-fx="$(new_fixture)"
-mkdir -p "${fx}/sub/src"
-printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
-printf 'submitted config\n' > "${fx}/sub/config.txt"
-assert_exit "overlay/benign archive overlays" 0 "trusted harness retained" "${fx}/trusted" \
-  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
-assert_equal "overlay/editable file replaced" "$(cat "${fx}/trusted/src/kernel.txt")" "submitted kernel"
-assert_equal "overlay/REPLACE deletes what the archive omits" \
-  "$([[ -e "${fx}/trusted/src/helper.txt" ]] && echo present || echo absent)" "absent"
-assert_equal "overlay/optional head declaration kept from the trusted copy" \
-  "$(cat "${fx}/trusted/head.manifest.json")" '{"source":"pinned"}'
-assert_equal "overlay/non-editable trusted file untouched" \
-  "$(cat "${fx}/trusted/Sources/MLXFastCLI/main.swift")" "trusted CLI"
-
-# A missing REQUIRED editable path is a stale clone, and it is a refusal.
-fx="$(new_fixture)"
-mkdir -p "${fx}/sub/src"
-printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
-assert_exit "overlay/missing required editable path fails closed" 1 \
-  "submitted editable path is missing" "${fx}/trusted" \
-  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
-
-# Symlink smuggling: a submitted editable path that is, or contains, a symlink.
-fx="$(new_fixture)"
-mkdir -p "${fx}/sub/src"
-printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
-ln -s /etc/passwd "${fx}/sub/src/leak.txt"
-printf 'submitted config\n' > "${fx}/sub/config.txt"
-assert_exit "overlay/symlink inside an editable path rejected" 1 \
-  "must not contain symlinks" "${fx}/trusted" \
-  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
-
-fx="$(new_fixture)"
-mkdir -p "${fx}/sub"
-ln -s /etc "${fx}/sub/src"
-printf 'submitted config\n' > "${fx}/sub/config.txt"
-assert_exit "overlay/editable path that IS a symlink rejected" 1 \
-  "must not contain symlinks" "${fx}/trusted" \
-  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
-
-# Other non-regular shapes (issue #32). The pre-copy check was symlink-ONLY, so
-# a FIFO at an editable root got past it, `rm -rf` had already deleted the
-# trusted copy, and `cp` then blocked on the FIFO instead of overlaying
-# anything -- validate_overlay_tree is a POST-copy check and never runs. The
-# refusal has to happen before the trusted copy goes.
-fx="$(new_fixture)"
-mkdir -p "${fx}/sub/src"
-printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
-mkfifo "${fx}/sub/config.txt"
-assert_exit "overlay/FIFO at an editable root rejected before the trusted copy is deleted" 1 \
-  "must contain only regular files and directories" "${fx}/trusted" \
-  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
-
-# Nested git metadata (issue #46). A `.git` directory inside an editable path
-# lands its config, hooks and objects in the TRUSTED checkout, where a later git
-# read would honour them -- the vector hardened-git.sh neutralizes on the
-# submission side, planted on the trusted side instead.
-fx="$(new_fixture)"
-mkdir -p "${fx}/sub/src/.git"
-printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
-printf '[core]\n\thooksPath = /tmp/attacker-hooks\n' > "${fx}/sub/src/.git/config"
-printf 'submitted config\n' > "${fx}/sub/config.txt"
-assert_exit "overlay/nested .git metadata inside an editable path rejected" 1 \
-  "must not contain .git metadata" "${fx}/trusted" \
-  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
-
-# The same metadata under another spelling. On the case-insensitive filesystem
-# the ranked Mac runs, `.GIT` is `.git` to git, so a case-sensitive name test
-# admitted a nested repository that git would then honour. Refused under any
-# spelling, on every filesystem, and the trusted side stays intact.
-fx="$(new_fixture)"
-mkdir -p "${fx}/sub/src/.GIT"
-printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
-printf '[core]\n\thooksPath = /tmp/attacker-hooks\n' > "${fx}/sub/src/.GIT/config"
-printf 'submitted config\n' > "${fx}/sub/config.txt"
-assert_exit "overlay/nested .GIT metadata (other spelling) inside an editable path rejected" 1 \
-  "must not contain .git metadata" "${fx}/trusted" \
-  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
-
-# Setuid smuggling. The asserted guarantee is that a setuid bit never LANDS in
-# the trusted checkout, not which layer stops it: the unprivileged tar/cp the
-# overlay uses already drops setuid/setgid on extraction, and
-# validate_overlay_tree is the backstop for a copy that did preserve it (root,
-# or a tar invoked with -p). See docs/submission-restriction-spec.md.
-fx="$(new_fixture)"
-mkdir -p "${fx}/sub/src"
-printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
-printf 'submitted config\n' > "${fx}/sub/config.txt"
-chmod 4755 "${fx}/sub/src/kernel.txt"
-( cd "${fx}/trusted" && SUBMISSION_WORKTREE="${fx}/sub" \
-  "${SCRIPTS}/overlay-editable-paths.sh" >/dev/null 2>&1 ) || true
-# `find` over a directory that does not exist prints nothing and `wc -l` says 0
-# -- which is the answer the setuid assertion below wants. So prove the overlay
-# actually produced the tree first, and that the file the setuid bit was set on
-# is really there: without this, an overlay that silently wrote nothing reads as
-# "the bit never landed".
-assert_equal "overlay/setuid fixture: the overlaid file exists to be checked" \
-  "$([ -f "${fx}/trusted/src/kernel.txt" ] && echo present || echo MISSING)" "present"
-assert_equal "overlay/setuid positive control: find does see the bit on the source" \
-  "$(find "${fx}/sub/src" \( -perm -4000 -o -perm -2000 \) -print -quit | wc -l | tr -d ' ')" "1"
-assert_equal "overlay/setuid bit never lands in the trusted checkout" \
-  "$(find "${fx}/trusted/src" \( -perm -4000 -o -perm -2000 \) -print -quit | wc -l | tr -d ' ')" "0"
-
-# Hardlinked files inside an overlaid directory: tar recreates the link, so the
-# post-copy tree check is what fires.
-fx="$(new_fixture)"
-mkdir -p "${fx}/sub/src"
-printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
-ln "${fx}/sub/src/kernel.txt" "${fx}/sub/src/alias.txt"
-printf 'submitted config\n' > "${fx}/sub/config.txt"
-assert_exit "overlay/hardlinked file rejected" 1 "must not contain hardlinked files" \
-  "${fx}/trusted" env SUBMISSION_WORKTREE="${fx}/sub" \
-  "${SCRIPTS}/overlay-editable-paths.sh"
-
-# Path escape: the archive carries entries above its own root. The overlay only
-# ever reads the TRUSTED contract's paths, so they are never even opened.
-fx="$(new_fixture)"
-mkdir -p "${fx}/sub/src"
-printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
-printf 'submitted config\n' > "${fx}/sub/config.txt"
-printf 'pwned\n' > "${fx}/sub/../escape-attempt.txt"
-mkdir -p "${fx}/sub/dotdot"
-printf 'pwned\n' > "${fx}/sub/dotdot/payload.txt"
-assert_exit "overlay/archive entries outside editablePaths are inert" 0 \
-  "trusted harness retained" "${fx}/trusted" \
-  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
-assert_equal "overlay/sentinel above the trusted root untouched" \
-  "$(cat "${fx}/sentinel.txt")" "untouched"
-assert_equal "overlay/non-editable archive payload not landed" \
-  "$([[ -e "${fx}/trusted/dotdot" ]] && echo present || echo absent)" "absent"
-
-# A contract whose editablePaths themselves try to escape or go absolute.
-for evil in "../evil" "src/../../evil" "/etc" "./src" 'src\evil' ":pathspec"; do
-  fx="$(new_fixture)"
-  python3 - "${fx}/trusted/benchmark.json" "${evil}" <<'PY'
-import json, sys
-p, evil = sys.argv[1], sys.argv[2]
-c = json.load(open(p))
-c["editablePaths"] = [evil]
-json.dump(c, open(p, "w"))
-PY
-  mkdir -p "${fx}/sub/src"
-  printf 'x\n' > "${fx}/sub/src/kernel.txt"
-  assert_exit "overlay/contract path '${evil}' rejected" 1 "invalid editable path" \
-    "${fx}/trusted" env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
-done
-
-# Pinned measurement harness: an editable entry that reaches what decides which
-# scorer runs is refused by construction. benchd used to be a SOURCE submodule
-# (`benchd` + `.gitmodules`); it is now a channel PREBUILT (the retired `benchd.pin` spelling ->
-# `benchd-bin/`). BOTH generations are exercised: the live pin paths because they
-# carry the property today, and the retired submodule spellings because all three
-# guard layers deliberately still carry them so a reintroduced gitlink is covered
-# on arrival -- a case this suite must keep proving is non-vacuous.
-for gitlink in "benchd" "benchd/crates" ".gitmodules" "benchd.pin" "benchd-bin" "benchd-bin/benchd"; do
-  fx="$(new_fixture)"
-  python3 - "${fx}/trusted/benchmark.json" "${gitlink}" <<'PY'
-import json, sys
-p, gitlink = sys.argv[1], sys.argv[2]
-c = json.load(open(p))
-c["editablePaths"] = ["src", gitlink]
-json.dump(c, open(p, "w"))
-PY
-  mkdir -p "${fx}/sub/src" "${fx}/sub/benchd/crates"
-  printf 'x\n' > "${fx}/sub/src/kernel.txt"
-  printf 'attacker daemon\n' > "${fx}/sub/benchd/PIN"
-  printf 'attacker daemon\n' > "${fx}/sub/benchd/crates/PIN"
-  printf '[submodule "benchd"]\n\tpath = elsewhere\n' > "${fx}/sub/.gitmodules"
-  assert_exit "overlay/gitlink entry '${gitlink}' refused" 1 \
-    "measurement-harness surface" "${fx}/trusted" \
-    env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
-done
-
-# The engine fork is the OTHER live gitlink (issue #31): `Vendor/mlx-swift-lm`
-# is a submodule, so an editable entry reaching it would overlay the pinned fork
-# with whatever the archive carries. lint-benchmark-manifest.py always refused
-# the spelling and the two shell layers did not; this asserts the lockstep.
-fx="$(new_fixture)"
-python3 - "${fx}/trusted/benchmark.json" <<'PY'
-import json, sys
-p = sys.argv[1]
-c = json.load(open(p))
-c["editablePaths"] = ["src", "Vendor/mlx-swift-lm"]
-json.dump(c, open(p, "w"))
-PY
-mkdir -p "${fx}/sub/src" "${fx}/sub/Vendor/mlx-swift-lm"
-printf 'x\n' > "${fx}/sub/src/kernel.txt"
-printf 'attacker engine\n' > "${fx}/sub/Vendor/mlx-swift-lm/Package.swift"
-assert_exit "overlay/engine fork submodule entry 'Vendor/mlx-swift-lm' refused" 1 \
-  "measurement-harness surface" "${fx}/trusted" \
-  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
-
-# And with the real (gitlink-free) contract, an archive that merely CONTAINS a
-# replacement benchd/.gitmodules cannot land it.
-fx="$(new_fixture)"
-mkdir -p "${fx}/sub/src" "${fx}/sub/benchd"
-printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
-printf 'submitted config\n' > "${fx}/sub/config.txt"
-printf 'attacker daemon\n' > "${fx}/sub/benchd/PIN"
-printf '[submodule "benchd"]\n\tpath = attacker\n' > "${fx}/sub/.gitmodules"
-mkdir -p "${fx}/sub/Sources/MLXFastCLI"
-printf 'attacker CLI\n' > "${fx}/sub/Sources/MLXFastCLI/main.swift"
-assert_exit "overlay/archive with a gitlink payload overlays only the surface" 0 \
-  "trusted harness retained" "${fx}/trusted" \
-  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
-assert_equal "overlay/gitlink content untouched" "$(cat "${fx}/trusted/benchd/PIN")" \
-  "pinned measurement daemon"
-assert_equal "overlay/.gitmodules untouched" \
-  "$(grep -c 'path = benchd' "${fx}/trusted/.gitmodules")" "1"
-assert_equal "overlay/non-editable path write not landed" \
-  "$(cat "${fx}/trusted/Sources/MLXFastCLI/main.swift")" "trusted CLI"
-
-# optionalEditablePaths abuse: the submission ships its own contract declaring a
-# wider surface and more optional paths. The overlay reads the TRUSTED contract
-# only, so the widened surface is inert and the missing REQUIRED path still
-# fails closed.
-fx="$(new_fixture)"
-mkdir -p "${fx}/sub/src"
-printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
-python3 - "${fx}/sub/benchmark.json" <<'PY'
-import json, sys
-json.dump({
-    "editablePaths": ["src", "config.txt", "Sources", "benchd", ".gitmodules"],
-    "optionalEditablePaths": ["config.txt", "Sources", "benchd", ".gitmodules"],
-    "editableSurfaceByteBudget": {"exemptPaths": ["src"], "maxTotalBytes": 999999999},
-    "staticReviewTrackId": "test-track-v1",
-}, open(sys.argv[1], "w"))
-PY
-assert_exit "overlay/submission-supplied contract cannot make its gaps optional" 1 \
-  "submitted editable path is missing" "${fx}/trusted" \
-  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
-
-# CASE FOLDING (B3). APFS is case-insensitive by default, so an editable entry
-# spelled BENCHD names the real submodule: the byte-comparison guard passed it
-# and `rm -rf BENCHD` then deleted the pinned scorer before the submission's
-# copy landed on top. Every case variant must be refused, and the pinned content
-# must survive the attempt.
-for gitlink_variant in "BENCHD" "Benchd" "BENCHD/crates" ".GITMODULES" ".GitModules"; do
-  fx="$(new_fixture)"
-  python3 - "${fx}/trusted/benchmark.json" "${gitlink_variant}" <<'PY'
-import json, sys
-p, gitlink = sys.argv[1], sys.argv[2]
-c = json.load(open(p))
-c["editablePaths"] = ["src", gitlink]
-json.dump(c, open(p, "w"))
-PY
-  mkdir -p "${fx}/sub/src" "${fx}/sub/BENCHD/crates"
-  printf 'x\n' > "${fx}/sub/src/kernel.txt"
-  printf 'attacker daemon\n' > "${fx}/sub/BENCHD/PIN"
-  printf 'attacker daemon\n' > "${fx}/sub/BENCHD/crates/PIN"
-  printf '[submodule "benchd"]\n\tpath = elsewhere\n' > "${fx}/sub/.GITMODULES"
-  assert_exit "overlay/case-folded gitlink entry '${gitlink_variant}' refused" 1 \
-    "measurement-harness surface" "${fx}/trusted" \
-    env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
-  assert_equal "overlay/case-folded gitlink '${gitlink_variant}' left benchd intact" \
-    "$(cat "${fx}/trusted/benchd/PIN")" "pinned measurement daemon"
-done
-
-# Q8 (issue #20): the overlay must not print its success trailer after overlaying
-# NOTHING. The allowlist is the TRUSTED contract's; an empty, absent, or
-# unparseable one is a broken trusted checkout, and a "success" that moved
-# nothing lets a pipeline measure the trusted tree and score it as the
-# submission. All three fail closed before the trailer.
-fx="$(new_fixture)"
-mkdir -p "${fx}/sub/src"
-printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
-printf 'submitted config\n' > "${fx}/sub/config.txt"
-python3 - "${fx}/trusted/benchmark.json" <<'PY'
-import json, sys
-p = sys.argv[1]; c = json.load(open(p)); c["editablePaths"] = []
-json.dump(c, open(p, "w"))
-PY
-assert_exit "overlay/empty editablePaths fails closed, not a no-op success" 1 \
-  "lists no editablePaths" "${fx}/trusted" \
-  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
-
-fx="$(new_fixture)"
-mkdir -p "${fx}/sub/src"
-printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
-printf 'submitted config\n' > "${fx}/sub/config.txt"
-python3 - "${fx}/trusted/benchmark.json" <<'PY'
-import json, sys
-p = sys.argv[1]; c = json.load(open(p)); c.pop("editablePaths")
-json.dump(c, open(p, "w"))
-PY
-assert_exit "overlay/missing editablePaths key fails closed, not a no-op success" 1 \
-  "lists no editablePaths" "${fx}/trusted" \
-  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
-
-fx="$(new_fixture)"
-mkdir -p "${fx}/sub/src"
-printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
-printf 'this is not json {' > "${fx}/trusted/benchmark.json"
-assert_exit "overlay/unparseable contract fails closed, not a no-op success" 1 \
-  "does not parse" "${fx}/trusted" \
-  env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
 
 echo
 echo "=== C. static review deterministic gates ==================================="
@@ -1063,191 +740,6 @@ assert_exit "malformed-cap/budget object is null: shell enforcer" 1 "" \
   "${SCRIPTS}/submission-static-review-checks.sh"
 
 echo
-echo "=== D. modifiable-surface gate (enforce-modifiable-surface.sh) ============="
-
-gdir="$(git_fixture)"
-base="$(git -C "${gdir}" rev-parse HEAD)"
-printf 'attacker CLI\n' > "${gdir}/Sources/MLXFastCLI/main.swift"
-git -C "${gdir}" add -A
-git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m outside
-head_sha="$(git -C "${gdir}" rev-parse HEAD)"
-assert_exit "surface-gate/write outside editablePaths rejected" 1 \
-  "outside the modifiable surface" "${gdir}" \
-  env BASE_SHA="${base}" HEAD_SHA="${head_sha}" CONTRACT_PATH=benchmark.json \
-  "${SCRIPTS}/enforce-modifiable-surface.sh"
-
-gdir="$(git_fixture)"
-base="$(git -C "${gdir}" rev-parse HEAD)"
-printf 'a better kernel\n' > "${gdir}/src/kernel.txt"
-git -C "${gdir}" add -A
-git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m inside
-head_sha="$(git -C "${gdir}" rev-parse HEAD)"
-assert_exit "surface-gate/write inside editablePaths accepted" 0 "" "${gdir}" \
-  env BASE_SHA="${base}" HEAD_SHA="${head_sha}" CONTRACT_PATH=benchmark.json \
-  "${SCRIPTS}/enforce-modifiable-surface.sh"
-
-# The allowlist comes from the BASE commit: a submission that widens its own
-# contract in the HEAD commit is still judged by the base's surface.
-gdir="$(git_fixture)"
-base="$(git -C "${gdir}" rev-parse HEAD)"
-python3 - "${gdir}/benchmark.json" <<'PY'
-import json, sys
-p = sys.argv[1]
-c = json.load(open(p))
-c["editablePaths"] = ["src", "config.txt", "head.manifest.json", "head", "Sources"]
-json.dump(c, open(p, "w"))
-PY
-printf 'attacker CLI\n' > "${gdir}/Sources/MLXFastCLI/main.swift"
-git -C "${gdir}" add -A
-git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m widen
-head_sha="$(git -C "${gdir}" rev-parse HEAD)"
-assert_exit "surface-gate/self-widened contract does not grant access" 1 \
-  "outside the modifiable surface" "${gdir}" \
-  env BASE_SHA="${base}" HEAD_SHA="${head_sha}" CONTRACT_PATH=benchmark.json \
-  "${SCRIPTS}/enforce-modifiable-surface.sh"
-
-# B3: the gate carries the gitlink guard the other two layers already had, and
-# it is case-folded. Both cases below drift the BASE (trusted) contract to list
-# the gitlink, so the allowlist WOULD admit the write -- only the guard refuses
-# it. The second spells the changed path in a different case, which on the
-# case-insensitive ranked filesystem is the same file.
-drifted_base_fixture() { # drifted_base_fixture ENTRY -> echoes a repo whose BASE contract lists ENTRY
-  local entry="$1" fx dir
-  fx="$(new_fixture)"
-  dir="${fx}/trusted"
-  python3 - "${dir}/benchmark.json" "${entry}" <<'PY'
-import json, sys
-p, entry = sys.argv[1], sys.argv[2]
-c = json.load(open(p))
-c["editablePaths"] = c["editablePaths"] + [entry]
-json.dump(c, open(p, "w"))
-PY
-  {
-    git -C "${dir}" init -q -b main
-    git -C "${dir}" add -A
-    git -C "${dir}" -c user.name=t -c user.email=t@e commit -q -m base
-  } >&2
-  echo "${dir}"
-}
-
-gdir="$(drifted_base_fixture benchd)"
-base="$(git -C "${gdir}" rev-parse HEAD)"
-printf 'attacker daemon\n' > "${gdir}/benchd/PIN"
-git -C "${gdir}" add -A
-git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m repoint-scorer
-head_sha="$(git -C "${gdir}" rev-parse HEAD)"
-assert_exit "surface-gate/gitlink write refused even when the base contract lists it" 1 \
-  "reaches the measurement-harness surface" "${gdir}" \
-  env BASE_SHA="${base}" HEAD_SHA="${head_sha}" CONTRACT_PATH=benchmark.json \
-  "${SCRIPTS}/enforce-modifiable-surface.sh"
-
-# The LIVE pin paths (the retired-submodule cases above and below stay because
-# all three guard layers still carry those spellings). Writing benchd.pin
-# repoints which binary scores the submission; writing benchd-bin/benchd swaps
-# the bytes after fetch-benchd.sh verified them. Both must be refused even when
-# the trusted contract has drifted to list them.
-for live_pin in benchd.pin benchd-bin/benchd; do
-  gdir="$(drifted_base_fixture "${live_pin}")"
-  base="$(git -C "${gdir}" rev-parse HEAD)"
-  mkdir -p "$(dirname "${gdir}/${live_pin}")"
-  printf 'attacker harness\n' > "${gdir}/${live_pin}"
-  git -C "${gdir}" add -A
-  git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m repoint-pinned-harness
-  head_sha="$(git -C "${gdir}" rev-parse HEAD)"
-  assert_exit "surface-gate/${live_pin} write refused even when the base contract lists it" 1 \
-    "reaches the measurement-harness surface" "${gdir}" \
-    env BASE_SHA="${base}" HEAD_SHA="${head_sha}" CONTRACT_PATH=benchmark.json \
-    "${SCRIPTS}/enforce-modifiable-surface.sh"
-done
-
-gdir="$(drifted_base_fixture BENCHD)"
-base="$(git -C "${gdir}" rev-parse HEAD)"
-# Record the path in the index directly: on a case-insensitive filesystem a
-# worktree write to BENCHD/PIN would be stored under the existing benchd/ name,
-# so the case variant has to be staged as a blob to exist at all.
-case_blob="$(printf 'attacker daemon\n' | git -C "${gdir}" hash-object -w --stdin)"
-git -C "${gdir}" update-index --add --cacheinfo "100644,${case_blob},BENCHD/PIN"
-git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m repoint-scorer-case-variant
-head_sha="$(git -C "${gdir}" rev-parse HEAD)"
-assert_exit "surface-gate/case-folded gitlink write refused" 1 \
-  "reaches the measurement-harness surface" "${gdir}" \
-  env BASE_SHA="${base}" HEAD_SHA="${head_sha}" CONTRACT_PATH=benchmark.json \
-  "${SCRIPTS}/enforce-modifiable-surface.sh"
-
-gdir="$(drifted_base_fixture .gitmodules)"
-base="$(git -C "${gdir}" rev-parse HEAD)"
-printf '[submodule "benchd"]\n\tpath = attacker\n' > "${gdir}/.gitmodules"
-git -C "${gdir}" add -A
-git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m repoint-pointer
-head_sha="$(git -C "${gdir}" rev-parse HEAD)"
-assert_exit "surface-gate/.gitmodules write refused even when the base contract lists it" 1 \
-  "reaches the measurement-harness surface" "${gdir}" \
-  env BASE_SHA="${base}" HEAD_SHA="${head_sha}" CONTRACT_PATH=benchmark.json \
-  "${SCRIPTS}/enforce-modifiable-surface.sh"
-
-# The engine fork gitlink (issue #31), on the same drifted-base fixture: a write
-# inside Vendor/mlx-swift-lm repoints the fork the ranked run builds, so the
-# gate must refuse it exactly as the manifest linter already does.
-gdir="$(drifted_base_fixture Vendor/mlx-swift-lm)"
-base="$(git -C "${gdir}" rev-parse HEAD)"
-mkdir -p "${gdir}/Vendor/mlx-swift-lm"
-printf 'attacker engine\n' > "${gdir}/Vendor/mlx-swift-lm/Package.swift"
-git -C "${gdir}" add -A
-git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m repoint-engine-fork
-head_sha="$(git -C "${gdir}" rev-parse HEAD)"
-assert_exit "surface-gate/engine fork write refused even when the base contract lists it" 1 \
-  "reaches the measurement-harness surface" "${gdir}" \
-  env BASE_SHA="${base}" HEAD_SHA="${head_sha}" CONTRACT_PATH=benchmark.json \
-  "${SCRIPTS}/enforce-modifiable-surface.sh"
-
-# B3 (device:inode arm, the reason the guard is NOT ASCII-fold-only). A non-ASCII
-# spelling of a CURRENT forbidden path IS constructible on the ranked APFS box:
-# `.gitmoduleſ` (trailing U+017F LATIN SMALL LETTER LONG S) case-folds to
-# `.gitmodules` and names the SAME inode, but `tr '[:upper:]' '[:lower:]'` leaves
-# U+017F untouched, so the fold arm alone misses it. The drifted base contract
-# lists the long-s spelling, so the allowlist admits the write; only the
-# device:inode arm -- fed RAW bytes because the gate reads the diff with
-# core.quotePath=false -- refuses it. Two independent reverts green this: drop the
-# device arm (fold-only) and the raw long-s admits; drop quotePath=false and the
-# arm stats a C-quoted literal (`".gitmodule\305\277"`) that names no file, so the
-# gitlink refusal vanishes and the path is mis-rejected as merely out-of-surface.
-# The parity claim: overlay-editable-paths.sh and lint-benchmark-manifest.py both
-# refuse this same spelling (the overlay by the identical device:inode arm on its
-# raw-JSON editablePaths, the linter by str.casefold(), which DOES fold U+017F).
-#
-# Guarded by an inode-collision probe: the vulnerability exists only where the
-# filesystem folds U+017F (APFS). On a case/normalization-SENSITIVE filesystem
-# (ext4, the hosted CI runner) `.gitmoduleſ` is a genuinely distinct file that
-# does not touch the scorer, so there is nothing to refuse and the check is
-# skipped rather than asserted.
-fs_folds_longs() { # true when this filesystem folds `.gitmoduleſ` onto `.gitmodules`
-  local d ref alt; d="$(mktemp -d)"; printf x > "${d}/.gitmodules"
-  ref="$(stat -f '%d:%i' "${d}/.gitmodules" 2>/dev/null \
-      || stat -c '%d:%i' "${d}/.gitmodules" 2>/dev/null)"
-  alt="$(stat -f '%d:%i' "${d}/$(printf '.gitmodule\xc5\xbf')" 2>/dev/null \
-      || stat -c '%d:%i' "${d}/$(printf '.gitmodule\xc5\xbf')" 2>/dev/null)"
-  rm -rf "${d}"
-  [[ -n "${ref}" && "${ref}" == "${alt}" ]]
-}
-if fs_folds_longs; then
-  gdir="$(drifted_base_fixture "$(printf '.gitmodule\xc5\xbf')")"
-  base="$(git -C "${gdir}" rev-parse HEAD)"
-  # APFS folds a worktree write to `.gitmoduleſ` onto the existing `.gitmodules`,
-  # so the long-s spelling can exist only as a staged blob, never as its own file.
-  longs_blob="$(printf 'attacker daemon\n' | git -C "${gdir}" hash-object -w --stdin)"
-  git -C "${gdir}" update-index --add \
-    --cacheinfo "100644,${longs_blob},$(printf '.gitmodule\xc5\xbf')"
-  git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m repoint-pointer-longs
-  head_sha="$(git -C "${gdir}" rev-parse HEAD)"
-  assert_exit "surface-gate/non-ASCII long-s .gitmoduleſ write refused (device:inode, raw bytes)" 1 \
-    "reaches the measurement-harness surface" "${gdir}" \
-    env BASE_SHA="${base}" HEAD_SHA="${head_sha}" CONTRACT_PATH=benchmark.json \
-    "${SCRIPTS}/enforce-modifiable-surface.sh"
-else
-  echo "skip  surface-gate/non-ASCII long-s .gitmoduleſ (filesystem does not fold U+017F; no inode collision here)"
-fi
-
-echo
 echo "=== E. the real tree and manifest/enforcer drift ==========================="
 
 assert_exit "real-tree/benchmark.json surface fits its own budget" 0 "verified" \
@@ -1584,9 +1076,7 @@ assert_equal "lint/trusted-scope exemptPaths entry refused" \
 #    directory is the sharp one: os.path.join(root, rel) discards root for an
 #    absolute rel, so it compared as neither equal nor same-file. '' / '.' / './'
 #    denote the repo root and render as an EMPTY prefix list, so nothing was
-#    compared at all. All four are already refused at run time by
-#    overlay-editable-paths.sh:87,91-96 -- this is defence in depth, not a live
-#    hole -- and the linter now mirrors that script's validity rule exactly.
+#    compared at all. All four are refused by the linter's own validity rule.
 assert_equal "lint/trusted-scope absolute path to a trusted dir refused" \
   "$(trusted_scope_hits editablePaths "${REPO_ROOT}/Sources/MLXFastCore")" "1"
 for degenerate in "" "." "./"; do
@@ -1703,9 +1193,9 @@ done
 
 # 12. THE TWO DIVERGENT ROSTER ENTRIES, at the same depths as the inherited
 #     five. These are what the ruling actually bought: '.github' and 'tools'
-#     hold every gate in this repository -- the overlay, the static review, the
-#     surface gate, this linter, this suite, the CI tripwires -- so an entry
-#     reaching either of them is a submission proposing to edit its own judge.
+#     hold every gate in this repository -- the static review, this linter,
+#     this suite, the CI tripwires -- so an entry reaching either of them is a
+#     submission proposing to edit its own judge.
 #
 #     'contains' is not asserted for them because it is not reachable: both are
 #     single-segment paths at the repository root, so the only entry that could
@@ -1719,7 +1209,7 @@ done
 # Inside: a real file under each, so the assertion is about a path that EXISTS
 # and both the lexical and the samefile arm have something to bind to.
 assert_equal "lint/trusted-scope entry inside '.github' refused" \
-  "$(trusted_scope_hits editablePaths ".github/scripts/overlay-editable-paths.sh")" "1"
+  "$(trusted_scope_hits editablePaths ".github/scripts/submission-static-review-checks.sh")" "1"
 assert_equal "lint/trusted-scope entry inside 'tools' refused" \
   "$(trusted_scope_hits editablePaths "tools/lint-benchmark-manifest.py")" "1"
 
@@ -1758,8 +1248,7 @@ done
 #   Sources/MLXFastCLI                   the trusted driver
 #   Sources/MLXFastCore                  the pins and constants it drives from
 #     (those five are upstream's own TRUSTED_SCOPE roster)
-#   .github                              the overlay, the static review, the
-#                                        surface gate, the CI tripwires
+#   .github                              the static review, the CI tripwires
 #   tools                                this linter, the hostile-archive
 #                                        suite, the fetch/verify scripts
 #     (those two are David's 2026-08-20 divergence: "parity doctrine governs
@@ -1787,184 +1276,14 @@ echo "=== F. requant-only heads (David ruling 2026-08-26) ======================
 #
 # THE MECHANISM. `mtp-head/` is not an `editablePaths` entry;
 # `mtp-head.manifest.json` still is. So the rule is not a promise in prose, it
-# is the allowlist -- and the layer
-# that reads the allowlist against a submission's DIFF is
-# .github/scripts/enforce-modifiable-surface.sh.
+# is the allowlist: Yukon archives and overlays only the allowlist, and benchd
+# refuses a candidate that diverges from its baseline outside it.
 #
 # WHY THESE CASES RUN AGAINST THE REAL benchmark.json AND NOT THE SYNTHETIC
-# CONTRACT. Sections A-D prove the enforcers' MECHANICS on a miniature track,
-# which is right for mechanics and wrong for this: the property under test here
-# is a fact about THIS repository's declared surface. A synthetic contract would
-# stay green if someone put `mtp-head` back in the real one, which is the exact
-# regression these cases exist to catch.
-
-real_contract_fixture() { # -> echoes a git repo carrying the REAL benchmark.json
-  local dir
-  dir="$(mktemp -d "${WORK}/rq.XXXXXX")"
-  mkdir -p "${dir}/mtp-head" "${dir}/Sources/MLXFastTransform"
-  cp "${REPO_ROOT}/benchmark.json" "${dir}/benchmark.json"
-  cp "${REPO_ROOT}/mtp-head.manifest.json" "${dir}/mtp-head.manifest.json"
-  # Stand-in for content under the head directory. The directory holds no
-  # organizer weight file on this track -- the MTP head is embedded in the
-  # pinned target checkpoint -- but the PATH must stay non-editable, and what
-  # matters to this gate is only that a path under it shows up in the diff.
-  printf 'stand-in for head-directory content\n' > "${dir}/mtp-head/README.md"
-  printf 'let x = 1\n' > "${dir}/Sources/MLXFastTransform/Placeholder.swift"
-  {
-    git -C "${dir}" init -q -b main
-    git -C "${dir}" add -A
-    git -C "${dir}" -c user.name=t -c user.email=t@e commit -q -m base
-  } >&2
-  echo "${dir}"
-}
-
-commit_all() { # commit_all DIR MESSAGE -> echoes the new HEAD sha
-  {
-    git -C "$1" add -A
-    git -C "$1" -c user.name=t -c user.email=t@e commit -q -m "$2"
-  } >&2
-  git -C "$1" rev-parse HEAD
-}
-
-surface_gate() { # surface_gate DIR BASE HEAD
-  env BASE_SHA="$2" HEAD_SHA="$3" CONTRACT_PATH=benchmark.json \
-    "${SCRIPTS}/enforce-modifiable-surface.sh"
-}
-
-# --- F1. NEGATIVE CONTROL (a): a head weight file smuggled into a submission --
-#
-# The shape the ruling exists to stop. A participant adds their own head
-# weights under the head directory and submits. The nested case is here because
-# a rule that binds the top level and not a subdirectory is not a rule.
-for smuggled in "mtp-head/model.safetensors" "mtp-head/model-00001-of-00002.safetensors" \
-                "mtp-head/config.json" "mtp-head/nested/dir/shard.safetensors"; do
-  rq="$(real_contract_fixture)"
-  rq_base="$(git -C "${rq}" rev-parse HEAD)"
-  mkdir -p "$(dirname "${rq}/${smuggled}")"
-  printf 'attacker head weights\n' > "${rq}/${smuggled}"
-  rq_head="$(commit_all "${rq}" smuggle-head)"
-  assert_exit "requant-only/smuggled head weight '${smuggled}' refused by the surface gate" 1 \
-    "outside the modifiable surface" "${rq}" \
-    surface_gate "${rq}" "${rq_base}" "${rq_head}"
-done
-
-# --- F2. NEGATIVE CONTROL (b): the ORGANIZER's head bytes, modified -----------
-#
-# A different attack with the same remedy. Instead of adding a head, the
-# submission EDITS one that is already there -- the shape a participant would
-# reach for to "just re-quantize in place" and ship the result, and the shape a
-# tamper would take. It is refused for the same reason: the path is not
-# editable, so ANY diff touching it is outside the surface. Deletion counts too;
-# a gate that admitted deletions would let a submission remove the organizer's
-# head and let the loader fall through to something else.
-rq="$(real_contract_fixture)"
-rq_base="$(git -C "${rq}" rev-parse HEAD)"
-printf 'tampered organizer bytes\n' >> "${rq}/mtp-head/README.md"
-rq_head="$(commit_all "${rq}" tamper-head)"
-assert_exit "requant-only/modified organizer head bytes refused by the surface gate" 1 \
-  "outside the modifiable surface" "${rq}" \
-  surface_gate "${rq}" "${rq_base}" "${rq_head}"
-
-rq="$(real_contract_fixture)"
-rq_base="$(git -C "${rq}" rev-parse HEAD)"
-rm "${rq}/mtp-head/README.md"
-rq_head="$(commit_all "${rq}" delete-head-content)"
-assert_exit "requant-only/deleted organizer head content refused by the surface gate" 1 \
-  "outside the modifiable surface" "${rq}" \
-  surface_gate "${rq}" "${rq_base}" "${rq_head}"
-
-# --- F3. NEGATIVE CONTROL (c): re-granting the path to yourself ---------------
-#
-# The obvious bypass, and the one worth pinning: the submission puts `mtp-head`
-# back into its OWN copy of benchmark.json in the same commit that adds the
-# weights. It does not work, because the gate reads editablePaths from the BASE
-# commit. Note the diagnostic names benchmark.json itself first -- the contract
-# is trusted scope, so editing it is already outside the surface -- and the
-# weight file is named too.
-rq="$(real_contract_fixture)"
-rq_base="$(git -C "${rq}" rev-parse HEAD)"
-python3 - "${rq}/benchmark.json" <<'PY'
-import json, sys
-p = sys.argv[1]
-c = json.load(open(p))
-c["editablePaths"] = c["editablePaths"] + ["mtp-head"]
-c["optionalEditablePaths"] = c["optionalEditablePaths"] + ["mtp-head"]
-json.dump(c, open(p, "w"), indent=2)
-PY
-printf 'attacker head weights\n' > "${rq}/mtp-head/model.safetensors"
-rq_head="$(commit_all "${rq}" self-widen-heads)"
-rq_out="$( (cd "${rq}" && surface_gate "${rq}" "${rq_base}" "${rq_head}") 2>&1 )"
-assert_equal "requant-only/self-widened contract does not re-grant the head directory" \
-  "$(printf '%s\n' "${rq_out}" | grep -c 'mtp-head/model.safetensors is outside the modifiable surface')" "1"
-assert_equal "requant-only/self-widening edit to benchmark.json is itself refused" \
-  "$(printf '%s\n' "${rq_out}" | grep -c 'benchmark.json is outside the modifiable surface')" "1"
-
-# --- F4. POSITIVE DISCRIMINATOR: a declaration-only requant submission passes -
-#
-# Without this the section proves only that the gate refuses things, not that it
-# still admits the flow the ruling LEAVES open. A participant declaring a
-# re-quantization edits the manifest and (optionally) their own runtime code.
-# Nothing under the head directories moves, and the gate is silent.
-rq="$(real_contract_fixture)"
-rq_base="$(git -C "${rq}" rev-parse HEAD)"
-python3 - "${rq}/mtp-head.manifest.json" <<'PY'
-import json, sys
-p = sys.argv[1]
-c = json.load(open(p))
-c["bytes"] = 123456789
-json.dump(c, open(p, "w"), indent=2)
-PY
-printf 'let x = 2\n' > "${rq}/Sources/MLXFastTransform/Placeholder.swift"
-rq_head="$(commit_all "${rq}" declare-requant)"
-assert_exit "requant-only/declaration-only requant submission accepted" 0 "" "${rq}" \
-  surface_gate "${rq}" "${rq_base}" "${rq_head}"
-
-# --- F5. DEFENCE IN DEPTH: the overlay never carries head bytes across --------
-#
-# The surface gate is the layer that REFUSES. The overlay is the layer that
-# makes a refusal-bypass pointless: it copies editablePaths and only
-# editablePaths from the submission worktree, so head bytes that reached a
-# worktree some other way are simply never placed into the tree that gets built
-# and measured. Proven positively (the trusted head content survives untouched)
-# and negatively (the submission's file does not appear), because "the file is
-# absent" alone would also be true of an overlay that deleted everything.
-#
-# Uses a synthetic contract shaped like the post-ruling real one -- head
-# directory NOT editable, declaration file editable and optional -- because the
-# overlay walks EVERY editablePaths entry and demands each non-optional one
-# exist in the worktree, which no miniature fixture can satisfy for the real
-# 89-entry surface.
-REQUANT_CONTRACT_JSON='{
-  "editablePaths": ["src", "config.txt", "head.manifest.json"],
-  "optionalEditablePaths": ["head.manifest.json"],
-  "editableSurfaceByteBudget": {
-    "exemptPathMaxBytes": 8192,
-    "exemptPathMaxFileBytes": 7000,
-    "maxTotalBytes": 20000,
-    "maxFileBytes": 4096,
-    "maxGrowthBytes": 2048
-  },
-  "staticReviewTrackId": "test-track-v1"
-}'
-fx="$(new_fixture)"
-printf '%s\n' "${REQUANT_CONTRACT_JSON}" > "${fx}/trusted/benchmark.json"
-mkdir -p "${fx}/sub/src" "${fx}/sub/head"
-printf 'submitted kernel\n' > "${fx}/sub/src/kernel.txt"
-printf 'trusted helper\n' > "${fx}/sub/src/helper.txt"
-printf 'submitted config\n' > "${fx}/sub/config.txt"
-printf '{"source":"pinned","bytes":1}\n' > "${fx}/sub/head.manifest.json"
-printf 'ATTACKER HEAD WEIGHTS\n' > "${fx}/sub/head/weights.bin"
-printf 'ATTACKER HEAD SHARD\n' > "${fx}/sub/head/shard.safetensors"
-assert_exit "requant-only/overlay succeeds with the head directory non-editable" 0 \
-  "trusted harness retained" "${fx}/trusted" \
-  env CONTRACT_PATH=benchmark.json SUBMISSION_WORKTREE="${fx}/sub" \
-  "${SCRIPTS}/overlay-editable-paths.sh"
-assert_equal "requant-only/overlay does not import submitted head weights" \
-  "$(cat "${fx}/trusted/head/weights.bin")" "trusted head weights"
-assert_equal "requant-only/overlay does not create submitted head shards" \
-  "$([ -e "${fx}/trusted/head/shard.safetensors" ] && echo present || echo absent)" "absent"
-assert_equal "requant-only/overlay still carries the head DECLARATION across" \
-  "$(cat "${fx}/trusted/head.manifest.json")" '{"source":"pinned","bytes":1}'
+# CONTRACT. The property under test here is a fact about THIS repository's
+# declared surface. A synthetic contract would stay green if someone put
+# `mtp-head` back in the real one, which is the exact regression these cases
+# exist to catch.
 
 # --- F6. THE MANIFEST ITSELF: no head directory anywhere in the surface -------
 #
@@ -2025,8 +1344,8 @@ assert_equal "requant-only/exemptPaths is absent from the real budget block" \
 # What must NEVER appear is a head WEIGHTS directory in `editablePaths`.
 # `mtp-head/` and `dflash-head/` left that list under the 2026-08-26
 # requant-only ruling, and re-granting either one would reopen the custom-head
-# upload surface that ruling closed. Section F proves the surface gate refuses
-# smuggled head bytes; this proves the manifest still declines to invite them.
+# upload surface that ruling closed. Section F proves the manifest declines to
+# invite head bytes; Yukon archives only what the manifest lists.
 #
 # The model files that decide the head's geometry are NOT in this tree any
 # more: the engine is the Vendor/mlx-swift-lm submodule, and a gitlink is not
