@@ -266,8 +266,6 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// Debug taps (tests): when set, every layer's output stream and the block
     /// inputs/outputs are appended here.
     nonisolated(unsafe) static var debugTaps: [(String, MLXArray)]? = nil
-    /// Layers per partial dispatch inside a forward (0 = one dispatch per step).
-    nonisolated(unsafe) public static var asyncChunk: Int = 6
 
     /// Kill switch for A/B: `TRACK_FAST_FORWARD=0` routes every forward to the
     /// wrapped model.
@@ -713,11 +711,6 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
             pendingInject = injectW
             residual = stream
-            // Dispatch the graph so far: the GPU starts on these layers while the
-            // CPU keeps building the rest (the build is otherwise GPU-idle time).
-            if Self.asyncChunk > 0, (layer.index + 1) % Self.asyncChunk == 0 {
-                asyncEval(stream)
-            }
         }
         let (multi, finalNormed) = TrackFastKernels.injectNorm(
             residual: residual, out: pendingOut, inject: pendingInject,
