@@ -565,8 +565,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     static func moeForwardShared(_ m: TrackMoE, _ x: MLXArray) -> MLXArray {
         let logits = matmul(x.asType(.float32), m.routerW32.transposed())
-        let idx = argPartition(-logits, kth: m.topK - 1, axis: -1)[.ellipsis, ..<m.topK]
-        let weights = softmax(takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
+        let idx: MLXArray, weights: MLXArray, pairOrder: MLXArray?
+        if x.dim(0) == 1, x.dim(1) <= 8, m.topK <= 32, logits.dim(-1) <= 512 {
+            let selected = TrackExpertRouting.select(logits, topK: m.topK)
+            idx = selected[0]
+            weights = selected[1]
+            pairOrder = x.dim(1) > 1 ? selected[2] : nil
+        } else {
+            idx = argPartition(-logits, kth: m.topK - 1, axis: -1)[.ellipsis, ..<m.topK]
+            weights = softmax(takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
+            pairOrder = nil
+        }
         let routed: MLXArray
         if x.dim(0) == 1 && x.dim(1) <= 8 {
             // Custom gather over MLX's own per-row GEMV arithmetic (bit-exact with
@@ -578,11 +587,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
                 wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b,
                 x: x.reshaped(S, H), idx: flatIdx, xrow: xrow,
-                groupSize: m.expertGroupSize, bits: m.expertBits)
+                groupSize: m.expertGroupSize, bits: m.expertBits, pairOrder: pairOrder)
             let act = TrackFastKernels.swiglu2(gate: gu.gate, up: gu.up)
             routed = TrackFastMoEKernels.single(
                 w: m.expertDown.w, scales: m.expertDown.s, biases: m.expertDown.b,
-                x: act, idx: flatIdx, groupSize: m.expertGroupSize, bits: m.expertBits
+                x: act, idx: flatIdx, groupSize: m.expertGroupSize, bits: m.expertBits,
+                pairOrder: pairOrder
             ).reshaped(1, S, K, H)
         } else {
             routed = m.switchMLP(x, idx)  // [B,S,K,H]

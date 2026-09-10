@@ -638,7 +638,7 @@ METAL_FUNC void qmv_impl(
     ///   wg/sg/bg, wu/su/bu: [E, N, K/8] / [E, N, K/32]; x [R, K]; idx [B] uint32 expert; xrow [B] uint32 row
     ///   -> gate [B, N], up [B, N]
     static let gateUpSource = """
-        const uint b = threadgroup_position_in_grid.z;
+        const uint b = ORDERED ? order[threadgroup_position_in_grid.z] : threadgroup_position_in_grid.z;
         const uint e = idx[b];
         const uint r = xrow[b];
         const uint kw = (uint)K / 8;
@@ -665,7 +665,7 @@ METAL_FUNC void qmv_impl(
     /// one projection per pair (the down projection), RB 8-row blocks per threadgroup.
     /// x [B, K] (row b), out [B, N]. grid threads (32, NB*2, B).
     static let singleSource = """
-        const uint b = threadgroup_position_in_grid.z;
+        const uint b = ORDERED ? order[threadgroup_position_in_grid.z] : threadgroup_position_in_grid.z;
         const uint e = idx[b];
         const uint kw = (uint)K / 8;
         const uint kg = (uint)K / GS;
@@ -687,13 +687,13 @@ METAL_FUNC void qmv_impl(
 
     nonisolated(unsafe) static let gateUpKernel = MLXFast.metalKernel(
         name: "track_moe_gate_up",
-        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "x", "idx", "xrow", "K", "N"],
+        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "x", "idx", "xrow", "K", "N", "order"],
         outputNames: ["gate", "up"],
         source: gateUpSource, header: helpers, ensureRowContiguous: true)
 
     nonisolated(unsafe) static let singleKernel = MLXFast.metalKernel(
         name: "track_moe_single",
-        inputNames: ["w", "scales", "biases", "x", "idx", "K", "N"],
+        inputNames: ["w", "scales", "biases", "x", "idx", "K", "N", "order"],
         outputNames: ["out"],
         source: singleSource, header: helpers, ensureRowContiguous: true)
 
@@ -717,15 +717,16 @@ METAL_FUNC void qmv_impl(
     /// gate/up for `B` (row, expert) pairs.
     static func gateUp(
         wg: MLXArray, sg: MLXArray, bg: MLXArray, wu: MLXArray, su: MLXArray, bu: MLXArray,
-        x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int, rowBlocks: Int? = nil
+        x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int,
+        rowBlocks: Int? = nil, pairOrder: MLXArray? = nil
     ) -> (gate: MLXArray, up: MLXArray) {
         let B = idx.dim(0), K = x.dim(1), N = wg.dim(1)
         precondition(N % 8 == 0 && bits == 4)
         let rb = rowBlocks ?? Self.rowBlocks(k: K)
         let nb = (N / 8 + rb - 1) / rb
         let outs = gateUpKernel(
-            [wg, sg, bg, wu, su, bu, x, idx, xrow, MLXArray(Int32(K)), MLXArray(Int32(N))],
-            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb)],
+            [wg, sg, bg, wu, su, bu, x, idx, xrow, MLXArray(Int32(K)), MLXArray(Int32(N)), pairOrder ?? idx],
+            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb), ("ORDERED", pairOrder != nil)],
             grid: (32, nb * 2 * 2, B), threadGroup: (32, 2, 1),
             outputShapes: [[B, N], [B, N]], outputDTypes: [x.dtype, x.dtype])
         return (outs[0], outs[1])
@@ -733,15 +734,15 @@ METAL_FUNC void qmv_impl(
 
     static func single(
         w: MLXArray, scales: MLXArray, biases: MLXArray, x: MLXArray, idx: MLXArray,
-        groupSize: Int, bits: Int, rowBlocks: Int? = nil
+        groupSize: Int, bits: Int, rowBlocks: Int? = nil, pairOrder: MLXArray? = nil
     ) -> MLXArray {
         let B = idx.dim(0), K = x.dim(1), N = w.dim(1)
         precondition(N % 8 == 0 && bits == 4)
         let rb = rowBlocks ?? Self.rowBlocks(k: K)
         let nb = (N / 8 + rb - 1) / rb
         return singleKernel(
-            [w, scales, biases, x, idx, MLXArray(Int32(K)), MLXArray(Int32(N))],
-            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb)],
+            [w, scales, biases, x, idx, MLXArray(Int32(K)), MLXArray(Int32(N)), pairOrder ?? idx],
+            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb), ("ORDERED", pairOrder != nil)],
             grid: (32, nb * 2, B), threadGroup: (32, 2, 1),
             outputShapes: [[B, N]], outputDTypes: [x.dtype])[0]
     }
