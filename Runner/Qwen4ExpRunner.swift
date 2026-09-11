@@ -60,7 +60,39 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
     ///     caller that holds one.
     public static let ngramRowSourceResource = "qwen4exp.ngramRowSource"
 
-    public static let manifest = RunnerManifest(
+    // MLXFAST-CMDBUF: MLX decides to commit the current Metal command buffer after
+    // every primitive, in `CommandEncoder::needs_commit()`:
+    //     (buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb)
+    // `buffer_sizes_` accumulates `a.data_size()` per distinct bound input buffer,
+    // which is a count of ELEMENTS, while `max_mb` is a megabyte budget. The routed
+    // expert weights are [512, 640, 320] uint32 = 104.9M elements, so `>> 20` is 100
+    // and any dispatch binding them breaches the budget on its own. That forces a
+    // commit after `track_moe_gate_up_act` and again after `track_moe_down_combine`,
+    // on every layer, plus the `lm_head` GEMV. The device-class defaults are also
+    // small: this arch string ends in `p`, which selects 20 ops / 40 "MB".
+    //
+    // Each boundary is a CPU commit, a completion handler and a scheduler round trip,
+    // and on the GPU a full pipeline drain, because the next buffer cannot start until
+    // the previous one retires. Raising both limits leaves `asyncEval` as the only
+    // thing that commits, so a buffer still never spans more than one layer and the
+    // input-retention window is unchanged.
+    //
+    // The values are set with overwrite = 0, so an explicit operator value still wins.
+    // These are process-local scheduling knobs read once, at `Device` construction;
+    // `RunnerRegistry.register` reads `manifest.modelTypes` before anything touches
+    // Metal, which is what makes this static the earliest available hook.
+    private static let tuneCommandBufferLimits: Void = {
+        // Only the size trigger is neutralized. MLX_MAX_OPS_PER_BUFFER is deliberately
+        // left at its device-class default: it is a real bound on how large a command
+        // buffer can grow, and it is the safety net if a code path does not reach the
+        // per-layer asyncEval. Raising both limits together made the free-decode phase
+        // produce zero tokens, because nothing then committed the buffer at all.
+        setenv("MLX_MAX_MB_PER_BUFFER", "1000000", 0)
+    }()
+
+    public static let manifest: RunnerManifest = {
+        _ = tuneCommandBufferLimits
+        return RunnerManifest(
         runnerID: "layr/qwen4exp-125b-a6b",
         modelTypes: ["qwen4_exp", "qwen4_exp_text"],
         engine: CBv2ModelCapabilities(
@@ -87,6 +119,7 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         multimodal: false,
         recurrentLayers: true,
         requiresKeepMask: true)
+    }()
 
     public let servingModel: any LanguageModel
     public let tokenizer: any MLXLMCommon.Tokenizer
