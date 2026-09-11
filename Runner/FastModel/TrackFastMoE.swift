@@ -755,7 +755,7 @@ METAL_FUNC void qmv_impl(
 // `simd_sum`, multiply by the reciprocal).
 
 extension TrackFastMoEKernels {
-    /// logits f32 [R, E] -> idx uint32 [R, K], w f32 [R, K].
+    /// logits f32 [R, E] -> idx uint32 [R, K], w f32 [R, K]. grid threads (32, R, 1), tg (32,1,1).
     static let routeSource = """
         constexpr int E_PER = (E + 31) / 32;
         const uint row = threadgroup_position_in_grid.y;
@@ -813,6 +813,7 @@ extension TrackFastMoEKernels {
         float maxval = -FLT_MAX;
         for (int i = 0; i < N_READS; i++) { maxval = (maxval < ld[i]) ? ld[i] : maxval; }
         maxval = simd_max(maxval);
+        maxval = simd_max((lane == 0) ? maxval : -INFINITY);
         float normalizer = 0;
         for (int i = 0; i < N_READS; i++) {
             float exp_x = fast::exp(ld[i] - maxval);
@@ -820,6 +821,7 @@ extension TrackFastMoEKernels {
             normalizer += exp_x;
         }
         normalizer = simd_sum(normalizer);
+        normalizer = simd_sum((lane == 0) ? normalizer : 0.0f);
         normalizer = 1 / normalizer;
         for (int i = 0; i < N_READS; i++) {
             const int p = (int)lane * N_READS + i;
@@ -853,11 +855,10 @@ extension TrackFastMoEKernels {
         let lead = Array(logits.shape.dropLast())
         let R = lead.reduce(1, *)
         precondition(topK <= 32 && topK <= E && R >= 1 && R <= 8 && KD % 256 == 0)
-        let simdgroups = g == nil ? 1 : 2
         let outs = (R == 1 ? routeKernel1 : routeKernel)(
             [logits.reshaped(R, E), x.reshaped(R, KD), g?.weight ?? x, g?.scales ?? x, g?.biases ?? x],
             template: [("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32), ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R), ("HAS_GATE", g != nil)],
-            grid: (32, R * simdgroups, 1), threadGroup: (32, simdgroups, 1),
+            grid: (32, R * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [[R, topK], [R, topK], [R]], outputDTypes: [.uint32, .float32, x.dtype])
         return (outs[0].reshaped(lead + [topK]), outs[1].reshaped(lead + [topK]), outs[2].reshaped(lead))
     }
@@ -1321,6 +1322,16 @@ extension TrackFastMoEKernels {
         threadgroup float prod[K][4];
         threadgroup float shvT[4];
         float res[4];
+        // MLXFAST-DCSHARE: the shared expert's walk is independent of every
+        // routed walk, so it gets its own simdgroup instead of riding on
+        // simdgroup 0. In the frontier source simdgroup 0 walked K / KSG routed
+        // experts AND the shared expert, so every threadgroup's longest chain
+        // was that one extra walk, and the launch ends when its slowest
+        // threadgroup ends. The walk itself is untouched -- same `qmv_reg` /
+        // `qmv_wide_reg_full` call on the same rows, same lane mapping, same
+        // `prod`/`shvT` slots -- so the products and the fold order are
+        // bit-identical; only which simdgroup executes them moved.
+        if (sgi < (uint)KSG) {
         // K % KSG == 0, so the trip count is the constant K / KSG and the loop
         // still unrolls: each simdgroup keeps that many expert walks in flight.
         for (int kk = 0; kk < K / KSG; ++kk) {
@@ -1336,10 +1347,11 @@ extension TrackFastMoEKernels {
                 for (int i = 0; i < 4; ++i) { prod[k][i] = static_cast<float>(static_cast<T>(res[i])) * wk; }
             }
         }
+        }
         // Shared expert down rows d0..d0+3 for token t: one token routes to `qmv`'s
         // normal branch (K = 640), two to eight to `qmv_wide` (full tiles; a row's
         // walk does not depend on how many vectors share its tile).
-        if (sgi == (KSG > K ? (uint)K : 0u)) {
+        if (sgi == (uint)KSG) {
             const device T* xs = act + (size_t)(BR + t) * (size_t)F;
             if constexpr (VPT == 1) {
                 float rs[4];
@@ -1398,10 +1410,12 @@ extension TrackFastMoEKernels {
         precondition(BR % topK == 0 && H % 4 == 0 && bits == 4 && w.dtype == .float32 && S >= 1 && S <= 8)
         precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
+        // One extra simdgroup carries the shared expert's walk (MLXFAST-DCSHARE).
+        let nsimd = ksg + 1
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
             template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg)],
-            grid: (32, (H / 4) * ksg, S), threadGroup: (32, ksg, 1),
+            grid: (32, (H / 4) * nsimd, S), threadGroup: (32, nsimd, 1),
             outputShapes: [[S, H]], outputDTypes: [act.dtype])[0]
     }
 }
