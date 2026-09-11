@@ -706,6 +706,14 @@ METAL_FUNC void qmv_impl(
 
     static func isFast(k: Int, n: Int) -> Bool { n % 8 == 0 && k % 512 == 0 }
 
+    static func downCombineUsesPackedWordLoads(
+        dtype: DType, streams: Int, inputSize: Int, outputSize: Int,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> Bool {
+        dtype == .bfloat16 && streams == 1 && inputSize == 640 && outputSize == 2560
+            && groupSize == 32 && bits == 4 && mode == .affine
+    }
+
     /// 8-row blocks per threadgroup: the K=640 down projection is overhead-bound
     /// at one block per threadgroup.
     static func rowBlocks(k: Int) -> Int { k % 512 == 0 ? 1 : 4 }
@@ -924,8 +932,30 @@ extension TrackFastMoEKernels {
           }
         }
 
+        template <typename U, int values_per_thread, int bits>
+        inline U qdot_packed_word(
+            const device uint8_t* w,
+            const thread U* x_thread,
+            U scale,
+            U bias,
+            U sum) {
+          static_assert(bits == 4, "packed word qdot is 4-bit only");
+          static_assert(values_per_thread == 8, "packed word qdot requires eight values");
+          U accum = 0;
+          const uint packet = *((const device uint*)w);
+          for (int i = 0; i < (values_per_thread / 4); i++) {
+            const uint word = (packet >> (16 * i)) & 0xffffu;
+            accum +=
+                (x_thread[4 * i] * (word & 0x000f) +
+                 x_thread[4 * i + 1] * (word & 0x00f0) +
+                 x_thread[4 * i + 2] * (word & 0x0f00) +
+                 x_thread[4 * i + 3] * (word & 0xf000));
+          }
+          return scale * accum + sum * bias;
+        }
+
         // qmv_impl's normal branch (out_vec_size >= 8, full tile) likewise.
-        template <typename T, int group_size, int bits>
+        template <typename T, int group_size, int bits, bool packed_word_load = false>
         METAL_FUNC void qmv_reg(
             const device uint32_t* w,
             const device T* scales,
@@ -962,7 +992,11 @@ extension TrackFastMoEKernels {
               const device T* bl = biases + row * in_vec_size_g;
               U s = sl[0];
               U b = bl[0];
-              result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+              if constexpr (packed_word_load) {
+                result[row] += qdot_packed_word<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+              } else {
+                result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+              }
             }
             ws += block_size * bytes_per_pack / pack_factor;
             scales += block_size / group_size;
@@ -979,7 +1013,15 @@ extension TrackFastMoEKernels {
               const device T* bl = biases + row * in_vec_size_g;
               U s = sl[0];
               U b = bl[0];
-              result[row] += qdot_safe<U, values_per_thread, bits>(wl, x_thread, s, b, sum, remaining);
+              if constexpr (packed_word_load) {
+                if (remaining == values_per_thread) {
+                  result[row] += qdot_packed_word<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+                } else {
+                  result[row] += qdot_safe<U, values_per_thread, bits>(wl, x_thread, s, b, sum, remaining);
+                }
+              } else {
+                result[row] += qdot_safe<U, values_per_thread, bits>(wl, x_thread, s, b, sum, remaining);
+              }
             }
           }
           for (int row = 0; row < results_per_simdgroup; row++) {
@@ -1200,7 +1242,7 @@ extension TrackFastMoEKernels {
             const size_t eoff = (size_t)e * (size_t)H;
             const device T* xb = act + (size_t)z * (size_t)F;
             if (FAST) { qmv_fast_reg<T, GS, BITS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, thread_index_in_simdgroup, res); }
-            else { qmv_reg<T, GS, BITS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, thread_index_in_simdgroup, res); }
+            else { qmv_reg<T, GS, BITS, PACKED>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, thread_index_in_simdgroup, res); }
             const float wk = w[z];
             for (int i = 0; i < 4; ++i) { prod[k][i] = static_cast<float>(static_cast<T>(res[i])) * wk; }
         }
@@ -1212,7 +1254,7 @@ extension TrackFastMoEKernels {
             const device T* xs = act + (size_t)(BR + t) * (size_t)F;
             if constexpr (VPT == 1) {
                 float rs[4];
-                qmv_reg<T, GS, BITS>(wsd, ssd, bsd, xs, F, d0, thread_index_in_simdgroup, rs);
+                qmv_reg<T, GS, BITS, PACKED>(wsd, ssd, bsd, xs, F, d0, thread_index_in_simdgroup, rs);
                 for (int i = 0; i < 4; ++i) { shv[i] = static_cast<T>(rs[i]); }
             } else {
                 float rw[1];
@@ -1256,7 +1298,7 @@ extension TrackFastMoEKernels {
         precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
-            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S)],
+            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("PACKED", downCombineUsesPackedWordLoads(dtype: act.dtype, streams: S, inputSize: F, outputSize: H, groupSize: groupSize, bits: bits, mode: sharedDown.mode)), ("BR", BR), ("VPT", S)],
             grid: (32, H / 4, S), threadGroup: (32, 1, 1),
             outputShapes: [[S, H]], outputDTypes: [act.dtype])[0]
     }
