@@ -217,6 +217,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let hcCount: Int
     let hidden: Int
     let eps: Float
+    private let injectNormReplay: @Sendable ([MLXArray]) -> [MLXArray]
     let rotaryDims: Int
     let rotary: Qwen4ExpRotary
     let indexerBudget: Int
@@ -226,7 +227,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// inputs/outputs are appended here.
     nonisolated(unsafe) static var debugTaps: [(String, MLXArray)]? = nil
     /// Layers per partial dispatch inside a forward (0 = one dispatch per step).
-    nonisolated(unsafe) public static var asyncChunk: Int = 3  // MLXFAST-CHUNK3: 8 -> 16 submissions; 12 measured -0.41% so the gradient favours smaller
+    // MLXFAST-CHUNK3: 8 -> 16 submissions; 12 measured -0.41% so the gradient favours smaller
+    nonisolated(unsafe) public static var asyncChunk: Int = 1
+    /// Dispatch again at the middle of each layer, after the attention half is
+    /// built. The asyncChunk sweep is monotone toward more submissions (12 -> 6 ->
+    /// 3 -> 1 all improve), so 1 is the coarsest limit of that knob, not an
+    /// optimum. Defaults on; set false for the untouched single-dispatch base.
+    nonisolated(unsafe) public static var asyncSubLayer: Bool = true
 
     /// Kill switch for A/B: `TRACK_FAST_FORWARD=0` routes every forward to the
     /// wrapped model.
@@ -241,6 +248,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         self.hcCount = cfg.hcCount
         self.hidden = cfg.hiddenSize
         self.eps = cfg.rmsNormEps
+        self.injectNormReplay = compile(shapeless: false) {
+            [hcCount = cfg.hcCount, hidden = cfg.hiddenSize, eps = cfg.rmsNormEps] inputs in
+            let result = TrackFastKernels.injectNorm(
+                residual: inputs[0], out: inputs[1], inject: inputs[2], scale: inputs[3],
+                hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
+            return [result.stream, result.normed]
+        }
         self.rotaryDims = cfg.rotaryDimensions
         self.rotary = Qwen4ExpRotary(dimensions: cfg.rotaryDimensions, base: cfg.ropeTheta)
         self.indexerBudget = cfg.indexerBudget
@@ -672,6 +686,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return gated + convolved
     }
 
+    private func injectNorm(
+        residual: MLXArray, out: MLXArray?, inject: MLXArray?, scale: MLXArray, tile: Bool
+    ) -> (stream: MLXArray, normed: MLXArray) {
+        // Native replay does not key Swift task-local streams; trace and replay
+        // only on the canonical GPU stream. Other contexts retain the raw path.
+        if !tile, let out, let inject, StreamOrDevice.default.stream === Stream.gpu {
+            let result = injectNormReplay([residual, out, inject, scale])
+            return (result[0], result[1])
+        }
+        return TrackFastKernels.injectNorm(
+            residual: residual, out: out, inject: inject, scale: scale,
+            hcCount: hcCount, hidden: hidden, eps: eps, tile: tile)
+    }
+
     /// Both tower streams. `caches` is the compact attention layout.
     ///
     /// The inject of one block and the norm of the next mixer are one launch
@@ -698,22 +726,22 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             var normed: MLXArray
             if let ple = layer.ple {
                 // Materialize the stream, add the PLE block, then norm.
-                (stream, _) = TrackFastKernels.injectNorm(
+                (stream, _) = injectNorm(
                     residual: residual, out: pendingOut, inject: pendingInject,
-                    scale: layer.attnHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
+                    scale: layer.attnHC.normScaleQ,
                     tile: tile)
                 stream =
                     stream
                     + pleForward(
                         ple, stream: stream, ids: ids, evaluation: evaluation, capture: capture)
-                (stream, normed) = TrackFastKernels.injectNorm(
+                (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
-                    scale: layer.attnHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
+                    scale: layer.attnHC.normScaleQ,
                     tile: false)
             } else {
-                (stream, normed) = TrackFastKernels.injectNorm(
+                (stream, normed) = injectNorm(
                     residual: residual, out: pendingOut, inject: pendingInject,
-                    scale: layer.attnHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
+                    scale: layer.attnHC.normScaleQ,
                     tile: tile)
             }
             tile = false
@@ -734,11 +762,14 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             Self.debugTaps?.append(("L\(layer.index).attn.out", attended))
             if profiling { TrackFastProfile.tick(layer.gdn != nil ? "gdn" : "attn", &profT, [attended]) }
-            (stream, normed) = TrackFastKernels.injectNorm(
+            (stream, normed) = injectNorm(
                 residual: stream, out: attended, inject: injectW,
-                scale: layer.mlpHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
+                scale: layer.mlpHC.normScaleQ,
                 tile: false)
             if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
+            // Mid-layer dispatch: the attention half is complete here and everything
+            // below depends on it, so the GPU can start while the MoE half is built.
+            if Self.asyncSubLayer { asyncEval([stream, normed]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
             let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
             input = mm.input; injectW = mm.inject
@@ -755,9 +786,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 asyncEval(stream)
             }
         }
-        let (multi, finalNormed) = TrackFastKernels.injectNorm(
+        let (multi, finalNormed) = injectNorm(
             residual: residual, out: pendingOut, inject: pendingInject,
-            scale: finalMixer.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
+            scale: finalMixer.normScaleQ,
             tile: false)
         let mixed = hcMix(finalMixer, normed: finalNormed).input
         return (mixed, multi)
