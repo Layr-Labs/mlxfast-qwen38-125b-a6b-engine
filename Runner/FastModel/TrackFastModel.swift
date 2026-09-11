@@ -229,10 +229,18 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     nonisolated(unsafe) static var debugTaps: [(String, MLXArray)]? = nil
     /// Layers per partial dispatch inside a forward (0 = one dispatch per step).
     nonisolated(unsafe) public static var asyncChunk: Int = 3
-    /// Layers in the first partial-dispatch chunk (0 = same as asyncChunk):
-    /// the first dispatch lands right after the PLE layer, whose host row
-    /// gather is the one host sync of the step.
-    nonisolated(unsafe) public static var asyncFirst: Int = 2
+    /// Layers in the first partial-dispatch chunk (0 = same as asyncChunk).
+    ///
+    /// MLXFAST-ASYNCFIRST: was 2, "so the first dispatch lands right after the
+    /// PLE layer, whose host row gather is the one host sync of the step". That
+    /// justification does not hold: the PLE gather at layer 1 reads the sampled
+    /// token with `ids.asArray`, which blocks on the PREVIOUS step's GPU work,
+    /// not on this step's. So with 2, layer 0 of this step is built but still
+    /// unqueued while the CPU sits in that wait, and the GPU has nothing of the
+    /// current step to chew on. At 1 the flush cadence is unchanged in count
+    /// (n = 1, 4, 7, ... instead of 2, 5, 8, ...) and simply starts one layer
+    /// earlier, so layer 0 is already submitted before the sync.
+    nonisolated(unsafe) public static var asyncFirst: Int = 1
     /// Layer count at an optional second dispatch (0 = none).
     nonisolated(unsafe) public static var asyncSecond: Int = 0
 
