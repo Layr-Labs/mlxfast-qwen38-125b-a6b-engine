@@ -226,7 +226,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// inputs/outputs are appended here.
     nonisolated(unsafe) static var debugTaps: [(String, MLXArray)]? = nil
     /// Layers per partial dispatch inside a forward (0 = one dispatch per step).
-    nonisolated(unsafe) public static var asyncChunk: Int = 3  // MLXFAST-CHUNK3: 8 -> 16 submissions; 12 measured -0.41% so the gradient favours smaller
+    // MLXFAST-CHUNK3: 8 -> 16 submissions; 12 measured -0.41% so the gradient favours smaller
+    nonisolated(unsafe) public static var asyncChunk: Int = 1
+    /// Dispatch again at the middle of each layer, after the attention half is
+    /// built. The asyncChunk sweep is monotone toward more submissions (12 -> 6 ->
+    /// 3 -> 1 all improve), so 1 is the coarsest limit of that knob, not an
+    /// optimum. Defaults on; set false for the untouched single-dispatch base.
+    nonisolated(unsafe) public static var asyncSubLayer: Bool = true
 
     /// Kill switch for A/B: `TRACK_FAST_FORWARD=0` routes every forward to the
     /// wrapped model.
@@ -739,6 +745,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 scale: layer.mlpHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
                 tile: false)
             if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
+            // Mid-layer dispatch: the attention half is complete here and everything
+            // below depends on it, so the GPU can start while the MoE half is built.
+            if Self.asyncSubLayer { asyncEval([stream, normed]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
             let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
             input = mm.input; injectW = mm.inject
