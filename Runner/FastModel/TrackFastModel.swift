@@ -199,6 +199,8 @@ struct TrackLayer {
     let index: Int
     let attnHC: TrackHC
     let mlpHC: TrackHC
+    let attnDownInjectReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
+    let mlpDownInjectReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let gdn: TrackGDN?
     let attn: TrackAttn?
     let moe: TrackMoE
@@ -412,7 +414,33 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             ple = bindPLE(pleLayer, ordinal: ordinal, cfg: cfg)
         }
         return TrackLayer(
-            index: index, attnHC: attnHC, mlpHC: mlpHC, gdn: gdn, attn: attn, moe: moe, ple: ple)
+            index: index, attnHC: attnHC, mlpHC: mlpHC,
+            attnDownInjectReplay: makeDownInjectReplay(attnHC),
+            mlpDownInjectReplay: makeDownInjectReplay(mlpHC),
+            gdn: gdn, attn: attn, moe: moe, ple: ple)
+    }
+
+    private static func makeDownInjectReplay(_ hc: TrackHC)
+        -> (@Sendable ([MLXArray]) -> [MLXArray])?
+    {
+        guard hc.hasInject, case .quant(let down) = hc.down, case .quant(let up) = hc.up,
+            case .quant(let inject)? = hc.inject,
+            down.biases != nil, up.biases != nil, inject.biases != nil
+        else { return nil }
+        // Bind metadata, never tensors: parameter updates must stay live inputs.
+        let downGroupSize = down.groupSize, downBits = down.bits, downMode = down.mode
+        let injectGroupSize = inject.groupSize, injectBits = inject.bits, injectMode = inject.mode
+        return compile(shapeless: false) {
+            [downGroupSize, downBits, downMode, injectGroupSize, injectBits, injectMode] inputs in
+            let down = TrackQuantWeight(
+                weight: inputs[1], scales: inputs[2], biases: inputs[3],
+                groupSize: downGroupSize, bits: downBits, mode: downMode)
+            let inject = TrackQuantWeight(
+                weight: inputs[4], scales: inputs[5], biases: inputs[6],
+                groupSize: injectGroupSize, bits: injectBits, mode: injectMode)
+            let result = TrackFastMixerKernels.downInject(normed: inputs[0], down: down, inject: inject)
+            return [result.lo, result.act, result.inj]
+        }
     }
 
     // MARK: forward pieces
@@ -427,7 +455,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// block input `[B,S,H]` and the inject weights `[B,S,hc]`.
     /// Returns the block input, the inject weights and, when `emitF32`, the
     /// input as float32 (the router's operand) written by the same launch.
-    private func hcMix(_ hc: TrackHC, normed: MLXArray, tag: String = "", emitF32: Bool = false)
+    private func hcMix(
+        _ hc: TrackHC, normed: MLXArray,
+        downInjectReplay: (@Sendable ([MLXArray]) -> [MLXArray])?,
+        tag: String = "", emitF32: Bool = false
+    )
         -> (input: MLXArray, inject: MLXArray, inputF32: MLXArray?)
     {
         let S = normed.dim(1)
@@ -438,7 +470,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             if hc.hasInject, case .quant(let q)? = hc.inject, q.biases != nil { injQ = q }
             if !hc.hasInject || injQ != nil {
                 let n2 = normed.reshaped(S, hcCount * hidden)
-                let d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
+                let d: (lo: MLXArray, act: MLXArray, inj: MLXArray)
+                // Native compile does not key Swift's scoped stream defaults.
+                if let downInjectReplay, let injQ, StreamOrDevice.default.stream === Stream.gpu {
+                    let outputs = downInjectReplay([
+                        n2, dq.weight, dq.scales, dq.biases!,
+                        injQ.weight, injQ.scales, injQ.biases!,
+                    ])
+                    d = (outputs[0], outputs[1], outputs[2])
+                } else {
+                    d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
+                }
                 let u = TrackFastMixerKernels.upMix(
                     act: d.act, normed: n2, up: uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
                     hasInject: hc.hasInject, emitF32: emitF32)
@@ -718,7 +760,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             tile = false
             if profiling { TrackFastProfile.tick(layer.ple != nil ? "norm+ple" : "norm", &profT, [stream, normed]) }
-            let am = hcMix(layer.attnHC, normed: normed, tag: "L\(layer.index).attn.hc")
+            let am = hcMix(
+                layer.attnHC, normed: normed, downInjectReplay: layer.attnDownInjectReplay,
+                tag: "L\(layer.index).attn.hc")
             var input = am.input, injectW = am.inject
             if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
             Self.debugTaps?.append(("L\(layer.index).attn.stream_in", stream))
@@ -740,7 +784,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 tile: false)
             if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
-            let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
+            let mm = hcMix(
+                layer.mlpHC, normed: normed, downInjectReplay: layer.mlpDownInjectReplay,
+                tag: "L\(layer.index).mlp.hc", emitF32: true)
             input = mm.input; injectW = mm.inject
             if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
@@ -759,7 +805,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             residual: residual, out: pendingOut, inject: pendingInject,
             scale: finalMixer.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
             tile: false)
-        let mixed = hcMix(finalMixer, normed: finalNormed).input
+        let mixed = hcMix(finalMixer, normed: finalNormed, downInjectReplay: nil).input
         return (mixed, multi)
     }
 
