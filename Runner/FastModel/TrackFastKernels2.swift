@@ -316,11 +316,84 @@ extension TrackFastKernels {
         outputNames: ["out"],
         source: gatedRMSSource, header: exactHeader, ensureRowContiguous: true)
 
+    static let gatedRMSVectorSource = """
+        constexpr int N_READS = 4;
+        using InT4 = vec<InT, 4>;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint hv = thread_position_in_grid.y;
+        const uint row = thread_position_in_grid.z;
+        const uint lane = thread_index_in_simdgroup;
+        threadgroup float local_sums[32];
+        const uint ybase = (row * Hv + hv) * Dv;
+        const device InT4* y4 = (const device InT4*)(y + ybase);
+        const InT4 xv = y4[lid];
+        float thread_x[N_READS];
+        thread_x[0] = static_cast<float>(xv[0]);
+        thread_x[1] = static_cast<float>(xv[1]);
+        thread_x[2] = static_cast<float>(xv[2]);
+        thread_x[3] = static_cast<float>(xv[3]);
+        float acc = 0.0f;
+        acc += thread_x[0] * thread_x[0];
+        acc += thread_x[1] * thread_x[1];
+        acc += thread_x[2] * thread_x[2];
+        acc += thread_x[3] * thread_x[3];
+        acc = simd_sum(acc);
+        if (lane >= 1) { local_sums[lane] = 0; }
+        if (lane == 0) { local_sums[0] = acc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        acc = simd_sum(local_sums[lane]);
+        const float inv_mean = metal::precise::rsqrt(acc / (float)Dv + as_type<float>((uint)EPS_BITS));
+        const uint dbase = lid * N_READS;
+        const device InT4* proj4 = (const device InT4*)(proj + row * PW + Z_OFF + hv * Dv);
+        const InT4 zv = proj4[lid];
+        InT4 result;
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = dbase + i;
+            InT n = w[d] * static_cast<InT>(thread_x[i] * inv_mean);
+            const float z = static_cast<float>(zv[i]);
+            const float g = mlx_sigmoid(z);
+            result[i] = static_cast<InT>(g * static_cast<float>(n));
+        }
+        device InT4* out4 = (device InT4*)(out + ybase);
+        out4[lid] = result;
+        """
+
+    nonisolated(unsafe) static let gatedRMSVectorKernel = MLXFast.metalKernel(
+        name: "track_gated_rms_vec4",
+        inputNames: ["y", "proj", "w"],
+        outputNames: ["out"],
+        source: gatedRMSVectorSource, header: exactHeader, ensureRowContiguous: true)
+
+    static func gatedRMSUsesVectorActivationLoads(
+        yDType: DType, projDType: DType, weightDType: DType,
+        sequenceLength: Int, projectionWidth: Int, zOffset: Int
+    ) -> Bool {
+        sequenceLength > 8
+            && yDType == .bfloat16
+            && projDType == .bfloat16
+            && weightDType == .bfloat16
+            && projectionWidth % 4 == 0
+            && zOffset % 4 == 0
+    }
+
     static func gatedRMS(y: MLXArray, proj: MLXArray, w: MLXArray, zOffset: Int, eps: Float)
         -> MLXArray
     {
         let B = y.dim(0), S = y.dim(1), Hv = y.dim(2), Dv = y.dim(3)
         precondition(Dv == 128)
+        if gatedRMSUsesVectorActivationLoads(
+            yDType: y.dtype, projDType: proj.dtype, weightDType: w.dtype,
+            sequenceLength: S, projectionWidth: proj.dim(2), zOffset: zOffset
+        ) {
+            return gatedRMSVectorKernel(
+                [y, proj, w],
+                template: [
+                    ("InT", y.dtype), ("Hv", Hv), ("Dv", Dv), ("PW", proj.dim(2)),
+                    ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)),
+                ],
+                grid: (32, Hv, B * S), threadGroup: (32, 1, 1),
+                outputShapes: [[B, S, Hv * Dv]], outputDTypes: [y.dtype])[0]
+        }
         return gatedRMSKernel(
             [y, proj, w],
             template: [
