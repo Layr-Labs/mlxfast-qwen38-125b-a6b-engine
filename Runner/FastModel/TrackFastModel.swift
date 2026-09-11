@@ -242,6 +242,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     nonisolated(unsafe) public static var asyncFirst: Int = 2
     /// Layer count at an optional second dispatch (0 = none).
     nonisolated(unsafe) public static var asyncSecond: Int = 0
+    /// Layers per partial dispatch for a WIDE window (prefill). A decode step is
+    /// a few tokens and latency-bound, so it wants its dispatches early and
+    /// often; a prefill window is a thousand tokens with enough work in flight to
+    /// hide the build, so it pipelines better with fewer synchronization points.
+    /// One schedule cannot be right for both, and until now both used
+    /// `asyncChunk`.
+    nonisolated(unsafe) public static var asyncWideChunk: Int = 6
+    /// Windows at or above this length take `asyncWideChunk`. Eight is the decode
+    /// window this file already uses for its one-token kernel paths, so every
+    /// scored decode step keeps the tuned schedule unchanged.
+    nonisolated(unsafe) public static var asyncWideMinS: Int = 9
 
     /// Kill switch for A/B: `TRACK_FAST_FORWARD=0` routes every forward to the
     /// wrapped model.
@@ -880,6 +891,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         var stream = residual
         let ropeTab = ropeTables(offset: offset, count: ids.dim(1), dtype: residual.dtype)
 
+        // Dispatch granularity is chosen once per window, from its width. A
+        // scored decode step is S <= 8 and keeps `asyncChunk` exactly as tuned;
+        // only a wide prefill window takes the sparser schedule.
+        let chunk = ids.dim(1) >= Self.asyncWideMinS ? Self.asyncWideChunk : Self.asyncChunk
+
         let profiling = TrackFastProfile.prefill != nil && ids.dim(1) >= TrackFastProfile.minWindow
         var profT = profiling ? CFAbsoluteTimeGetCurrent() : 0
         if profiling { TrackFastProfile.windows += 1 }
@@ -941,11 +957,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             residual = stream
             // Dispatch the graph so far: the GPU starts on these layers while the
             // CPU keeps building the rest (the build is otherwise GPU-idle time).
-            if Self.asyncChunk > 0 {
+            if chunk > 0 {
                 let n = layer.index + 1
-                let first = Self.asyncFirst > 0 ? Self.asyncFirst : Self.asyncChunk
+                let first = Self.asyncFirst > 0 ? Self.asyncFirst : chunk
                 let second = Self.asyncSecond > first ? Self.asyncSecond : first
-                if n == first || n == second || (n > second && (n - second) % Self.asyncChunk == 0) { asyncEval(stream) }
+                if n == first || n == second || (n > second && (n - second) % chunk == 0) { asyncEval(stream) }
             }
         }
         let (multi, finalNormed) = injectNorm(
