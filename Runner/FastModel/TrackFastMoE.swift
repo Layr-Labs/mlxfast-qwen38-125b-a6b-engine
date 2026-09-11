@@ -842,10 +842,33 @@ extension TrackFastMoEKernels {
         outputNames: ["idx", "w", "gate"],
         source: routeSource, header: TrackFastKernels.mixerHeadHeader + wideDecls, ensureRowContiguous: true)
 
+    static let prepareInputSource = """
+        {
+            static_assert(VPT == 1 && BITS == 4 && KD % 512 == 0, "prepared input geometry");
+            if (simdgroup_index_in_threadgroup == 1) {
+                for (uint chunk = thread_index_in_simdgroup; chunk < KD / 16; chunk += 32) {
+                    float values[16];
+                    const float sum = load_vector<T, float, 16, 4>(x + chunk * 16, values);
+                    for (int i = 0; i < 16; ++i) { prepared_x[chunk * 16 + i] = values[i]; }
+                    prepared_sums[chunk] = sum;
+                }
+            }
+        }
+        """
+
+    nonisolated(unsafe) static let routePreparedKernel1 = MLXFast.metalKernel(
+        name: "track_moe_route_prepared_1",
+        inputNames: ["logits", "x", "wg", "sgw", "bgw"],
+        outputNames: ["idx", "w", "gate", "prepared_x", "prepared_sums"],
+        source: prepareInputSource + "\n" + routeSource,
+        header: TrackFastKernels.mixerHeadHeader + wideDecls, ensureRowContiguous: true)
+
     /// logits f32 [..., E] -> (idx uint32 [..., K], w f32 [..., K])
     /// Also the shared-expert gate logit per row: x [..., KD] x sharedGate [1, KD] -> gate [...] (pre-sigmoid).
-    static func route(logits: MLXArray, x: MLXArray, sharedGate: TrackQuantWeight?, topK: Int)
-        -> (idx: MLXArray, w: MLXArray, gate: MLXArray)
+    static func route(
+        logits: MLXArray, x: MLXArray, sharedGate: TrackQuantWeight?, topK: Int,
+        prepareInput: Bool = false
+    ) -> (idx: MLXArray, w: MLXArray, gate: MLXArray, prepared: (x: MLXArray, sums: MLXArray)?)
     {
         precondition(logits.dtype == .float32 && (sharedGate == nil || (sharedGate!.rows == 1 && sharedGate!.bits == 4)))
         let g = sharedGate
@@ -854,12 +877,18 @@ extension TrackFastMoEKernels {
         let R = lead.reduce(1, *)
         precondition(topK <= 32 && topK <= E && R >= 1 && R <= 8 && KD % 256 == 0)
         let simdgroups = g == nil ? 1 : 2
-        let outs = (R == 1 ? routeKernel1 : routeKernel)(
+        let prepare = prepareInput && R == 1 && KD == 2560 && x.dtype == .bfloat16
+            && g?.groupSize == 32 && g?.bits == 4 && g?.mode == .affine
+        let kernel = prepare ? routePreparedKernel1 : (R == 1 ? routeKernel1 : routeKernel)
+        let outs = kernel(
             [logits.reshaped(R, E), x.reshaped(R, KD), g?.weight ?? x, g?.scales ?? x, g?.biases ?? x],
             template: [("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32), ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R), ("HAS_GATE", g != nil)],
             grid: (32, R * simdgroups, 1), threadGroup: (32, simdgroups, 1),
-            outputShapes: [[R, topK], [R, topK], [R]], outputDTypes: [.uint32, .float32, x.dtype])
-        return (outs[0].reshaped(lead + [topK]), outs[1].reshaped(lead + [topK]), outs[2].reshaped(lead))
+            outputShapes: [[R, topK], [R, topK], [R]] + (prepare ? [[KD], [KD / 16]] : []),
+            outputDTypes: [.uint32, .float32, x.dtype] + (prepare ? [.float32, .float32] : []))
+        return (
+            outs[0].reshaped(lead + [topK]), outs[1].reshaped(lead + [topK]), outs[2].reshaped(lead),
+            prepare ? (outs[3], outs[4]) : nil)
     }
 }
 
@@ -1168,7 +1197,7 @@ extension TrackFastMoEKernels {
     static let gateUpReuseRowsPerSimdgroup = 2
 
     static let gateUpReuseHelpers = #"""
-        template <typename T, int group_size, int bits, int rows>
+        template <typename T, int group_size, int bits, int rows, bool PREPARED>
         METAL_FUNC void qmv_fast_reg_dual(
             const device uint32_t* w0,
             const device T* scales0,
@@ -1177,6 +1206,8 @@ extension TrackFastMoEKernels {
             const device T* scales1,
             const device T* biases1,
             const device T* x,
+            const device float* prepared_x,
+            const device float* prepared_sums,
             const int in_vec_size,
             const int out_row,
             uint simd_lid,
@@ -1206,7 +1237,15 @@ extension TrackFastMoEKernels {
           biases1 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
           x += simd_lid * values_per_thread;
           for (int k = 0; k < in_vec_size; k += block_size) {
-            U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+            U sum;
+            if constexpr (PREPARED) {
+              for (int i = 0; i < values_per_thread; ++i) {
+                x_thread[i] = prepared_x[k + simd_lid * values_per_thread + i];
+              }
+              sum = prepared_sums[k / values_per_thread + simd_lid];
+            } else {
+              sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+            }
             for (int row = 0; row < rows; row++) {
               auto wl0 = (const device uint8_t*)(ws0 + row * in_vec_size_w);
               const device T* sl0 = scales0 + row * in_vec_size_g;
@@ -1236,7 +1275,8 @@ extension TrackFastMoEKernels {
         }
         """#
 
-    static let gateUpReuseSource = """
+    static func gateUpReuseSource(prepared: Bool) -> String {
+        """
         const uint z = threadgroup_position_in_grid.z;
         const bool shared = z == (uint)BR;
         const uint e = shared ? 0u : idx[z];
@@ -1253,8 +1293,9 @@ extension TrackFastMoEKernels {
         const int out_row = (int)threadgroup_position_in_grid.y * (2 * RPS)
             + (int)simdgroup_index_in_threadgroup * RPS;
         float g[RPS], u[RPS];
-        qmv_fast_reg_dual<T, GS, BITS, RPS>(
+        qmv_fast_reg_dual<T, GS, BITS, RPS, \(prepared ? "true" : "false")>(
             gw, gs, gb, uw, us, ub, x + (size_t)r * (size_t)KD,
+            \(prepared ? "prepared_x" : "nullptr"), \(prepared ? "prepared_sums" : "nullptr"),
             KD, out_row, thread_index_in_simdgroup, g, u);
         if (thread_index_in_simdgroup == 0) {
             for (int i = 0; i < RPS; ++i) {
@@ -1264,19 +1305,29 @@ extension TrackFastMoEKernels {
             }
         }
         """
+    }
 
     nonisolated(unsafe) static let gateUpReuseKernel = MLXFast.metalKernel(
         name: "track_moe_gate_up_reuse_2row",
         inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
         outputNames: ["act"],
-        source: gateUpReuseSource,
+        source: gateUpReuseSource(prepared: false),
+        header: helpersCore + TrackFastKernels.exactHeader + gateUpReuseHelpers,
+        ensureRowContiguous: true)
+
+    nonisolated(unsafe) static let gateUpPreparedKernel = MLXFast.metalKernel(
+        name: "track_moe_gate_up_prepared_2row",
+        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow", "prepared_x", "prepared_sums"],
+        outputNames: ["act"],
+        source: gateUpReuseSource(prepared: true),
         header: helpersCore + TrackFastKernels.exactHeader + gateUpReuseHelpers,
         ensureRowContiguous: true)
 
     /// Routed slots [0, BR) then the shared expert for the S tokens: act [BR + S, N].
     static func gateUpAct(
         wg: MLXArray, sg: MLXArray, bg: MLXArray, wu: MLXArray, su: MLXArray, bu: MLXArray,
-        shared: TrackQuantWeight, x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int
+        shared: TrackQuantWeight, x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int,
+        prepared: (x: MLXArray, sums: MLXArray)? = nil
     ) -> MLXArray {
         let BR = idx.dim(0), S = x.dim(0), KD = x.dim(1), N = wg.dim(1)
         precondition(N % 8 == 0 && bits == 4 && idx.dtype == .uint32 && xrow.dtype == .uint32)
@@ -1286,8 +1337,14 @@ extension TrackFastMoEKernels {
             && groupSize == 32 && bits == 4 && shared.mode == .affine
         {
             let rows = gateUpReuseRowsPerSimdgroup
-            return gateUpReuseKernel(
-                [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
+            if let prepared {
+                precondition(prepared.x.dtype == .float32 && prepared.sums.dtype == .float32)
+                precondition(prepared.x.shape == [KD] && prepared.sums.shape == [KD / 16])
+            }
+            let kernel = prepared == nil ? gateUpReuseKernel : gateUpPreparedKernel
+            return kernel(
+                [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow]
+                    + (prepared.map { [$0.x, $0.sums] } ?? []),
                 template: [
                     ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N),
                     ("KD", KD), ("BR", BR), ("RPS", rows),
