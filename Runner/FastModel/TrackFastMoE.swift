@@ -68,12 +68,21 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 4) {
+    // MLXFAST-VEC4LOAD: one 8-byte vector load per four activations instead of
+    // four scalar loads. `x` advances by `simd_lid * values_per_thread` and by
+    // `block_size`, both multiples of 16 elements (32 B at bf16), and `i` steps
+    // by 4 (8 B), so every access here is 8-byte aligned and a `vec<T,4>` load
+    // is legal. Bit-exact by construction: the four values are the same four
+    // values, the running sum keeps the identical left-to-right order
+    // (v.x, v.y, v.z, v.w == x[i], x[i+1], x[i+2], x[i+3]), and the four
+    // `x_thread` scale divisors are unchanged. Only the load instruction moves.
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+      const vec<T, 4> v = *reinterpret_cast<const device vec<T, 4>*>(x + i);
+      sum += v.x + v.y + v.z + v.w;
+      x_thread[i] = v.x;
+      x_thread[i + 1] = v.y / 16.0f;
+      x_thread[i + 2] = v.z / 256.0f;
+      x_thread[i + 3] = v.w / 4096.0f;
     }
   }
 
