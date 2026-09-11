@@ -875,11 +875,9 @@ extension TrackFastMoEKernels {
 extension TrackFastMoEKernels {
     static let regHelpers = #"""
 
-        // qmv_fast_impl with `out_row` given and the row results returned
+        // qmv_fast_impl with `out_row` given and the 4 row results returned
         // (all lanes hold them after simd_sum). x points at the vector.
-        // MLXFAST-MIX2ROW: only the number of independent contiguous rows varies.
-        // The default preserves every existing four-row caller's arithmetic.
-        template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
+        template <typename T, int group_size, int bits>
         METAL_FUNC void qmv_fast_reg(
             const device uint32_t* w,
             const device T* scales,
@@ -888,8 +886,9 @@ extension TrackFastMoEKernels {
             const int in_vec_size,
             const int out_row,
             uint simd_lid,
-            thread float (&result)[results_per_simdgroup]) {
+            thread float (&result)[4]) {
           constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+          constexpr int results_per_simdgroup = 4;
           constexpr int pack_factor = get_pack_factor<bits, 32>();
           constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
           constexpr int values_per_thread = pack_factor * packs_per_thread;
