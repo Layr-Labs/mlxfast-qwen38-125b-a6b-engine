@@ -148,6 +148,7 @@ struct TrackGDN {
     let geometry: TrackFastKernels.GDNGeometry
     let zOffset: Int
     let valueDim: Int
+    let replay: (@Sendable ([MLXArray]) -> [MLXArray])?
 }
 
 struct TrackAttn {
@@ -322,9 +323,37 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             projWidth: proj.width, convDim: convDim, convKernel: kc,
             hk: hk, hv: hv, dk: dk, dv: dv,
             bOffset: proj.offsets[2], aOffset: proj.offsets[3])
+        let replay = Self.makeGDNReplay(geometry: geometry, zOffset: proj.offsets[1])
         return TrackGDN(
             proj: proj, convW: convW, negExpALog: negExpALog, dtBias: dtBias, normW: normW,
-            out: out, geometry: geometry, zOffset: proj.offsets[1], valueDim: valueDim)
+            out: out, geometry: geometry, zOffset: proj.offsets[1], valueDim: valueDim,
+            replay: replay)
+    }
+
+    /// Replay only the three opaque GDN launches (prep, lean recurrence,
+    /// gated norm); the projection GEMVs, state staging and out projection
+    /// stay live. Geometry scalars are captured; all seven arrays stay live
+    /// arguments. `capture` windows and the split-projection wide path keep
+    /// the raw path (their template/geometry differs).
+    static func makeGDNReplay(
+        geometry geo: TrackFastKernels.GDNGeometry, zOffset: Int
+    ) -> @Sendable ([MLXArray]) -> [MLXArray] {
+        return compile(shapeless: false) {
+            [projWidth = geo.projWidth, convDim = geo.convDim,
+             convKernel = geo.convKernel, hk = geo.hk, hv = geo.hv,
+             dk = geo.dk, dv = geo.dv, bOffset = geo.bOffset, aOffset = geo.aOffset,
+             zOffset = zOffset] inputs in
+            let geometry = TrackFastKernels.GDNGeometry(
+                projWidth: projWidth, convDim: convDim, convKernel: convKernel,
+                hk: hk, hv: hv, dk: dk, dv: dv, bOffset: bOffset, aOffset: aOffset)
+            let r = TrackFastKernels.gdn(
+                proj: inputs[0], convState: inputs[1], convW: inputs[2],
+                negExpALog: inputs[3], dtBias: inputs[4], stateIn: inputs[5],
+                T: inputs[0].dim(1), capture: false, geometry: geometry)
+            let gated = TrackFastKernels.gatedRMS(
+                y: r.y, proj: inputs[0], w: inputs[6], zOffset: zOffset, eps: 1e-6)
+            return [gated, r.convOut, r.stateOut]
+        }
     }
 
     static func bindAttn(_ m: Module, cfg: Qwen4ExpTextConfiguration) -> TrackAttn {
@@ -539,6 +568,19 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             state?.conv ?? MLXArray.zeros([B, geo.convKernel - 1, geo.convDim], dtype: x.dtype)
         let ssm =
             state?.ssm ?? MLXArray.zeros([B, geo.hv, geo.dv, geo.dk], dtype: .float32)
+        if let replay = g.replay, !capture, !separate,
+            StreamOrDevice.default.stream === Stream.gpu
+        {
+            let out = replay([
+                proj, convState, g.convW, g.negExpALog, g.dtBias, ssm, g.normW,
+            ])
+            do {
+                try evaluation.stage(modelLayerIndex: layerIndex, conv: out[1], ssm: out[2])
+            } catch {
+                preconditionFailure("TrackFastModel: recurrent stage failed at layer \(layerIndex): \(error)")
+            }
+            return g.out.apply(out[0])
+        }
         let r = TrackFastKernels.gdn(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
             dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo,
