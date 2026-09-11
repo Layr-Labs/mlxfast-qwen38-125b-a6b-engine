@@ -224,6 +224,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let indexerBudget: Int
     let attentionScale: Float
 
+    // MLXFAST-NOTAPE: keep deferred QSA copies out of cache.innerState().
+    // KV buffers, device offsets and recurrent evaluation roots are unchanged.
+    private let pendingIndexerTapes = TrackPendingIndexerTapes()
+
     /// Debug taps (tests): when set, every layer's output stream and the block
     /// inputs/outputs are appended here.
     nonisolated(unsafe) static var debugTaps: [(String, MLXArray)]? = nil
@@ -538,7 +542,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func attnForward(
         _ a: TrackAttn, _ x: MLXArray, cache: Qwen4ExpCBv2LayerCache,
-        rope: (cos: MLXArray, sin: MLXArray)
+        rope: (cos: MLXArray, sin: MLXArray), capture: Bool
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let heads = cfg.attentionHeads, kvHeads = cfg.kvHeads, d = cfg.headDim
@@ -551,7 +555,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } else {
             idxKeys = a.indexerFull.apply(x)[.ellipsis, a.indexerQWidth...]
         }
-        _ = cache.updateIndexerTape(keys: idxKeys)
+        // MLXFAST-NOTAPE: keepMask is nil throughout the eligible fast path.
+        pendingIndexerTapes.append(keys: idxKeys, cache: cache, deferred: !capture && S <= 8)
 
         let prep = TrackFastKernels.attnPrep(
             qkv: qkv, qNorm: a.qNormW, kNorm: a.kNormW, cos: rope.cos, sin: rope.sin,
@@ -822,7 +827,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             } else {
                 let cache = caches[attentionIndex]
                 attentionIndex += 1
-                attended = attnForward(layer.attn!, input, cache: cache, rope: ropeTab)
+                attended = attnForward(
+                    layer.attn!, input, cache: cache, rope: ropeTab, capture: capture)
             }
             Self.debugTaps?.append(("L\(layer.index).attn.out", attended))
             if profiling { TrackFastProfile.tick(layer.gdn != nil ? "gdn" : "attn", &profT, [attended]) }
@@ -892,10 +898,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         _ tokens: MLXArray, inputEmbeddings: MLXArray?, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, capture: Bool
     ) -> (mixed: MLXArray, multi: MLXArray)? {
+        // MLXFAST-NOTAPE: every failed plan hands the original cache to the
+        // wrapped model, which may read the tape. Capture starts fully eager.
+        pendingIndexerTapes.prune()
         guard let plan = fastPlan(
             tokens: tokens, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds)
-        else { return nil }
+        else {
+            pendingIndexerTapes.flush()
+            return nil
+        }
+        if capture { pendingIndexerTapes.flush() }
         return fastStreams(
             tokens, inputEmbeddings: inputEmbeddings, caches: plan.caches,
             recurrentState: recurrentState, offset: plan.offset, capture: capture)
@@ -914,10 +927,13 @@ extension TrackQwen4ExpFastModel: LanguageModel, KVCacheDimensionProvider {
         base.sanitize(weights: weights, metadata: metadata)
     }
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
-        try base.prepare(input, cache: cache, windowSize: windowSize)
+        // MLXFAST-NOTAPE: legacy entry points delegate without fastPlan.
+        pendingIndexerTapes.flush()
+        return try base.prepare(input, cache: cache, windowSize: windowSize)
     }
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        base(inputs, cache: cache)
+        pendingIndexerTapes.flush()
+        return base(inputs, cache: cache)
     }
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         base.newCache(parameters: parameters)
@@ -971,7 +987,8 @@ extension TrackQwen4ExpFastModel: CBv2PositionedRecurrentLanguageModelForwardabl
     public func embeddingForward(
         _ inputs: MLXArray, inputEmbedding: MLXArray, cache: [KVCache]?
     ) -> MLXArray {
-        base.embeddingForward(inputs, inputEmbedding: inputEmbedding, cache: cache)
+        pendingIndexerTapes.flush()
+        return base.embeddingForward(inputs, inputEmbedding: inputEmbedding, cache: cache)
     }
 
     public func embeddingForward(
