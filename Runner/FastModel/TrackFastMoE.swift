@@ -696,13 +696,15 @@ METAL_FUNC void qmv_impl(
         name: "track_moe_gate_up",
         inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "x", "idx", "xrow"],
         outputNames: ["gate", "up"],
-        source: gateUpSource, header: helpers, ensureRowContiguous: true)
+        // MLXFAST-HDRTRIM: the entry point requires 4-bit weights.
+        source: gateUpSource, header: helpers4, ensureRowContiguous: true)
 
     nonisolated(unsafe) static let singleKernel = MLXFast.metalKernel(
         name: "track_moe_single",
         inputNames: ["w", "scales", "biases", "x", "idx"],
         outputNames: ["out"],
-        source: singleSource, header: helpers, ensureRowContiguous: true)
+        // MLXFAST-HDRTRIM: the entry point requires 4-bit weights.
+        source: singleSource, header: helpers4, ensureRowContiguous: true)
 
     static func isFast(k: Int, n: Int) -> Bool { n % 8 == 0 && k % 512 == 0 }
 
@@ -836,7 +838,8 @@ extension TrackFastMoEKernels {
         name: "track_moe_route",
         inputNames: ["logits", "x", "wg", "sgw", "bgw"],
         outputNames: ["idx", "w", "gate"],
-        source: routeSource, header: TrackFastKernels.mixerHeadHeader + wideHelpers, ensureRowContiguous: true)
+        // MLXFAST-HDRTRIM: the entry point requires 4-bit weights.
+        source: routeSource, header: TrackFastKernels.mixerHeadHeader + wideHelpers4, ensureRowContiguous: true)
     /// One-token instantiation: same source, wide bodies replaced by their declarations.
     nonisolated(unsafe) static let routeKernel1 = MLXFast.metalKernel(
         name: "track_moe_route_1",
@@ -1156,13 +1159,15 @@ extension TrackFastMoEKernels {
         name: "track_moe_gate_up_act",
         inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
         outputNames: ["act"],
-        source: gateUpActSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideHelpers,
+        // MLXFAST-HDRTRIM: the entry point requires 4-bit weights.
+        source: gateUpActSource, header: helpersCore4 + TrackFastKernels.exactHeader + regHelpers4 + wideHelpers4,
         ensureRowContiguous: true)
     nonisolated(unsafe) static let gateUpActKernel1 = MLXFast.metalKernel(
         name: "track_moe_gate_up_act_1",
         inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
         outputNames: ["act"],
-        source: gateUpActSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
+        // MLXFAST-HDRTRIM: the entry point requires 4-bit weights.
+        source: gateUpActSource, header: helpersCore4 + TrackFastKernels.exactHeader + regHelpers4 + wideDecls,
         ensureRowContiguous: true)
 
     /// Routed slots [0, BR) then the shared expert for the S tokens: act [BR + S, N].
@@ -1236,13 +1241,15 @@ extension TrackFastMoEKernels {
         name: "track_moe_down_combine",
         inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate"],
         outputNames: ["out"],
-        source: downCombineSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideHelpers,
+        // MLXFAST-HDRTRIM: the entry point requires 4-bit weights.
+        source: downCombineSource, header: helpersCore4 + TrackFastKernels.exactHeader + regHelpers4 + wideHelpers4,
         ensureRowContiguous: true)
     nonisolated(unsafe) static let downCombineKernel1 = MLXFast.metalKernel(
         name: "track_moe_down_combine_1",
         inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate"],
         outputNames: ["out"],
-        source: downCombineSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
+        // MLXFAST-HDRTRIM: the entry point requires 4-bit weights.
+        source: downCombineSource, header: helpersCore4 + TrackFastKernels.exactHeader + regHelpers4 + wideDecls,
         ensureRowContiguous: true)
 
     /// act [BR + S, F] (routed slots, then the shared expert per token), gate [S] pre-sigmoid.
@@ -1254,6 +1261,8 @@ extension TrackFastMoEKernels {
         let S = BR / topK
         precondition(BR % topK == 0 && H % 4 == 0 && bits == 4 && w.dtype == .float32 && S >= 1 && S <= 8)
         precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
+        // MLXFAST-HDRTRIM: both weights use the one GS/BITS template pair.
+        precondition(sharedDown.bits == bits && sharedDown.groupSize == groupSize)
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
             template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S)],
@@ -1877,7 +1886,8 @@ extension TrackFastMoEKernels {
         name: "track_qmv_wide_check",
         inputNames: ["w", "scales", "biases", "x"],
         outputNames: ["y"],
-        source: wideCheckSource, header: helpers + TrackFastKernels.exactHeader + wideHelpers, ensureRowContiguous: true)
+        // MLXFAST-HDRTRIM: the entry point requires 4-bit weights.
+        source: wideCheckSource, header: helpers4 + TrackFastKernels.exactHeader + wideHelpers4, ensureRowContiguous: true)
 
     static func wideCheck(w: MLXArray, scales: MLXArray, biases: MLXArray, x: MLXArray, groupSize: Int, bits: Int) -> MLXArray {
         let M = x.dim(0), K = x.dim(1), N = w.dim(0)
@@ -1908,7 +1918,8 @@ extension TrackFastMoEKernels {
         name: "track_qmv_wide_partial_check",
         inputNames: ["w", "scales", "biases", "x"],
         outputNames: ["y"],
-        source: widePartialCheckSource, header: helpers + TrackFastKernels.exactHeader + wideHelpers, ensureRowContiguous: true)
+        // MLXFAST-HDRTRIM: the entry point requires 4-bit weights.
+        source: widePartialCheckSource, header: helpers4 + TrackFastKernels.exactHeader + wideHelpers4, ensureRowContiguous: true)
 
     static func widePartialCheck(w: MLXArray, scales: MLXArray, biases: MLXArray, x: MLXArray, groupSize: Int, bits: Int) -> MLXArray {
         let M = x.dim(0), K = x.dim(1), N = w.dim(0)

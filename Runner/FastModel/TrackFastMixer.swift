@@ -12,12 +12,13 @@ import MLX
 import MLXFast
 
 enum TrackFastMixerKernels {
+    // MLXFAST-HDRTRIM: downInject and upMix require 4-bit weights.
     static let header =
-        TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader + TrackFastMoEKernels.regHelpers
-        + TrackFastKernels.mixerHeadHeaderTail + TrackFastMoEKernels.wideHelpers
+        TrackFastMoEKernels.helpersCore4 + TrackFastKernels.exactHeader + TrackFastMoEKernels.regHelpers4
+        + TrackFastKernels.mixerHeadHeaderTail + TrackFastMoEKernels.wideHelpers4
     /// One-token instantiations: the wide bodies are replaced by their declarations.
     static let header1 =
-        TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader + TrackFastMoEKernels.regHelpers
+        TrackFastMoEKernels.helpersCore4 + TrackFastKernels.exactHeader + TrackFastMoEKernels.regHelpers4
         + TrackFastKernels.mixerHeadHeaderTail + TrackFastMoEKernels.wideDecls
 
     /// normed [S, KD] -> lo [S, ND] (down), inj [S, HC] (inject).
@@ -83,6 +84,8 @@ enum TrackFastMixerKernels {
         let HC = inject?.rows ?? 4
         precondition(S >= 1 && S <= 8 && ND % 8 == 0 && KD % 512 == 0 && down.bits == 4)
         let inj = inject ?? down
+        // MLXFAST-HDRTRIM: inject shares down's GS/BITS template arguments.
+        precondition(inj.bits == 4 && inj.groupSize == down.groupSize)
         let tiles = ND / 8 + (inject != nil ? 1 : 0)
         let outs = (S == 1 ? downInjectKernel1 : downInjectKernel)(
             [normed, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],

@@ -558,7 +558,8 @@ extension TrackFastKernels {
 //       the loads pipeline, with the accumulation order unchanged.
 
 extension TrackFastKernels {
-    static let mixerHeadHeader = TrackFastMoEKernels.helpersCore + exactHeader + mixerHeadHeaderTail
+    // MLXFAST-HDRTRIM: mixerHead and route both require 4-bit weights.
+    static let mixerHeadHeader = TrackFastMoEKernels.helpersCore4 + exactHeader + mixerHeadHeaderTail
     static let mixerHeadHeaderTail = #"""
 
         // `qmv_impl`'s `out_vec_size < num_simdgroups * results_per_simdgroup`
