@@ -61,7 +61,18 @@ final class TrackFastHead {
         self.finalMixer = TrackQwen4ExpFastModel.bindHC(mtp.trackChild("hyper_connection_mixer"), cfg: cfg)
     }
 
-    private func hcMix(_ hc: TrackHC, normed: MLXArray) -> (MLXArray, MLXArray) {
+    /// MLXFAST-HEADROUTE: `emitF32` mirrors the tower's `hcMix`. The tower calls
+    /// it with `emitF32: true` for the MLP block (TrackFastModel.swift:941) and
+    /// forwards `inputF32` into `moeForwardShared`, whose router path reads
+    /// `(inputF32 ?? x.asType(.float32))`. Without it the head's router operand
+    /// is computed in bf16, ROUNDED to bf16, then widened back to float32 — a
+    /// precision round-trip the target never takes. bf16 carries 8 mantissa
+    /// bits, so near a routing tie the head can select a DIFFERENT top-K expert
+    /// set than the target and the draft is rejected. The head only proposes,
+    /// so this is pure acceptance, not fidelity.
+    private func hcMix(_ hc: TrackHC, normed: MLXArray, emitF32: Bool = false)
+        -> (MLXArray, MLXArray, MLXArray?)
+    {
         let S = normed.dim(1)
         if normed.dim(0) == 1, S <= 8, case .quant(let dq) = hc.down, case .quant(let uq) = hc.up,
             dq.biases != nil, uq.biases != nil
@@ -73,8 +84,9 @@ final class TrackFastHead {
                 let d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
                 let u = TrackFastMixerKernels.upMix(
                     act: d.act, normed: n2, up: uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
-                    hasInject: hc.hasInject)
-                return (u.input.reshaped(1, S, hidden), u.inject.reshaped(1, S, hcCount))
+                    hasInject: hc.hasInject, emitF32: emitF32)
+                let f32 = emitF32 ? u.inputF32.reshaped(1, S, hidden) : nil
+                return (u.input.reshaped(1, S, hidden), u.inject.reshaped(1, S, hcCount), f32)
             }
         }
         let lo = hc.down.apply(normed)
@@ -89,9 +101,10 @@ final class TrackFastHead {
             act = TrackFastKernels.siluHead(lo: lo, width: hc.lowrank)
         }
         let w = hc.up.apply(act)
-        return TrackFastKernels.hcMix(
+        let r2 = TrackFastKernels.hcMix(
             w: w, normed: normed, inj: inj, hcCount: hcCount, hidden: hidden,
             hasInject: hc.hasInject)
+        return (r2.0, r2.1, nil)
     }
 
     /// One head application over `[1, S]` inputs; returns `sample` `[1,S,H]`
@@ -118,17 +131,19 @@ final class TrackFastHead {
         var (st, normed) = TrackFastKernels.injectNorm(
             residual: hyper, out: nil, inject: nil, scale: attnHC.normScaleQ,
             hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
-        var (input, injectW) = hcMix(attnHC, normed: normed)
+        var (input, injectW, _) = hcMix(attnHC, normed: normed)
         let attended = attention(input, cache: cache, offset: offset)
         (st, normed) = TrackFastKernels.injectNorm(
             residual: st, out: attended, inject: injectW, scale: mlpHC.normScaleQ,
             hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
-        (input, injectW) = hcMix(mlpHC, normed: normed)
-        let moeOut = TrackQwen4ExpFastModel.moeForwardShared(moe, input, replay: nil)
+        let mm = hcMix(mlpHC, normed: normed, emitF32: true)
+        input = mm.0; injectW = mm.1
+        let moeOut = TrackQwen4ExpFastModel.moeForwardShared(
+            moe, input, inputF32: mm.2, replay: nil)
         let (multiNext, finalNormed) = TrackFastKernels.injectNorm(
             residual: st, out: moeOut, inject: injectW, scale: finalMixer.normScaleQ,
             hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
-        let (sample, _) = hcMix(finalMixer, normed: finalNormed)
+        let (sample, _, _) = hcMix(finalMixer, normed: finalNormed)
         return (sample, multiNext)
     }
 
