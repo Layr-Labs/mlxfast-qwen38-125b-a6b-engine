@@ -12,9 +12,14 @@ import MLX
 import MLXFast
 
 enum TrackFastMixerKernels {
-    // MLXFAST-MIX2ROW: source-time choice for S == 1 only; use 1 for the
-    // optional traffic/parallelism experiment, or 4 for the original ownership.
-    static let downRowsPerSimdgroup = 2
+    // MLXFAST-MIX2ROW: source-time choice for S == 1 only; 4 was the original
+    // ownership. At the served shape (KD = hcCount * hidden = 10240, ND = 320) the
+    // launch is ND / (2 * RPS) + 2 tiles of 64 threads, so RPS picks between 162,
+    // 82 and 42 threadgroups. MLXFAST-INJSPLIT moved that formula; re-swept after
+    // it, one is the best of the three and two the runner-up. Ownership only: each
+    // row keeps its own K walk, so every setting is bit-exact with the others
+    // (asserted numerically in the local mixer bench, max|diff| == 0).
+    static let downRowsPerSimdgroup = 1
 
     static let header =
         TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader + TrackFastMoEKernels.regHelpers
