@@ -287,7 +287,6 @@ extension TrackFastKernels {
         const uint hv = thread_position_in_grid.y;
         const uint row = thread_position_in_grid.z;
         const uint lane = thread_index_in_simdgroup;
-        threadgroup float local_sums[32];
         const uint ybase = (row * Hv + hv) * Dv;
         float thread_x[N_READS];
         float acc = 0.0f;
@@ -295,11 +294,18 @@ extension TrackFastKernels {
             thread_x[i] = static_cast<float>(y[ybase + lid * N_READS + i]);
             acc += thread_x[i] * thread_x[i];
         }
+        // MLXFAST-RMS1SG: this kernel launches threadGroup (32, 1, 1) -- ONE
+        // simdgroup -- so after `simd_sum(acc)` every lane already holds the
+        // total over all Dv = 32 * N_READS elements. The old code then stored
+        // that total at local_sums[0], zeroed the other 31 slots, barriered,
+        // and re-reduced: simd_sum([acc, 0, 0, ..., 0]) == acc. Adding 31
+        // exact zeros is the identity, so the second reduction returned the
+        // value every lane already had, at the cost of 32 threadgroup writes,
+        // a barrier and a full simdgroup reduction. Removing it is exact by
+        // construction -- no accumulation order changes, because the removed
+        // work contributed nothing to the sum. It also frees the 128 B
+        // `local_sums` allocation, which can only help occupancy.
         acc = simd_sum(acc);
-        if (lane >= 1) { local_sums[lane] = 0; }
-        if (lane == 0) { local_sums[0] = acc; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        acc = simd_sum(local_sums[lane]);
         const float inv_mean = metal::precise::rsqrt(acc / (float)Dv + as_type<float>((uint)EPS_BITS));
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
