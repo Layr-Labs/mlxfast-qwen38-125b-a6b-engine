@@ -324,18 +324,29 @@ enum TrackFastKernels {
     static func gdn(
         proj: MLXArray, convState: MLXArray, convW: MLXArray,
         negExpALog: MLXArray, dtBias: MLXArray, stateIn: MLXArray,
-        T: Int, capture: Bool, geometry g: GDNGeometry
+        T: Int, capture: Bool, geometry g: GDNGeometry,
+        separateBA: (b: MLXArray, a: MLXArray)? = nil
     ) -> (y: MLXArray, convOut: MLXArray, stateOut: MLXArray) {
         let B = proj.dim(0)
         let slots = capture ? B * T : B
         precondition(g.dk == 128 && g.dv == 128 && g.convDim % 128 == 0)
         let prof = TrackFastProfile.prefill != nil && T >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
-        let prep = gdnPrep(
-            proj: proj, convState: convState, convW: convW, negExpALog: negExpALog,
-            dtBias: dtBias, T: T, capture: capture, geometry: g)
+        let prep: [MLXArray]
+        if let separateBA {
+            // The same kernel body: only the two 48-wide gate rows move from
+            // offsets in the concatenated projection to their own buffers.
+            prep = TrackP12Prefill.gdnPrepSplit(
+                proj: proj, b: separateBA.b, a: separateBA.a, convState: convState,
+                convW: convW, negExpALog: negExpALog, dtBias: dtBias, T: T,
+                capture: capture, geometry: g)
+        } else {
+            prep = gdnPrep(
+                proj: proj, convState: convState, convW: convW, negExpALog: negExpALog,
+                dtBias: dtBias, T: T, capture: capture, geometry: g)
+        }
         if prof { TrackFastProfile.tick("gdn.prep", &pt, prep) }
-        // MLXFAST-GDNTILE: Tile prefill only; preserve both launch tuples below.
+        // Each prefill SIMD group owns two value rows; omit the unused grid rows.
         let recurrence = T > 1 ? leanTwoRowKernel : leanKernel
         let rec = recurrence(
             [prep[0], prep[1], prep[2], prep[3], prep[4], stateIn],
@@ -343,7 +354,7 @@ enum TrackFastKernels {
                 ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
                 ("Hk", g.hk), ("Hv", g.hv), ("CAPTURE", capture), ("T", T),
             ],
-            grid: (32, g.dv, B * g.hv), threadGroup: (32, 4, 1),
+            grid: (32, T > 1 ? g.dv / 2 : g.dv, B * g.hv), threadGroup: (32, 4, 1),
             outputShapes: [[B, T, g.hv, g.dv], [slots, g.hv, g.dv, g.dk]],
             outputDTypes: [proj.dtype, stateIn.dtype])
         if prof { TrackFastProfile.tick("gdn.lean", &pt, rec) }
