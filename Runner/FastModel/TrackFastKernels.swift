@@ -122,6 +122,121 @@ enum TrackFastKernels {
         outputNames: ["qn", "kn", "vv", "g", "beta", "conv_out"],
         source: prepSource, header: exactHeader, ensureRowContiguous: true)
 
+    static let prepVec4Source = """
+        constexpr int KM1 = KC - 1;
+        constexpr int N_READS = 4;
+        constexpr int VEC_Q = Hk;
+        constexpr int VEC_K = 2 * Hk;
+        using InT4 = vec<InT, 4>;
+        const uint lane = thread_position_in_threadgroup.x;
+        const uint vec = thread_position_in_grid.y;
+        const uint bt = thread_position_in_grid.z;
+        const uint b = bt / T;
+        const uint t = bt % T;
+        const uint ch_base = vec * 128 + lane * N_READS;
+        const device InT* proj_b = proj + (uint)(b * T * PROJ_W);
+        const device InT* cst_b = conv_state + (uint)(b * KM1 * CONV_DIM);
+        auto win4 = [&](int r) -> InT4 {
+            if (r < KM1) {
+                return *((const device InT4*)(cst_b + (uint)(r * CONV_DIM) + ch_base));
+            }
+            return *((const device InT4*)(proj_b + (uint)((r - KM1) * PROJ_W) + ch_base));
+        };
+        float cacc[N_READS] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int j = 0; j < KC; ++j) {
+            const InT4 window = win4((int)t + j);
+            cacc[0] += static_cast<float>(window[0]) * conv_w[(ch_base + 0) * KC + j];
+            cacc[1] += static_cast<float>(window[1]) * conv_w[(ch_base + 1) * KC + j];
+            cacc[2] += static_cast<float>(window[2]) * conv_w[(ch_base + 2) * KC + j];
+            cacc[3] += static_cast<float>(window[3]) * conv_w[(ch_base + 3) * KC + j];
+        }
+        float thread_x[N_READS];
+        float acc = 0.0f;
+        for (int i = 0; i < N_READS; ++i) {
+            const InT c0 = static_cast<InT>(cacc[i]);
+            const InT c1 = mlx_silu(c0);
+            thread_x[i] = static_cast<float>(c1);
+            acc += thread_x[i] * thread_x[i];
+        }
+        if (vec < VEC_K) {
+            acc = simd_sum(acc);
+            const float inv_mean = metal::precise::rsqrt(acc / 128.0f + 1e-6f);
+            const float inv_scale = metal::rsqrt(static_cast<float>(Dk));
+            const InT q_mul = static_cast<InT>(inv_scale * inv_scale);
+            const InT k_mul = static_cast<InT>(inv_scale);
+            if (vec < VEC_Q) {
+                InT4 result;
+                for (int i = 0; i < N_READS; ++i) {
+                    const InT n = static_cast<InT>(thread_x[i] * inv_mean);
+                    result[i] = q_mul * n;
+                }
+                const uint out_base = (uint)((bt * Hk + vec) * Dk) + lane * N_READS;
+                *((device InT4*)(qn + out_base)) = result;
+            } else {
+                InT4 result;
+                for (int i = 0; i < N_READS; ++i) {
+                    const InT n = static_cast<InT>(thread_x[i] * inv_mean);
+                    result[i] = k_mul * n;
+                }
+                const uint out_base = (uint)((bt * Hk + (vec - VEC_Q)) * Dk) + lane * N_READS;
+                *((device InT4*)(kn + out_base)) = result;
+            }
+        } else {
+            InT4 result;
+            for (int i = 0; i < N_READS; ++i) {
+                result[i] = static_cast<InT>(thread_x[i]);
+            }
+            const uint out_base = (uint)((bt * Hv + (vec - VEC_K)) * Dv) + lane * N_READS;
+            *((device InT4*)(vv + out_base)) = result;
+        }
+        if (vec == 0) {
+            const device InT* row = proj_b + (uint)(t * PROJ_W);
+            for (int hh = lane; hh < Hv; hh += 32) {
+                const InT b_raw = row[B_OFF + hh];
+                beta[bt * Hv + hh] = static_cast<float>(mlx_sigmoid(b_raw));
+                const InT ax = row[A_OFF + hh] + dt_bias[hh];
+                const InT sp = mlx_logaddexp0(ax);
+                g[bt * Hv + hh] = metal::precise::exp(neg_exp_alog[hh] * sp);
+            }
+        }
+        if (CAPTURE || t == (uint)(T - 1)) {
+            const uint slot = CAPTURE ? bt : b;
+            device InT* o_conv = conv_out + (uint)(slot * KM1 * CONV_DIM);
+            for (int j = 0; j < KM1; ++j) {
+                const InT4 window = win4((int)t + 1 + j);
+                InT4 result;
+                result[0] = static_cast<InT>(static_cast<float>(window[0]));
+                result[1] = static_cast<InT>(static_cast<float>(window[1]));
+                result[2] = static_cast<InT>(static_cast<float>(window[2]));
+                result[3] = static_cast<InT>(static_cast<float>(window[3]));
+                *((device InT4*)(o_conv + (uint)(j * CONV_DIM) + ch_base)) = result;
+            }
+        }
+        """
+
+    nonisolated(unsafe) static let prepVec4Kernel = MLXFast.metalKernel(
+        name: "track_gdn_prep_vec4",
+        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias"],
+        outputNames: ["qn", "kn", "vv", "g", "beta", "conv_out"],
+        source: prepVec4Source, header: exactHeader, ensureRowContiguous: true)
+
+    static func gdnPrepUsesVec4(
+        projDType: DType, convStateDType: DType, convWeightDType: DType,
+        negExpALogDType: DType, dtBiasDType: DType, sequenceLength: Int,
+        geometry g: GDNGeometry
+    ) -> Bool {
+        sequenceLength > 8
+            && projDType == .bfloat16
+            && convStateDType == .bfloat16
+            && convWeightDType == .bfloat16
+            && negExpALogDType == .float32
+            && dtBiasDType == .bfloat16
+            && g.hk == 16 && g.hv == 48
+            && g.dk == 128 && g.dv == 128
+            && g.convDim == 10_240
+            && g.projWidth % 4 == 0
+    }
+
     /// The prep half alone (tests).
     static func gdnPrep(
         proj: MLXArray, convState: MLXArray, convW: MLXArray,
@@ -130,7 +245,12 @@ enum TrackFastKernels {
         let B = proj.dim(0)
         let slots = capture ? B * T : B
         precondition(g.dk == 128 && g.dv == 128 && g.convDim % 128 == 0)
-        return prepKernel(
+        let kernel = gdnPrepUsesVec4(
+            projDType: proj.dtype, convStateDType: convState.dtype,
+            convWeightDType: convW.dtype, negExpALogDType: negExpALog.dtype,
+            dtBiasDType: dtBias.dtype, sequenceLength: T, geometry: g
+        ) ? prepVec4Kernel : prepKernel
+        return kernel(
             [proj, convState, convW, negExpALog, dtBias],
             template: [
                 ("InT", proj.dtype), ("T", T), ("Dk", g.dk), ("Dv", g.dv), ("Hk", g.hk),
