@@ -1286,6 +1286,69 @@ extension TrackFastMoEKernels {
     }
 }
 
+// MARK: o_proj 2-rows-per-simdgroup replica (S == 1 decode)
+
+extension TrackFastMoEKernels {
+    /// MLXFAST-OPROJ2ROW: the verbatim `qmv_fast` walk (`qmv_fast_reg`), with
+    /// only the number of independent contiguous rows owned per simdgroup
+    /// changed from MLX's 4 to 2. That doubles the simdgroups covering one
+    /// launch (640 -> 1,280) and halves each simdgroup's serial row chain.
+    ///
+    /// Bit-exact by construction, not by measurement. Reassigning row
+    /// ownership is a RELABELING, not a reassociation: for a given physical
+    /// row r the lane -> group assignment (`simd_lid * values_per_thread`),
+    /// the per-group dequant (`out_row * in_vec_size_g`), the whole-K element
+    /// order, the `simd_sum` butterfly and the single final `static_cast<T>`
+    /// are all untouched. Only which simdgroup executes row r moves. Do NOT
+    /// additionally split K across simdgroups: that WOULD change the reduction
+    /// ladder and break this argument.
+    static let oProjSource = """
+        const int tile = (int)threadgroup_position_in_grid.y;
+        const uint sg  = simdgroup_index_in_threadgroup;
+        const uint lid = thread_index_in_simdgroup;
+        constexpr int RPS = 2;                      // MLXFAST-OPROJ2ROW: 4 -> 2
+        constexpr int NT = ND / (2 * RPS);          // 640 for N = 2560
+        static_assert(ND % (2 * RPS) == 0, "o_proj rows must tile evenly");
+        if (tile < NT) {
+            const int out_row = tile * (2 * RPS) + (int)sg * RPS;
+            float r[RPS];
+            qmv_fast_reg<T, GS, BITS, RPS>(wd, sd, bd, x, KD, out_row, lid, r);
+            if (lid == 0) {
+                for (int i = 0; i < RPS; ++i) { y[out_row + i] = static_cast<T>(r[i]); }
+            }
+        }
+        """
+
+    nonisolated(unsafe) static let oProjKernel = MLXFast.metalKernel(
+        name: "track_o_proj_2row",
+        inputNames: ["x", "wd", "sd", "bd"], outputNames: ["y"],
+        source: oProjSource,
+        header: helpersCore + TrackFastKernels.exactHeader + regHelpers,
+        ensureRowContiguous: true)
+
+    /// out [..., KD] -> [..., ND] for the single-vector decode step only.
+    /// Wide windows and any non-affine/non-4-bit projection fall back to MLX.
+    static func oProj2Row(_ out: MLXArray, _ q: TrackQuantWeight) -> MLXArray? {
+        let K = out.dim(-1), N = q.rows
+        guard out.size == K, out.dtype != .float32, q.bits == 4,
+            q.mode == .affine, let bd = q.biases, N % 4 == 0,
+            // qmv_fast's K stride is block_size = values_per_thread * SIMD_SIZE
+            // = 16 * 32 = 512 at 4 bits. MLX itself routes K % 512 != 0 to
+            // `qmv_impl`; a weaker guard would let the final trip read past x.
+            K % 512 == 0
+        else { return nil }
+        let tiles = N / 4  // (2 simdgroups * RPS 2) rows per threadgroup
+        let lead = Array(out.shape.dropLast())
+        let y = oProjKernel(
+            [out.reshaped(K), q.weight, q.scales, bd],
+            template: [("T", out.dtype), ("GS", q.groupSize), ("BITS", q.bits),
+                       ("KD", K), ("ND", N)],
+            grid: (32, tiles * 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[N]], outputDTypes: [out.dtype])[0]
+        return y.reshaped(lead + [N])
+    }
+}
+
 // MARK: qmv_wide replica (2-8 token windows)
 extension TrackFastMoEKernels {
     static let wideHelpers = #"""

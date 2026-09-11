@@ -558,7 +558,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } catch {
             preconditionFailure("TrackFastModel: recurrent stage failed at layer \(layerIndex): \(error)")
         }
-        let o = g.out.apply(gated)
+        // MLXFAST-OPROJ2ROW: the GDN output projection is the same 6144 -> 2560
+        // qmv_fast shape as attention o_proj, and runs 36 launches/step to
+        // attention's 12. Same replica, same bit-exactness argument; the guards
+        // inside oProj2Row reject every shape it cannot serve.
+        var o: MLXArray
+        if case .quant(let gq) = g.out, let fast = TrackFastMoEKernels.oProj2Row(gated, gq) {
+            o = fast
+        } else {
+            o = g.out.apply(gated)
+        }
         if prof { TrackFastProfile.tick("gdn.out", &pt, [o]) }
         return o
     }
@@ -602,6 +611,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             queries: prep.q, keys: prep.k, values: prep.v,
             scale: attentionScale, sinks: nil, keepMask: nil)  // [B,HQ,S,D]
         let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: a.qWidth)
+        // MLXFAST-OPROJ2ROW: S == 1 decode takes the 2-rows-per-simdgroup
+        // replica; every other shape keeps MLX's own launch unchanged.
+        if case .quant(let oq) = a.out, let o = TrackFastMoEKernels.oProj2Row(out, oq) {
+            return o
+        }
         return a.out.apply(out)
     }
 
