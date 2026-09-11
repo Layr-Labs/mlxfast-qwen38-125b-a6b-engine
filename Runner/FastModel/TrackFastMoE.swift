@@ -1273,6 +1273,37 @@ extension TrackFastMoEKernels {
         header: helpersCore + TrackFastKernels.exactHeader + gateUpReuseHelpers,
         ensureRowContiguous: true)
 
+    static let gateUpReuseWindowSource = """
+        if (threadgroup_position_in_grid.z == (uint)BR) {
+            const int tile = (int)threadgroup_position_in_grid.y;
+            if (tile >= N / 8) { return; }
+            const uint kw = (uint)KD / 8;
+            const uint kg = (uint)KD / GS;
+            const int row = tile * 8 + (int)simdgroup_index_in_threadgroup * 4
+                + (int)(thread_index_in_simdgroup / 8);
+            float g[VPT], u[VPT];
+            qmv_wide_reg_full<T, GS, BITS, VPT, 8, false>(
+                wsh, ssh, bsh, x, KD, VPT, row, thread_index_in_simdgroup, g);
+            qmv_wide_reg_full<T, GS, BITS, VPT, 8, false>(
+                wsh + (size_t)N * kw, ssh + (size_t)N * kg, bsh + (size_t)N * kg,
+                x, KD, VPT, row, thread_index_in_simdgroup, u);
+            if ((thread_index_in_simdgroup % 8) == 0) {
+                for (int v = 0; v < VPT; ++v) {
+                    act[(size_t)(BR + v) * (size_t)N + (size_t)row] = mlx_silu(static_cast<T>(g[v])) * static_cast<T>(u[v]);
+                }
+            }
+            return;
+        }
+        """ + "\n" + gateUpReuseSource
+
+    nonisolated(unsafe) static let gateUpReuseWindowKernel = MLXFast.metalKernel(
+        name: "track_moe_gate_up_reuse_2row_window",
+        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
+        outputNames: ["act"],
+        source: gateUpReuseWindowSource,
+        header: helpersCore + TrackFastKernels.exactHeader + gateUpReuseHelpers + wideHelpers,
+        ensureRowContiguous: true)
+
     /// Routed slots [0, BR) then the shared expert for the S tokens: act [BR + S, N].
     static func gateUpAct(
         wg: MLXArray, sg: MLXArray, bg: MLXArray, wu: MLXArray, su: MLXArray, bu: MLXArray,
@@ -1282,10 +1313,20 @@ extension TrackFastMoEKernels {
         precondition(N % 8 == 0 && bits == 4 && idx.dtype == .uint32 && xrow.dtype == .uint32)
         precondition(shared.rows == 2 * N && shared.groupSize == groupSize && shared.bits == bits && S >= 1 && S <= 8)
         precondition(isFast(k: KD, n: N), "shared expert one-token path assumes qmv_fast")
-        if x.dtype == .bfloat16 && S == 1 && KD == 2560 && N == 640
+        if x.dtype == .bfloat16 && KD == 2560 && N == 640
             && groupSize == 32 && bits == 4 && shared.mode == .affine
         {
             let rows = gateUpReuseRowsPerSimdgroup
+            if S > 1 {
+                return gateUpReuseWindowKernel(
+                    [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
+                    template: [
+                        ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N),
+                        ("KD", KD), ("BR", BR), ("RPS", rows), ("VPT", S),
+                    ],
+                    grid: (32, N / rows, BR + 1), threadGroup: (32, 2, 1),
+                    outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
+            }
             return gateUpReuseKernel(
                 [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
                 template: [
