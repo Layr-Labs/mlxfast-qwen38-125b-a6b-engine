@@ -204,6 +204,8 @@ struct TrackLayer {
     let attn: TrackAttn?
     let moe: TrackMoE
     let moePairReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
+    // MLXFAST-GDNREPLAY
+    let gdnReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let ple: TrackPLE?
 }
 
@@ -422,9 +424,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         if let pleLayer = layer.ple, let ordinal = cfg.pleLayerIndices.firstIndex(of: index) {
             ple = bindPLE(pleLayer, ordinal: ordinal, cfg: cfg)
         }
+        // MLXFAST-GDNREPLAY
+        let gdnReplay = gdn.flatMap { makeGDNReplay($0, geometry: $0.geometry) }
         return TrackLayer(
             index: index, attnHC: attnHC, mlpHC: mlpHC, gdn: gdn, attn: attn, moe: moe,
-            moePairReplay: makeMoEPairReplay(moe), ple: ple)
+            moePairReplay: makeMoEPairReplay(moe), gdnReplay: gdnReplay, ple: ple)
     }
 
     // MARK: forward pieces
@@ -494,11 +498,36 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func gdnForward(
         _ g: TrackGDN, _ x: MLXArray, layerIndex: Int,
-        evaluation: CBv2RecurrentStateEvaluation, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, capture: Bool,
+        replay: (@Sendable ([MLXArray]) -> [MLXArray])?  // MLXFAST-GDNREPLAY
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let geo = g.geometry
         let prof = TrackFastProfile.prefill != nil && S >= TrackFastProfile.minWindow
+        // MLXFAST-GDNREPLAY: keep first-step zeros, capture, profiling and special shapes
+        // on the original body below. S <= 8 also matches TrackMultiProj's fused path.
+        // A non-nil state can still need zeros if either of its arrays is absent.
+        if let replay, StreamOrDevice.default.stream === Stream.gpu,
+            !capture, !prof, Self.debugTaps == nil, B == 1, S >= 1, S <= 8,
+            case .quant(let pq)? = g.proj.fused, case .quant(let oq) = g.out,
+            let pb = pq.biases, let ob = oq.biases,
+            let state = evaluation.inputState(modelLayerIndex: layerIndex),
+            let convState = state.conv, let ssm = state.ssm
+        {
+            let r = replay([
+                x, convState, ssm,
+                pq.weight, pq.scales, pb,
+                g.convW, g.negExpALog, g.dtBias, g.normW,
+                oq.weight, oq.scales, ob,
+            ])
+            // Staging remains outside the graph; capture always uses the original body.
+            do {
+                try evaluation.stage(modelLayerIndex: layerIndex, conv: r[1], ssm: r[2])
+            } catch {
+                preconditionFailure("TrackFastModel: recurrent stage failed at layer \(layerIndex): \(error)")
+            }
+            return r[0]
+        }
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
         let proj = g.proj.apply(x)  // [B,S,PROJ_W]
         if prof { TrackFastProfile.tick("gdn.proj", &pt, [proj]) }
@@ -561,6 +590,46 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             scale: attentionScale, sinks: nil, keepMask: nil)  // [B,HQ,S,D]
         let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: a.qWidth)
         return a.out.apply(out)
+    }
+
+
+    // MLXFAST-GDNREPLAY: replay the existing projection, GDN, gated RMS and output ops.
+    static func makeGDNReplay(_ g: TrackGDN, geometry: TrackFastKernels.GDNGeometry)
+        -> (@Sendable ([MLXArray]) -> [MLXArray])?
+    {
+        guard case .quant(let pq)? = g.proj.fused, case .quant(let oq) = g.out,
+            pq.biases != nil, oq.biases != nil
+        else { return nil }
+        return compile(shapeless: false) {
+            [projWidth = geometry.projWidth, convDim = geometry.convDim,
+             convKernel = geometry.convKernel, hk = geometry.hk, hv = geometry.hv,
+             dk = geometry.dk, dv = geometry.dv,
+             bOffset = geometry.bOffset, aOffset = geometry.aOffset,
+             zOffset = g.zOffset, eps = Float(1e-6), capture = false,
+             projGroupSize = pq.groupSize, projBits = pq.bits, projMode = pq.mode,
+             outGroupSize = oq.groupSize, outBits = oq.bits, outMode = oq.mode] inputs in
+            let projWeight = TrackQuantWeight(
+                weight: inputs[3], scales: inputs[4], biases: inputs[5],
+                groupSize: projGroupSize, bits: projBits, mode: projMode)
+            let proj = projWeight.apply(inputs[0])
+            let geo = TrackFastKernels.GDNGeometry(
+                projWidth: projWidth, convDim: convDim, convKernel: convKernel,
+                hk: hk, hv: hv, dk: dk, dv: dv, bOffset: bOffset, aOffset: aOffset)
+            // Like the mixer S, T comes from the traced input shape. Shape-keyed replay
+            // retraces for every window size, including the T == 1 recurrence dispatch.
+            // Unlike MoE's xrowTable(S:K:), T needs no separately supplied array.
+            let T = inputs[0].dim(1)
+            let r = TrackFastKernels.gdn(
+                proj: proj, convState: inputs[1], convW: inputs[6], negExpALog: inputs[7],
+                dtBias: inputs[8], stateIn: inputs[2], T: T, capture: capture, geometry: geo)
+            let gated = TrackFastKernels.gatedRMS(
+                y: r.y, proj: proj, w: inputs[9], zOffset: zOffset, eps: eps)
+            let outWeight = TrackQuantWeight(
+                weight: inputs[10], scales: inputs[11], biases: inputs[12],
+                groupSize: outGroupSize, bits: outBits, mode: outMode)
+            let o = outWeight.apply(gated)
+            return [o, r.convOut, r.stateOut]
+        }
     }
 
     /// Replay only the two opaque expert launches; routing and all current arrays stay live.
@@ -818,7 +887,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let attended: MLXArray
             if let gdn = layer.gdn {
                 attended = gdnForward(
-                    gdn, input, layerIndex: layer.index, evaluation: evaluation, capture: capture)
+                    gdn, input, layerIndex: layer.index, evaluation: evaluation, capture: capture,
+                    replay: layer.gdnReplay)
             } else {
                 let cache = caches[attentionIndex]
                 attentionIndex += 1
