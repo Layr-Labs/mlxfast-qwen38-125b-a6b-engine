@@ -170,6 +170,10 @@ struct TrackMoE {
     let routerW32: MLXArray  // [E, H] float32
     let routerW16: MLXArray  // [E, H] bf16: the values routerW32 was cast from
     let switchMLP: SwitchGLU
+    /// The same three loaded expert projections `switchMLP` itself calls, so
+    /// the sorted combine can run them without the closing scatter/unsort.
+    /// References to the loaded modules; no new or transformed weights.
+    let p12SortedParts: (gate: SwitchLinear, up: SwitchLinear, down: SwitchLinear)?
     /// The routed experts' quantized arrays, for the custom gather path.
     let expertGate: (w: MLXArray, s: MLXArray, b: MLXArray)
     let expertUp: (w: MLXArray, s: MLXArray, b: MLXArray)
@@ -191,6 +195,8 @@ struct TrackPLE {
     let normQueryScale: MLXArray
     let normConvScale: MLXArray
     let convW: MLXArray  // [wide, K, 1]
+    /// The same weight as `[wide, K]`, for the fused conv.
+    let convW2: MLXArray
     let dilation: Int
     let stateLength: Int
     let stateLayerIndex: Int
@@ -382,6 +388,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let sharedGate = TrackProj(m.trackChild("shared_expert_gate"))
         return TrackMoE(
             routerW32: routerW, routerW16: routerW16, switchMLP: switchMLP,
+            p12SortedParts: {
+                guard let g = switchMLP.trackChild("gate_proj") as? SwitchLinear,
+                    let u = switchMLP.trackChild("up_proj") as? SwitchLinear,
+                    let d = switchMLP.trackChild("down_proj") as? SwitchLinear
+                else { return nil }
+                return (gate: g, up: u, down: d)
+            }(),
             expertGate: expert("gate_proj"), expertUp: expert("up_proj"), expertDown: expert("down_proj"),
             expertGroupSize: qdown.groupSize, expertBits: qdown.bits,
             sharedGateUp: TrackMultiProj([sg, su]),
@@ -392,14 +405,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     static func bindPLE(_ ple: Qwen4ExpPLELayer, ordinal: Int, cfg: Qwen4ExpTextConfiguration)
         -> TrackPLE
     {
-        TrackPLE(
+        let convW = ple.trackChild("conv1d").trackArray("weight")
+        return TrackPLE(
             embedding: ple.pleEmbedding,
             keyProj: TrackProj(ple.trackChild("key_proj")),
             valueProj: TrackProj(ple.trackChild("value_proj")),
             normKeyScale: ple.trackChild("norm_key").trackArray("weight"),
             normQueryScale: ple.trackChild("norm_query").trackArray("weight"),
             normConvScale: ple.trackChild("norm_conv").trackArray("weight"),
-            convW: ple.trackChild("conv1d").trackArray("weight"),
+            convW: convW,
+            convW2: convW.reshaped(convW.dim(0), convW.dim(1)),
             dilation: cfg.ngramSize,
             stateLength: (cfg.pleConvKernelSize - 1) * cfg.ngramSize,
             stateLayerIndex: cfg.pleStateLayerIndex(ordinal: ordinal))
@@ -497,11 +512,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         evaluation: CBv2RecurrentStateEvaluation, capture: Bool
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
-        let geo = g.geometry
+        // A wide window already runs the four input projections as four
+        // separate GEMMs (the split-K choice depends on N). `separate` drops
+        // only the concatenation that followed them: the prep kernel reads the
+        // beta/alpha gates from their own buffers and the gated RMS kernel
+        // reads z from its own, so every GEMM, shape and rounding is unchanged.
+        let separate =
+            TrackP12Prefill.splitGDN && TrackP12Prefill.eligible(x) && !capture
+            && g.proj.parts.count == 4
+        let geo = separate ? TrackP12Prefill.splitGeometry(g.geometry) : g.geometry
         let prof = TrackFastProfile.prefill != nil && S >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
-        let proj = g.proj.apply(x)  // [B,S,PROJ_W]
-        if prof { TrackFastProfile.tick("gdn.proj", &pt, [proj]) }
+        let split = separate ? g.proj.parts.map { $0.apply(x) } : nil
+        let proj = split?[0] ?? g.proj.apply(x)  // [B,S,PROJ_W]
+        if prof { TrackFastProfile.tick("gdn.proj", &pt, split ?? [proj]) }
         let state = evaluation.inputState(modelLayerIndex: layerIndex)
         let convState =
             state?.conv ?? MLXArray.zeros([B, geo.convKernel - 1, geo.convDim], dtype: x.dtype)
@@ -509,10 +533,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             state?.ssm ?? MLXArray.zeros([B, geo.hv, geo.dv, geo.dk], dtype: .float32)
         let r = TrackFastKernels.gdn(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
-            dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo)
+            dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo,
+            separateBA: split.map { (b: $0[2], a: $0[3]) })
         if prof { TrackFastProfile.tick("gdn.prep+lean", &pt, [r.y, r.stateOut, r.convOut]) }
         let gated = TrackFastKernels.gatedRMS(
-            y: r.y, proj: proj, w: g.normW, zOffset: g.zOffset, eps: 1e-6)
+            y: r.y, proj: split?[1] ?? proj, w: g.normW,
+            zOffset: separate ? 0 : g.zOffset, eps: 1e-6)
         if prof { TrackFastProfile.tick("gdn.gatedRMS", &pt, [gated]) }
         do {
             if capture {
@@ -542,7 +568,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let heads = cfg.attentionHeads, kvHeads = cfg.kvHeads, d = cfg.headDim
-        let qkv = a.qkv.apply(x)  // q | gate | k | v | indexer k
+        // A wide window takes the indexer tape from the full `index_qk_proj`
+        // below (its GEMM rounding depends on N), so the fourth part of this
+        // concatenation -- the narrow indexer-K projection -- is an unread
+        // tail. The three kept projections and their offsets are unchanged.
+        let qkv =
+            TrackP12Prefill.omitUnusedIndexer && TrackP12Prefill.eligible(x) && S > 8
+            && a.qkv.parts.count == 4
+            ? concatenated(a.qkv.parts.prefix(3).map { $0.apply(x) }, axis: -1)
+            : a.qkv.apply(x)  // q | gate | k | v | [indexer k]
         // The indexer tape first: its truncation reads the pre-update offset.
         let idxKeys: MLXArray
         if S <= 8 {
@@ -666,10 +700,33 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let idx = argPartition(-logits, kth: m.topK - 1, axis: -1)[.ellipsis, ..<m.topK]
         let weights = softmax(takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
         if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights]) }
-        let gu = m.sharedGateUp.apply(x)
-        let shared = m.sharedDown.apply(TrackFastKernels.swiglu(gu: gu))
+        let sharedAct: MLXArray
+        if TrackP12Prefill.splitShared, TrackP12Prefill.eligible(x),
+            m.sharedGateUp.parts.count == 2
+        {
+            // The same two GEMMs and the same `mlx_silu(gate) * up`, over the
+            // two outputs directly instead of over their concatenation.
+            let rows = x.dim(0) * x.dim(1)
+            let sgate = m.sharedGateUp.parts[0].apply(x)
+            let sup = m.sharedGateUp.parts[1].apply(x)
+            sharedAct = TrackFastKernels.swiglu2(
+                gate: sgate.reshaped(rows, m.sharedHidden),
+                up: sup.reshaped(rows, m.sharedHidden)
+            ).reshaped(x.dim(0), x.dim(1), m.sharedHidden)
+        } else {
+            sharedAct = TrackFastKernels.swiglu(gu: m.sharedGateUp.apply(x))
+        }
+        let shared = m.sharedDown.apply(sharedAct)
         let gate = m.sharedGate.apply(x)  // [B,S,1]
         if prof { TrackFastProfile.tick("moe.shared", &pt, [shared, gate]) }
+        // Read the routed rows through the permutation the sort already
+        // produced instead of materialising a scattered copy of them.
+        if let combined = TrackP12Prefill.sortedMoE(
+            m, x, indices: idx, weights: weights, shared: shared, gate: gate)
+        {
+            if prof { TrackFastProfile.tick("moe.sorted+combine", &pt, [combined]) }
+            return combined
+        }
         let routed = m.switchMLP(x, idx)  // [B,S,K,H]
         if prof { TrackFastProfile.tick("moe.switchMLP", &pt, [routed]) }
         // The combine kernel folds the K products in the association MLX's small
@@ -714,18 +771,24 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } else {
             embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
         }
-        let key = groupNorm(p.keyProj.apply(embedded), scale: p.normKeyScale)
-            .reshaped(B, S, hcCount, hidden)
+        let keyFlat = p.keyProj.apply(embedded)
         let value = p.valueProj.apply(embedded)
-        let query = groupNorm(stream, scale: p.normQueryScale).reshaped(B, S, hcCount, hidden)
-        var gate = (key * query).sum(axis: -1, keepDims: true) / Foundation.sqrt(Float(hidden))
-        let floor = TrackFastKernels.scalar(Float(1e-6), dtype: gate.dtype)
-        gate = MLX.sqrt(maximum(MLX.abs(gate), floor)) * MLX.sign(gate)
-        let gated = (sigmoid(gate) * value[.ellipsis, .newAxis, 0...]).reshaped(B, S, wide)
-        let normed = groupNorm(gated, scale: p.normConvScale)
-        let full = concatenated([convState, normed], axis: 1)  // [1, n+S, wide]
-        let convolved = silu(
-            conv1d(full, p.convW, stride: 1, padding: 0, dilation: p.dilation, groups: wide))
+        // norm_key * norm_query, then MLX's own reduction over the last axis.
+        let prod = TrackFastPLEKernels.prod(
+            keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
+            hcCount: hcCount, hidden: hidden, eps: eps)
+        let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
+        // The two scalars the reference's `/` and `maximum` build, built the
+        // same way so they carry the same rounding into the activation dtype.
+        let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
+        let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
+        let gn = TrackFastPLEKernels.gated(
+            g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
+            hcCount: hcCount, hidden: hidden, eps: eps)
+        let gated = gn.gated
+        let full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
+        let block = TrackFastPLEKernels.conv(
+            full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
         do {
             if capture {
                 let n = p.stateLength
@@ -761,7 +824,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } catch {
             preconditionFailure("TrackFastModel: PLE stage failed: \(error)")
         }
-        return gated + convolved
+        return block
     }
 
     /// Both tower streams. `caches` is the compact attention layout.
