@@ -29,7 +29,7 @@ enum TrackFastKernels {
         let a = MLXArray(v, dtype: dtype); eval(a); typedScalars[key] = a; return a
     }
 
-    struct GDNGeometry {
+    struct GDNGeometry: Equatable {
         let projWidth: Int  // PROJ_W
         let convDim: Int  // CONV_DIM = 2*Hk*Dk + Hv*Dv
         let convKernel: Int  // KC

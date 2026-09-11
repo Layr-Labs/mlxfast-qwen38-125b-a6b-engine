@@ -1129,25 +1129,44 @@ extension TrackFastMoEKernels {
             return;
         }
         const uint e = idx[z];
-        const uint r = xrow[z];
+        if constexpr (DEDUP) {
+            // A multi-token window lists the same expert under several slots
+            // (one per token that routes to it). The first slot's threadgroup
+            // walks the expert's rows for every such slot below, so the
+            // later slots exit here before touching the weight: one read of
+            // the expert per window instead of one per slot. The per-slot
+            // arithmetic is the same call over the same rows and the slot's
+            // own token; only which threadgroup issues it changes.
+            for (uint zz = 0; zz < z; ++zz) {
+                if (idx[zz] == e) { return; }
+            }
+        }
         const uint kw = (uint)KD / 8;
         const uint kg = (uint)KD / GS;
         const int out_row = (int)threadgroup_position_in_grid.y * 8 + (int)simdgroup_index_in_threadgroup * 4;
-        const device T* xb = x + (size_t)r * (size_t)KD;
         const size_t eoff = (size_t)e * (size_t)N;
-        float g[4], u[4];
-        if (FAST) {
-            qmv_fast_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
-            qmv_fast_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
-        } else {
-            qmv_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
-            qmv_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
-        }
-        if (thread_index_in_simdgroup == 0) {
-            for (int i = 0; i < 4; ++i) {
-                const T gv = static_cast<T>(g[i]);
-                const T uv = static_cast<T>(u[i]);
-                act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+        auto slot = [&](uint zz) {
+            const device T* xb = x + (size_t)xrow[zz] * (size_t)KD;
+            float g[4], u[4];
+            if (FAST) {
+                qmv_fast_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
+                qmv_fast_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
+            } else {
+                qmv_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
+                qmv_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
+            }
+            if (thread_index_in_simdgroup == 0) {
+                for (int i = 0; i < 4; ++i) {
+                    const T gv = static_cast<T>(g[i]);
+                    const T uv = static_cast<T>(u[i]);
+                    act[(size_t)zz * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+                }
+            }
+        };
+        slot(z);
+        if constexpr (DEDUP) {
+            for (uint zz = z + 1; zz < (uint)BR; ++zz) {
+                if (idx[zz] == e) { slot(zz); }
             }
         }
         """
@@ -1297,7 +1316,7 @@ extension TrackFastMoEKernels {
         }
         return (S == 1 ? gateUpActKernel1 : gateUpActKernel)(
             [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
-            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("BR", BR), ("VPT", S)],
+            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("BR", BR), ("VPT", S), ("DEDUP", S > 1)],
             grid: (32, (N / 8) * 2, BR + 1), threadGroup: (32, 2, 1),
             outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
     }
@@ -1309,17 +1328,26 @@ extension TrackFastMoEKernels {
     /// grid threads (32, H/4, S), threadgroup (32, 1, 1): one simdgroup owns
     /// 4 output columns for one token across all K experts.
     static let downCombineSource = """
-        const uint t = threadgroup_position_in_grid.z;
+        // A multi-token window (FOLD) puts every token's tile in ONE threadgroup:
+        // simdgroups [t * KSG, (t + 1) * KSG) walk token t's experts exactly as
+        // the per-token threadgroup did, so an expert two tokens share is read
+        // by simdgroups on one core back to back instead of by two threadgroups.
+        // Each simdgroup's walks, products and fold are unchanged.
+        const uint t = FOLD ? (simdgroup_index_in_threadgroup / KSG) : threadgroup_position_in_grid.z;
         const int d0 = (int)threadgroup_position_in_grid.y * 4;
         const uint kw = (uint)F / 8;
         const uint kg = (uint)F / GS;
-        const uint sgi = simdgroup_index_in_threadgroup;
+        const uint sgi = FOLD ? (simdgroup_index_in_threadgroup % KSG) : simdgroup_index_in_threadgroup;
         const uint lid = thread_index_in_simdgroup;
         // The K expert walks are independent of one another, so they are spread
         // over KSG simdgroups; each product lands in threadgroup memory as the
         // float it already was, and the epilogue folds them in the same k order.
-        threadgroup float prod[K][4];
-        threadgroup float shvT[4];
+        constexpr int TT = FOLD ? VPT : 1;
+        const uint tt = FOLD ? t : 0u;
+        threadgroup float prodT[TT][K][4];
+        threadgroup float shvTT[TT][4];
+        threadgroup float (&prod)[K][4] = prodT[tt];
+        threadgroup float (&shvT)[4] = shvTT[tt];
         float res[4];
         // K % KSG == 0, so the trip count is the constant K / KSG and the loop
         // still unrolls: each simdgroup keeps that many expert walks in flight.
@@ -1398,10 +1426,14 @@ extension TrackFastMoEKernels {
         precondition(BR % topK == 0 && H % 4 == 0 && bits == 4 && w.dtype == .float32 && S >= 1 && S <= 8)
         precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
+        // Multi-token windows fold the S per-token tiles into one threadgroup of
+        // S * ksg simdgroups (same simdgroup count, same per-simdgroup walks).
+        let fold = S > 1
+        let sgPerGroup = fold ? ksg * S : ksg
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
-            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg)],
-            grid: (32, (H / 4) * ksg, S), threadGroup: (32, ksg, 1),
+            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("FOLD", fold)],
+            grid: (32, (H / 4) * sgPerGroup, fold ? 1 : S), threadGroup: (32, sgPerGroup, 1),
             outputShapes: [[S, H]], outputDTypes: [act.dtype])[0]
     }
 }
