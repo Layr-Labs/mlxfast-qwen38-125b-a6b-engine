@@ -780,7 +780,9 @@ METAL_FUNC void qmv_fast_impl(
   typedef float U;
 
   thread U x_thread[values_per_thread];
-  thread U result[results_per_simdgroup] = {0};
+  // MLXFAST-QMVILP: Split the K chain without changing lane or row ownership.
+  constexpr int num_partials = 2;
+  thread U result[num_partials][results_per_simdgroup] = {{0}};
 
   // Adjust positions
   const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
@@ -794,29 +796,36 @@ METAL_FUNC void qmv_fast_impl(
   x += tid.x * in_vec_size + simd_lid * values_per_thread;
   y += tid.x * out_vec_size + out_row;
 
-  for (int k = 0; k < in_vec_size; k += block_size) {
-    U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+  for (int k = 0; k < in_vec_size; k += num_partials * block_size) {
+#pragma clang loop unroll(full)
+    for (int partial = 0; partial < num_partials; partial++) {
+      // The fast path requires block_size alignment, not two-block alignment.
+      if (k + partial * block_size < in_vec_size) {
+        U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-      const device T* sl = scales + row * in_vec_size_g;
-      const device T* bl = biases + row * in_vec_size_g;
+        for (int row = 0; row < results_per_simdgroup; row++) {
+          auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+          const device T* sl = scales + row * in_vec_size_g;
+          const device T* bl = biases + row * in_vec_size_g;
 
-      U s = sl[0];
-      U b = bl[0];
-      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+          U s = sl[0];
+          U b = bl[0];
+          result[partial][row] +=
+              qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+        }
+
+        ws += block_size * bytes_per_pack / pack_factor;
+        scales += block_size / group_size;
+        biases += block_size / group_size;
+        x += block_size;
+      }
     }
-
-    ws += block_size * bytes_per_pack / pack_factor;
-    scales += block_size / group_size;
-    biases += block_size / group_size;
-    x += block_size;
   }
 
   for (int row = 0; row < results_per_simdgroup; row++) {
-    result[row] = simd_sum(result[row]);
+    U sum = simd_sum(result[0][row] + result[1][row]);
     if (simd_lid == 0) {
-      y[row] = static_cast<T>(result[row]);
+      y[row] = static_cast<T>(sum);
     }
   }
 }
