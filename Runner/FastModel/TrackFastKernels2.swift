@@ -268,8 +268,43 @@ extension TrackFastKernels {
         outputNames: ["out"],
         source: siluHeadSource, header: exactHeader, ensureRowContiguous: true)
 
+    static let siluHeadVec4Source = """
+        const uint j = thread_position_in_grid.x;
+        const uint row = thread_position_in_grid.y;
+        const uint d = 4 * j;
+        if (d >= LMIX) return;
+        const uint inBase = row * LW + d;
+        const vec<InT, 4> x = *((const device vec<InT, 4>*)(lo + inBase));
+        vec<InT, 4> y;
+        y[0] = mlx_silu(x[0]);
+        y[1] = mlx_silu(x[1]);
+        y[2] = mlx_silu(x[2]);
+        y[3] = mlx_silu(x[3]);
+        *((device vec<InT, 4>*)(out + row * LMIX + d)) = y;
+        """
+
+    nonisolated(unsafe) static let siluHeadVec4Kernel = MLXFast.metalKernel(
+        name: "track_silu_head_vec4",
+        inputNames: ["lo"],
+        outputNames: ["out"],
+        source: siluHeadVec4Source, header: exactHeader, ensureRowContiguous: true)
+
+    static func siluHeadUsesVec4(
+        dtype: DType, sequenceLength: Int, width: Int, inputWidth: Int
+    ) -> Bool {
+        dtype == .bfloat16 && sequenceLength > 8 && width == 320 && inputWidth % 4 == 0
+    }
+
     static func siluHead(lo: MLXArray, width: Int) -> MLXArray {
         let B = lo.dim(0), S = lo.dim(1)
+        if siluHeadUsesVec4(
+            dtype: lo.dtype, sequenceLength: S, width: width, inputWidth: lo.dim(2))
+        {
+            return siluHeadVec4Kernel(
+                [lo], template: [("InT", lo.dtype), ("LW", lo.dim(2)), ("LMIX", width)],
+                grid: (width / 4, B * S, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[B, S, width]], outputDTypes: [lo.dtype])[0]
+        }
         return siluHeadKernel(
             [lo], template: [("InT", lo.dtype), ("LW", lo.dim(2)), ("LMIX", width)],
             grid: (width, B * S, 1), threadGroup: (256, 1, 1),
