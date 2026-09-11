@@ -706,9 +706,13 @@ METAL_FUNC void qmv_impl(
 
     static func isFast(k: Int, n: Int) -> Bool { n % 8 == 0 && k % 512 == 0 }
 
-    /// 8-row blocks per threadgroup: the K=640 down projection is overhead-bound
-    /// at one block per threadgroup.
-    static func rowBlocks(k: Int) -> Int { k % 512 == 0 ? 1 : 4 }
+    /// 8-row blocks per threadgroup. `RB` picks ownership only: every block is
+    /// still one `qmv_*_impl` call over the full K, so this is bit-exact whatever
+    /// it returns. The old split (1 for K % 512 == 0, else 4) justified itself by
+    /// the K=640 down projection alone and the gate/up branch inherited its value;
+    /// two is the better setting for both shapes, which sit on opposite sides of
+    /// that branch and move the threadgroup count in opposite directions.
+    static func rowBlocks(k: Int) -> Int { 2 }
 
     /// gate/up for `B` (row, expert) pairs.
     static func gateUp(
