@@ -204,6 +204,9 @@ struct TrackLayer {
     let attn: TrackAttn?
     let moe: TrackMoE
     let moePairReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
+    // MLXFAST-MIXREPLAY: bound once; every array remains an explicit replay input.
+    let attnMixerReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
+    let mlpMixerReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let ple: TrackPLE?
 }
 
@@ -268,6 +271,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             built.append(Self.bind(layer: layer, index: index, cfg: cfg))
         }
         self.layers = built
+        // MLXFAST-MIXREPLAY: opt-in bind counts for local verification.
+        if ProcessInfo.processInfo.environment["TRACK_FAST_MIXREPLAY_DEBUG"] == "1" {
+            let attnCount = built.filter { $0.attnMixerReplay != nil }.count
+            let mlpCount = built.filter { $0.mlpMixerReplay != nil }.count
+            FileHandle.standardError.write(Data(
+                "MLXFAST-MIXREPLAY: attn=\(attnCount)/\(built.count) mlp=\(mlpCount)/\(built.count)\n".utf8))
+        }
         self.finalMixer = Self.bindHC(tower.trackChild("hyper_connection_mixer"), cfg: cfg)
         super.init()
     }
@@ -422,9 +432,14 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         if let pleLayer = layer.ple, let ordinal = cfg.pleLayerIndices.firstIndex(of: index) {
             ple = bindPLE(pleLayer, ordinal: ordinal, cfg: cfg)
         }
+        // MLXFAST-MIXREPLAY: layer 0 has no pending injection; PLE keeps both original regions.
+        let attnMixerReplay = index > 0 && layer.ple == nil
+            ? makeAttnMixerReplay(attnHC, cfg: cfg, tile: false) : nil
+        let mlpMixerReplay = layer.ple == nil ? makeMLPMixerReplay(mlpHC, cfg: cfg) : nil
         return TrackLayer(
             index: index, attnHC: attnHC, mlpHC: mlpHC, gdn: gdn, attn: attn, moe: moe,
-            moePairReplay: makeMoEPairReplay(moe), ple: ple)
+            moePairReplay: makeMoEPairReplay(moe),
+            attnMixerReplay: attnMixerReplay, mlpMixerReplay: mlpMixerReplay, ple: ple)
     }
 
     // MARK: forward pieces
@@ -586,6 +601,79 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 wd: inputs[14], sd: inputs[15], bd: inputs[16], sharedDown: sharedDown,
                 act: act, idx: inputs[1], w: inputs[2], gate: inputs[3], topK: topK,
                 groupSize: groupSize, bits: bits)]
+        }
+    }
+
+    // MLXFAST-MIXREPLAY: region A replays the same three opaque kernel calls and reshapes.
+    static func makeAttnMixerReplay(_ hc: TrackHC, cfg: Qwen4ExpTextConfiguration, tile: Bool)
+        -> (@Sendable ([MLXArray]) -> [MLXArray])?
+    {
+        guard case .quant(let dq) = hc.down, case .quant(let iq)? = hc.inject,
+            case .quant(let uq) = hc.up, dq.biases != nil, iq.biases != nil, uq.biases != nil
+        else { return nil }
+        return compile(shapeless: false) {
+            [hcCount = cfg.hcCount, hidden = cfg.hiddenSize, eps = cfg.rmsNormEps, tile = tile,
+             downGroupSize = dq.groupSize, downBits = dq.bits, downMode = dq.mode,
+             injGroupSize = iq.groupSize, injBits = iq.bits, injMode = iq.mode,
+             upGroupSize = uq.groupSize, upBits = uq.bits, upMode = uq.mode,
+             hasInject = hc.hasInject] inputs in
+            let (stream, normed) = TrackFastKernels.injectNorm(
+                residual: inputs[0], out: inputs[1], inject: inputs[2], scale: inputs[12],
+                hcCount: hcCount, hidden: hidden, eps: eps, tile: tile)
+            let down = TrackQuantWeight(
+                weight: inputs[3], scales: inputs[4], biases: inputs[5],
+                groupSize: downGroupSize, bits: downBits, mode: downMode)
+            let inject = TrackQuantWeight(
+                weight: inputs[6], scales: inputs[7], biases: inputs[8],
+                groupSize: injGroupSize, bits: injBits, mode: injMode)
+            let up = TrackQuantWeight(
+                weight: inputs[9], scales: inputs[10], biases: inputs[11],
+                groupSize: upGroupSize, bits: upBits, mode: upMode)
+            let S = normed.dim(1)
+            let n2 = normed.reshaped(S, hcCount * hidden)
+            let d = TrackFastMixerKernels.downInject(
+                normed: n2, down: down, inject: hasInject ? inject : nil)
+            let u = TrackFastMixerKernels.upMix(
+                act: d.act, normed: n2, up: up, inj: d.inj, hcCount: hcCount, hidden: hidden,
+                hasInject: hasInject, emitF32: false)
+            return [stream, u.input.reshaped(1, S, hidden), u.inject.reshaped(1, S, hcCount)]
+        }
+    }
+
+    // MLXFAST-MIXREPLAY: region B also returns the existing float32 router operand.
+    static func makeMLPMixerReplay(_ hc: TrackHC, cfg: Qwen4ExpTextConfiguration)
+        -> (@Sendable ([MLXArray]) -> [MLXArray])?
+    {
+        guard case .quant(let dq) = hc.down, case .quant(let iq)? = hc.inject,
+            case .quant(let uq) = hc.up, dq.biases != nil, iq.biases != nil, uq.biases != nil
+        else { return nil }
+        return compile(shapeless: false) {
+            [hcCount = cfg.hcCount, hidden = cfg.hiddenSize, eps = cfg.rmsNormEps,
+             downGroupSize = dq.groupSize, downBits = dq.bits, downMode = dq.mode,
+             injGroupSize = iq.groupSize, injBits = iq.bits, injMode = iq.mode,
+             upGroupSize = uq.groupSize, upBits = uq.bits, upMode = uq.mode,
+             hasInject = hc.hasInject] inputs in
+            let (stream, normed) = TrackFastKernels.injectNorm(
+                residual: inputs[0], out: inputs[1], inject: inputs[2], scale: inputs[12],
+                hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
+            let down = TrackQuantWeight(
+                weight: inputs[3], scales: inputs[4], biases: inputs[5],
+                groupSize: downGroupSize, bits: downBits, mode: downMode)
+            let inject = TrackQuantWeight(
+                weight: inputs[6], scales: inputs[7], biases: inputs[8],
+                groupSize: injGroupSize, bits: injBits, mode: injMode)
+            let up = TrackQuantWeight(
+                weight: inputs[9], scales: inputs[10], biases: inputs[11],
+                groupSize: upGroupSize, bits: upBits, mode: upMode)
+            let S = normed.dim(1)
+            let n2 = normed.reshaped(S, hcCount * hidden)
+            let d = TrackFastMixerKernels.downInject(
+                normed: n2, down: down, inject: hasInject ? inject : nil)
+            let u = TrackFastMixerKernels.upMix(
+                act: d.act, normed: n2, up: up, inj: d.inj, hcCount: hcCount, hidden: hidden,
+                hasInject: hasInject, emitF32: true)
+            let f32 = u.inputF32.reshaped(1, S, hidden)
+            return [stream, u.input.reshaped(1, S, hidden), u.inject.reshaped(1, S, hcCount), f32]
         }
     }
 
@@ -787,32 +875,50 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         var profT = profiling ? CFAbsoluteTimeGetCurrent() : 0
         if profiling { TrackFastProfile.windows += 1 }
         for layer in layers {
-            var normed: MLXArray
-            if let ple = layer.ple {
-                // Materialize the stream, add the PLE block, then norm.
-                (stream, _) = TrackFastKernels.injectNorm(
-                    residual: residual, out: pendingOut, inject: pendingInject,
-                    scale: layer.attnHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
-                    tile: tile)
-                stream =
-                    stream
-                    + pleForward(
-                        ple, stream: stream, ids: ids, evaluation: evaluation, capture: capture)
-                (stream, normed) = TrackFastKernels.injectNorm(
-                    residual: stream, out: nil, inject: nil,
-                    scale: layer.attnHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
-                    tile: false)
+            var input: MLXArray, injectW: MLXArray
+            // MLXFAST-MIXREPLAY: shape guards match hcMix; nil inputs keep the original graph.
+            if let replay = layer.attnMixerReplay, let pendingOut, let pendingInject,
+                !tile, layer.ple == nil, Self.debugTaps == nil, !profiling,
+                StreamOrDevice.default.stream === Stream.gpu,
+                residual.dim(0) == 1, residual.dim(1) <= 8,
+                case .quant(let dq) = layer.attnHC.down,
+                case .quant(let iq)? = layer.attnHC.inject, case .quant(let uq) = layer.attnHC.up
+            {
+                let r = replay([
+                    residual, pendingOut, pendingInject,
+                    dq.weight, dq.scales, dq.biases!,
+                    iq.weight, iq.scales, iq.biases!,
+                    uq.weight, uq.scales, uq.biases!, layer.attnHC.normScaleQ,
+                ])
+                stream = r[0]; input = r[1]; injectW = r[2]
             } else {
-                (stream, normed) = TrackFastKernels.injectNorm(
-                    residual: residual, out: pendingOut, inject: pendingInject,
-                    scale: layer.attnHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
-                    tile: tile)
+                var normed: MLXArray
+                if let ple = layer.ple {
+                    // Materialize the stream, add the PLE block, then norm.
+                    (stream, _) = TrackFastKernels.injectNorm(
+                        residual: residual, out: pendingOut, inject: pendingInject,
+                        scale: layer.attnHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
+                        tile: tile)
+                    stream =
+                        stream
+                        + pleForward(
+                            ple, stream: stream, ids: ids, evaluation: evaluation, capture: capture)
+                    (stream, normed) = TrackFastKernels.injectNorm(
+                        residual: stream, out: nil, inject: nil,
+                        scale: layer.attnHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
+                        tile: false)
+                } else {
+                    (stream, normed) = TrackFastKernels.injectNorm(
+                        residual: residual, out: pendingOut, inject: pendingInject,
+                        scale: layer.attnHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
+                        tile: tile)
+                }
+                if profiling { TrackFastProfile.tick(layer.ple != nil ? "norm+ple" : "norm", &profT, [stream, normed]) }
+                let am = hcMix(layer.attnHC, normed: normed, tag: "L\(layer.index).attn.hc")
+                input = am.input; injectW = am.inject
+                if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
             }
             tile = false
-            if profiling { TrackFastProfile.tick(layer.ple != nil ? "norm+ple" : "norm", &profT, [stream, normed]) }
-            let am = hcMix(layer.attnHC, normed: normed, tag: "L\(layer.index).attn.hc")
-            var input = am.input, injectW = am.inject
-            if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
             Self.debugTaps?.append(("L\(layer.index).attn.stream_in", stream))
             Self.debugTaps?.append(("L\(layer.index).attn.input", input))
             let attended: MLXArray
@@ -826,18 +932,37 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             Self.debugTaps?.append(("L\(layer.index).attn.out", attended))
             if profiling { TrackFastProfile.tick(layer.gdn != nil ? "gdn" : "attn", &profT, [attended]) }
-            (stream, normed) = TrackFastKernels.injectNorm(
-                residual: stream, out: attended, inject: injectW,
-                scale: layer.mlpHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
-                tile: false)
-            if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
-            Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
-            let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
-            input = mm.input; injectW = mm.inject
-            if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
+            // MLXFAST-MIXREPLAY: attention/cache work stays outside either replay region.
+            let inputF32: MLXArray?
+            if let replay = layer.mlpMixerReplay, layer.ple == nil,
+                Self.debugTaps == nil, !profiling, StreamOrDevice.default.stream === Stream.gpu,
+                stream.dim(0) == 1, stream.dim(1) <= 8,
+                case .quant(let dq) = layer.mlpHC.down,
+                case .quant(let iq)? = layer.mlpHC.inject, case .quant(let uq) = layer.mlpHC.up
+            {
+                let r = replay([
+                    stream, attended, injectW,
+                    dq.weight, dq.scales, dq.biases!,
+                    iq.weight, iq.scales, iq.biases!,
+                    uq.weight, uq.scales, uq.biases!, layer.mlpHC.normScaleQ,
+                ])
+                stream = r[0]; input = r[1]; injectW = r[2]; inputF32 = r[3]
+            } else {
+                var normed: MLXArray
+                (stream, normed) = TrackFastKernels.injectNorm(
+                    residual: stream, out: attended, inject: injectW,
+                    scale: layer.mlpHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
+                    tile: false)
+                if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
+                Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
+                let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
+                input = mm.input; injectW = mm.inject
+                if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
+                inputF32 = mm.inputF32
+            }
             Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
             pendingOut = Self.moeForwardShared(
-                layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay)
+                layer.moe, input, inputF32: inputF32, replay: layer.moePairReplay)
             if profiling { TrackFastProfile.tick("moe", &profT, [pendingOut!]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
             pendingInject = injectW
