@@ -925,6 +925,52 @@ extension TrackFastMoEKernels {
           }
         }
 
+        // Routed gate|up pair: share activation loads, preserving each output's K-block and row accumulation order.
+        template <typename T, int group_size, int bits>
+        METAL_FUNC void qmv_fast_pair_reg(
+            const device uint32_t* wg, const device T* sg, const device T* bg,
+            const device uint32_t* wu, const device T* su, const device T* bu,
+            const device T* x, const int in_vec_size, const int out_row,
+            uint simd_lid, thread float (&g)[4], thread float (&u)[4]) {
+          constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+          constexpr int pack_factor = get_pack_factor<bits, 32>();
+          constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+          constexpr int values_per_thread = pack_factor * packs_per_thread;
+          constexpr int block_size = values_per_thread * SIMD_SIZE;
+          constexpr int scale_step_per_thread = group_size / values_per_thread;
+          const device uint8_t* wgb = (const device uint8_t*)wg;
+          const device uint8_t* wub = (const device uint8_t*)wu;
+          typedef float U;
+          thread U x_thread[values_per_thread];
+          for (int row = 0; row < 4; row++) { g[row] = 0; u[row] = 0; }
+          const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+          const int in_vec_size_g = in_vec_size / group_size;
+          wgb += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+          wub += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+          sg += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          bg += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          su += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          bu += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          x += simd_lid * values_per_thread;
+          for (int k = 0; k < in_vec_size; k += block_size) {
+            U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+            for (int row = 0; row < 4; row++) {
+              auto wgl = (const device uint8_t*)(wgb + row * in_vec_size_w);
+              U gs = sg[row * in_vec_size_g], gb = bg[row * in_vec_size_g];
+              g[row] += qdot<U, values_per_thread, bits>(wgl, x_thread, gs, gb, sum);
+              auto wul = (const device uint8_t*)(wub + row * in_vec_size_w);
+              U us = su[row * in_vec_size_g], ub = bu[row * in_vec_size_g];
+              u[row] += qdot<U, values_per_thread, bits>(wul, x_thread, us, ub, sum);
+            }
+            wgb += block_size * bytes_per_pack / pack_factor;
+            wub += block_size * bytes_per_pack / pack_factor;
+            sg += block_size / group_size; bg += block_size / group_size;
+            su += block_size / group_size; bu += block_size / group_size;
+            x += block_size;
+          }
+          for (int row = 0; row < 4; row++) { g[row] = simd_sum(g[row]); u[row] = simd_sum(u[row]); }
+        }
+
         // qmv_impl's normal branch (out_vec_size >= 8, full tile) likewise.
         template <typename T, int group_size, int bits>
         METAL_FUNC void qmv_reg(
@@ -1138,8 +1184,7 @@ extension TrackFastMoEKernels {
         const size_t eoff = (size_t)e * (size_t)N;
         float g[4], u[4];
         if (FAST) {
-            qmv_fast_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
-            qmv_fast_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
+            qmv_fast_pair_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g, u);
         } else {
             qmv_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
             qmv_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
