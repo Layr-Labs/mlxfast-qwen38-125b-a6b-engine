@@ -18,6 +18,30 @@ import Foundation
 import MLX
 
 enum TrackFastKernels {
+    /// Host scalars the kernels take as inputs, made once per value: a fresh
+    /// `MLXArray(scalar)` per call is a small host allocation and one more
+    /// buffer to bind on every launch (about 180 of them per decode step).
+    private static let scalarLock = NSLock()
+    nonisolated(unsafe) private static var floatScalars: [UInt32: MLXArray] = [:]
+    nonisolated(unsafe) private static var int32Scalars: [Int32: MLXArray] = [:]
+    static func scalar(_ v: Float) -> MLXArray {
+        scalarLock.lock(); defer { scalarLock.unlock() }
+        let key = v.bitPattern
+        if let a = floatScalars[key] { return a }
+        let a = MLXArray(v); eval(a); floatScalars[key] = a; return a
+    }
+    nonisolated(unsafe) private static var typedScalars: [String: MLXArray] = [:]
+    static func scalar(_ v: Float, dtype: DType) -> MLXArray {
+        scalarLock.lock(); defer { scalarLock.unlock() }
+        let key = "\(v.bitPattern):\(dtype)"
+        if let a = typedScalars[key] { return a }
+        let a = MLXArray(v, dtype: dtype); eval(a); typedScalars[key] = a; return a
+    }
+    static func scalar(_ v: Int32) -> MLXArray {
+        scalarLock.lock(); defer { scalarLock.unlock() }
+        if let a = int32Scalars[v] { return a }
+        let a = MLXArray(v); eval(a); int32Scalars[v] = a; return a
+    }
 
     struct GDNGeometry {
         let projWidth: Int  // PROJ_W
@@ -218,7 +242,7 @@ enum TrackFastKernels {
             dtBias: dtBias, T: T, capture: capture, geometry: g)
         if prof { TrackFastProfile.tick("gdn.prep", &pt, prep) }
         let rec = leanKernel(
-            [prep[0], prep[1], prep[2], prep[3], prep[4], stateIn, MLXArray(Int32(T))],
+            [prep[0], prep[1], prep[2], prep[3], prep[4], stateIn, scalar(Int32(T))],
             template: [
                 ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
                 ("Hk", g.hk), ("Hv", g.hv), ("CAPTURE", capture),

@@ -14,7 +14,7 @@ import MLXFast
 enum TrackFastMixerKernels {
     static let header =
         TrackFastMoEKernels.helpers + TrackFastKernels.exactHeader + TrackFastMoEKernels.regHelpers
-        + TrackFastKernels.mixerHeadHeaderTail + TrackFastMoEKernels.wideHelpers
+        + TrackFastKernels.mixerHeadHeaderTail + TrackFastMoEKernels.wideHelpers + TrackFastMoEKernels.pipelinedHelpers
 
     /// normed [S, KD] -> lo [S, ND] (down), inj [S, HC] (inject).
     /// grid threads (32, 2 * (ND/8 + (HAS_INJECT ? 1 : 0)), 1), tg (32, 2, 1).
@@ -26,7 +26,8 @@ enum TrackFastMixerKernels {
         if (tile < NT) {
             if (VPT == 1) {
                 float r[4];
-                qmv_fast_reg<T, GS, BITS>(wd, sd, bd, normed, KD, tile * 8 + (int)sg * 4, lid, r);
+                if (PF) { qmv_fast_reg_pf<T, GS, BITS>(wd, sd, bd, normed, KD, tile * 8 + (int)sg * 4, lid, r); }
+                else { qmv_fast_reg<T, GS, BITS>(wd, sd, bd, normed, KD, tile * 8 + (int)sg * 4, lid, r); }
                 if (lid == 0) {
                     for (int i = 0; i < 4; ++i) {
                         const T l = static_cast<T>(r[i]);
@@ -67,8 +68,9 @@ enum TrackFastMixerKernels {
         outputNames: ["lo", "act", "inj"],
         source: downInjectSource, header: header, ensureRowContiguous: true)
 
+    nonisolated(unsafe) static var pipelineDown: Bool = false
     static func downInject(
-        normed: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?
+        normed: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?, pipelined: Bool? = nil
     ) -> (lo: MLXArray, act: MLXArray, inj: MLXArray) {
         let S = normed.dim(0), KD = normed.dim(1), ND = down.rows
         let HC = inject?.rows ?? 4
@@ -79,7 +81,7 @@ enum TrackFastMixerKernels {
             [normed, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
             template: [
                 ("T", normed.dtype), ("GS", down.groupSize), ("BITS", down.bits), ("KD", KD), ("ND", ND),
-                ("HC", HC), ("VPT", S), ("HAS_INJECT", inject != nil),
+                ("HC", HC), ("VPT", S), ("HAS_INJECT", inject != nil), ("PF", pipelined ?? Self.pipelineDown),
             ],
             grid: (32, tiles * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [[S, ND], [S, ND], [S, HC]], outputDTypes: [normed.dtype, normed.dtype, normed.dtype])
