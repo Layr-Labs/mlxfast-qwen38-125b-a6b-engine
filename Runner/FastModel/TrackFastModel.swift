@@ -221,6 +221,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let rotary: Qwen4ExpRotary
     let indexerBudget: Int
     let attentionScale: Float
+    // MLXFAST-ROPE: Evaluated, input-independent positional tables [budget, rot].
+    private let serialRoPETables: (cos: MLXArray, sin: MLXArray)
 
     /// Debug taps (tests): when set, every layer's output stream and the block
     /// inputs/outputs are appended here.
@@ -242,7 +244,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         self.hidden = cfg.hiddenSize
         self.eps = cfg.rmsNormEps
         self.rotaryDims = cfg.rotaryDimensions
-        self.rotary = Qwen4ExpRotary(dimensions: cfg.rotaryDimensions, base: cfg.ropeTheta)
+        // MLXFAST-ROPE: Use this same rotary implementation for cached and fallback rows.
+        let rotary = Qwen4ExpRotary(dimensions: cfg.rotaryDimensions, base: cfg.ropeTheta)
+        self.rotary = rotary
         self.indexerBudget = cfg.indexerBudget
         self.attentionScale = Foundation.pow(Float(cfg.headDim), -0.5)
         precondition(
@@ -253,6 +257,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             preconditionFailure("TrackFastModel: tower has no embed_tokens")
         }
         self.embedTokens = embed
+        // MLXFAST-ROPE: The affine checkpoint's embedding activations use its
+        // scales' dtype (BF16); dense embeddings use their weight dtype.
+        let servingDType = (embed as? QuantizedEmbedding)?.scales.dtype ?? embed.weight.dtype
+        self.serialRoPETables = Self.makeSerialRoPETables(
+            rotary: rotary, budget: cfg.indexerBudget, dtype: servingDType)
 
         let tower = base.model
         var built: [TrackLayer] = []
@@ -517,9 +526,43 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return o
     }
 
+    // MLXFAST-ROPE: Build each position with the EXACT serial graph, including
+    // count == 1, casts and reshapes. Evaluate before packing so concatenation
+    // only copies finished bytes; it cannot widen the trigonometry's dispatch.
+    private static func makeSerialRoPETables(
+        rotary: Qwen4ExpRotary, budget: Int, dtype: DType
+    ) -> (cos: MLXArray, sin: MLXArray) {
+        var cosRows: [MLXArray] = []
+        var sinRows: [MLXArray] = []
+        cosRows.reserveCapacity(budget)
+        sinRows.reserveCapacity(budget)
+        for offset in 0..<budget {
+            let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: 1))
+            let cosRow = c.asType(dtype).reshaped(1, rotary.dimensions)
+            let sinRow = s.asType(dtype).reshaped(1, rotary.dimensions)
+            eval(cosRow, sinRow)
+            cosRows.append(cosRow)
+            sinRows.append(sinRow)
+        }
+        let cos = concatenated(cosRows, axis: 0)
+        let sin = concatenated(sinRows, axis: 0)
+        eval(cos, sin)
+        return (cos, sin)
+    }
+
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
+        // MLXFAST-ROPE: Full-width, unit-stride rows are contiguous shared-buffer
+        // views. Do not call contiguous() here: it can copy a small view of a
+        // large allocation. All other counts, dtypes and offsets stay unchanged.
+        if count == 1, dtype == serialRoPETables.cos.dtype,
+            offset >= 0, offset < indexerBudget
+        {
+            return (
+                serialRoPETables.cos[offset..<(offset + 1), 0...],
+                serialRoPETables.sin[offset..<(offset + 1), 0...])
+        }
         let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
         return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
     }
