@@ -136,6 +136,8 @@ struct TrackHC {
     let up: TrackProj
     let lowrank: Int
     let hasInject: Bool
+    let mixerReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
+    let mixerReplayEmitsF32: Bool
 }
 
 struct TrackGDN {
@@ -282,21 +284,64 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             built.append(Self.bind(layer: layer, index: index, cfg: cfg))
         }
         self.layers = built
-        self.finalMixer = Self.bindHC(tower.trackChild("hyper_connection_mixer"), cfg: cfg)
+        self.finalMixer = Self.bindHC(
+            tower.trackChild("hyper_connection_mixer"), cfg: cfg, replayEmitF32: false)
         super.init()
     }
 
     // MARK: binding
 
-    static func bindHC(_ m: Module, cfg: Qwen4ExpTextConfiguration) -> TrackHC {
+    static func bindHC(
+        _ m: Module, cfg: Qwen4ExpTextConfiguration, replayEmitF32: Bool? = nil
+    ) -> TrackHC {
         let scale = m.trackChild("hc_norm").trackArray("weight")
         let down = TrackProj(m.trackChild("input_mix_weight_down"))
         let up = TrackProj(m.trackChild("input_mix_weight_up"))
         let inject = m.children()[unwrapping: "block_inject_weight"].map { TrackProj($0) }
         let q = (scale * MLXArray(Float(1) / Float(cfg.hcCount), dtype: scale.dtype))
+        let replay = replayEmitF32.flatMap {
+            makeMixerReplay(
+                down: down, up: up, inject: inject, hcCount: cfg.hcCount,
+                hidden: cfg.hiddenSize, emitF32: $0)
+        }
         return TrackHC(
             normScaleQ: q, down: down, inject: inject, up: up, lowrank: cfg.hcLowrank,
-            hasInject: inject != nil)
+            hasInject: inject != nil, mixerReplay: replay, mixerReplayEmitsF32: replayEmitF32 ?? false)
+    }
+
+    private static func makeMixerReplay(
+        down: TrackProj, up: TrackProj, inject: TrackProj?, hcCount: Int, hidden: Int, emitF32: Bool
+    ) -> (@Sendable ([MLXArray]) -> [MLXArray])? {
+        guard case .quant(let dq) = down, case .quant(let uq) = up,
+            dq.biases != nil, uq.biases != nil
+        else { return nil }
+        let iq: TrackQuantWeight
+        if let inject {
+            guard case .quant(let q) = inject, q.biases != nil else { return nil }
+            iq = q
+        } else {
+            iq = dq
+        }
+        return compile(shapeless: false) {
+            [downGroupSize = dq.groupSize, downBits = dq.bits, downMode = dq.mode,
+             upGroupSize = uq.groupSize, upBits = uq.bits, upMode = uq.mode,
+             injectGroupSize = iq.groupSize, injectBits = iq.bits, injectMode = iq.mode,
+             hasInject = inject != nil] inputs in
+            let down = TrackQuantWeight(
+                weight: inputs[1], scales: inputs[2], biases: inputs[3],
+                groupSize: downGroupSize, bits: downBits, mode: downMode)
+            let up = TrackQuantWeight(
+                weight: inputs[4], scales: inputs[5], biases: inputs[6],
+                groupSize: upGroupSize, bits: upBits, mode: upMode)
+            let inject = hasInject ? TrackQuantWeight(
+                weight: inputs[7], scales: inputs[8], biases: inputs[9],
+                groupSize: injectGroupSize, bits: injectBits, mode: injectMode) : nil
+            let d = TrackFastMixerKernels.downInject(normed: inputs[0], down: down, inject: inject)
+            let u = TrackFastMixerKernels.upMix(
+                act: d.act, normed: inputs[0], up: up, inj: d.inj, hcCount: hcCount, hidden: hidden,
+                hasInject: hasInject, emitF32: emitF32)
+            return [u.input, u.inject, u.inputF32]
+        }
     }
 
     static func bindGDN(_ m: Module, cfg: Qwen4ExpTextConfiguration) -> TrackGDN {
@@ -431,8 +476,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     static func bind(layer: Qwen4ExpDecoderLayer, index: Int, cfg: Qwen4ExpTextConfiguration)
         -> TrackLayer
     {
-        let attnHC = bindHC(layer.trackChild("attn_hyper_connection"), cfg: cfg)
-        let mlpHC = bindHC(layer.trackChild("mlp_hyper_connection"), cfg: cfg)
+        let attnHC = bindHC(layer.trackChild("attn_hyper_connection"), cfg: cfg, replayEmitF32: false)
+        let mlpHC = bindHC(layer.trackChild("mlp_hyper_connection"), cfg: cfg, replayEmitF32: true)
         let moe = bindMoE(layer.trackChild("mlp"), cfg: cfg)
         var gdn: TrackGDN? = nil
         var attn: TrackAttn? = nil
@@ -473,6 +518,19 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             if hc.hasInject, case .quant(let q)? = hc.inject, q.biases != nil { injQ = q }
             if !hc.hasInject || injQ != nil {
                 let n2 = normed.reshaped(S, hcCount * hidden)
+                if S == 1, normed.dtype == .bfloat16, Self.debugTaps == nil,
+                    hc.mixerReplayEmitsF32 == emitF32, let replay = hc.mixerReplay,
+                    StreamOrDevice.default.stream === Stream.gpu
+                {
+                    let iq = injQ ?? dq
+                    let result = replay([
+                        n2, dq.weight, dq.scales, dq.biases!,
+                        uq.weight, uq.scales, uq.biases!, iq.weight, iq.scales, iq.biases!,
+                    ])
+                    return (
+                        result[0].reshaped(1, S, hidden), result[1].reshaped(1, S, hcCount),
+                        emitF32 ? result[2].reshaped(1, S, hidden) : nil)
+                }
                 let d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
                 let u = TrackFastMixerKernels.upMix(
                     act: d.act, normed: n2, up: uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
