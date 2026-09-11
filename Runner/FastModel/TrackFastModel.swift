@@ -235,7 +235,14 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// inputs/outputs are appended here.
     nonisolated(unsafe) static var debugTaps: [(String, MLXArray)]? = nil
     /// Layers per partial dispatch inside a forward (0 = one dispatch per step).
-    nonisolated(unsafe) public static var asyncChunk: Int = 3
+    /// MLXFAST-ASYNC2: 3 -> 2, following a measured gradient. Going the other
+    /// way (3 -> 6, halving the forced stream evaluations) scored -0.41%, which
+    /// means the partial dispatches are KEEPING THE GPU FED rather than stalling
+    /// the host -- the host has slack and the GPU is the bottleneck. If that is
+    /// the mechanism, dispatching more often should feed it better still. This
+    /// is a scheduling change only: MLX's graph is lazy, so the values produced
+    /// are identical regardless of when evaluation is forced.
+    nonisolated(unsafe) public static var asyncChunk: Int = 2
     /// Layers in the first partial-dispatch chunk (0 = same as asyncChunk):
     /// the first dispatch lands right after the PLE layer, whose host row
     /// gather is the one host sync of the step.
