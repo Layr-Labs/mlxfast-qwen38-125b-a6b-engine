@@ -1096,7 +1096,11 @@ extension TrackFastMoEKernels {
         """#
 
     /// Routed experts, gate|up + SwiGLU. x [S, KD], idx/xrow uint32 [BR] ->
-    /// act [BR, N]. grid threads (32, N/8, BR), threadgroup (32, 2, 1).
+    /// act [BR, N]. S == 1: grid threads (32, N/4, BR), threadgroup (32, 2, 1);
+    /// simdgroup 0 walks the gate rows and simdgroup 1 the same up rows, met
+    /// in threadgroup memory before the unchanged per-element combine (the two
+    /// walks are independent, so this is bit-exact). S > 1 keeps grid threads
+    /// (32, N/8, BR) with both walks serial per simdgroup.
     static let gateUpActSource = """
         const uint z = threadgroup_position_in_grid.z;
         if (z == (uint)BR) {
@@ -1107,13 +1111,27 @@ extension TrackFastMoEKernels {
             const uint kg2 = (uint)KD / GS;
             const int tile = (int)threadgroup_position_in_grid.y;
             if constexpr (VPT == 1) {
-                const int out_row = tile * 8 + (int)simdgroup_index_in_threadgroup * 4;
+                // MLXFAST-GATEUPSPLIT: the gate and up walks read disjoint
+                // weights over the same input row, so they run on the two
+                // simdgroups at once instead of back to back.Identical walk
+                // arguments, slots and per-element fold: bit-exact.
+                const uint sgi = simdgroup_index_in_threadgroup;
+                const uint lid = thread_index_in_simdgroup;
+                const int out_row = tile * 4;
+                threadgroup float uex[4];
                 float g[4], u[4];
-                qmv_fast_reg<T, GS, BITS>(wsh, ssh, bsh, x, KD, out_row, thread_index_in_simdgroup, g);
-                qmv_fast_reg<T, GS, BITS>(wsh + (size_t)N * kw2, ssh + (size_t)N * kg2, bsh + (size_t)N * kg2, x, KD, out_row, thread_index_in_simdgroup, u);
-                if (thread_index_in_simdgroup == 0) {
+                if (sgi == 0) {
+                    qmv_fast_reg<T, GS, BITS>(wsh, ssh, bsh, x, KD, out_row, lid, g);
+                } else {
+                    qmv_fast_reg<T, GS, BITS>(wsh + (size_t)N * kw2, ssh + (size_t)N * kg2, bsh + (size_t)N * kg2, x, KD, out_row, lid, u);
+                    if (lid == 0) {
+                        for (int i = 0; i < 4; ++i) { uex[i] = u[i]; }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sgi == 0 && lid == 0) {
                     for (int i = 0; i < 4; ++i) {
-                        act[(size_t)BR * (size_t)N + (size_t)(out_row + i)] = mlx_silu(static_cast<T>(g[i])) * static_cast<T>(u[i]);
+                        act[(size_t)BR * (size_t)N + (size_t)(out_row + i)] = mlx_silu(static_cast<T>(g[i])) * static_cast<T>(uex[i]);
                     }
                 }
             } else {
@@ -1133,6 +1151,40 @@ extension TrackFastMoEKernels {
         const uint r = xrow[z];
         const uint kw = (uint)KD / 8;
         const uint kg = (uint)KD / GS;
+        if constexpr (VPT == 1) {
+            // MLXFAST-GATEUPSPLIT (routed): same split as the shared branch.
+            const uint sgi = simdgroup_index_in_threadgroup;
+            const uint lid = thread_index_in_simdgroup;
+            const int out_row = (int)threadgroup_position_in_grid.y * 4;
+            const device T* xb = x + (size_t)r * (size_t)KD;
+            const size_t eoff = (size_t)e * (size_t)N;
+            threadgroup float uex[4];
+            float g[4], u[4];
+            if (sgi == 0) {
+                if (FAST) {
+                    qmv_fast_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, lid, g);
+                } else {
+                    qmv_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, lid, g);
+                }
+            } else {
+                if (FAST) {
+                    qmv_fast_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, lid, u);
+                } else {
+                    qmv_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, lid, u);
+                }
+                if (lid == 0) {
+                    for (int i = 0; i < 4; ++i) { uex[i] = u[i]; }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sgi == 0 && lid == 0) {
+                for (int i = 0; i < 4; ++i) {
+                    const T gv = static_cast<T>(g[i]);
+                    const T uv = static_cast<T>(uex[i]);
+                    act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+                }
+            }
+        } else {
         const int out_row = (int)threadgroup_position_in_grid.y * 8 + (int)simdgroup_index_in_threadgroup * 4;
         const device T* xb = x + (size_t)r * (size_t)KD;
         const size_t eoff = (size_t)e * (size_t)N;
@@ -1150,6 +1202,7 @@ extension TrackFastMoEKernels {
                 const T uv = static_cast<T>(u[i]);
                 act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
             }
+        }
         }
         """
 
@@ -1178,7 +1231,7 @@ extension TrackFastMoEKernels {
         return (S == 1 ? gateUpActKernel1 : gateUpActKernel)(
             [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
             template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("BR", BR), ("VPT", S)],
-            grid: (32, (N / 8) * 2, BR + 1), threadGroup: (32, 2, 1),
+            grid: (32, (S == 1 ? (N / 4) * 2 : (N / 8) * 2), BR + 1), threadGroup: (32, 2, 1),
             outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
     }
 
