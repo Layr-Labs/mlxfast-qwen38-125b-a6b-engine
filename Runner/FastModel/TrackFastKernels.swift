@@ -212,7 +212,7 @@ enum TrackFastKernels {
         let slots = capture ? B * T : B
         precondition(g.dk == 128 && g.dv == 128 && g.convDim % 128 == 0)
         let prof = TrackFastProfile.prefill != nil && T >= TrackFastProfile.minWindow
-        var pt = CFAbsoluteTimeGetCurrent()
+        var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
         let prep = gdnPrep(
             proj: proj, convState: convState, convW: convW, negExpALog: negExpALog,
             dtBias: dtBias, T: T, capture: capture, geometry: g)

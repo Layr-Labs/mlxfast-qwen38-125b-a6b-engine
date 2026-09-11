@@ -487,7 +487,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let B = x.dim(0), S = x.dim(1)
         let geo = g.geometry
         let prof = TrackFastProfile.prefill != nil && S >= TrackFastProfile.minWindow
-        var pt = CFAbsoluteTimeGetCurrent()
+        var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
         let proj = g.proj.apply(x)  // [B,S,PROJ_W]
         if prof { TrackFastProfile.tick("gdn.proj", &pt, [proj]) }
         let state = evaluation.inputState(modelLayerIndex: layerIndex)
@@ -570,7 +570,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     static func moeForwardShared(_ m: TrackMoE, _ x: MLXArray, inputF32: MLXArray? = nil) -> MLXArray {
         let prof = TrackFastProfile.prefill != nil && x.dim(1) >= TrackFastProfile.minWindow
-        var pt = CFAbsoluteTimeGetCurrent()
+        var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
         let logits = matmul(inputF32 ?? x.asType(.float32), m.routerW32.transposed())
         if prof { TrackFastProfile.tick("moe.router", &pt, [logits]) }
         // Top-k + softmax in one launch (argpartition's stable order, softmax_single_row).
@@ -691,8 +691,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         var stream = residual
         let ropeTab = ropeTables(offset: offset, count: ids.dim(1), dtype: residual.dtype)
 
-        var profT = CFAbsoluteTimeGetCurrent()
         let profiling = TrackFastProfile.prefill != nil && ids.dim(1) >= TrackFastProfile.minWindow
+        var profT = profiling ? CFAbsoluteTimeGetCurrent() : 0
         if profiling { TrackFastProfile.windows += 1 }
         for layer in layers {
             var normed: MLXArray
