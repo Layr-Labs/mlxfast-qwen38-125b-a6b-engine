@@ -755,19 +755,35 @@ METAL_FUNC void qmv_impl(
 // `simd_sum`, multiply by the reciprocal).
 
 extension TrackFastMoEKernels {
-    /// logits f32 [R, E] -> idx uint32 [R, K], w f32 [R, K].
+    /// logits f32 [R, E] -> idx uint32 [R, K], w f32 [R, K]. grid threads (32, R, 1), tg (32,1,1).
     static let routeSource = """
         constexpr int E_PER = (E + 31) / 32;
         const uint row = threadgroup_position_in_grid.y;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
         // Shared-expert gate (1 row, K = KD): one token routes to `qmv`'s small-N
-        // branch (simdgroup 0), two to eight to `qmv_wide`'s short tile, which
-        // folds K across the 8 slots of BOTH simdgroups.
+        // branch, two to eight to `qmv_wide`'s short tile, which folds K across
+        // the 8 slots of BOTH simdgroups.
+        //
+        // MLXFAST-ROUTE-OVERLAP: on the one-token path the gate walk and the
+        // top-k selection below are INDEPENDENT -- the gate writes `gate[row]`
+        // and nothing the selection reads -- and the selection runs on
+        // simdgroup 0 alone (it is one row, so it cannot be split across
+        // simdgroups without changing the tie order). The gate walk was
+        // therefore serialized in front of the selection on that same
+        // simdgroup while simdgroup 1 only waited at the barrier. It is a
+        // single row of K = 2560, which is exactly one simdgroup's worth of
+        // `qmv` small-N branch, so simdgroup 1 walks it while simdgroup 0
+        // selects; the two chains then overlap instead of adding. Every lane,
+        // every block, `qdot`/`qdot_safe` and the `simd_sum` are untouched --
+        // `simd_gid` is passed as 0, which is the row this walk always took.
+        // The barrier after the selection is unchanged.
         if (HAS_GATE) {
             const device T* xr = x + (size_t)row * (size_t)KD;
             if constexpr (VPT == 1) {
-                track_inject_qmv<T, GS, BITS, KD, 1, 4>(wg, sgw, bgw, xr, gate + row, sg, lane);
+                if (sg == 1) {
+                    track_inject_qmv<T, GS, BITS, KD, 1, 4>(wg, sgw, bgw, xr, gate + row, 0u, lane);
+                }
             } else {
                 threadgroup float fp[8];
                 float r[1]; bool valid = false; int orow = 0;
@@ -813,6 +829,7 @@ extension TrackFastMoEKernels {
         float maxval = -FLT_MAX;
         for (int i = 0; i < N_READS; i++) { maxval = (maxval < ld[i]) ? ld[i] : maxval; }
         maxval = simd_max(maxval);
+        maxval = simd_max((lane == 0) ? maxval : -INFINITY);
         float normalizer = 0;
         for (int i = 0; i < N_READS; i++) {
             float exp_x = fast::exp(ld[i] - maxval);
@@ -820,6 +837,7 @@ extension TrackFastMoEKernels {
             normalizer += exp_x;
         }
         normalizer = simd_sum(normalizer);
+        normalizer = simd_sum((lane == 0) ? normalizer : 0.0f);
         normalizer = 1 / normalizer;
         for (int i = 0; i < N_READS; i++) {
             const int p = (int)lane * N_READS + i;
@@ -853,11 +871,10 @@ extension TrackFastMoEKernels {
         let lead = Array(logits.shape.dropLast())
         let R = lead.reduce(1, *)
         precondition(topK <= 32 && topK <= E && R >= 1 && R <= 8 && KD % 256 == 0)
-        let simdgroups = g == nil ? 1 : 2
         let outs = (R == 1 ? routeKernel1 : routeKernel)(
             [logits.reshaped(R, E), x.reshaped(R, KD), g?.weight ?? x, g?.scales ?? x, g?.biases ?? x],
             template: [("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32), ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R), ("HAS_GATE", g != nil)],
-            grid: (32, R * simdgroups, 1), threadGroup: (32, simdgroups, 1),
+            grid: (32, R * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [[R, topK], [R, topK], [R]], outputDTypes: [.uint32, .float32, x.dtype])
         return (outs[0].reshaped(lead + [topK]), outs[1].reshaped(lead + [topK]), outs[2].reshaped(lead))
     }
