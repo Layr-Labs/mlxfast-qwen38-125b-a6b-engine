@@ -113,12 +113,9 @@ extension TrackFastKernels {
         source: injectNormSource, header: exactHeader, ensureRowContiguous: true)
 
 
-    /// Wide-window variant (prefill): ONE simdgroup per (row, stream). Lane l
-    /// plays virtual thread 32g + l of the 640-thread layout for g = 0..NT/32-1,
-    /// so every partial sits in the same lane and the same `simd_sum` as the
-    /// reference `rms_single_row`; the per-simdgroup partials are then folded
-    /// by the same 32-lane `simd_sum` over `local_sums`. Same arithmetic, 20x
-    /// fewer threads per row: the 640-thread threadgroups were occupancy-bound.
+    /// Wide-window variant (prefill): two simdgroups per (row, stream), each
+    /// handling alternating virtual 32-lane chunks. Each chunk keeps its
+    /// original accumulation and the final `simd_sum` keeps the chunk order.
     static let injectNormWideSource = """
         constexpr int N_READS = 4;
         constexpr uint NT = H / N_READS;
@@ -126,11 +123,12 @@ extension TrackFastKernels {
         const uint row = thread_position_in_grid.z;
         const uint hc = thread_position_in_grid.y;
         const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
         threadgroup float local_sums[32];
         const uint base = row * W + hc * H;
         InT inj_t = InT(0);
         if (HAS_INJECT) { inj_t = inject[row * HC + hc]; }
-        for (uint g = 0; g < simd_groups; ++g) {
+        for (uint g = sg; g < simd_groups; g += 2) {
             const uint lid = g * 32 + lane;
             float acc = 0.0f;
             if (lid < NT) {
@@ -150,11 +148,11 @@ extension TrackFastKernels {
             acc = simd_sum(acc);
             if (lane == 0) { local_sums[g] = acc; }
         }
-        if (lane >= simd_groups) { local_sums[lane] = 0; }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0 && lane >= simd_groups) { local_sums[lane] = 0; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         const float total = simd_sum(local_sums[lane]);
         const float inv_mean = metal::precise::rsqrt(total / (float)H + as_type<float>((uint)EPS_BITS));
-        for (uint g = 0; g < simd_groups; ++g) {
+        for (uint g = sg; g < simd_groups; g += 2) {
             const uint lid = g * 32 + lane;
             if (lid < NT) {
                 for (int i = 0; i < N_READS; ++i) {
@@ -167,7 +165,7 @@ extension TrackFastKernels {
         """
 
     nonisolated(unsafe) static let injectNormWideKernel = MLXFast.metalKernel(
-        name: "track_inject_norm_wide",
+        name: "track_inject_norm_wide_2sg",
         inputNames: ["residual", "out", "inject", "scale"],
         outputNames: ["stream", "normed"],
         source: injectNormWideSource, ensureRowContiguous: true)
@@ -189,7 +187,7 @@ extension TrackFastKernels {
                     ("InT", residual.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
                     ("HAS_INJECT", hasInject), ("TILE", tile), ("EPS_BITS", Int(eps.bitPattern)),
                 ],
-                grid: (32, hcCount, B * S), threadGroup: (32, 1, 1),
+                grid: (64, hcCount, B * S), threadGroup: (64, 1, 1),
                 outputShapes: [[B, S, W], [B, S, W]],
                 outputDTypes: [residual.dtype, residual.dtype])
             return (outs[0], outs[1])
