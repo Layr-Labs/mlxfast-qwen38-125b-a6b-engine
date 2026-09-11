@@ -71,7 +71,18 @@ public final class TrackQwen4ExpInlineMTPAssistant {
         let groupSize: Int, bits: Int
     }
     private let shortlist: Shortlist?
-    static let shortlistLowIds = 98304
+    // MLXFAST-SHORTLIST: was 98304, justified in the comment above by "the
+    // public golden's tokens fall under 98,304 in 99.7% of cases". But the
+    // public golden is the long-copy fixture, and the organizers SCREEN
+    // repetitive prompts out of the timed set (reject above 0.03 self-
+    // similarity; long-copy scores 0.922). On screened varied prose the
+    // target's argmax lands in the uncovered band (98304, 248044) — 60% of the
+    // vocabulary — far more often, and every such round is a STRUCTURALLY
+    // rejected draft regardless of head quality. Covering the full range makes
+    // the shortlist argmax always equal the full argmax. Correctness is
+    // unaffected either way: a miss only ever cost a rejected draft, never a
+    // token, because the target verifies every emitted token.
+    static let shortlistLowIds = 248044
     static let shortlistSpecialFrom = 248044
 
     /// - Parameters:
