@@ -1166,7 +1166,12 @@ extension TrackFastMoEKernels {
         source: gateUpActSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
 
-    static let gateUpReuseRowsPerSimdgroup = 2
+    /// Rows per simdgroup for the S == 1 gate/up dual walk. One row halves the
+    /// live accumulators per simdgroup (2 vs 4) and deals the N rows over twice
+    /// as many simdgroups (640 vs 320), trading shorter serial chains for finer
+    /// occupancy. Env override keeps the crown geometry available locally.
+    static let gateUpReuseRowsPerSimdgroup =
+        ProcessInfo.processInfo.environment["MLXFAST_MOE_GATEUP_RPS"].flatMap { Int($0) } ?? 1
 
     static let gateUpReuseHelpers = #"""
         template <typename T, int group_size, int bits, int rows>
@@ -1267,7 +1272,7 @@ extension TrackFastMoEKernels {
         """
 
     nonisolated(unsafe) static let gateUpReuseKernel = MLXFast.metalKernel(
-        name: "track_moe_gate_up_reuse_2row",
+        name: "track_moe_gate_up_reuse",
         inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
         outputNames: ["act"],
         source: gateUpReuseSource,
