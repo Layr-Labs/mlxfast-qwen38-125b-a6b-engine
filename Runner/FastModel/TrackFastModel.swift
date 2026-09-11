@@ -205,6 +205,39 @@ struct TrackLayer {
     let ple: TrackPLE?
 }
 
+struct TrackRoPETableCache {
+    let rotary: Qwen4ExpRotary
+    let dimensions: Int
+    let budget: Int
+    let cached: (cos: MLXArray, sin: MLXArray)
+
+    init(dimensions: Int, base: Float, budget: Int) {
+        let rotary = Qwen4ExpRotary(dimensions: dimensions, base: base)
+        let (cos, sin) = rotary.cosSin(qwen4ExpPositions(offset: 0, count: budget))
+        let cached = (
+            cos.asType(.bfloat16).reshaped(budget, dimensions),
+            sin.asType(.bfloat16).reshaped(budget, dimensions))
+        eval(cached.0, cached.1)
+        self.rotary = rotary
+        self.dimensions = dimensions
+        self.budget = budget
+        self.cached = cached
+    }
+
+    func tables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
+        if dtype == .bfloat16, offset >= 0, count >= 0, count <= budget,
+            offset <= budget - count
+        {
+            let rows = offset ..< (offset + count)
+            return (cached.cos[rows], cached.sin[rows])
+        }
+        let (cos, sin) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
+        return (
+            cos.asType(dtype).reshaped(count, dimensions),
+            sin.asType(dtype).reshaped(count, dimensions))
+    }
+}
+
 // MARK: - The model
 
 public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
@@ -217,8 +250,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let hcCount: Int
     let hidden: Int
     let eps: Float
-    let rotaryDims: Int
-    let rotary: Qwen4ExpRotary
+    let ropeCache: TrackRoPETableCache
     let indexerBudget: Int
     let attentionScale: Float
 
@@ -226,7 +258,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// inputs/outputs are appended here.
     nonisolated(unsafe) static var debugTaps: [(String, MLXArray)]? = nil
     /// Layers per partial dispatch inside a forward (0 = one dispatch per step).
-    nonisolated(unsafe) public static var asyncChunk: Int = 3  // MLXFAST-CHUNK3: 8 -> 16 submissions; 12 measured -0.41% so the gradient favours smaller
+    nonisolated(unsafe) public static var asyncChunk: Int = 6
 
     /// Kill switch for A/B: `TRACK_FAST_FORWARD=0` routes every forward to the
     /// wrapped model.
@@ -241,9 +273,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         self.hcCount = cfg.hcCount
         self.hidden = cfg.hiddenSize
         self.eps = cfg.rmsNormEps
-        self.rotaryDims = cfg.rotaryDimensions
-        self.rotary = Qwen4ExpRotary(dimensions: cfg.rotaryDimensions, base: cfg.ropeTheta)
         self.indexerBudget = cfg.indexerBudget
+        self.ropeCache = TrackRoPETableCache(
+            dimensions: cfg.rotaryDimensions, base: cfg.ropeTheta, budget: cfg.indexerBudget)
         self.attentionScale = Foundation.pow(Float(cfg.headDim), -0.5)
         precondition(
             cfg.rmsNormWeightOffset == 0,
@@ -520,8 +552,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
-        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
-        return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
+        ropeCache.tables(offset: offset, count: count, dtype: dtype)
     }
 
     private func attnForward(
@@ -543,7 +574,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
         let prep = TrackFastKernels.attnPrep(
             qkv: qkv, qNorm: a.qNormW, kNorm: a.kNormW, cos: rope.cos, sin: rope.sin,
-            heads: heads, kvHeads: kvHeads, headDim: d, rotaryDims: rotaryDims, eps: eps)
+            heads: heads, kvHeads: kvHeads, headDim: d, rotaryDims: ropeCache.dimensions, eps: eps)
         let att = cache.updateAndAttend(
             queries: prep.q, keys: prep.k, values: prep.v,
             scale: attentionScale, sinks: nil, keepMask: nil)  // [B,HQ,S,D]
@@ -788,7 +819,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         else { return nil }
         let offset = first.rows[0].absoluteOffset
         let S = tokens.dim(1)
-        guard offset + S <= indexerBudget else { return nil }
+        guard offset >= 0, S <= indexerBudget, offset <= indexerBudget - S else { return nil }
         return (typed, offset)
     }
 
