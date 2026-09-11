@@ -1385,8 +1385,20 @@ extension TrackFastMoEKernels {
     /// shortens each simdgroup's serial chain and drops the per-thread product
     /// array into threadgroup memory. Every product and the fold order are
     /// unchanged, so the output is bit-identical for any value.
+    /// MLXFAST-KSG1: 2 -> 1, following a measured gradient. The host gate
+    /// (`topK % downCombineSimdgroups == 0 ? ... : 1`) restricts this to
+    /// divisors of topK = 10, so the whole valid set is {1, 2, 5, 10}. KSG=5
+    /// measured **-1.01%** same-box: the extra simdgroup waves cost more than
+    /// the shorter walk chain saved. KSG=1 is the only untested point in the
+    /// favourable direction -- it HALVES the threadgroups and simdgroups for
+    /// this launch (grid (32, (H/4)*ksg, S), threadGroup (32, ksg, 1)) at the
+    /// cost of one simdgroup walking all 11 expert chains instead of two
+    /// walking (6,5). Every product and the fold order are unchanged, so the
+    /// output is bit-identical for any value -- the kernel's own comment says
+    /// so, and the K walk is `k = sgi + kk * KSG` with each expert's product
+    /// landing in its own `prod[k]` slot.
     static let downCombineSimdgroups =
-        ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 2
+        ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 1
 
     /// act [BR + S, F] (routed slots, then the shared expert per token), gate [S] pre-sigmoid.
     static func downCombine(
