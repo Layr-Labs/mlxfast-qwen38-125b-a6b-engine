@@ -19,10 +19,12 @@ enum TrackFastMixerKernels {
     static let header =
         TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader + TrackFastMoEKernels.regHelpers
         + TrackFastKernels.mixerHeadHeaderTail + TrackFastMoEKernels.wideHelpers
+        + TrackFastMoEKernels.regVecHelpers
     /// One-token instantiations: the wide bodies are replaced by their declarations.
     static let header1 =
         TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader + TrackFastMoEKernels.regHelpers
         + TrackFastKernels.mixerHeadHeaderTail + TrackFastMoEKernels.wideDecls
+        + TrackFastMoEKernels.regVecDecls
 
     /// normed [S, KD] -> lo [S, ND] (down), inj [S, HC] (inject).
     /// S == 1: each simdgroup owns downRowsPerSimdgroup adjacent down rows.
@@ -46,6 +48,28 @@ enum TrackFastMixerKernels {
                         const T l = static_cast<T>(r[i]);
                         lo[tile * (2 * RPS) + (int)sg * RPS + i] = l;
                         act[tile * (2 * RPS) + (int)sg * RPS + i] = mlx_silu(l);
+                    }
+                }
+            } else if constexpr (VPT >= 2 && VPT <= 4) {
+                // MLXFAST-VERIFYVEC: the MTP verify window. 32 lanes walk each
+                // row's K in qmv_fast_reg geometry and the VPT positions ride a
+                // register vector axis sharing the weight block, so weight
+                // traffic falls by VPT. Row coverage is identical to the wide
+                // path below (tile * 8 + sg * 4), so the grid and tile count do
+                // not move. Capped at VPT <= 4: x_thread[VPT][16] plus
+                // result[RPS][VPT] is 128 + 32 floats at VPT = 8 and would
+                // spill. At draft depth 1 the only widths reaching this kernel
+                // are S == 1 (the branch above) and S == 2.
+                float r[RPS][VPT];
+                const int row0 = tile * (2 * RPS) + (int)sg * RPS;
+                qmv_fast_reg_vec<T, GS, BITS, RPS, VPT>(wd, sd, bd, normed, KD, row0, lid, r);
+                if (lid == 0) {
+                    for (int i = 0; i < RPS; ++i) {
+                        for (int v = 0; v < VPT; ++v) {
+                            const T l = static_cast<T>(r[i][v]);
+                            lo[v * ND + row0 + i] = l;
+                            act[v * ND + row0 + i] = mlx_silu(l);
+                        }
                     }
                 }
             } else {
