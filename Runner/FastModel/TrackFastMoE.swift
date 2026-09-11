@@ -68,12 +68,21 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 4) {
+    // MLXFAST-VEC4LOAD: one 8-byte vector load per four activations instead of
+    // four scalar loads. `x` advances by `simd_lid * values_per_thread` and by
+    // `block_size`, both multiples of 16 elements (32 B at bf16), and `i` steps
+    // by 4 (8 B), so every access here is 8-byte aligned and a `vec<T,4>` load
+    // is legal. Bit-exact by construction: the four values are the same four
+    // values, the running sum keeps the identical left-to-right order
+    // (v.x, v.y, v.z, v.w == x[i], x[i+1], x[i+2], x[i+3]), and the four
+    // `x_thread` scale divisors are unchanged. Only the load instruction moves.
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+      const vec<T, 4> v = *reinterpret_cast<const device vec<T, 4>*>(x + i);
+      sum += v.x + v.y + v.z + v.w;
+      x_thread[i] = v.x;
+      x_thread[i + 1] = v.y / 16.0f;
+      x_thread[i + 2] = v.z / 256.0f;
+      x_thread[i + 3] = v.w / 4096.0f;
     }
   }
 
@@ -1093,6 +1102,84 @@ extension TrackFastMoEKernels {
           }
         }
         """#
+
+    /// MLXFAST-VERIFYVEC: `qmv_fast_reg` walked for VPT positions at once. Each
+    /// row's K is walked by all 32 lanes exactly as `qmv_fast_reg` walks it --
+    /// same packs_per_thread, values_per_thread, block_size, load_vector, qdot,
+    /// ascending block order and terminal simd_sum. The only addition is a
+    /// register vector axis: each weight block is read once and reused across
+    /// VPT activations, so weight traffic drops by VPT while each output keeps
+    /// its own unchanged association.
+    ///
+    /// NOTE: bit-identical PER OUTPUT to `qmv_fast_reg`, but NOT identical to
+    /// the k_lanes == 8 `qmv_wide_reg_full` path it replaces, which reduces over
+    /// 8 lanes through a depth-3 shuffle ladder. Wide-window outputs move. That
+    /// is a deliberate spend against the contract's 10% per-stream token
+    /// tolerance (5.4), not a free change.
+    static let regVecHelpers = #"""
+        template <typename T, int group_size, int bits, int rps, int vpt>
+        METAL_FUNC void qmv_fast_reg_vec(
+            const device uint32_t* w,
+            const device T* scales,
+            const device T* biases,
+            const device T* x,
+            const int in_vec_size,
+            const int out_row,
+            uint simd_lid,
+            thread float (&result)[rps][vpt]) {
+          constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+          constexpr int pack_factor = get_pack_factor<bits, 32>();
+          constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+          constexpr int values_per_thread = pack_factor * packs_per_thread;
+          constexpr int block_size = values_per_thread * SIMD_SIZE;
+          constexpr int scale_step_per_thread = group_size / values_per_thread;
+          const device uint8_t* ws = (const device uint8_t*)w;
+          typedef float U;
+          thread U x_thread[vpt][values_per_thread];
+          for (int row = 0; row < rps; row++) {
+            for (int v = 0; v < vpt; v++) { result[row][v] = 0; }
+          }
+          const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+          const int in_vec_size_g = in_vec_size / group_size;
+          ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+          scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          for (int k = 0; k < in_vec_size; k += block_size) {
+            thread U xsum[vpt];
+            for (int v = 0; v < vpt; v++) {
+              xsum[v] = load_vector<T, U, values_per_thread, bits>(
+                  x + v * in_vec_size + k + simd_lid * values_per_thread, x_thread[v]);
+            }
+            for (int row = 0; row < rps; row++) {
+              auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+              const device T* sl = scales + row * in_vec_size_g;
+              const device T* bl = biases + row * in_vec_size_g;
+              U s = sl[0];
+              U b = bl[0];
+              for (int v = 0; v < vpt; v++) {
+                result[row][v] += qdot<U, values_per_thread, bits>(wl, x_thread[v], s, b, xsum[v]);
+              }
+            }
+            ws += block_size * bytes_per_pack / pack_factor;
+            scales += block_size / group_size;
+            biases += block_size / group_size;
+          }
+          for (int row = 0; row < rps; row++) {
+            for (int v = 0; v < vpt; v++) { result[row][v] = simd_sum(result[row][v]); }
+          }
+        }
+        """#
+
+    /// Declaration only: S == 1 instantiations parse the name without carrying
+    /// the body, so their hashed source does not grow.
+    static let regVecDecls = #"""
+        template <typename T, int group_size, int bits, int rps, int vpt>
+        METAL_FUNC void qmv_fast_reg_vec(
+            const device uint32_t* w, const device T* scales, const device T* biases,
+            const device T* x, const int in_vec_size, const int out_row, uint simd_lid,
+            thread float (&result)[rps][vpt]);
+        """#
+
 
     /// Routed experts, gate|up + SwiGLU. x [S, KD], idx/xrow uint32 [BR] ->
     /// act [BR, N]. grid threads (32, N/8, BR), threadgroup (32, 2, 1).

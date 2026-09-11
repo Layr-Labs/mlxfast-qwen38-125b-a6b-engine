@@ -71,7 +71,14 @@ public final class TrackQwen4ExpInlineMTPAssistant {
         let groupSize: Int, bits: Int
     }
     private let shortlist: Shortlist?
-    static let shortlistLowIds = 98304
+    // MLXFAST-SHORTLIST: 248,044 makes `ids.count == n`, so the constructor's
+    // `if ids.count < n` guard leaves `shortlist == nil` and the drafter takes
+    // `target.head(lastSample)` -- the full head with NO gather. Measured
+    // acceptance 0.427 vs 0.304 at the shipped 98,304, and a 163,840 cutoff
+    // measured acceptance identical to 15 decimals (38/89) while scoring 2%
+    // worse, which is consistent with the gather being the dominant cost that
+    // full coverage avoids entirely.
+    static let shortlistLowIds = 248044
     static let shortlistSpecialFrom = 248044
 
     /// - Parameters:
