@@ -453,14 +453,59 @@ extension TrackFastKernels {
         outputNames: ["out"],
         source: attnGateSource, header: exactHeader, ensureRowContiguous: true)
 
+    static let attnGateVec4Source = """
+        const uint j = 4 * thread_position_in_grid.x;
+        const uint row = thread_position_in_grid.y;
+        if (j >= HQ * D) return;
+        const uint h = j / D;
+        const uint d = j % D;
+        const uint b = row / S;
+        const uint s = row % S;
+        const size_t att_off = ((b * HQ + h) * S + s) * D + d;
+        const size_t gate_off = row * QW + GATE_OFF + j;
+        const vec<InT, 4> a = *((const device vec<InT, 4>*)(att + att_off));
+        const vec<InT, 4> g = *((const device vec<InT, 4>*)(qkv + gate_off));
+        vec<InT, 4> result;
+        result[0] = a[0] * mlx_sigmoid(g[0]);
+        result[1] = a[1] * mlx_sigmoid(g[1]);
+        result[2] = a[2] * mlx_sigmoid(g[2]);
+        result[3] = a[3] * mlx_sigmoid(g[3]);
+        *((device vec<InT, 4>*)(out + row * HQ * D + j)) = result;
+        """
+
+    nonisolated(unsafe) static let attnGateVec4Kernel = MLXFast.metalKernel(
+        name: "track_attn_gate_vec4",
+        inputNames: ["att", "qkv"],
+        outputNames: ["out"],
+        source: attnGateVec4Source, header: exactHeader, ensureRowContiguous: true)
+
+    static func attnGateUsesVec4(
+        attDType: DType, qkvDType: DType, sequenceLength: Int,
+        headDim: Int, qkvWidth: Int, gateOffset: Int
+    ) -> Bool {
+        sequenceLength > 8 && attDType == .bfloat16 && qkvDType == .bfloat16
+            && headDim % 4 == 0 && qkvWidth % 4 == 0 && gateOffset % 4 == 0
+    }
+
     static func attnGate(att: MLXArray, qkv: MLXArray, gateOffset: Int) -> MLXArray {
         let B = att.dim(0), HQ = att.dim(1), S = att.dim(2), D = att.dim(3)
+        let qkvWidth = qkv.dim(2)
+        let template: [(String, any KernelTemplateArg)] = [
+            ("InT", att.dtype), ("HQ", HQ), ("D", D), ("S", S), ("QW", qkvWidth),
+            ("GATE_OFF", gateOffset),
+        ]
+        if attnGateUsesVec4(
+            attDType: att.dtype, qkvDType: qkv.dtype, sequenceLength: S,
+            headDim: D, qkvWidth: qkvWidth, gateOffset: gateOffset)
+        {
+            return attnGateVec4Kernel(
+                [att, qkv], template: template,
+                grid: (HQ * D / 4, B * S, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[B, S, HQ * D]], outputDTypes: [att.dtype])[0]
+        }
         return attnGateKernel(
             [att, qkv],
-            template: [
-                ("InT", att.dtype), ("HQ", HQ), ("D", D), ("S", S), ("QW", qkv.dim(2)),
-                ("GATE_OFF", gateOffset),
-            ],
+            template: template,
             grid: (HQ * D, B * S, 1), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, HQ * D]], outputDTypes: [att.dtype])[0]
     }

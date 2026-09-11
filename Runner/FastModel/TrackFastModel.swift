@@ -203,7 +203,6 @@ struct TrackLayer {
     let gdn: TrackGDN?
     let attn: TrackAttn?
     let moe: TrackMoE
-    let moePairReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let ple: TrackPLE?
 }
 
@@ -423,8 +422,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             ple = bindPLE(pleLayer, ordinal: ordinal, cfg: cfg)
         }
         return TrackLayer(
-            index: index, attnHC: attnHC, mlpHC: mlpHC, gdn: gdn, attn: attn, moe: moe,
-            moePairReplay: makeMoEPairReplay(moe), ple: ple)
+            index: index, attnHC: attnHC, mlpHC: mlpHC, gdn: gdn, attn: attn, moe: moe, ple: ple)
     }
 
     // MARK: forward pieces
@@ -563,30 +561,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return a.out.apply(out)
     }
 
-    /// Replay only the two opaque expert launches; routing and all current arrays stay live.
-    static func makeMoEPairReplay(_ m: TrackMoE) -> (@Sendable ([MLXArray]) -> [MLXArray])? {
-        guard let fused = m.sharedGateUp.fused, case .quant(let guq) = fused,
-            case .quant(let dq) = m.sharedDown, guq.biases != nil, dq.biases != nil
-        else { return nil }
-        return compile(shapeless: false) {
-            [groupSize = m.expertGroupSize, bits = m.expertBits, topK = m.topK,
-             guGroupSize = guq.groupSize, guBits = guq.bits, guMode = guq.mode,
-             downGroupSize = dq.groupSize, downBits = dq.bits, downMode = dq.mode] inputs in
-            let sharedGU = TrackQuantWeight(
-                weight: inputs[11], scales: inputs[12], biases: inputs[13],
-                groupSize: guGroupSize, bits: guBits, mode: guMode)
-            let act = TrackFastMoEKernels.gateUpAct(
-                wg: inputs[5], sg: inputs[6], bg: inputs[7],
-                wu: inputs[8], su: inputs[9], bu: inputs[10], shared: sharedGU,
-                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits)
-            let sharedDown = TrackQuantWeight(
-                weight: inputs[17], scales: inputs[18], biases: inputs[19],
-                groupSize: downGroupSize, bits: downBits, mode: downMode)
-            return [TrackFastMoEKernels.downCombine(
-                wd: inputs[14], sd: inputs[15], bd: inputs[16], sharedDown: sharedDown,
-                act: act, idx: inputs[1], w: inputs[2], gate: inputs[3], topK: topK,
-                groupSize: groupSize, bits: bits)]
-        }
+    private func moeForward(_ m: TrackMoE, _ x: MLXArray, inputF32: MLXArray? = nil) -> MLXArray {
+        Self.moeForwardShared(m, x, inputF32: inputF32)
     }
 
     /// Row index of each (token, expert) slot, one constant array per window size
@@ -602,10 +578,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return t
     }
 
-    static func moeForwardShared(
-        _ m: TrackMoE, _ x: MLXArray, inputF32: MLXArray? = nil,
-        replay: (@Sendable ([MLXArray]) -> [MLXArray])?
-    ) -> MLXArray {
+    static func moeForwardShared(_ m: TrackMoE, _ x: MLXArray, inputF32: MLXArray? = nil) -> MLXArray {
         let prof = TrackFastProfile.prefill != nil && x.dim(1) >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
         let logits: MLXArray
@@ -642,16 +615,6 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights, gate]) }
             let flatIdx = idx.reshaped(S * K)
             let xrow = Self.xrowTable(S: S, K: K)
-            if let replay, StreamOrDevice.default.stream === Stream.gpu {
-                return replay([
-                    x2, flatIdx, weights.reshaped(S * K), gate, xrow,
-                    m.expertGate.w, m.expertGate.s, m.expertGate.b,
-                    m.expertUp.w, m.expertUp.s, m.expertUp.b,
-                    guq.weight, guq.scales, guq.biases!,
-                    m.expertDown.w, m.expertDown.s, m.expertDown.b,
-                    dq.weight, dq.scales, dq.biases!,
-                ])[0].reshaped(1, S, H)
-            }
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
                 wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b, shared: guq,
@@ -836,8 +799,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             input = mm.input; injectW = mm.inject
             if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
-            pendingOut = Self.moeForwardShared(
-                layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay)
+            pendingOut = moeForward(layer.moe, input, inputF32: mm.inputF32)
             if profiling { TrackFastProfile.tick("moe", &profT, [pendingOut!]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
             pendingInject = injectW
