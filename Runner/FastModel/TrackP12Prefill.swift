@@ -62,6 +62,8 @@ enum TrackP12Prefill {
     static let sortedCombine = on("TRACK_P12_SORTED_COMBINE")
     static let splitShared = on("TRACK_P12_SPLIT_SHARED_INPUTS")
     static let omitUnusedIndexer = on("TRACK_P12_OMIT_UNUSED_INDEXER")
+    static let splitQKV = on("TRACK_P12_SPLIT_QKV")
+    static let emitRouterF32 = on("TRACK_P12_EMIT_ROUTER_F32")
 
     /// Wide, batch-one, activation-dtype windows only: the decode and verify
     /// windows keep the fused projections and the small-window MoE kernels.
@@ -71,7 +73,7 @@ enum TrackP12Prefill {
 
     /// Reuse an existing kernel body literally, replacing only the listed
     /// address expressions. Fails closed if an anchor is no longer unique.
-    private static func addressVariant(
+    static func addressVariant(
         _ source: String, _ replacements: [(String, String)]
     ) -> String {
         var result = source
@@ -188,5 +190,55 @@ enum TrackP12Prefill {
             template: [("InT", down.dtype), ("K", K), ("H", H)],
             grid: (H, B * S, 1), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, H]], outputDTypes: [down.dtype])[0]
+    }
+
+    // MARK: - 3. Attention QKV without the three-part concatenation
+
+    /// `track_attn_prep` reading the q|gate, k and v projection outputs
+    /// directly. The only change is the load address: each part keeps its
+    /// own row pitch (QWQ/QWK/QWV) instead of the concatenated one (QW), via
+    /// a branch-local base pointer. Threads, reductions, casts, rope and the
+    /// v pass-through layout are the original source.
+    nonisolated(unsafe) private static let qkvPrepKernel = MLXFast.metalKernel(
+        name: "track_p12_attn_prep_split_qkv",
+        inputNames: ["q", "k", "v", "qnorm", "knorm", "cosb", "sinb"],
+        outputNames: ["qout", "kout", "vout"],
+        source: addressVariant(
+            TrackFastKernels.attnPrepSource,
+            [
+                (
+                    "uint hh, src;\nif (isQ) { hh = h; src = row * QW + h * D; }\nelse if (!isV) { hh = h - HQ; src = row * QW + 2 * HQ * D + hh * D; }\nelse { hh = h - HQ - HK; src = row * QW + 2 * HQ * D + HK * D + hh * D; }",
+                    "uint hh, src;\nconst device InT* qq;\nif (isQ) { hh = h; src = row * QWQ + h * D; qq = q; }\nelse if (!isV) { hh = h - HQ; src = row * QWK + hh * D; qq = k; }\nelse { hh = h - HQ - HK; src = row * QWV + hh * D; qq = v; }"
+                ),
+                (
+                    "vout[((b * HK + hh) * S + s) * D + d] = qkv[src + d];",
+                    "vout[((b * HK + hh) * S + s) * D + d] = qq[src + d];"
+                ),
+                (
+                    "thread_x[i] = static_cast<float>(qkv[src + lid * N_READS + i]);",
+                    "thread_x[i] = static_cast<float>(qq[src + lid * N_READS + i]);"
+                ),
+            ]),
+        header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
+
+    static func attnPrepSplit(
+        q: MLXArray, k: MLXArray, v: MLXArray, qNorm: MLXArray, kNorm: MLXArray,
+        cos: MLXArray, sin: MLXArray, heads: Int, kvHeads: Int, headDim: Int,
+        rotaryDims: Int, eps: Float
+    ) -> (q: MLXArray, k: MLXArray, v: MLXArray) {
+        let B = q.dim(0), S = q.dim(1)
+        precondition(headDim % 4 == 0 && rotaryDims % 8 == 0 && cos.dim(1) == rotaryDims)
+        precondition(q.dtype == k.dtype && q.dtype == v.dtype)
+        let outs = qkvPrepKernel(
+            [q, k, v, qNorm, kNorm, cos, sin],
+            template: [
+                ("InT", q.dtype), ("D", headDim), ("HQ", heads), ("HK", kvHeads), ("S", S),
+                ("QWQ", q.dim(2)), ("QWK", k.dim(2)), ("QWV", v.dim(2)),
+                ("ROT", rotaryDims), ("EPS_BITS", Int(eps.bitPattern)),
+            ],
+            grid: (headDim / 4, heads + 2 * kvHeads, B * S), threadGroup: (headDim / 4, 1, 1),
+            outputShapes: [[B, heads, S, headDim], [B, kvHeads, S, headDim], [B, kvHeads, S, headDim]],
+            outputDTypes: [q.dtype, q.dtype, q.dtype])
+        return (outs[0], outs[1], outs[2])
     }
 }

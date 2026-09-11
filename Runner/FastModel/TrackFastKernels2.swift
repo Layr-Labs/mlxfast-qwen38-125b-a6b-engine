@@ -253,6 +253,41 @@ extension TrackFastKernels {
         return (outs[0], outs[1])
     }
 
+    // MARK: mixer combine with float32 side output (wide prefill only)
+
+    /// `track_hc_mix` plus an exact bf16->f32 widening of the stored input,
+    /// so the router matmul need not materialize its own `asType` copy.
+    /// Separate kernel object so the decode path keeps its two outputs.
+    nonisolated(unsafe) private static let mixF32Kernel = MLXFast.metalKernel(
+        name: "track_hc_mix_f32",
+        inputNames: ["w", "normed", "inj"],
+        outputNames: ["input", "inject", "inputF32"],
+        source: TrackP12Prefill.addressVariant(
+            mixSource,
+            [
+                (
+                    "input[row * H + d] = acc;",
+                    "input[row * H + d] = acc;\n        inputF32[row * H + d] = static_cast<float>(acc);"
+                )
+            ]),
+        header: exactHeader, ensureRowContiguous: true)
+
+    static func hcMixF32(
+        w: MLXArray, normed: MLXArray, inj: MLXArray, hcCount: Int, hidden: Int, hasInject: Bool
+    ) -> (input: MLXArray, inject: MLXArray, inputF32: MLXArray) {
+        let B = w.dim(0), S = w.dim(1)
+        let outs = mixF32Kernel(
+            [w, normed, inj],
+            template: [
+                ("InT", w.dtype), ("H", hidden), ("W", hcCount * hidden), ("HC", hcCount),
+                ("LW", inj.dim(2)), ("HAS_INJECT", hasInject),
+            ],
+            grid: (hidden, B * S, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[B, S, hidden], [B, S, hcCount], [B, S, hidden]],
+            outputDTypes: [w.dtype, w.dtype, .float32])
+        return (outs[0], outs[1], outs[2])
+    }
+
     // MARK: compiled silu over the leading columns
 
     static let siluHeadSource = """

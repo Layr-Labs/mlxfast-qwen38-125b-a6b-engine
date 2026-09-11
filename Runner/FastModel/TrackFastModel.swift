@@ -509,6 +509,14 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             Self.debugTaps?.append((tag + ".act", act))
             Self.debugTaps?.append((tag + ".w", w))
         }
+        // Wide prefill with a waiting router: side-store the float32 input in
+        // the same launch instead of materializing a standalone asType copy.
+        if emitF32, TrackP12Prefill.emitRouterF32, TrackP12Prefill.eligible(normed) {
+            let r = TrackFastKernels.hcMixF32(
+                w: w, normed: normed, inj: inj, hcCount: hcCount, hidden: hidden,
+                hasInject: hc.hasInject)
+            return (r.input, r.inject, r.inputF32)
+        }
         let r = TrackFastKernels.hcMix(
             w: w, normed: normed, inj: inj, hcCount: hcCount, hidden: hidden,
             hasInject: hc.hasInject)
@@ -580,10 +588,22 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // below (its GEMM rounding depends on N), so the fourth part of this
         // concatenation -- the narrow indexer-K projection -- is an unread
         // tail. The three kept projections and their offsets are unchanged.
-        let qkv =
+        let wideNoIndexer =
             TrackP12Prefill.omitUnusedIndexer && TrackP12Prefill.eligible(x) && S > 8
             && a.qkv.parts.count == 4
-            ? concatenated(a.qkv.parts.prefix(3).map { $0.apply(x) }, axis: -1)
+        // The split-QKV path keeps the three projection outputs separate and
+        // re-addresses the two consumers instead of concatenating.
+        let splitQKV =
+            wideNoIndexer && TrackP12Prefill.splitQKV
+        let qkvParts =
+            (wideNoIndexer
+            ? Array(a.qkv.parts.prefix(3).map { $0.apply(x) })
+            : nil)
+        let qkv =
+            splitQKV
+            ? qkvParts![0]  // placeholder; the split path never reads the concatenation
+            : wideNoIndexer
+            ? concatenated(qkvParts!, axis: -1)
             : a.qkv.apply(x)  // q | gate | k | v | [indexer k]
         // The indexer tape first: its truncation reads the pre-update offset.
         let idxKeys: MLXArray
@@ -595,13 +615,25 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         _ = cache.updateIndexerTape(keys: idxKeys)
 
-        let prep = TrackFastKernels.attnPrep(
-            qkv: qkv, qNorm: a.qNormW, kNorm: a.kNormW, cos: rope.cos, sin: rope.sin,
-            heads: heads, kvHeads: kvHeads, headDim: d, rotaryDims: rotaryDims, eps: eps)
+        let prep: (q: MLXArray, k: MLXArray, v: MLXArray)
+        let gateQKV: MLXArray
+        if splitQKV {
+            let qp = qkvParts!
+            prep = TrackP12Prefill.attnPrepSplit(
+                q: qp[0], k: qp[1], v: qp[2], qNorm: a.qNormW, kNorm: a.kNormW,
+                cos: rope.cos, sin: rope.sin, heads: heads, kvHeads: kvHeads,
+                headDim: d, rotaryDims: rotaryDims, eps: eps)
+            gateQKV = qp[0]
+        } else {
+            prep = TrackFastKernels.attnPrep(
+                qkv: qkv, qNorm: a.qNormW, kNorm: a.kNormW, cos: rope.cos, sin: rope.sin,
+                heads: heads, kvHeads: kvHeads, headDim: d, rotaryDims: rotaryDims, eps: eps)
+            gateQKV = qkv
+        }
         let att = cache.updateAndAttend(
             queries: prep.q, keys: prep.k, values: prep.v,
             scale: attentionScale, sinks: nil, keepMask: nil)  // [B,HQ,S,D]
-        let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: a.qWidth)
+        let out = TrackFastKernels.attnGate(att: att, qkv: gateQKV, gateOffset: a.qWidth)
         return a.out.apply(out)
     }
 
