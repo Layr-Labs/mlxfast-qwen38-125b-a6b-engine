@@ -117,7 +117,7 @@ extension TrackFastKernels {
     /// plays virtual thread 32g + l of the 640-thread layout for g = 0..NT/32-1,
     /// so every partial sits in the same lane and the same `simd_sum` as the
     /// reference `rms_single_row`; the per-simdgroup partials are then folded
-    /// by the same 32-lane `simd_sum` over `local_sums`. Same arithmetic, 20x
+    /// by the same 32-lane `simd_sum` over lane-owned partials. Same arithmetic, 20x
     /// fewer threads per row: the 640-thread threadgroups were occupancy-bound.
     static let injectNormWideSource = """
         constexpr int N_READS = 4;
@@ -126,7 +126,7 @@ extension TrackFastKernels {
         const uint row = thread_position_in_grid.z;
         const uint hc = thread_position_in_grid.y;
         const uint lane = thread_index_in_simdgroup;
-        threadgroup float local_sums[32];
+        float partial = 0.0f;
         const uint base = row * W + hc * H;
         InT inj_t = InT(0);
         if (HAS_INJECT) { inj_t = inject[row * HC + hc]; }
@@ -148,11 +148,9 @@ extension TrackFastKernels {
                 }
             }
             acc = simd_sum(acc);
-            if (lane == 0) { local_sums[g] = acc; }
+            if (lane == g) { partial = acc; }
         }
-        if (lane >= simd_groups) { local_sums[lane] = 0; }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        const float total = simd_sum(local_sums[lane]);
+        const float total = simd_sum(partial);
         const float inv_mean = metal::precise::rsqrt(total / (float)H + as_type<float>((uint)EPS_BITS));
         for (uint g = 0; g < simd_groups; ++g) {
             const uint lid = g * 32 + lane;
