@@ -488,11 +488,75 @@ extension TrackFastKernels {
         outputNames: ["out"],
         source: moeCombineSource, header: exactHeader, ensureRowContiguous: true)
 
+    static let moeCombineVec4Source = """
+        using InT4 = vec<InT, 4>;
+        const uint d = 4 * thread_position_in_grid.x;
+        const uint row = thread_position_in_grid.y;
+        if (d + 3 >= H) return;
+        float prod0[K];
+        float prod1[K];
+        float prod2[K];
+        float prod3[K];
+        for (int k = 0; k < K; ++k) {
+            const size_t routed_off = ((size_t)row * K + k) * H + d;
+            const InT4 rv = *((const device InT4*)(routed + routed_off));
+            const float wk = w[row * K + k];
+            prod0[k] = static_cast<float>(rv[0]) * wk;
+            prod1[k] = static_cast<float>(rv[1]) * wk;
+            prod2[k] = static_cast<float>(rv[2]) * wk;
+            prod3[k] = static_cast<float>(rv[3]) * wk;
+        }
+        const InT r0 = static_cast<InT>(mlx_colsum_small_f32<K>(prod0));
+        const InT r1 = static_cast<InT>(mlx_colsum_small_f32<K>(prod1));
+        const InT r2 = static_cast<InT>(mlx_colsum_small_f32<K>(prod2));
+        const InT r3 = static_cast<InT>(mlx_colsum_small_f32<K>(prod3));
+        const InT sg = mlx_sigmoid(gate[row]);
+        const InT4 sv = *((const device InT4*)(shared + (size_t)row * H + d));
+        InT4 result;
+        const InT sh0 = sg * sv[0];
+        const InT sh1 = sg * sv[1];
+        const InT sh2 = sg * sv[2];
+        const InT sh3 = sg * sv[3];
+        result[0] = r0 + sh0;
+        result[1] = r1 + sh1;
+        result[2] = r2 + sh2;
+        result[3] = r3 + sh3;
+        *((device InT4*)(out + (size_t)row * H + d)) = result;
+        """
+
+    nonisolated(unsafe) static let moeCombineVec4Kernel = MLXFast.metalKernel(
+        name: "track_moe_combine_vec4",
+        inputNames: ["routed", "w", "shared", "gate"],
+        outputNames: ["out"],
+        source: moeCombineVec4Source, header: exactHeader, ensureRowContiguous: true)
+
+    static func moeCombineUsesVec4(
+        routedDType: DType, sharedDType: DType, gateDType: DType,
+        sequenceLength: Int, expertsPerToken: Int, hidden: Int
+    ) -> Bool {
+        sequenceLength > 8
+            && routedDType == .bfloat16
+            && sharedDType == .bfloat16
+            && gateDType == .bfloat16
+            && expertsPerToken == 10
+            && hidden == 2560
+    }
+
     static func moeCombine(routed: MLXArray, w: MLXArray, shared: MLXArray, gate: MLXArray)
         -> MLXArray
     {
         let B = routed.dim(0), S = routed.dim(1), K = routed.dim(2), H = routed.dim(3)
         precondition(w.dtype == .float32)
+        if moeCombineUsesVec4(
+            routedDType: routed.dtype, sharedDType: shared.dtype, gateDType: gate.dtype,
+            sequenceLength: S, expertsPerToken: K, hidden: H
+        ) {
+            return moeCombineVec4Kernel(
+                [routed, w, shared, gate],
+                template: [("InT", routed.dtype), ("K", K), ("H", H)],
+                grid: (H / 4, B * S, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[B, S, H]], outputDTypes: [routed.dtype])[0]
+        }
         return moeCombineKernel(
             [routed, w, shared, gate],
             template: [("InT", routed.dtype), ("K", K), ("H", H)],
