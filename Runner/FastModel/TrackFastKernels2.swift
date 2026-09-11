@@ -112,6 +112,68 @@ extension TrackFastKernels {
         outputNames: ["stream", "normed"],
         source: injectNormSource, header: exactHeader, ensureRowContiguous: true)
 
+
+    /// Wide-window variant (prefill): ONE simdgroup per (row, stream). Lane l
+    /// plays virtual thread 32g + l of the 640-thread layout for g = 0..NT/32-1,
+    /// so every partial sits in the same lane and the same `simd_sum` as the
+    /// reference `rms_single_row`; the per-simdgroup partials are then folded
+    /// by the same 32-lane `simd_sum` over `local_sums`. Same arithmetic, 20x
+    /// fewer threads per row: the 640-thread threadgroups were occupancy-bound.
+    static let injectNormWideSource = """
+        constexpr int N_READS = 4;
+        constexpr uint NT = H / N_READS;
+        constexpr uint simd_groups = (H + 32 * N_READS - 1) / (32 * N_READS);
+        const uint row = thread_position_in_grid.z;
+        const uint hc = thread_position_in_grid.y;
+        const uint lane = thread_index_in_simdgroup;
+        threadgroup float local_sums[32];
+        const uint base = row * W + hc * H;
+        InT inj_t = InT(0);
+        if (HAS_INJECT) { inj_t = inject[row * HC + hc]; }
+        for (uint g = 0; g < simd_groups; ++g) {
+            const uint lid = g * 32 + lane;
+            float acc = 0.0f;
+            if (lid < NT) {
+                for (int i = 0; i < N_READS; ++i) {
+                    const uint d = lid * N_READS + i;
+                    const uint src = TILE ? (row * H + d) : (base + d);
+                    InT r = residual[src];
+                    if (HAS_INJECT) {
+                        InT sp = out[row * H + d] * inj_t;
+                        r = r + sp;
+                    }
+                    stream[base + d] = r;
+                    const float xf = static_cast<float>(r);
+                    acc += xf * xf;
+                }
+            }
+            acc = simd_sum(acc);
+            if (lane == 0) { local_sums[g] = acc; }
+        }
+        if (lane >= simd_groups) { local_sums[lane] = 0; }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const float total = simd_sum(local_sums[lane]);
+        const float inv_mean = metal::precise::rsqrt(total / (float)H + as_type<float>((uint)EPS_BITS));
+        for (uint g = 0; g < simd_groups; ++g) {
+            const uint lid = g * 32 + lane;
+            if (lid < NT) {
+                for (int i = 0; i < N_READS; ++i) {
+                    const uint d = lid * N_READS + i;
+                    InT n = static_cast<InT>(static_cast<float>(stream[base + d]) * inv_mean);
+                    normed[base + d] = n * scale[hc * H + d];
+                }
+            }
+        }
+        """
+
+    nonisolated(unsafe) static let injectNormWideKernel = MLXFast.metalKernel(
+        name: "track_inject_norm_wide",
+        inputNames: ["residual", "out", "inject", "scale"],
+        outputNames: ["stream", "normed"],
+        source: injectNormWideSource, ensureRowContiguous: true)
+
+    nonisolated(unsafe) static var wideNormMinS = 9
+
     static func injectNorm(
         residual: MLXArray, out: MLXArray?, inject: MLXArray?, scale: MLXArray,
         hcCount: Int, hidden: Int, eps: Float, tile: Bool
@@ -120,6 +182,18 @@ extension TrackFastKernels {
         let W = hcCount * hidden
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024)
         let hasInject = out != nil
+        if S >= wideNormMinS {
+            let outs = injectNormWideKernel(
+                [residual, out ?? residual, inject ?? residual, scale],
+                template: [
+                    ("InT", residual.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+                    ("HAS_INJECT", hasInject), ("TILE", tile), ("EPS_BITS", Int(eps.bitPattern)),
+                ],
+                grid: (32, hcCount, B * S), threadGroup: (32, 1, 1),
+                outputShapes: [[B, S, W], [B, S, W]],
+                outputDTypes: [residual.dtype, residual.dtype])
+            return (outs[0], outs[1])
+        }
         let outs = injectNormKernel(
             [residual, out ?? residual, inject ?? residual, scale],
             template: [
@@ -484,7 +558,7 @@ extension TrackFastKernels {
 //       the loads pipeline, with the accumulation order unchanged.
 
 extension TrackFastKernels {
-    static let mixerHeadHeader = TrackFastMoEKernels.helpers + exactHeader + mixerHeadHeaderTail
+    static let mixerHeadHeader = TrackFastMoEKernels.helpersCore + exactHeader + mixerHeadHeaderTail
     static let mixerHeadHeaderTail = #"""
 
         // `qmv_impl`'s `out_vec_size < num_simdgroups * results_per_simdgroup`

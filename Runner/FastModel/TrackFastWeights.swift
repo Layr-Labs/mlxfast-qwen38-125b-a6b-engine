@@ -54,6 +54,11 @@ public enum TrackFastProfile {
     /// Smallest window the ticks apply to (9 = prefill only; 2 = also MTP verify windows).
     nonisolated(unsafe) public static var minWindow: Int = 9
     nonisolated(unsafe) public static var windows: Int = 0
+    /// Prefill-width knob exposed for the bench drivers (kernel selection only; results are exact either way).
+    nonisolated(unsafe) public static var wideNormMinS: Int {
+        get { TrackFastKernels.wideNormMinS }
+        set { TrackFastKernels.wideNormMinS = newValue }
+    }
     static func tick(_ key: String, _ t0: inout Double, _ arrays: [MLXArray]) {
         guard prefill != nil else { return }
         eval(arrays)

@@ -13,8 +13,12 @@ import MLXFast
 
 enum TrackFastMixerKernels {
     static let header =
-        TrackFastMoEKernels.helpers + TrackFastKernels.exactHeader + TrackFastMoEKernels.regHelpers
+        TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader + TrackFastMoEKernels.regHelpers
         + TrackFastKernels.mixerHeadHeaderTail + TrackFastMoEKernels.wideHelpers
+    /// One-token instantiations: the wide bodies are replaced by their declarations.
+    static let header1 =
+        TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader + TrackFastMoEKernels.regHelpers
+        + TrackFastKernels.mixerHeadHeaderTail + TrackFastMoEKernels.wideDecls
 
     /// normed [S, KD] -> lo [S, ND] (down), inj [S, HC] (inject).
     /// grid threads (32, 2 * (ND/8 + (HAS_INJECT ? 1 : 0)), 1), tg (32, 2, 1).
@@ -24,7 +28,7 @@ enum TrackFastMixerKernels {
         const uint lid = thread_index_in_simdgroup;
         constexpr int NT = ND / 8;
         if (tile < NT) {
-            if (VPT == 1) {
+            if constexpr (VPT == 1) {
                 float r[4];
                 qmv_fast_reg<T, GS, BITS>(wd, sd, bd, normed, KD, tile * 8 + (int)sg * 4, lid, r);
                 if (lid == 0) {
@@ -47,7 +51,7 @@ enum TrackFastMixerKernels {
                 }
             }
         } else if (HAS_INJECT) {
-            if (VPT == 1) {
+            if constexpr (VPT == 1) {
                 track_inject_qmv<T, GS, BITS, KD, HC, 4>(wi, si, bi, normed, inj, sg, lid);
             } else {
                 threadgroup float fp[8 * VPT];
@@ -66,6 +70,11 @@ enum TrackFastMixerKernels {
         inputNames: ["normed", "wd", "sd", "bd", "wi", "si", "bi"],
         outputNames: ["lo", "act", "inj"],
         source: downInjectSource, header: header, ensureRowContiguous: true)
+    nonisolated(unsafe) static let downInjectKernel1 = MLXFast.metalKernel(
+        name: "track_mixer_down_inject_1",
+        inputNames: ["normed", "wd", "sd", "bd", "wi", "si", "bi"],
+        outputNames: ["lo", "act", "inj"],
+        source: downInjectSource, header: header1, ensureRowContiguous: true)
 
     static func downInject(
         normed: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?
@@ -75,7 +84,7 @@ enum TrackFastMixerKernels {
         precondition(S >= 1 && S <= 8 && ND % 8 == 0 && KD % 512 == 0 && down.bits == 4)
         let inj = inject ?? down
         let tiles = ND / 8 + (inject != nil ? 1 : 0)
-        let outs = downInjectKernel(
+        let outs = (S == 1 ? downInjectKernel1 : downInjectKernel)(
             [normed, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
             template: [
                 ("T", normed.dtype), ("GS", down.groupSize), ("BITS", down.bits), ("KD", KD), ("ND", ND),
@@ -95,7 +104,7 @@ enum TrackFastMixerKernels {
         const uint sg = simdgroup_index_in_threadgroup;
         const uint lid = thread_index_in_simdgroup;
         threadgroup float res[8][VPT];
-        if (VPT == 1) {
+        if constexpr (VPT == 1) {
             int rows[4];
             for (int i = 0; i < 4; ++i) { const int s = (int)sg * 4 + i; rows[i] = d0 + (s & 1) + H * (s >> 1); }
             float r[4];
@@ -135,6 +144,11 @@ enum TrackFastMixerKernels {
         inputNames: ["act", "normed", "wu", "su", "bu", "inj"],
         outputNames: ["input", "inject", "inputF"],
         source: upMixSource, header: header, ensureRowContiguous: true)
+    nonisolated(unsafe) static let upMixKernel1 = MLXFast.metalKernel(
+        name: "track_mixer_up_mix_1",
+        inputNames: ["act", "normed", "wu", "su", "bu", "inj"],
+        outputNames: ["input", "inject", "inputF"],
+        source: upMixSource, header: header1, ensureRowContiguous: true)
 
     static func upMix(
         act: MLXArray, normed: MLXArray, up: TrackQuantWeight, inj: MLXArray, hcCount: Int, hidden: Int,
@@ -143,7 +157,7 @@ enum TrackFastMixerKernels {
         let S = act.dim(0), LW = act.dim(1)
         precondition(S >= 1 && S <= 8 && hidden % 2 == 0 && up.rows == hcCount * hidden && up.bits == 4)
         precondition(LW % 32 == 0 && LW < 512 + 256)  // K = 320: one full block + a tail, the `qmv` normal branch
-        let outs = upMixKernel(
+        let outs = (S == 1 ? upMixKernel1 : upMixKernel)(
             [act, normed, up.weight, up.scales, up.biases!, inj],
             template: [
                 ("T", act.dtype), ("GS", up.groupSize), ("BITS", up.bits), ("H", hidden), ("HC", hcCount),

@@ -18,6 +18,16 @@ import Foundation
 import MLX
 
 enum TrackFastKernels {
+    /// A typed host scalar made once per (value, dtype): a fresh `MLXArray`
+    /// per call is a host allocation and a cast launch.
+    private static let scalarLock = NSLock()
+    nonisolated(unsafe) private static var typedScalars: [String: MLXArray] = [:]
+    static func scalar(_ v: Float, dtype: DType) -> MLXArray {
+        scalarLock.lock(); defer { scalarLock.unlock() }
+        let key = "\(v.bitPattern):\(dtype)"
+        if let a = typedScalars[key] { return a }
+        let a = MLXArray(v, dtype: dtype); eval(a); typedScalars[key] = a; return a
+    }
 
     struct GDNGeometry {
         let projWidth: Int  // PROJ_W
@@ -155,8 +165,17 @@ enum TrackFastKernels {
         const device float* beta_ = beta + b_idx * T_ * Hv;
         const device StT* i_state = state_in + (n * Dv + dv_idx) * Dk;
         float state[n_per_t];
-        for (int i = 0; i < n_per_t; ++i) {
-            state[i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);
+        // Each lane owns n_per_t consecutive state entries: one vector load /
+        // store per lane when that is a float4 (same values, one instruction
+        // instead of four strided ones; this kernel is load/store bound).
+        constexpr bool vec4 = (n_per_t == 4) && metal::is_same<StT, float>::value;
+        if constexpr (vec4) {
+            const float4 s4 = *reinterpret_cast<const device float4*>(i_state + 4 * dk_idx);
+            state[0] = s4.x; state[1] = s4.y; state[2] = s4.z; state[3] = s4.w;
+        } else {
+            for (int i = 0; i < n_per_t; ++i) {
+                state[i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);
+            }
         }
         for (int t = 0; t < T_; ++t) {
             float kv_mem = 0.0f;
@@ -187,8 +206,12 @@ enum TrackFastKernels {
             if (CAPTURE || t == T_ - 1) {
                 const uint slot = CAPTURE ? (b_idx * T_ + t) : b_idx;
                 device StT* o_state = state_out + ((slot * Hv + hv_idx) * Dv + dv_idx) * Dk;
-                for (int i = 0; i < n_per_t; ++i) {
-                    o_state[n_per_t * dk_idx + i] = static_cast<StT>(state[i]);
+                if constexpr (vec4) {
+                    *reinterpret_cast<device float4*>(o_state + 4 * dk_idx) = float4(state[0], state[1], state[2], state[3]);
+                } else {
+                    for (int i = 0; i < n_per_t; ++i) {
+                        o_state[n_per_t * dk_idx + i] = static_cast<StT>(state[i]);
+                    }
                 }
             }
             q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; g_ += Hv; beta_ += Hv;
