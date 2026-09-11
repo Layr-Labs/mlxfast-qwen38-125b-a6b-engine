@@ -60,7 +60,52 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
     ///     caller that holds one.
     public static let ngramRowSourceResource = "qwen4exp.ngramRowSource"
 
-    public static let manifest = RunnerManifest(
+    // MLXFAST-CMDBUF: MLX decides to commit the current Metal command buffer after
+    // every primitive, in `CommandEncoder::needs_commit()`:
+    //     (buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb)
+    // `buffer_sizes_` accumulates `a.data_size()` per distinct bound input buffer,
+    // which is a count of ELEMENTS, while `max_mb` is a megabyte budget. The routed
+    // expert weights are [512, 640, 320] uint32 = 104.9M elements, so `>> 20` is 100
+    // and any dispatch binding them breaches the budget on its own. That forces a
+    // commit after `track_moe_gate_up_act` and again after `track_moe_down_combine`,
+    // on every layer, plus the `lm_head` GEMV. The device-class defaults are also
+    // small: this arch string ends in `p`, which selects 20 ops / 40 "MB".
+    //
+    // Each boundary is a CPU commit, a completion handler and a scheduler round trip,
+    // and on the GPU a full pipeline drain, because the next buffer cannot start until
+    // the previous one retires. Raising both limits leaves `asyncEval` as the only
+    // thing that commits, so a buffer still never spans more than one layer and the
+    // input-retention window is unchanged.
+    //
+    // The values are set with overwrite = 0, so an explicit operator value still wins.
+    // These are process-local scheduling knobs read once, at `Device` construction;
+    // `RunnerRegistry.register` reads `manifest.modelTypes` before anything touches
+    // Metal, which is what makes this static the earliest available hook.
+    // MLXFAST-CMDBUF: submit work to the GPU MORE often, not less.
+    //
+    // MLX commits the current Metal command buffer after any primitive where
+    //     (buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb)
+    // and the device-class default here is 50 ops / 50 "MB". I first tried raising
+    // the size limit, on the theory that each commit costs a GPU pipeline drain.
+    // That measured 1.56958 against a 1.63412 bar: -3.95%. The theory was wrong.
+    //
+    // For a launch-bound single-stream decode the commit is not a drain, it is a
+    // handoff: committing early lets the GPU start executing while the CPU is still
+    // encoding the next ops, so a smaller buffer means less GPU idle at the head of
+    // each layer. The engine's own tuned history says the same thing from a second
+    // direction -- asyncChunk 6->3 was +1.46%, 3->1 another +0.24%, and 12 was
+    // -0.30%. Every measurement on this tree prefers flushing sooner.
+    //
+    // So lower the op budget instead. The size trigger is deliberately left alone:
+    // it fires about twice per layer on the routed expert weights and, by the same
+    // argument, that is useful rather than wasteful.
+    private static let tuneCommandBufferLimits: Void = {
+        setenv("MLX_MAX_OPS_PER_BUFFER", "8", 0)
+    }()
+
+    public static let manifest: RunnerManifest = {
+        _ = tuneCommandBufferLimits
+        return RunnerManifest(
         runnerID: "layr/qwen4exp-125b-a6b",
         modelTypes: ["qwen4_exp", "qwen4_exp_text"],
         engine: CBv2ModelCapabilities(
@@ -87,6 +132,7 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         multimodal: false,
         recurrentLayers: true,
         requiresKeepMask: true)
+    }()
 
     public let servingModel: any LanguageModel
     public let tokenizer: any MLXLMCommon.Tokenizer
