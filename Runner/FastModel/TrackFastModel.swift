@@ -203,7 +203,6 @@ struct TrackLayer {
     let gdn: TrackGDN?
     let attn: TrackAttn?
     let moe: TrackMoE
-    let moePairReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let ple: TrackPLE?
 }
 
@@ -423,8 +422,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             ple = bindPLE(pleLayer, ordinal: ordinal, cfg: cfg)
         }
         return TrackLayer(
-            index: index, attnHC: attnHC, mlpHC: mlpHC, gdn: gdn, attn: attn, moe: moe,
-            moePairReplay: makeMoEPairReplay(moe), ple: ple)
+            index: index, attnHC: attnHC, mlpHC: mlpHC, gdn: gdn, attn: attn, moe: moe, ple: ple)
     }
 
     // MARK: forward pieces
@@ -439,7 +437,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// block input `[B,S,H]` and the inject weights `[B,S,hc]`.
     /// Returns the block input, the inject weights and, when `emitF32`, the
     /// input as float32 (the router's operand) written by the same launch.
-    private func hcMix(_ hc: TrackHC, normed: MLXArray, tag: String = "", emitF32: Bool = false)
+    // MLXFAST-INJFUSE: A fused norm may supply the already-computed down/inject outputs.
+    private func hcMix(
+        _ hc: TrackHC, normed: MLXArray, tag: String = "", emitF32: Bool = false,
+        downInjected: (lo: MLXArray, act: MLXArray, inj: MLXArray)? = nil
+    )
         -> (input: MLXArray, inject: MLXArray, inputF32: MLXArray?)
     {
         let S = normed.dim(1)
@@ -450,7 +452,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             if hc.hasInject, case .quant(let q)? = hc.inject, q.biases != nil { injQ = q }
             if !hc.hasInject || injQ != nil {
                 let n2 = normed.reshaped(S, hcCount * hidden)
-                let d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
+                // MLXFAST-INJFUSE: The nil fallback is the original S<=8 path.
+                let d = downInjected ?? TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
                 let u = TrackFastMixerKernels.upMix(
                     act: d.act, normed: n2, up: uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
                     hasInject: hc.hasInject, emitF32: emitF32)
@@ -458,7 +461,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 if Self.debugTaps != nil, !tag.isEmpty {
                     Self.debugTaps?.append((tag + ".normedQ", normed))
                     Self.debugTaps?.append((tag + ".lo", d.lo.reshaped(1, S, -1)))
-                    Self.debugTaps?.append((tag + ".inj", d.inj.reshaped(1, S, -1)))
+                    // MLXFAST-INJFUSE: Expose the same act tap on both mixer paths.
+                    Self.debugTaps?.append((tag + ".act", d.act.reshaped(1, S, -1)))
+                    // MLXFAST-INJFUSE: No inj values are written by the final mixer.
+                    if hc.hasInject {
+                        Self.debugTaps?.append((tag + ".inj", d.inj.reshaped(1, S, -1)))
+                    }
                 }
                 return (u.input.reshaped(1, S, hidden), u.inject.reshaped(1, S, hcCount), f32)
             }
@@ -490,6 +498,34 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             w: w, normed: normed, inj: inj, hcCount: hcCount, hidden: hidden,
             hasInject: hc.hasInject)
         return (r.input, r.inject, nil)
+    }
+
+    // MLXFAST-INJFUSE: Fuse only batch-one, one-token bf16 mixers with the
+    // supported geometry. Returning nil leaves standalone norm + hcMix intact.
+    private func hcMix(
+        _ hc: TrackHC, residual: MLXArray, out: MLXArray?, pendingInject: MLXArray?,
+        tile: Bool, tag: String = "", emitF32: Bool = false
+    ) -> (stream: MLXArray, normed: MLXArray,
+          mix: (input: MLXArray, inject: MLXArray, inputF32: MLXArray?))?
+    {
+        guard residual.dim(0) == 1, residual.dim(1) == 1, residual.dtype == .bfloat16,
+            hcCount == 4, hidden == 2560,
+            case .quant(let dq) = hc.down, case .quant(let uq) = hc.up,
+            dq.biases != nil, uq.biases != nil, dq.bits == 4, uq.bits == 4
+        else { return nil }
+        var injQ: TrackQuantWeight? = nil
+        if hc.hasInject {
+            guard case .quant(let q)? = hc.inject, q.biases != nil,
+                q.rows == hcCount, q.bits == dq.bits, q.groupSize == dq.groupSize
+            else { return nil }
+            injQ = q
+        }
+        let d = TrackFastMixerKernels.downInject(
+            residual: residual, out: out, pendingInject: pendingInject, scale: hc.normScaleQ,
+            down: dq, inject: injQ, hcCount: hcCount, hidden: hidden, eps: eps, tile: tile)
+        let mix = hcMix(hc, normed: d.normed, tag: tag, emitF32: emitF32,
+                        downInjected: (d.lo, d.act, d.inj))
+        return (d.stream, d.normed, mix)
     }
 
     private func gdnForward(
@@ -563,30 +599,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return a.out.apply(out)
     }
 
-    /// Replay only the two opaque expert launches; routing and all current arrays stay live.
-    static func makeMoEPairReplay(_ m: TrackMoE) -> (@Sendable ([MLXArray]) -> [MLXArray])? {
-        guard let fused = m.sharedGateUp.fused, case .quant(let guq) = fused,
-            case .quant(let dq) = m.sharedDown, guq.biases != nil, dq.biases != nil
-        else { return nil }
-        return compile(shapeless: false) {
-            [groupSize = m.expertGroupSize, bits = m.expertBits, topK = m.topK,
-             guGroupSize = guq.groupSize, guBits = guq.bits, guMode = guq.mode,
-             downGroupSize = dq.groupSize, downBits = dq.bits, downMode = dq.mode] inputs in
-            let sharedGU = TrackQuantWeight(
-                weight: inputs[11], scales: inputs[12], biases: inputs[13],
-                groupSize: guGroupSize, bits: guBits, mode: guMode)
-            let act = TrackFastMoEKernels.gateUpAct(
-                wg: inputs[5], sg: inputs[6], bg: inputs[7],
-                wu: inputs[8], su: inputs[9], bu: inputs[10], shared: sharedGU,
-                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits)
-            let sharedDown = TrackQuantWeight(
-                weight: inputs[17], scales: inputs[18], biases: inputs[19],
-                groupSize: downGroupSize, bits: downBits, mode: downMode)
-            return [TrackFastMoEKernels.downCombine(
-                wd: inputs[14], sd: inputs[15], bd: inputs[16], sharedDown: sharedDown,
-                act: act, idx: inputs[1], w: inputs[2], gate: inputs[3], topK: topK,
-                groupSize: groupSize, bits: bits)]
-        }
+    private func moeForward(_ m: TrackMoE, _ x: MLXArray, inputF32: MLXArray? = nil) -> MLXArray {
+        Self.moeForwardShared(m, x, inputF32: inputF32)
     }
 
     /// Row index of each (token, expert) slot, one constant array per window size
@@ -602,10 +616,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return t
     }
 
-    static func moeForwardShared(
-        _ m: TrackMoE, _ x: MLXArray, inputF32: MLXArray? = nil,
-        replay: (@Sendable ([MLXArray]) -> [MLXArray])?
-    ) -> MLXArray {
+    static func moeForwardShared(_ m: TrackMoE, _ x: MLXArray, inputF32: MLXArray? = nil) -> MLXArray {
         let prof = TrackFastProfile.prefill != nil && x.dim(1) >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
         let logits: MLXArray
@@ -642,16 +653,6 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights, gate]) }
             let flatIdx = idx.reshaped(S * K)
             let xrow = Self.xrowTable(S: S, K: K)
-            if let replay, StreamOrDevice.default.stream === Stream.gpu {
-                return replay([
-                    x2, flatIdx, weights.reshaped(S * K), gate, xrow,
-                    m.expertGate.w, m.expertGate.s, m.expertGate.b,
-                    m.expertUp.w, m.expertUp.s, m.expertUp.b,
-                    guq.weight, guq.scales, guq.biases!,
-                    m.expertDown.w, m.expertDown.s, m.expertDown.b,
-                    dq.weight, dq.scales, dq.biases!,
-                ])[0].reshaped(1, S, H)
-            }
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
                 wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b, shared: guq,
@@ -788,6 +789,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         if profiling { TrackFastProfile.windows += 1 }
         for layer in layers {
             var normed: MLXArray
+            // MLXFAST-INJFUSE: PLE retains both standalone norms and its original mixer.
+            var fusedMix: (input: MLXArray, inject: MLXArray, inputF32: MLXArray?)? = nil
             if let ple = layer.ple {
                 // Materialize the stream, add the PLE block, then norm.
                 (stream, _) = TrackFastKernels.injectNorm(
@@ -802,6 +805,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
                     tile: false)
+            } else if let fused = hcMix(
+                layer.attnHC, residual: residual, out: pendingOut, pendingInject: pendingInject,
+                tile: tile, tag: "L\(layer.index).attn.hc")
+            {
+                // MLXFAST-INJFUSE: Layer zero also enters here with TILE=true.
+                stream = fused.stream; normed = fused.normed; fusedMix = fused.mix
             } else {
                 (stream, normed) = TrackFastKernels.injectNorm(
                     residual: residual, out: pendingOut, inject: pendingInject,
@@ -810,7 +819,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             tile = false
             if profiling { TrackFastProfile.tick(layer.ple != nil ? "norm+ple" : "norm", &profT, [stream, normed]) }
-            let am = hcMix(layer.attnHC, normed: normed, tag: "L\(layer.index).attn.hc")
+            // MLXFAST-INJFUSE: Lazy fallback preserves the unfused/multi-token path.
+            let am = fusedMix ?? hcMix(layer.attnHC, normed: normed, tag: "L\(layer.index).attn.hc")
             var input = am.input, injectW = am.inject
             if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
             Self.debugTaps?.append(("L\(layer.index).attn.stream_in", stream))
@@ -826,18 +836,27 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             Self.debugTaps?.append(("L\(layer.index).attn.out", attended))
             if profiling { TrackFastProfile.tick(layer.gdn != nil ? "gdn" : "attn", &profT, [attended]) }
-            (stream, normed) = TrackFastKernels.injectNorm(
-                residual: stream, out: attended, inject: injectW,
-                scale: layer.mlpHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
-                tile: false)
+            // MLXFAST-INJFUSE: All one-token MLP mixers consume the pending attention update.
+            if let fused = hcMix(
+                layer.mlpHC, residual: stream, out: attended, pendingInject: injectW,
+                tile: false, tag: "L\(layer.index).mlp.hc", emitF32: true)
+            {
+                stream = fused.stream; normed = fused.normed; fusedMix = fused.mix
+            } else {
+                fusedMix = nil
+                (stream, normed) = TrackFastKernels.injectNorm(
+                    residual: stream, out: attended, inject: injectW,
+                    scale: layer.mlpHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
+                    tile: false)
+            }
             if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
-            let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
+            // MLXFAST-INJFUSE: Reuse the fused mix, including the router's float32 input.
+            let mm = fusedMix ?? hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
             input = mm.input; injectW = mm.inject
             if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
-            pendingOut = Self.moeForwardShared(
-                layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay)
+            pendingOut = moeForward(layer.moe, input, inputF32: mm.inputF32)
             if profiling { TrackFastProfile.tick("moe", &profT, [pendingOut!]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
             pendingInject = injectW
@@ -851,11 +870,22 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 if n == first || n == second || (n > second && (n - second) % Self.asyncChunk == 0) { asyncEval(stream) }
             }
         }
+        // MLXFAST-INJFUSE: Final mixer has no outgoing inject GEMV (40 groups),
+        // but must still apply the pending MLP update before normalization.
+        if let fused = hcMix(
+            finalMixer, residual: residual, out: pendingOut, pendingInject: pendingInject,
+            tile: false, tag: "final.hc")
+        {
+            Self.debugTaps?.append(("final.stream_in", fused.stream))
+            return (fused.mix.input, fused.stream)
+        }
         let (multi, finalNormed) = TrackFastKernels.injectNorm(
             residual: residual, out: pendingOut, inject: pendingInject,
             scale: finalMixer.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
             tile: false)
-        let mixed = hcMix(finalMixer, normed: finalNormed).input
+        // MLXFAST-INJFUSE: Final taps are available on the unchanged fallback too.
+        Self.debugTaps?.append(("final.stream_in", multi))
+        let mixed = hcMix(finalMixer, normed: finalNormed, tag: "final.hc").input
         return (mixed, multi)
     }
 

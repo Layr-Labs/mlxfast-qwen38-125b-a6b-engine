@@ -124,7 +124,7 @@ final class TrackFastHead {
             residual: st, out: attended, inject: injectW, scale: mlpHC.normScaleQ,
             hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
         (input, injectW) = hcMix(mlpHC, normed: normed)
-        let moeOut = TrackQwen4ExpFastModel.moeForwardShared(moe, input, replay: nil)
+        let moeOut = TrackQwen4ExpFastModel.moeForwardShared(moe, input)
         let (multiNext, finalNormed) = TrackFastKernels.injectNorm(
             residual: st, out: moeOut, inject: injectW, scale: finalMixer.normScaleQ,
             hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
