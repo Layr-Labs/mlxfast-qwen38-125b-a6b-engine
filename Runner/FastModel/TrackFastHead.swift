@@ -32,6 +32,7 @@ final class TrackFastHead {
     let attn: TrackAttn
     let moe: TrackMoE
     let finalMixer: TrackHC
+    private lazy var ropeCache = TrackRopeTables(rotary: rotary, rotaryDims: rotaryDims)
 
     static let enabled: Bool = {
         (ProcessInfo.processInfo.environment["TRACK_FAST_HEAD"] ?? "1") != "0"
@@ -138,10 +139,10 @@ final class TrackFastHead {
         let qkv = attn.qkv.apply(x)
         let idxStart = 2 * attn.qWidth + 2 * attn.kvWidth
         _ = cache.updateIndexer(keys: qkv[.ellipsis, idxStart ..< (idxStart + cfg.indexerHeadDim)])
-        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: S))
+        let rope = ropeCache.tables(offset: offset, count: S, dtype: x.dtype)
         let prep = TrackFastKernels.attnPrep(
             qkv: qkv, qNorm: attn.qNormW, kNorm: attn.kNormW,
-            cos: c.asType(x.dtype).reshaped(S, rotaryDims), sin: s.asType(x.dtype).reshaped(S, rotaryDims),
+            cos: rope.cos, sin: rope.sin,
             heads: heads, kvHeads: kvHeads, headDim: d, rotaryDims: rotaryDims, eps: eps)
         let mask = makeAttentionMask(n: S, cache: cache)
         let att = attentionWithCacheUpdate(
