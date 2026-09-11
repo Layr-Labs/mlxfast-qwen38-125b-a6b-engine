@@ -405,8 +405,8 @@ METAL_FUNC void qmv_fast_impl(
     const device T* biases,
     const device T* x,
     device T* y,
-    const constant int& in_vec_size,
-    const constant int& out_vec_size,
+    const int in_vec_size,
+    const int out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -472,8 +472,8 @@ METAL_FUNC void qmv_impl(
     const device T* biases,
     const device T* x,
     device T* y,
-    const constant int& in_vec_size,
-    const constant int& out_vec_size,
+    const int in_vec_size,
+    const int out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -687,13 +687,13 @@ METAL_FUNC void qmv_impl(
 
     nonisolated(unsafe) static let gateUpKernel = MLXFast.metalKernel(
         name: "track_moe_gate_up",
-        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "x", "idx", "xrow", "K", "N"],
+        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "x", "idx", "xrow"],
         outputNames: ["gate", "up"],
         source: gateUpSource, header: helpers, ensureRowContiguous: true)
 
     nonisolated(unsafe) static let singleKernel = MLXFast.metalKernel(
         name: "track_moe_single",
-        inputNames: ["w", "scales", "biases", "x", "idx", "K", "N"],
+        inputNames: ["w", "scales", "biases", "x", "idx"],
         outputNames: ["out"],
         source: singleSource, header: helpers, ensureRowContiguous: true)
 
@@ -713,8 +713,8 @@ METAL_FUNC void qmv_impl(
         let rb = rowBlocks ?? Self.rowBlocks(k: K)
         let nb = (N / 8 + rb - 1) / rb
         let outs = gateUpKernel(
-            [wg, sg, bg, wu, su, bu, x, idx, xrow, MLXArray(Int32(K)), MLXArray(Int32(N))],
-            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb)],
+            [wg, sg, bg, wu, su, bu, x, idx, xrow],
+            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb), ("K", K), ("N", N)],
             grid: (32, nb * 2 * 2, B), threadGroup: (32, 2, 1),
             outputShapes: [[B, N], [B, N]], outputDTypes: [x.dtype, x.dtype])
         return (outs[0], outs[1])
@@ -729,8 +729,8 @@ METAL_FUNC void qmv_impl(
         let rb = rowBlocks ?? Self.rowBlocks(k: K)
         let nb = (N / 8 + rb - 1) / rb
         return singleKernel(
-            [w, scales, biases, x, idx, MLXArray(Int32(K)), MLXArray(Int32(N))],
-            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb)],
+            [w, scales, biases, x, idx],
+            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb), ("K", K), ("N", N)],
             grid: (32, nb * 2, B), threadGroup: (32, 2, 1),
             outputShapes: [[B, N]], outputDTypes: [x.dtype])[0]
     }
