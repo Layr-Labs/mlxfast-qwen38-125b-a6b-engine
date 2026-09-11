@@ -706,6 +706,14 @@ METAL_FUNC void qmv_impl(
 
     static func isFast(k: Int, n: Int) -> Bool { n % 8 == 0 && k % 512 == 0 }
 
+    static func gateUpActReusesLoads(
+        dtype: DType, streams: Int, inputSize: Int, outputSize: Int,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> Bool {
+        dtype == .bfloat16 && streams == 1 && inputSize == 2560 && outputSize == 640
+            && groupSize == 32 && bits == 4 && mode == .affine
+    }
+
     /// 8-row blocks per threadgroup: the K=640 down projection is overhead-bound
     /// at one block per threadgroup.
     static func rowBlocks(k: Int) -> Int { k % 512 == 0 ? 1 : 4 }
@@ -924,6 +932,74 @@ extension TrackFastMoEKernels {
           }
         }
 
+        template <typename T, int group_size, int bits>
+        METAL_FUNC void qmv_fast_reg_dual(
+            const device uint32_t* w0,
+            const device T* scales0,
+            const device T* biases0,
+            const device uint32_t* w1,
+            const device T* scales1,
+            const device T* biases1,
+            const device T* x,
+            const int in_vec_size,
+            const int out_row,
+            uint simd_lid,
+            thread float (&result0)[4],
+            thread float (&result1)[4]) {
+          constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+          constexpr int results_per_simdgroup = 4;
+          constexpr int pack_factor = get_pack_factor<bits, 32>();
+          constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+          constexpr int values_per_thread = pack_factor * packs_per_thread;
+          constexpr int block_size = values_per_thread * SIMD_SIZE;
+          constexpr int scale_step_per_thread = group_size / values_per_thread;
+          const device uint8_t* ws0 = (const device uint8_t*)w0;
+          const device uint8_t* ws1 = (const device uint8_t*)w1;
+          typedef float U;
+          thread U x_thread[values_per_thread];
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            result0[row] = 0;
+            result1[row] = 0;
+          }
+          const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+          const int in_vec_size_g = in_vec_size / group_size;
+          ws0 += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+          ws1 += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+          scales0 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          scales1 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          biases0 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          biases1 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          x += simd_lid * values_per_thread;
+          for (int k = 0; k < in_vec_size; k += block_size) {
+            U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+            for (int row = 0; row < results_per_simdgroup; row++) {
+              auto wl0 = (const device uint8_t*)(ws0 + row * in_vec_size_w);
+              const device T* sl0 = scales0 + row * in_vec_size_g;
+              const device T* bl0 = biases0 + row * in_vec_size_g;
+              U s0 = sl0[0];
+              U b0 = bl0[0];
+              result0[row] += qdot<U, values_per_thread, bits>(wl0, x_thread, s0, b0, sum);
+              auto wl1 = (const device uint8_t*)(ws1 + row * in_vec_size_w);
+              const device T* sl1 = scales1 + row * in_vec_size_g;
+              const device T* bl1 = biases1 + row * in_vec_size_g;
+              U s1 = sl1[0];
+              U b1 = bl1[0];
+              result1[row] += qdot<U, values_per_thread, bits>(wl1, x_thread, s1, b1, sum);
+            }
+            ws0 += block_size * bytes_per_pack / pack_factor;
+            ws1 += block_size * bytes_per_pack / pack_factor;
+            scales0 += block_size / group_size;
+            scales1 += block_size / group_size;
+            biases0 += block_size / group_size;
+            biases1 += block_size / group_size;
+            x += block_size;
+          }
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            result0[row] = simd_sum(result0[row]);
+            result1[row] = simd_sum(result1[row]);
+          }
+        }
+
         // qmv_impl's normal branch (out_vec_size >= 8, full tile) likewise.
         template <typename T, int group_size, int bits>
         METAL_FUNC void qmv_reg(
@@ -1108,8 +1184,12 @@ extension TrackFastMoEKernels {
             if constexpr (VPT == 1) {
                 const int out_row = tile * 8 + (int)simdgroup_index_in_threadgroup * 4;
                 float g[4], u[4];
-                qmv_fast_reg<T, GS, BITS>(wsh, ssh, bsh, x, KD, out_row, thread_index_in_simdgroup, g);
-                qmv_fast_reg<T, GS, BITS>(wsh + (size_t)N * kw2, ssh + (size_t)N * kg2, bsh + (size_t)N * kg2, x, KD, out_row, thread_index_in_simdgroup, u);
+                if constexpr (REUSE) {
+                    qmv_fast_reg_dual<T, GS, BITS>(wsh, ssh, bsh, wsh + (size_t)N * kw2, ssh + (size_t)N * kg2, bsh + (size_t)N * kg2, x, KD, out_row, thread_index_in_simdgroup, g, u);
+                } else {
+                    qmv_fast_reg<T, GS, BITS>(wsh, ssh, bsh, x, KD, out_row, thread_index_in_simdgroup, g);
+                    qmv_fast_reg<T, GS, BITS>(wsh + (size_t)N * kw2, ssh + (size_t)N * kg2, bsh + (size_t)N * kg2, x, KD, out_row, thread_index_in_simdgroup, u);
+                }
                 if (thread_index_in_simdgroup == 0) {
                     for (int i = 0; i < 4; ++i) {
                         act[(size_t)BR * (size_t)N + (size_t)(out_row + i)] = mlx_silu(static_cast<T>(g[i])) * static_cast<T>(u[i]);
@@ -1136,7 +1216,9 @@ extension TrackFastMoEKernels {
         const device T* xb = x + (size_t)r * (size_t)KD;
         const size_t eoff = (size_t)e * (size_t)N;
         float g[4], u[4];
-        if (FAST) {
+        if constexpr (REUSE) {
+            qmv_fast_reg_dual<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g, u);
+        } else if (FAST) {
             qmv_fast_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
             qmv_fast_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
         } else {
@@ -1176,7 +1258,7 @@ extension TrackFastMoEKernels {
         precondition(isFast(k: KD, n: N), "shared expert one-token path assumes qmv_fast")
         return (S == 1 ? gateUpActKernel1 : gateUpActKernel)(
             [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
-            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("BR", BR), ("VPT", S)],
+            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("REUSE", gateUpActReusesLoads(dtype: x.dtype, streams: S, inputSize: KD, outputSize: N, groupSize: groupSize, bits: bits, mode: shared.mode)), ("BR", BR), ("VPT", S)],
             grid: (32, (N / 8) * 2, BR + 1), threadGroup: (32, 2, 1),
             outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
     }
