@@ -1385,8 +1385,36 @@ extension TrackFastMoEKernels {
     /// shortens each simdgroup's serial chain and drops the per-thread product
     /// array into threadgroup memory. Every product and the fold order are
     /// unchanged, so the output is bit-identical for any value.
+    /// One, not two. This is a deliberate test of an INVERSION I measured rather
+    /// than a tuning guess, and the prediction is stated before the run.
+    ///
+    /// An in-process sweep of KSG -- a template parameter, so all legal values
+    /// (topK % KSG == 0: 1, 2, 5, 10) run in one build off the shipping kernel --
+    /// said KSG=5 is 2.4% FASTER than the incumbent 2 and KSG=1 is 3.2-3.5%
+    /// SLOWER, at the real 512-expert table, 4 of 4 interleaved repeats. Submitted
+    /// as such, KSG=5 scored -3.58% on the ranked box: a real regression, not
+    /// noise (the positive tail of this board is thin and small -- +0.02%, +0.19%,
+    /// +0.48%, +0.55% -- which is not what a 2%-noise instrument produces).
+    ///
+    /// The mechanism that fits: KSG sets threads per threadgroup (32 x KSG), and
+    /// the threadgroup count stays H/4 = 640 regardless. Alone on the GPU, 160
+    /// threads per threadgroup wins. In situ, with 84 GB of weights streaming
+    /// through the same cache hierarchy, the extra outstanding memory requests
+    /// cost more than the added parallelism returns. The same shape explains
+    /// rowBlocks=2, which cut gate/up from 160 threadgroups to 80 and also
+    /// regressed on the board while winning in isolation.
+    ///
+    /// So this takes the opposite end: KSG=1 is 640 threadgroups of 32 threads,
+    /// the finest granularity the kernel allows, which both readings predict is
+    /// best in situ and which my isolated bench calls worst. Bit-identical either
+    /// way -- prod[K][4] and shvT[4] are sized by K, not KSG, and the epilogue
+    /// folds prod in absolute k order -- asserted numerically, max|diff| == 0.
+    ///
+    /// Note the env var never reached the scored run: benchd does not forward
+    /// custom environment variables to the worker, so this default IS the value
+    /// the benchmark measures.
     static let downCombineSimdgroups =
-        ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 2
+        ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 1
 
     /// act [BR + S, F] (routed slots, then the shared expert per token), gate [S] pre-sigmoid.
     static func downCombine(
