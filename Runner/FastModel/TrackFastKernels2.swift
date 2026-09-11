@@ -208,7 +208,7 @@ extension TrackFastKernels {
 
     // MARK: mixer combine
 
-    /// input[d] = bf16( sum_s f32(bf16(sigmoid(w[s,d])) * normed[s,d]) ) (row-order f32 sum, one rounding)
+    /// input[d] accumulates four BF16 stream products in row order.
     /// inject[s] = 2 * sigmoid(inj[s])   (bf16 ops)
     static let mixSource = """
         const uint d = thread_position_in_grid.x;
@@ -231,23 +231,90 @@ extension TrackFastKernels {
         }
         """
 
+    static let mixVectorSource = """
+        const uint thread_x = thread_position_in_grid.x;
+        const uint row = thread_position_in_grid.y;
+        const uint d = thread_x * 4;
+        if (d >= H) return;
+        InT acc0 = InT(0);
+        InT acc1 = InT(0);
+        InT acc2 = InT(0);
+        InT acc3 = InT(0);
+        for (int s = 0; s < HC; ++s) {
+            const uint i = row * W + s * H + d;
+            const vec<InT, 4> w4 = *((const device vec<InT, 4>*)(w + i));
+            const vec<InT, 4> n4 = *((const device vec<InT, 4>*)(normed + i));
+            InT sg0 = mlx_sigmoid(w4[0]);
+            InT sg1 = mlx_sigmoid(w4[1]);
+            InT sg2 = mlx_sigmoid(w4[2]);
+            InT sg3 = mlx_sigmoid(w4[3]);
+            InT p0 = sg0 * n4[0];
+            InT p1 = sg1 * n4[1];
+            InT p2 = sg2 * n4[2];
+            InT p3 = sg3 * n4[3];
+            acc0 = acc0 + p0;
+            acc1 = acc1 + p1;
+            acc2 = acc2 + p2;
+            acc3 = acc3 + p3;
+        }
+        vec<InT, 4> out4;
+        out4[0] = acc0;
+        out4[1] = acc1;
+        out4[2] = acc2;
+        out4[3] = acc3;
+        *((device vec<InT, 4>*)(input + row * H + d)) = out4;
+        if (HAS_INJECT && thread_x == 0) {
+            const uint i = row * LW + (LW - HC);
+            InT x0 = inj[i + 0];
+            InT x1 = inj[i + 1];
+            InT x2 = inj[i + 2];
+            InT x3 = inj[i + 3];
+            InT sg0 = mlx_sigmoid(x0);
+            InT sg1 = mlx_sigmoid(x1);
+            InT sg2 = mlx_sigmoid(x2);
+            InT sg3 = mlx_sigmoid(x3);
+            inject[row * HC + 0] = InT(2) * sg0;
+            inject[row * HC + 1] = InT(2) * sg1;
+            inject[row * HC + 2] = InT(2) * sg2;
+            inject[row * HC + 3] = InT(2) * sg3;
+        }
+        """
+
     nonisolated(unsafe) static let mixKernel = MLXFast.metalKernel(
         name: "track_hc_mix",
         inputNames: ["w", "normed", "inj"],
         outputNames: ["input", "inject"],
         source: mixSource, header: exactHeader, ensureRowContiguous: true)
 
+    nonisolated(unsafe) static let mixVectorKernel = MLXFast.metalKernel(
+        name: "track_hc_mix_vec4",
+        inputNames: ["w", "normed", "inj"],
+        outputNames: ["input", "inject"],
+        source: mixVectorSource, header: exactHeader, ensureRowContiguous: true)
+
+    static func hcMixUsesVectorAccess(
+        sequenceLength: Int, wDType: DType, normedDType: DType, injDType: DType,
+        hcCount: Int, hidden: Int
+    ) -> Bool {
+        sequenceLength > 8 && wDType == .bfloat16 && normedDType == .bfloat16
+            && injDType == .bfloat16 && hcCount == 4 && hidden == 2560
+    }
+
     static func hcMix(
         w: MLXArray, normed: MLXArray, inj: MLXArray, hcCount: Int, hidden: Int, hasInject: Bool
     ) -> (input: MLXArray, inject: MLXArray) {
         let B = w.dim(0), S = w.dim(1)
-        let outs = mixKernel(
+        let useVector = hcMixUsesVectorAccess(
+            sequenceLength: S, wDType: w.dtype, normedDType: normed.dtype,
+            injDType: inj.dtype, hcCount: hcCount, hidden: hidden)
+        let kernel = useVector ? mixVectorKernel : mixKernel
+        let outs = kernel(
             [w, normed, inj],
             template: [
                 ("InT", w.dtype), ("H", hidden), ("W", hcCount * hidden), ("HC", hcCount),
                 ("LW", inj.dim(2)), ("HAS_INJECT", hasInject),
             ],
-            grid: (hidden, B * S, 1), threadGroup: (256, 1, 1),
+            grid: (useVector ? hidden / 4 : hidden, B * S, 1), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, hidden], [B, S, hcCount]],
             outputDTypes: [w.dtype, w.dtype])
         return (outs[0], outs[1])
