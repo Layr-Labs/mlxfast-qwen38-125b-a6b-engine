@@ -667,8 +667,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             case .quant(let guq) = m.sharedGateUp.fused ?? .dense(x),
             case .quant(let dq) = m.sharedDown, guq.biases != nil, dq.biases != nil
         {
-            // The shared-expert gate is a bf16 Linear on this checkpoint (router gates
-            // are BF16): MLX's own GEMV keeps it; a quantized one rides in `route`.
+            // The shared-expert gate is AFFINE 4-BIT on this checkpoint, not a bf16
+            // Linear: `Qwen4ExpCheckpointValidation.swift:384` pins it with
+            // `addAffine("...mlp.shared_expert_gate", leading: [1], inFeatures: hidden)`.
+            // So `gateQ` is non-nil here and the gate rides inside `route` rather
+            // than taking MLX's own GEMV. It matters for anyone counting launches:
+            // the dense fallback below would add one dispatch per layer, 48 per
+            // token, and it never fires on this checkpoint.
             var gateQ: TrackQuantWeight? = nil
             if case .quant(let gq) = m.sharedGate, gq.biases != nil { gateQ = gq }
             // Decode windows: three launches over MLX's own GEMV arithmetic for the

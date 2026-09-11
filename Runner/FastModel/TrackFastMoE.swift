@@ -1385,8 +1385,22 @@ extension TrackFastMoEKernels {
     /// shortens each simdgroup's serial chain and drops the per-thread product
     /// array into threadgroup memory. Every product and the fold order are
     /// unchanged, so the output is bit-identical for any value.
+    /// Five, not two. `KSG` is a template parameter, so all legal values (topK %
+    /// KSG == 0, i.e. 1, 2, 5, 10) can be swept in one process off the shipping
+    /// kernel; five is faster than the incumbent two in 4 of 4 interleaved
+    /// repeats (-1.41%, -1.70%, -2.22%, -1.43%, n=72 per arm) and one is worse in
+    /// 4 of 4 (+3.5% to +4.2%), so the response is ordered rather than noise. Ten
+    /// matches five on the mean but scatters twice as widely. Nothing about the
+    /// threadgroup's memory depends on KSG -- `prod[K][4]` and `shvT[4]` are
+    /// sized by K -- and the epilogue folds `prod` in absolute k order, which is
+    /// why every value is bit-identical; asserted numerically in the local sweep,
+    /// not merely taken from the comment above.
+    ///
+    /// Note the env var never reached the scored run: benchd does not forward
+    /// custom environment variables to the worker, so this default IS the value
+    /// the benchmark has always measured.
     static let downCombineSimdgroups =
-        ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 2
+        ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 5
 
     /// act [BR + S, F] (routed slots, then the shared expert per token), gate [S] pre-sigmoid.
     static func downCombine(
