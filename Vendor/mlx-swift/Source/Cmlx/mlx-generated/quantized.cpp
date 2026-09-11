@@ -794,6 +794,10 @@ METAL_FUNC void qmv_fast_impl(
 
   thread U x_thread[values_per_thread];
   thread U result[results_per_simdgroup] = {0};
+  // MLXFAST-QFAST2: second activation buffer for the unrolled K-block pair.
+  thread U x_thread1[values_per_thread];
+  constexpr int qfast2_w_step = block_size * bytes_per_pack / pack_factor;
+  constexpr int qfast2_g_step = block_size / group_size;
 
   // Adjust positions
   const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
@@ -807,7 +811,40 @@ METAL_FUNC void qmv_fast_impl(
   x += tid.x * in_vec_size + simd_lid * values_per_thread;
   y += tid.x * out_vec_size + out_row;
 
-  for (int k = 0; k < in_vec_size; k += block_size) {
+  // MLXFAST-QFAST2: unroll the K-block loop by two. The halves keep
+  // independent activation buffers so the second half's loads issue while
+  // the first half's row dots compute. Within each row the block-k partial
+  // still accumulates before the block-(k+1) partial, and pairs still retire
+  // in ascending K order, so the summation order, the dequantization
+  // expressions, and the reductions are verbatim.
+  int qfast2_k = 0;
+  for (; qfast2_k + 2 * block_size <= in_vec_size; qfast2_k += 2 * block_size) {
+    U sum0 = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+    U sum1 = load_vector<T, U, values_per_thread, bits>(x + block_size, x_thread1);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      auto wl0 = (const device uint8_t*)(ws + row * in_vec_size_w);
+      const device T* sl0 = scales + row * in_vec_size_g;
+      const device T* bl0 = biases + row * in_vec_size_g;
+      U s0 = sl0[0];
+      U b0 = bl0[0];
+      result[row] += qdot<U, values_per_thread, bits>(wl0, x_thread, s0, b0, sum0);
+
+      auto wl1 = (const device uint8_t*)(ws + qfast2_w_step + row * in_vec_size_w);
+      const device T* sl1 = scales + qfast2_g_step + row * in_vec_size_g;
+      const device T* bl1 = biases + qfast2_g_step + row * in_vec_size_g;
+      U s1 = sl1[0];
+      U b1 = bl1[0];
+      result[row] += qdot<U, values_per_thread, bits>(wl1, x_thread1, s1, b1, sum1);
+    }
+
+    ws += 2 * qfast2_w_step;
+    scales += 2 * qfast2_g_step;
+    biases += 2 * qfast2_g_step;
+    x += 2 * block_size;
+  }
+  // Odd-block tail (e.g. K = 5 blocks): one stock block, same order.
+  for (; qfast2_k < in_vec_size; qfast2_k += block_size) {
     U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
     for (int row = 0; row < results_per_simdgroup; row++) {
