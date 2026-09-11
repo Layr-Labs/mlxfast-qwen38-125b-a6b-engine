@@ -706,9 +706,17 @@ METAL_FUNC void qmv_impl(
 
     static func isFast(k: Int, n: Int) -> Bool { n % 8 == 0 && k % 512 == 0 }
 
-    /// 8-row blocks per threadgroup: the K=640 down projection is overhead-bound
-    /// at one block per threadgroup.
-    static func rowBlocks(k: Int) -> Int { k % 512 == 0 ? 1 : 4 }
+    /// 8-row blocks per threadgroup. `RB` picks ownership only -- every 8-row
+    /// block is still one `qmv_*_impl` call over the full K -- so any value is
+    /// bit-exact. Fewer rows per threadgroup means MORE threadgroups: at the
+    /// served shapes gate/up (N=640) runs 2*80/RB and down (N=2560) runs 320/RB.
+    /// gate/up keeps RB=1, which is already its maximum occupancy; only the down
+    /// projection moves, 4 -> 2, which takes it from 80 threadgroups to 160.
+    /// Raising the count is the direction that has paid on this kernel family
+    /// (MLXFAST-INJSPLIT, and downRowsPerSimdgroup 4 -> 2); lowering gate/up to
+    /// 80 by setting RB=2 everywhere scored -0.67% on the ranked box, which is
+    /// why this leaves gate/up alone.
+    static func rowBlocks(k: Int) -> Int { k % 512 == 0 ? 1 : 2 }
 
     /// gate/up for `B` (row, expert) pairs.
     static func gateUp(
@@ -1166,114 +1174,6 @@ extension TrackFastMoEKernels {
         source: gateUpActSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
 
-    static let gateUpReuseRowsPerSimdgroup = 2
-
-    static let gateUpReuseHelpers = #"""
-        template <typename T, int group_size, int bits, int rows>
-        METAL_FUNC void qmv_fast_reg_dual(
-            const device uint32_t* w0,
-            const device T* scales0,
-            const device T* biases0,
-            const device uint32_t* w1,
-            const device T* scales1,
-            const device T* biases1,
-            const device T* x,
-            const int in_vec_size,
-            const int out_row,
-            uint simd_lid,
-            thread float (&result0)[rows],
-            thread float (&result1)[rows]) {
-          constexpr int packs_per_thread = bits == 2 ? 1 : 2;
-          constexpr int pack_factor = get_pack_factor<bits, 32>();
-          constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
-          constexpr int values_per_thread = pack_factor * packs_per_thread;
-          constexpr int block_size = values_per_thread * SIMD_SIZE;
-          constexpr int scale_step_per_thread = group_size / values_per_thread;
-          const device uint8_t* ws0 = (const device uint8_t*)w0;
-          const device uint8_t* ws1 = (const device uint8_t*)w1;
-          typedef float U;
-          thread U x_thread[values_per_thread];
-          for (int row = 0; row < rows; row++) {
-            result0[row] = 0;
-            result1[row] = 0;
-          }
-          const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
-          const int in_vec_size_g = in_vec_size / group_size;
-          ws0 += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-          ws1 += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-          scales0 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-          scales1 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-          biases0 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-          biases1 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-          x += simd_lid * values_per_thread;
-          for (int k = 0; k < in_vec_size; k += block_size) {
-            U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
-            for (int row = 0; row < rows; row++) {
-              auto wl0 = (const device uint8_t*)(ws0 + row * in_vec_size_w);
-              const device T* sl0 = scales0 + row * in_vec_size_g;
-              const device T* bl0 = biases0 + row * in_vec_size_g;
-              U s0 = sl0[0];
-              U b0 = bl0[0];
-              result0[row] += qdot<U, values_per_thread, bits>(wl0, x_thread, s0, b0, sum);
-              auto wl1 = (const device uint8_t*)(ws1 + row * in_vec_size_w);
-              const device T* sl1 = scales1 + row * in_vec_size_g;
-              const device T* bl1 = biases1 + row * in_vec_size_g;
-              U s1 = sl1[0];
-              U b1 = bl1[0];
-              result1[row] += qdot<U, values_per_thread, bits>(wl1, x_thread, s1, b1, sum);
-            }
-            ws0 += block_size * bytes_per_pack / pack_factor;
-            ws1 += block_size * bytes_per_pack / pack_factor;
-            scales0 += block_size / group_size;
-            scales1 += block_size / group_size;
-            biases0 += block_size / group_size;
-            biases1 += block_size / group_size;
-            x += block_size;
-          }
-          for (int row = 0; row < rows; row++) {
-            result0[row] = simd_sum(result0[row]);
-            result1[row] = simd_sum(result1[row]);
-          }
-        }
-        """#
-
-    static let gateUpReuseSource = """
-        const uint z = threadgroup_position_in_grid.z;
-        const bool shared = z == (uint)BR;
-        const uint e = shared ? 0u : idx[z];
-        const uint r = shared ? 0u : xrow[z];
-        const size_t kw = (size_t)KD / 8;
-        const size_t kg = (size_t)KD / GS;
-        const size_t eoff = (size_t)e * (size_t)N;
-        const device uint32_t* gw = shared ? wsh : wg + eoff * kw;
-        const device T* gs = shared ? ssh : sg + eoff * kg;
-        const device T* gb = shared ? bsh : bg + eoff * kg;
-        const device uint32_t* uw = shared ? wsh + (size_t)N * kw : wu + eoff * kw;
-        const device T* us = shared ? ssh + (size_t)N * kg : su + eoff * kg;
-        const device T* ub = shared ? bsh + (size_t)N * kg : bu + eoff * kg;
-        const int out_row = (int)threadgroup_position_in_grid.y * (2 * RPS)
-            + (int)simdgroup_index_in_threadgroup * RPS;
-        float g[RPS], u[RPS];
-        qmv_fast_reg_dual<T, GS, BITS, RPS>(
-            gw, gs, gb, uw, us, ub, x + (size_t)r * (size_t)KD,
-            KD, out_row, thread_index_in_simdgroup, g, u);
-        if (thread_index_in_simdgroup == 0) {
-            for (int i = 0; i < RPS; ++i) {
-                const T gv = static_cast<T>(g[i]);
-                const T uv = static_cast<T>(u[i]);
-                act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
-            }
-        }
-        """
-
-    nonisolated(unsafe) static let gateUpReuseKernel = MLXFast.metalKernel(
-        name: "track_moe_gate_up_reuse_2row",
-        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
-        outputNames: ["act"],
-        source: gateUpReuseSource,
-        header: helpersCore + TrackFastKernels.exactHeader + gateUpReuseHelpers,
-        ensureRowContiguous: true)
-
     /// Routed slots [0, BR) then the shared expert for the S tokens: act [BR + S, N].
     static func gateUpAct(
         wg: MLXArray, sg: MLXArray, bg: MLXArray, wu: MLXArray, su: MLXArray, bu: MLXArray,
@@ -1283,19 +1183,6 @@ extension TrackFastMoEKernels {
         precondition(N % 8 == 0 && bits == 4 && idx.dtype == .uint32 && xrow.dtype == .uint32)
         precondition(shared.rows == 2 * N && shared.groupSize == groupSize && shared.bits == bits && S >= 1 && S <= 8)
         precondition(isFast(k: KD, n: N), "shared expert one-token path assumes qmv_fast")
-        if x.dtype == .bfloat16 && S == 1 && KD == 2560 && N == 640
-            && groupSize == 32 && bits == 4 && shared.mode == .affine
-        {
-            let rows = gateUpReuseRowsPerSimdgroup
-            return gateUpReuseKernel(
-                [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
-                template: [
-                    ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N),
-                    ("KD", KD), ("BR", BR), ("RPS", rows),
-                ],
-                grid: (32, N / rows, BR + 1), threadGroup: (32, 2, 1),
-                outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
-        }
         return (S == 1 ? gateUpActKernel1 : gateUpActKernel)(
             [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
             template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("BR", BR), ("VPT", S)],
