@@ -316,12 +316,87 @@ extension TrackFastKernels {
         outputNames: ["out"],
         source: gatedRMSSource, header: exactHeader, ensureRowContiguous: true)
 
+    /// Prefill-only widened activation access: identical arithmetic to
+    /// `gatedRMSSource`, but each lane's four `y` values move as two raw
+    /// 32-bit words (not four scalar bf16 loads), the four gate values move
+    /// the same way, and the four outputs store as two raw words. Norm
+    /// weights stay scalar; squares still accumulate in ascending component
+    /// order; reductions, barriers, `precise::rsqrt`, bf16 rounding points,
+    /// and sigmoid evaluation are unchanged. Dispatch guards (S>8, BF16 x3,
+    /// PW%4==0, Z_OFF%4==0, Dv==128) keep every word base 4-byte aligned;
+    /// all other cases use the scalar kernel.
+    static let gatedRMSPrefillVec4Source = """
+        constexpr int N_READS = 4;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint hv = thread_position_in_grid.y;
+        const uint row = thread_position_in_grid.z;
+        const uint lane = thread_index_in_simdgroup;
+        threadgroup float local_sums[32];
+        const uint ybase = (row * Hv + hv) * Dv;
+        float thread_x[N_READS];
+        float acc = 0.0f;
+        {
+            // One 8-byte activation row slice per lane, moved as two raw
+            // 32-bit words (Dv == 128 keeps ybase even). Each word holds two
+            // little-endian bf16 lanes; the per-lane values convert to the
+            // same four floats as four scalar loads, in the same order.
+            const device uint *yp32 = reinterpret_cast<const device uint *>(y) + ybase / 2;
+            const uint yw0 = yp32[lid * 2];
+            const uint yw1 = yp32[lid * 2 + 1];
+            thread_x[0] = static_cast<float>(as_type<InT>(static_cast<ushort>(yw0 & 0xffffu)));
+            thread_x[1] = static_cast<float>(as_type<InT>(static_cast<ushort>(yw0 >> 16)));
+            thread_x[2] = static_cast<float>(as_type<InT>(static_cast<ushort>(yw1 & 0xffffu)));
+            thread_x[3] = static_cast<float>(as_type<InT>(static_cast<ushort>(yw1 >> 16)));
+            for (int i = 0; i < N_READS; ++i) {
+                acc += thread_x[i] * thread_x[i];
+            }
+        }
+        acc = simd_sum(acc);
+        if (lane >= 1) { local_sums[lane] = 0; }
+        if (lane == 0) { local_sums[0] = acc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        acc = simd_sum(local_sums[lane]);
+        const float inv_mean = metal::precise::rsqrt(acc / (float)Dv + as_type<float>((uint)EPS_BITS));
+        {
+            // Same raw-word treatment for the four gate values (PW and
+            // Z_OFF are 4-divisible under the dispatch guard, so gbase is
+            // even) and for the four outputs. Norm weights stay scalar.
+            const uint gbase = row * PW + Z_OFF + hv * Dv;
+            const device uint *gp32 = reinterpret_cast<const device uint *>(proj) + gbase / 2;
+            const uint gw0 = gp32[lid * 2];
+            const uint gw1 = gp32[lid * 2 + 1];
+            InT n0 = w[lid * N_READS + 0] * static_cast<InT>(thread_x[0] * inv_mean);
+            InT n1 = w[lid * N_READS + 1] * static_cast<InT>(thread_x[1] * inv_mean);
+            InT n2 = w[lid * N_READS + 2] * static_cast<InT>(thread_x[2] * inv_mean);
+            InT n3 = w[lid * N_READS + 3] * static_cast<InT>(thread_x[3] * inv_mean);
+            const float z0 = static_cast<float>(as_type<InT>(static_cast<ushort>(gw0 & 0xffffu)));
+            const float z1 = static_cast<float>(as_type<InT>(static_cast<ushort>(gw0 >> 16)));
+            const float z2 = static_cast<float>(as_type<InT>(static_cast<ushort>(gw1 & 0xffffu)));
+            const float z3 = static_cast<float>(as_type<InT>(static_cast<ushort>(gw1 >> 16)));
+            const uint ow0 = static_cast<uint>(as_type<ushort>(static_cast<InT>(mlx_sigmoid(z0) * static_cast<float>(n0))))
+                | (static_cast<uint>(as_type<ushort>(static_cast<InT>(mlx_sigmoid(z1) * static_cast<float>(n1)))) << 16);
+            const uint ow1 = static_cast<uint>(as_type<ushort>(static_cast<InT>(mlx_sigmoid(z2) * static_cast<float>(n2))))
+                | (static_cast<uint>(as_type<ushort>(static_cast<InT>(mlx_sigmoid(z3) * static_cast<float>(n3)))) << 16);
+            device uint *op32 = reinterpret_cast<device uint *>(out) + ybase / 2;
+            op32[lid * 2] = ow0;
+            op32[lid * 2 + 1] = ow1;
+        }
+        """
+
+    nonisolated(unsafe) static let gatedRMSPrefillVec4Kernel = MLXFast.metalKernel(
+        name: "track_gated_rms_prefill_v4",
+        inputNames: ["y", "proj", "w"],
+        outputNames: ["out"],
+        source: gatedRMSPrefillVec4Source, header: exactHeader, ensureRowContiguous: true)
+
     static func gatedRMS(y: MLXArray, proj: MLXArray, w: MLXArray, zOffset: Int, eps: Float)
         -> MLXArray
     {
         let B = y.dim(0), S = y.dim(1), Hv = y.dim(2), Dv = y.dim(3)
         precondition(Dv == 128)
-        return gatedRMSKernel(
+        let useVec4 = S > 8 && y.dtype == .bfloat16 && proj.dtype == .bfloat16
+            && w.dtype == .bfloat16 && proj.dim(2) % 4 == 0 && zOffset % 4 == 0
+        return (useVec4 ? gatedRMSPrefillVec4Kernel : gatedRMSKernel)(
             [y, proj, w],
             template: [
                 ("InT", y.dtype), ("Hv", Hv), ("Dv", Dv), ("PW", proj.dim(2)),
