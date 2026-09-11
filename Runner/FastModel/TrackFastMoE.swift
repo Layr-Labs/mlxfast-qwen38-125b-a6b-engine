@@ -1099,6 +1099,13 @@ extension TrackFastMoEKernels {
     /// act [BR, N]. grid threads (32, N/8, BR), threadgroup (32, 2, 1).
     static let gateUpActSource = """
         const uint z = threadgroup_position_in_grid.z;
+        // MLXFAST-GATEUPSPLIT: at VPT == 1 the gate and up walks of one
+        // four-row tile run on the two simdgroups of the threadgroup in
+        // parallel and hand their float results through threadgroup memory.
+        // The walk, its accumulation tree and the SiLU product are unchanged;
+        // only which simdgroup holds each accumulator varies.
+        threadgroup float gsplit[4];
+        threadgroup float usplit[4];
         if (z == (uint)BR) {
             // Shared expert: gate rows [0, N) and up rows [N, 2N) of the fused
             // shared matrix, all S tokens. One token routes to `qmv_fast`, two to
@@ -1107,13 +1114,21 @@ extension TrackFastMoEKernels {
             const uint kg2 = (uint)KD / GS;
             const int tile = (int)threadgroup_position_in_grid.y;
             if constexpr (VPT == 1) {
-                const int out_row = tile * 8 + (int)simdgroup_index_in_threadgroup * 4;
-                float g[4], u[4];
-                qmv_fast_reg<T, GS, BITS>(wsh, ssh, bsh, x, KD, out_row, thread_index_in_simdgroup, g);
-                qmv_fast_reg<T, GS, BITS>(wsh + (size_t)N * kw2, ssh + (size_t)N * kg2, bsh + (size_t)N * kg2, x, KD, out_row, thread_index_in_simdgroup, u);
+                const int out_row = tile * 4;
+                const uint sgi = simdgroup_index_in_threadgroup;
+                float r[4];
+                if (sgi == 0) {
+                    qmv_fast_reg<T, GS, BITS>(wsh, ssh, bsh, x, KD, out_row, thread_index_in_simdgroup, r);
+                } else {
+                    qmv_fast_reg<T, GS, BITS>(wsh + (size_t)N * kw2, ssh + (size_t)N * kg2, bsh + (size_t)N * kg2, x, KD, out_row, thread_index_in_simdgroup, r);
+                }
                 if (thread_index_in_simdgroup == 0) {
+                    for (int i = 0; i < 4; ++i) { if (sgi == 0) { gsplit[i] = r[i]; } else { usplit[i] = r[i]; } }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sgi == 1 && thread_index_in_simdgroup == 0) {
                     for (int i = 0; i < 4; ++i) {
-                        act[(size_t)BR * (size_t)N + (size_t)(out_row + i)] = mlx_silu(static_cast<T>(g[i])) * static_cast<T>(u[i]);
+                        act[(size_t)BR * (size_t)N + (size_t)(out_row + i)] = mlx_silu(static_cast<T>(gsplit[i])) * static_cast<T>(usplit[i]);
                     }
                 }
             } else {
@@ -1133,22 +1148,52 @@ extension TrackFastMoEKernels {
         const uint r = xrow[z];
         const uint kw = (uint)KD / 8;
         const uint kg = (uint)KD / GS;
-        const int out_row = (int)threadgroup_position_in_grid.y * 8 + (int)simdgroup_index_in_threadgroup * 4;
         const device T* xb = x + (size_t)r * (size_t)KD;
         const size_t eoff = (size_t)e * (size_t)N;
-        float g[4], u[4];
-        if (FAST) {
-            qmv_fast_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
-            qmv_fast_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
+        if constexpr (VPT == 1) {
+            const int out_row = (int)threadgroup_position_in_grid.y * 4;
+            const uint sgi = simdgroup_index_in_threadgroup;
+            float res[4];
+            if (FAST) {
+                if (sgi == 0) {
+                    qmv_fast_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, res);
+                } else {
+                    qmv_fast_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, res);
+                }
+            } else {
+                if (sgi == 0) {
+                    qmv_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, res);
+                } else {
+                    qmv_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, res);
+                }
+            }
+            if (thread_index_in_simdgroup == 0) {
+                for (int i = 0; i < 4; ++i) { if (sgi == 0) { gsplit[i] = res[i]; } else { usplit[i] = res[i]; } }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sgi == 1 && thread_index_in_simdgroup == 0) {
+                for (int i = 0; i < 4; ++i) {
+                    const T gv = static_cast<T>(gsplit[i]);
+                    const T uv = static_cast<T>(usplit[i]);
+                    act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+                }
+            }
         } else {
-            qmv_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
-            qmv_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
-        }
-        if (thread_index_in_simdgroup == 0) {
-            for (int i = 0; i < 4; ++i) {
-                const T gv = static_cast<T>(g[i]);
-                const T uv = static_cast<T>(u[i]);
-                act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+            const int out_row = (int)threadgroup_position_in_grid.y * 8 + (int)simdgroup_index_in_threadgroup * 4;
+            float g[4], u[4];
+            if (FAST) {
+                qmv_fast_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
+                qmv_fast_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
+            } else {
+                qmv_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
+                qmv_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
+            }
+            if (thread_index_in_simdgroup == 0) {
+                for (int i = 0; i < 4; ++i) {
+                    const T gv = static_cast<T>(g[i]);
+                    const T uv = static_cast<T>(u[i]);
+                    act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+                }
             }
         }
         """
@@ -1178,7 +1223,10 @@ extension TrackFastMoEKernels {
         return (S == 1 ? gateUpActKernel1 : gateUpActKernel)(
             [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
             template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("BR", BR), ("VPT", S)],
-            grid: (32, (N / 8) * 2, BR + 1), threadGroup: (32, 2, 1),
+            // MLXFAST-GATEUPSPLIT: the one-token grid covers four rows per
+            // threadgroup (one walk per simdgroup); wider windows keep the
+            // eight-row tile of the original body.
+            grid: (32, (S == 1 ? N / 4 : N / 8) * 2, BR + 1), threadGroup: (32, 2, 1),
             outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
     }
 
