@@ -241,7 +241,23 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         (ProcessInfo.processInfo.environment["TRACK_FAST_FORWARD"] ?? "1") != "0"
     }()
 
+    // MLXFAST-ATTNBLOCK: the engine splits multi-token prompt attention into
+    // 128-query blocks (`AttentionV1.queryBlockSize`, env
+    // DARKBLOOM_CBV2_ATTN_QUERY_BLOCK, default 128). The scored prefill is a
+    // single 1024-token seed, and MLX's fused causal SDPA requires
+    // query_sequence_length >= 1024 with head_dim 256 and no array mask. The
+    // 8-way split therefore keeps the scored geometry off that kernel. Setting
+    // the documented kill switch to 0 issues one call for the whole chunk.
+    // Decode is provably untouched: L == 1 never blocks at any setting.
+    // Set before first access; `queryBlockSize` is a lazily-evaluated static.
+    nonisolated(unsafe) static let attnBlockOverride: Void = {
+        if ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"] == nil {
+            setenv("DARKBLOOM_CBV2_ATTN_QUERY_BLOCK", "0", 1)
+        }
+    }()
+
     public init(base: Qwen4ExpModel) {
+        _ = Self.attnBlockOverride  // MLXFAST-ATTNBLOCK
         self.base = base
         let cfg = base.configuration
         self.cfg = cfg
