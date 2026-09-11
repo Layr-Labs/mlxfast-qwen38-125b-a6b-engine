@@ -532,7 +532,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let prof = TrackFastProfile.prefill != nil && S >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
         let split = separate ? g.proj.parts.map { $0.apply(x) } : nil
-        let proj = split?[0] ?? g.proj.apply(x)  // [B,S,PROJ_W]
+        // MLXFAST-RPS16: same move on the GDN input projection (~4,120 -> ~1,030).
+        var proj: MLXArray
+        if let s0 = split?[0] {
+            proj = s0
+        } else if case .quant(let q) = g.proj.fused ?? .dense(MLXArray(0)),
+            let fast = TrackFastMoEKernels.oProj2Row(x, q, rps: 16) {
+            proj = fast
+        } else {
+            proj = g.proj.apply(x)
+        }  // [B,S,PROJ_W]
         if prof { TrackFastProfile.tick("gdn.proj", &pt, split ?? [proj]) }
         let state = evaluation.inputState(modelLayerIndex: layerIndex)
         let convState =
@@ -584,7 +593,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             TrackP12Prefill.omitUnusedIndexer && TrackP12Prefill.eligible(x) && S > 8
             && a.qkv.parts.count == 4
             ? concatenated(a.qkv.parts.prefix(3).map { $0.apply(x) }, axis: -1)
-            : a.qkv.apply(x)  // q | gate | k | v | [indexer k]
+            : {
+                // MLXFAST-RPS16: the fused qkv projection runs ~3,360 simdgroups
+                // at MLX's 4 rows each -- far past the point where added
+                // parallelism measured a loss. Raise rows/simdgroup to 16 to
+                // SHRINK the launch to ~840. Bit-exact: row ownership only.
+                if case .quant(let q) = a.qkv.fused ?? .dense(MLXArray(0)),
+                    let fast = TrackFastMoEKernels.oProj2Row(x, q, rps: 16) {
+                    return fast
+                }
+                return a.qkv.apply(x)
+            }()  // q | gate | k | v | [indexer k]
         // The indexer tape first: its truncation reads the pre-update offset.
         let idxKeys: MLXArray
         if S <= 8 {

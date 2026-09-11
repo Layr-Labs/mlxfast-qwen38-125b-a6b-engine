@@ -110,9 +110,18 @@ enum TrackPLEFusion {
         // lane 0 owns the single valid output. Keep those owners, discard
         // the padded matrix work, and require no threadgroup storage.
         constexpr uint W = 10240;
-        const uint c = threadgroup_position_in_grid.z;
+        // MLXFAST-PLEGRID: one channel per simdgroup, SGPG simdgroups per
+        // threadgroup. The original dispatch gave each channel its own
+        // threadgroup of 4 simdgroups and had 3 of them return immediately,
+        // so 10,240 threadgroups carried 4 useful lanes each. Packing SGPG
+        // channels into one threadgroup keeps every simdgroup's tap owners,
+        // shuffle ladder and FP32 addition order byte-for-byte identical --
+        // only the (threadgroup, simdgroup) that owns a channel changes.
+        constexpr uint SGPG = 8;
         const uint lane = thread_index_in_simdgroup;
-        if (simdgroup_index_in_threadgroup != 0) { return; }
+        const uint c = threadgroup_position_in_grid.z * SGPG
+                     + simdgroup_index_in_threadgroup;
+        if (c >= W) { return; }
         float product = 0.0f;
         if (lane < 4) {
             product = float(full[(lane * 3) * W + c]) * float(weight[c * 4 + lane]);
@@ -173,7 +182,7 @@ enum TrackPLEFusion {
             outputDTypes: [stream.dtype, stream.dtype])
         let output = convolutionKernel(
             [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
-            grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
+            grid: (32, 1, 10240), threadGroup: (32, 1, 8),
             outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
         return (r[1], output)
     }
