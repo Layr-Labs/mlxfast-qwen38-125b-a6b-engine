@@ -122,6 +122,97 @@ enum TrackFastKernels {
         outputNames: ["qn", "kn", "vv", "g", "beta", "conv_out"],
         source: prepSource, header: exactHeader, ensureRowContiguous: true)
 
+    // MLXFAST-GDNWIDE: Separate source preserves the decode JIT source verbatim.
+    // Only convolution weight reads differ from prepSource; KC=4 gives 8-byte
+    // aligned tap vectors. The scalar fallback preserves other types/widths.
+    static let prepWideSource = """
+        constexpr int KM1 = KC - 1;
+        constexpr int N_READS = 4;
+        constexpr int VEC_Q = Hk;
+        constexpr int VEC_K = 2 * Hk;
+        const uint lane = thread_position_in_threadgroup.x;   // 0..31
+        const uint vec = thread_position_in_grid.y;           // vector index
+        const uint bt = thread_position_in_grid.z;            // b*T + t
+        const uint b = bt / T;
+        const uint t = bt % T;
+        const device InT* proj_b = proj + (uint)(b * T * PROJ_W);
+        const device InT* cst_b = conv_state + (uint)(b * KM1 * CONV_DIM);
+        auto win = [&](int r, uint ch) -> float {
+            if (r < KM1) { return static_cast<float>(cst_b[(uint)(r * CONV_DIM) + ch]); }
+            return static_cast<float>(proj_b[(uint)((r - KM1) * PROJ_W) + ch]);
+        };
+        // MLXFAST-GDNWIDE: A lane still owns the same four channels. For each
+        // channel, load its four contiguous bf16 taps as one native vector, then
+        // consume them in the original j order with the same conversion/FMA.
+        // No extra float vector, threadgroup storage, or recurrent state.
+        auto weight = [&](uint ch, int j) -> InT {
+            if constexpr (T > 1 && KC == 4 && metal::is_same<InT, bfloat16_t>::value) {
+                return (*reinterpret_cast<const device metal::vec<InT, 4>*>(conv_w + ch * KC))[j];
+            } else { return conv_w[ch * KC + j]; }
+        };
+        float thread_x[N_READS];
+        float acc = 0.0f;
+        for (int i = 0; i < N_READS; ++i) {
+            const uint ch = vec * 128 + lane * N_READS + i;
+            float cacc = 0.0f;
+            for (int j = 0; j < KC; ++j) {
+                cacc += win((int)t + j, ch) * weight(ch, j);
+            }
+            const InT c0 = static_cast<InT>(cacc);
+            const InT c1 = mlx_silu(c0);
+            thread_x[i] = static_cast<float>(c1);
+            acc += thread_x[i] * thread_x[i];
+        }
+        if (vec < VEC_K) {
+            acc = simd_sum(acc);
+            const float inv_mean = metal::precise::rsqrt(acc / 128.0f + 1e-6f);
+            const float inv_scale = metal::rsqrt(static_cast<float>(Dk));
+            const InT q_mul = static_cast<InT>(inv_scale * inv_scale);
+            const InT k_mul = static_cast<InT>(inv_scale);
+            for (int i = 0; i < N_READS; ++i) {
+                const InT n = static_cast<InT>(thread_x[i] * inv_mean);
+                const uint d = lane * N_READS + i;
+                if (vec < VEC_Q) {
+                    qn[(uint)((bt * Hk + vec) * Dk) + d] = q_mul * n;
+                } else {
+                    kn[(uint)((bt * Hk + (vec - VEC_Q)) * Dk) + d] = k_mul * n;
+                }
+            }
+        } else {
+            for (int i = 0; i < N_READS; ++i) {
+                const uint d = lane * N_READS + i;
+                vv[(uint)((bt * Hv + (vec - VEC_K)) * Dv) + d] = static_cast<InT>(thread_x[i]);
+            }
+        }
+        if (vec == 0) {
+            const device InT* row = proj_b + (uint)(t * PROJ_W);
+            for (int hh = lane; hh < Hv; hh += 32) {
+                const InT b_raw = row[B_OFF + hh];
+                beta[bt * Hv + hh] = static_cast<float>(mlx_sigmoid(b_raw));
+                const InT ax = row[A_OFF + hh] + dt_bias[hh];
+                const InT sp = mlx_logaddexp0(ax);
+                g[bt * Hv + hh] = metal::precise::exp(neg_exp_alog[hh] * sp);
+            }
+        }
+        if (CAPTURE || t == (uint)(T - 1)) {
+            const uint slot = CAPTURE ? bt : b;
+            device InT* o_conv = conv_out + (uint)(slot * KM1 * CONV_DIM);
+            for (int i = 0; i < N_READS; ++i) {
+                const uint ch = vec * 128 + lane * N_READS + i;
+                for (int j = 0; j < KM1; ++j) {
+                    o_conv[(uint)(j * CONV_DIM) + ch] = static_cast<InT>(win((int)t + 1 + j, ch));
+                }
+            }
+        }
+        """
+
+    // MLXFAST-GDNWIDE: Original prepKernel remains the decode kernel.
+    nonisolated(unsafe) static let prepWideKernel = MLXFast.metalKernel(
+        name: "track_gdn_prep_wide",
+        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias"],
+        outputNames: ["qn", "kn", "vv", "g", "beta", "conv_out"],
+        source: prepWideSource, header: exactHeader, ensureRowContiguous: true)
+
     /// The prep half alone (tests).
     static func gdnPrep(
         proj: MLXArray, convState: MLXArray, convW: MLXArray,
@@ -130,6 +221,25 @@ enum TrackFastKernels {
         let B = proj.dim(0)
         let slots = capture ? B * T : B
         precondition(g.dk == 128 && g.dv == 128 && g.convDim % 128 == 0)
+        // MLXFAST-GDNWIDE: Prefill only, with the pinned four-tap bf16 layout.
+        // Keep the original decode dispatch below and the two-row recurrence
+        // selection in gdn unchanged, including both launch tuples.
+        if T > 1 && g.convKernel == 4 && proj.dtype == .bfloat16 && convW.dtype == .bfloat16 {
+            return prepWideKernel(
+                [proj, convState, convW, negExpALog, dtBias],
+                template: [
+                    ("InT", proj.dtype), ("T", T), ("Dk", g.dk), ("Dv", g.dv), ("Hk", g.hk),
+                    ("Hv", g.hv), ("KC", g.convKernel), ("PROJ_W", g.projWidth),
+                    ("CONV_DIM", g.convDim), ("B_OFF", g.bOffset), ("A_OFF", g.aOffset),
+                    ("CAPTURE", capture),
+                ],
+                grid: (32, g.convDim / 128, B * T), threadGroup: (32, 4, 1),
+                outputShapes: [
+                    [B, T, g.hk, g.dk], [B, T, g.hk, g.dk], [B, T, g.hv, g.dv],
+                    [B, T, g.hv], [B, T, g.hv], [slots, g.convKernel - 1, g.convDim],
+                ],
+                outputDTypes: [proj.dtype, proj.dtype, proj.dtype, .float32, .float32, proj.dtype])
+        }
         return prepKernel(
             [proj, convState, convW, negExpALog, dtBias],
             template: [

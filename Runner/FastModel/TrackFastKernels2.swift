@@ -134,18 +134,54 @@ extension TrackFastKernels {
             const uint lid = g * 32 + lane;
             float acc = 0.0f;
             if (lid < NT) {
-                for (int i = 0; i < N_READS; ++i) {
-                    const uint d = lid * N_READS + i;
-                    const uint src = TILE ? (row * H + d) : (base + d);
-                    InT r = residual[src];
-                    if (HAS_INJECT) {
-                        InT sp = out[row * H + d] * inj_t;
-                        r = r + sp;
+                // MLXFAST-PREFILLWIDE: Two bf16 values per word, same four elements per lane.
+                if constexpr (PREFILL_WIDE) {
+                    auto pair = [&](uint d) {
+                        const uint src = TILE ? (row * H + d) : (base + d);
+                        uint rw = *reinterpret_cast<const device uint*>(residual + src);
+                        const uint ow = HAS_INJECT
+                            ? *reinterpret_cast<const device uint*>(out + (row * H + d)) : 0;
+                        if (!HAS_INJECT) { *reinterpret_cast<device uint*>(stream + (base + d)) = rw; }
+                        // Consume one component at a time and reuse its bits in rw.
+                        {
+                            InT r = as_type<InT>(ushort(rw));
+                            if (HAS_INJECT) {
+                                InT sp = as_type<InT>(ushort(ow)) * inj_t;
+                                r = r + sp;
+                            }
+                            const float xf = static_cast<float>(r);
+                            acc += xf * xf;
+                            rw = (rw & 0xffff0000u) | uint(as_type<ushort>(r));
+                        }
+                        {
+                            InT r = as_type<InT>(ushort(rw >> 16));
+                            if (HAS_INJECT) {
+                                InT sp = as_type<InT>(ushort(ow >> 16)) * inj_t;
+                                r = r + sp;
+                            }
+                            const float xf = static_cast<float>(r);
+                            acc += xf * xf;
+                            rw = (rw & 0xffffu) | (uint(as_type<ushort>(r)) << 16);
+                        }
+                        if (HAS_INJECT) { *reinterpret_cast<device uint*>(stream + (base + d)) = rw; }
+                    };
+                    pair(lid * N_READS);
+                    pair(lid * N_READS + 2);
+                } else {
+                    for (int i = 0; i < N_READS; ++i) {
+                        const uint d = lid * N_READS + i;
+                        const uint src = TILE ? (row * H + d) : (base + d);
+                        InT r = residual[src];
+                        if (HAS_INJECT) {
+                            InT sp = out[row * H + d] * inj_t;
+                            r = r + sp;
+                        }
+                        stream[base + d] = r;
+                        const float xf = static_cast<float>(r);
+                        acc += xf * xf;
                     }
-                    stream[base + d] = r;
-                    const float xf = static_cast<float>(r);
-                    acc += xf * xf;
                 }
+                // MLXFAST-PREFILLWIDE: End paired injection; the scalar fallback is unchanged.
             }
             acc = simd_sum(acc);
             if (lane == 0) { local_sums[g] = acc; }
@@ -157,11 +193,33 @@ extension TrackFastKernels {
         for (uint g = 0; g < simd_groups; ++g) {
             const uint lid = g * 32 + lane;
             if (lid < NT) {
-                for (int i = 0; i < N_READS; ++i) {
-                    const uint d = lid * N_READS + i;
-                    InT n = static_cast<InT>(static_cast<float>(stream[base + d]) * inv_mean);
-                    normed[base + d] = n * scale[hc * H + d];
+                // MLXFAST-PREFILLWIDE: Reuse the existing second pass; no retained row values.
+                if constexpr (PREFILL_WIDE) {
+                    auto pair = [&](uint d) {
+                        uint rw = *reinterpret_cast<const device uint*>(stream + (base + d));
+                        const uint sw = *reinterpret_cast<const device uint*>(scale + (hc * H + d));
+                        {
+                            InT n = static_cast<InT>(static_cast<float>(as_type<InT>(ushort(rw))) * inv_mean);
+                            n = n * as_type<InT>(ushort(sw));
+                            rw = (rw & 0xffff0000u) | uint(as_type<ushort>(n));
+                        }
+                        {
+                            InT n = static_cast<InT>(static_cast<float>(as_type<InT>(ushort(rw >> 16))) * inv_mean);
+                            n = n * as_type<InT>(ushort(sw >> 16));
+                            rw = (rw & 0xffffu) | (uint(as_type<ushort>(n)) << 16);
+                        }
+                        *reinterpret_cast<device uint*>(normed + (base + d)) = rw;
+                    };
+                    pair(lid * N_READS);
+                    pair(lid * N_READS + 2);
+                } else {
+                    for (int i = 0; i < N_READS; ++i) {
+                        const uint d = lid * N_READS + i;
+                        InT n = static_cast<InT>(static_cast<float>(stream[base + d]) * inv_mean);
+                        normed[base + d] = n * scale[hc * H + d];
+                    }
                 }
+                // MLXFAST-PREFILLWIDE: End paired normalization.
             }
         }
         """
@@ -183,11 +241,17 @@ extension TrackFastKernels {
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024)
         let hasInject = out != nil
         if S >= wideNormMinS {
+            // MLXFAST-PREFILLWIDE: Exclude all S=1..8 decode/draft windows even if the
+            // wide-layout threshold is overridden. Four-element blocks and H % 4
+            // keep every word within a row; non-bf16 operands retain scalar access.
+            let prefillWide = S > 8 && residual.dtype == .bfloat16 && scale.dtype == .bfloat16
+                && (!hasInject || (out?.dtype == .bfloat16 && inject?.dtype == .bfloat16))
             let outs = injectNormWideKernel(
                 [residual, out ?? residual, inject ?? residual, scale],
                 template: [
                     ("InT", residual.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
                     ("HAS_INJECT", hasInject), ("TILE", tile), ("EPS_BITS", Int(eps.bitPattern)),
+                    ("PREFILL_WIDE", prefillWide), // MLXFAST-PREFILLWIDE
                 ],
                 grid: (32, hcCount, B * S), threadGroup: (32, 1, 1),
                 outputShapes: [[B, S, W], [B, S, W]],
@@ -316,11 +380,70 @@ extension TrackFastKernels {
         outputNames: ["out"],
         source: gatedRMSSource, header: exactHeader, ensureRowContiguous: true)
 
+    // MLXFAST-GRMSWIDE: Same four adjacent values per lane and scalar math;
+    // only the prefill activation loads/stores use native four-wide vectors.
+    static let gatedRMSWideSource = """
+        constexpr int N_READS = 4;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint hv = thread_position_in_grid.y;
+        const uint row = thread_position_in_grid.z;
+        const uint lane = thread_index_in_simdgroup;
+        threadgroup float local_sums[32];
+        const uint ybase = (row * Hv + hv) * Dv;
+        float thread_x[N_READS];
+        float acc = 0.0f;
+        {
+            const auto y4 = reinterpret_cast<const device metal::vec<InT, 4>*>(
+                y + ybase + lid * N_READS)[0];
+            for (int i = 0; i < N_READS; ++i) {
+                thread_x[i] = static_cast<float>(y4[i]);
+                acc += thread_x[i] * thread_x[i];
+            }
+        }
+        acc = simd_sum(acc);
+        if (lane >= 1) { local_sums[lane] = 0; }
+        if (lane == 0) { local_sums[0] = acc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        acc = simd_sum(local_sums[lane]);
+        const float inv_mean = metal::precise::rsqrt(acc / (float)Dv + as_type<float>((uint)EPS_BITS));
+        const auto z4 = reinterpret_cast<const device metal::vec<InT, 4>*>(
+            proj + row * PW + Z_OFF + hv * Dv + lid * N_READS)[0];
+        metal::vec<InT, 4> result;
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            InT n = w[d] * static_cast<InT>(thread_x[i] * inv_mean);
+            const float z = static_cast<float>(z4[i]);
+            const float g = mlx_sigmoid(z);
+            result[i] = static_cast<InT>(g * static_cast<float>(n));
+        }
+        reinterpret_cast<device metal::vec<InT, 4>*>(out + ybase + lid * N_READS)[0] = result;
+        """
+
+    static let gatedRMSWideKernel = MLXFast.metalKernel(
+        name: "track_gated_rms_wide",
+        inputNames: ["y", "proj", "w"],
+        outputNames: ["out"],
+        source: gatedRMSWideSource, header: exactHeader, ensureRowContiguous: true)
+
     static func gatedRMS(y: MLXArray, proj: MLXArray, w: MLXArray, zOffset: Int, eps: Float)
         -> MLXArray
     {
         let B = y.dim(0), S = y.dim(1), Hv = y.dim(2), Dv = y.dim(3)
         precondition(Dv == 128)
+        // MLXFAST-GRMSWIDE: Match GDN's T > 1 split; keep the decode call below
+        // unchanged. Four-element offsets keep each bf16 vector 8-byte aligned.
+        if S > 1, y.dtype == .bfloat16, proj.dtype == .bfloat16,
+            proj.dim(2) % 4 == 0, zOffset % 4 == 0
+        {
+            return gatedRMSWideKernel(
+                [y, proj, w],
+                template: [
+                    ("InT", y.dtype), ("Hv", Hv), ("Dv", Dv), ("PW", proj.dim(2)),
+                    ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)),
+                ],
+                grid: (32, Hv, B * S), threadGroup: (32, 1, 1),
+                outputShapes: [[B, S, Hv * Dv]], outputDTypes: [y.dtype])[0]
+        }
         return gatedRMSKernel(
             [y, proj, w],
             template: [
