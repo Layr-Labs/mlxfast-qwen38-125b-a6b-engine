@@ -106,11 +106,72 @@ extension TrackFastKernels {
         }
         """
 
+    /// Prefill-only bf16 accessor variant. Arithmetic and reductions match
+    /// `injectNormSource`; only each lane's aligned four-element activation
+    /// loads and output stores are widened to one Metal vector transaction.
+    static let injectNormVec4Source = """
+        constexpr int N_READS = 4;
+        constexpr uint NT = H / N_READS;
+        const uint row = thread_position_in_grid.z;
+        const uint hc = thread_position_in_grid.y;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        threadgroup float local_sums[32];
+        const uint base = row * W + hc * H;
+        float inj = 0.0f;
+        InT inj_t = InT(0);
+        if (HAS_INJECT) { inj_t = inject[row * HC + hc]; inj = static_cast<float>(inj_t); }
+        (void)inj;
+        const uint d0 = lid * N_READS;
+        const uint srcBase = TILE ? (row * H + d0) : (base + d0);
+        const vec<InT, 4> residual4 =
+            *((const device vec<InT, 4>*)(residual + srcBase));
+        vec<InT, 4> out4;
+        if (HAS_INJECT) {
+            out4 = *((const device vec<InT, 4>*)(out + row * H + d0));
+        }
+        vec<InT, 4> stream4;
+        float thread_x[N_READS];
+        float acc = 0.0f;
+        for (int i = 0; i < N_READS; ++i) {
+            InT r = residual4[i];
+            if (HAS_INJECT) {
+                InT sp = out4[i] * inj_t;
+                r = r + sp;
+            }
+            stream4[i] = r;
+            thread_x[i] = static_cast<float>(r);
+            acc += thread_x[i] * thread_x[i];
+        }
+        *((device vec<InT, 4>*)(stream + base + d0)) = stream4;
+        acc = simd_sum(acc);
+        constexpr uint simd_groups = (H + 32 * N_READS - 1) / (32 * N_READS);
+        if (sg == 0 && lane >= simd_groups) { local_sums[lane] = 0; }
+        if (lane == 0) { local_sums[sg] = acc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        acc = simd_sum(local_sums[lane]);
+        const float inv_mean = metal::precise::rsqrt(acc / (float)H + as_type<float>((uint)EPS_BITS));
+        vec<InT, 4> normed4;
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = d0 + i;
+            InT n = static_cast<InT>(thread_x[i] * inv_mean);
+            normed4[i] = n * scale[hc * H + d];
+        }
+        *((device vec<InT, 4>*)(normed + base + d0)) = normed4;
+        """
+
     nonisolated(unsafe) static let injectNormKernel = MLXFast.metalKernel(
         name: "track_inject_norm",
         inputNames: ["residual", "out", "inject", "scale"],
         outputNames: ["stream", "normed"],
         source: injectNormSource, header: exactHeader, ensureRowContiguous: true)
+
+    nonisolated(unsafe) static let injectNormVec4Kernel = MLXFast.metalKernel(
+        name: "track_inject_norm_vec4",
+        inputNames: ["residual", "out", "inject", "scale"],
+        outputNames: ["stream", "normed"],
+        source: injectNormVec4Source, header: exactHeader, ensureRowContiguous: true)
 
     static func injectNorm(
         residual: MLXArray, out: MLXArray?, inject: MLXArray?, scale: MLXArray,
@@ -120,7 +181,10 @@ extension TrackFastKernels {
         let W = hcCount * hidden
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024)
         let hasInject = out != nil
-        let outs = injectNormKernel(
+        let kernel = residual.dtype == .bfloat16 && S > 8
+            ? injectNormVec4Kernel
+            : injectNormKernel
+        let outs = kernel(
             [residual, out ?? residual, inject ?? residual, scale],
             template: [
                 ("InT", residual.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
@@ -263,7 +327,7 @@ extension TrackFastKernels {
     /// cos, sin [S, ROT] bf16 (the reference's tables cast to the activation dtype)
     ///   -> q [B,HQ,S,D], k [B,HK,S,D], v [B,HK,S,D]
     /// grid (D/4, HQ + 2*HK, B*S), threadgroup (D/4, 1, 1)   (D = 256 -> 64 threads, 2 simdgroups)
-    static let attnPrepSource = """
+    static let attnPrepScalarSource = """
         constexpr int N_READS = 4;
         const uint lid = thread_position_in_threadgroup.x;
         const uint h = thread_position_in_grid.y;
@@ -333,11 +397,92 @@ extension TrackFastKernels {
         }
         """
 
-    nonisolated(unsafe) static let attnPrepKernel = MLXFast.metalKernel(
+    nonisolated(unsafe) static let attnPrepScalarKernel = MLXFast.metalKernel(
         name: "track_attn_prep",
         inputNames: ["qkv", "qnorm", "knorm", "cosb", "sinb"],
         outputNames: ["qout", "kout", "vout"],
-        source: attnPrepSource, header: exactHeader, ensureRowContiguous: true)
+        source: attnPrepScalarSource, header: exactHeader, ensureRowContiguous: true)
+
+    static let attnPrepVector4Source = """
+        constexpr int N_READS = 4;
+        typedef vec<InT, 4> T4;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint h = thread_position_in_grid.y;
+        const uint row = thread_position_in_grid.z;
+        const uint b = row / S;
+        const uint s = row % S;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        threadgroup float local_sums[32];
+        threadgroup T4 staged[D / 4];
+        threadgroup InT* vec = reinterpret_cast<threadgroup InT*>(&staged[0]);
+
+        const bool isQ = h < HQ;
+        const bool isV = h >= HQ + HK;
+        uint hh, src;
+        if (isQ) { hh = h; src = row * QW + h * D; }
+        else if (!isV) { hh = h - HQ; src = row * QW + 2 * HQ * D + hh * D; }
+        else { hh = h - HQ - HK; src = row * QW + 2 * HQ * D + HK * D + hh * D; }
+        const T4 in4 = *reinterpret_cast<const device T4*>(qkv + src + lid * N_READS);
+        if (isV) {
+            device InT* vdst = vout + ((b * HK + hh) * S + s) * D + lid * N_READS;
+            *reinterpret_cast<device T4*>(vdst) = in4;
+            return;
+        }
+        float thread_x[N_READS];
+        float acc = 0.0f;
+        for (int i = 0; i < N_READS; ++i) {
+            thread_x[i] = static_cast<float>(in4[i]);
+            acc += thread_x[i] * thread_x[i];
+        }
+        acc = simd_sum(acc);
+        constexpr uint simd_groups = (D + 32 * N_READS - 1) / (32 * N_READS);
+        if (sg == 0 && lane >= simd_groups) { local_sums[lane] = 0; }
+        if (lane == 0) { local_sums[sg] = acc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        acc = simd_sum(local_sums[lane]);
+        const float inv_mean = metal::precise::rsqrt(acc / (float)D + as_type<float>((uint)EPS_BITS));
+        const device InT* weight = isQ ? qnorm : knorm;
+        const T4 weight4 = *reinterpret_cast<const device T4*>(weight + lid * N_READS);
+        T4 normalized4;
+        for (int i = 0; i < N_READS; ++i) {
+            normalized4[i] = weight4[i] * static_cast<InT>(thread_x[i] * inv_mean);
+        }
+        staged[lid] = normalized4;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        constexpr int hrot = ROT / 2;
+        device InT* dst = isQ ? (qout + ((b * HQ + hh) * S + s) * D) : (kout + ((b * HK + hh) * S + s) * D);
+        T4 out4;
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            InT o = vec[d];
+            if (d < ROT) {
+                const InT c = cosb[s * ROT + d];
+                const InT sn = sinb[s * ROT + d];
+                if (d < hrot) {
+                    InT x1 = vec[d];
+                    InT x2 = vec[d + hrot];
+                    InT t1 = x1 * c;
+                    InT t2 = (-x2) * sn;
+                    o = t1 + t2;
+                } else {
+                    InT x2 = vec[d];
+                    InT x1 = vec[d - hrot];
+                    InT t1 = x2 * c;
+                    InT t2 = x1 * sn;
+                    o = t1 + t2;
+                }
+            }
+            out4[i] = o;
+        }
+        *reinterpret_cast<device T4*>(dst + lid * N_READS) = out4;
+        """
+
+    nonisolated(unsafe) static let attnPrepVector4Kernel = MLXFast.metalKernel(
+        name: "track_attn_prep_vector4",
+        inputNames: ["qkv", "qnorm", "knorm", "cosb", "sinb"],
+        outputNames: ["qout", "kout", "vout"],
+        source: attnPrepVector4Source, header: exactHeader, ensureRowContiguous: true)
 
     static func attnPrep(
         qkv: MLXArray, qNorm: MLXArray, kNorm: MLXArray, cos: MLXArray, sin: MLXArray,
@@ -345,7 +490,9 @@ extension TrackFastKernels {
     ) -> (q: MLXArray, k: MLXArray, v: MLXArray) {
         let B = qkv.dim(0), S = qkv.dim(1)
         precondition(headDim % 4 == 0 && rotaryDims % 8 == 0 && cos.dim(1) == rotaryDims)
-        let outs = attnPrepKernel(
+        let kernel = qkv.dtype == .bfloat16 && qkv.dim(2) % 4 == 0
+            ? attnPrepVector4Kernel : attnPrepScalarKernel
+        let outs = kernel(
             [qkv, qNorm, kNorm, cos, sin],
             template: [
                 ("InT", qkv.dtype), ("D", headDim), ("HQ", heads), ("HK", kvHeads), ("S", S),
@@ -437,17 +584,42 @@ extension TrackFastKernels {
         out[row * F + f] = mlx_silu(g) * u;
         """
 
+    static let swigluVec4Source = """
+        typedef vec<InT, 4> InT4;
+        const uint f4 = thread_position_in_grid.x;
+        const uint row = thread_position_in_grid.y;
+        const size_t base = size_t(row) * 2 * F + size_t(f4) * 4;
+        const InT4 g4 = *reinterpret_cast<const device InT4*>(gu + base);
+        const InT4 u4 = *reinterpret_cast<const device InT4*>(gu + base + F);
+        InT4 o4;
+        for (uint i = 0; i < 4; ++i) {
+            const InT g = g4[i];
+            const InT u = u4[i];
+            o4[i] = mlx_silu(g) * u;
+        }
+        *reinterpret_cast<device InT4*>(out + size_t(row) * F + size_t(f4) * 4) = o4;
+        """
+
     nonisolated(unsafe) static let swigluKernel = MLXFast.metalKernel(
         name: "track_swiglu",
         inputNames: ["gu"],
         outputNames: ["out"],
         source: swigluSource, header: exactHeader, ensureRowContiguous: true)
 
+    nonisolated(unsafe) static let swigluVec4Kernel = MLXFast.metalKernel(
+        name: "track_swiglu_vec4",
+        inputNames: ["gu"],
+        outputNames: ["out"],
+        source: swigluVec4Source, header: exactHeader, ensureRowContiguous: true)
+
     static func swiglu(gu: MLXArray) -> MLXArray {
         let B = gu.dim(0), S = gu.dim(1), F = gu.dim(2) / 2
-        return swigluKernel(
+        let vector = gu.dtype == .bfloat16 && B * S >= 1024 && F % 4 == 0
+        let kernel = vector ? swigluVec4Kernel : swigluKernel
+        let gridWidth = vector ? F / 4 : F
+        return kernel(
             [gu], template: [("InT", gu.dtype), ("F", F)],
-            grid: (F, B * S, 1), threadGroup: (256, 1, 1),
+            grid: (gridWidth, B * S, 1), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, F]], outputDTypes: [gu.dtype])[0]
     }
 }
