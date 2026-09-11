@@ -706,6 +706,14 @@ METAL_FUNC void qmv_impl(
 
     static func isFast(k: Int, n: Int) -> Bool { n % 8 == 0 && k % 512 == 0 }
 
+    static func gateUpActUsesPackedWordLoads(
+        dtype: DType, streams: Int, inputSize: Int, outputSize: Int,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> Bool {
+        dtype == .bfloat16 && streams == 1 && inputSize == 2560 && outputSize == 640
+            && groupSize == 32 && bits == 4 && mode == .affine
+    }
+
     /// 8-row blocks per threadgroup: the K=640 down projection is overhead-bound
     /// at one block per threadgroup.
     static func rowBlocks(k: Int) -> Int { k % 512 == 0 ? 1 : 4 }
@@ -875,9 +883,37 @@ extension TrackFastMoEKernels {
 extension TrackFastMoEKernels {
     static let regHelpers = #"""
 
+        template <typename U, int values_per_thread, int bits>
+        inline U qdot16_packed_words(
+            const device uint8_t* w,
+            const thread U* x_thread,
+            U scale,
+            U bias,
+            U sum) {
+          static_assert(bits == 4, "packed qdot16 is 4-bit only");
+          static_assert(values_per_thread == 16, "packed qdot16 requires sixteen values");
+          U accum = 0;
+          const device uint* packets = (const device uint*)w;
+          const uint packet0 = packets[0];
+          const uint packet1 = packets[1];
+          const uint word0 = packet0 & 0xffffu;
+          const uint word1 = (packet0 >> 16) & 0xffffu;
+          const uint word2 = packet1 & 0xffffu;
+          const uint word3 = (packet1 >> 16) & 0xffffu;
+          accum += (x_thread[0] * (word0 & 0x000f) + x_thread[1] * (word0 & 0x00f0)
+              + x_thread[2] * (word0 & 0x0f00) + x_thread[3] * (word0 & 0xf000));
+          accum += (x_thread[4] * (word1 & 0x000f) + x_thread[5] * (word1 & 0x00f0)
+              + x_thread[6] * (word1 & 0x0f00) + x_thread[7] * (word1 & 0xf000));
+          accum += (x_thread[8] * (word2 & 0x000f) + x_thread[9] * (word2 & 0x00f0)
+              + x_thread[10] * (word2 & 0x0f00) + x_thread[11] * (word2 & 0xf000));
+          accum += (x_thread[12] * (word3 & 0x000f) + x_thread[13] * (word3 & 0x00f0)
+              + x_thread[14] * (word3 & 0x0f00) + x_thread[15] * (word3 & 0xf000));
+          return scale * accum + sum * bias;
+        }
+
         // qmv_fast_impl with `out_row` given and the 4 row results returned
         // (all lanes hold them after simd_sum). x points at the vector.
-        template <typename T, int group_size, int bits>
+        template <typename T, int group_size, int bits, bool packed_word_load = false>
         METAL_FUNC void qmv_fast_reg(
             const device uint32_t* w,
             const device T* scales,
@@ -912,7 +948,11 @@ extension TrackFastMoEKernels {
               const device T* bl = biases + row * in_vec_size_g;
               U s = sl[0];
               U b = bl[0];
-              result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+              if constexpr (packed_word_load) {
+                result[row] += qdot16_packed_words<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+              } else {
+                result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+              }
             }
             ws += block_size * bytes_per_pack / pack_factor;
             scales += block_size / group_size;
@@ -1108,8 +1148,8 @@ extension TrackFastMoEKernels {
             if constexpr (VPT == 1) {
                 const int out_row = tile * 8 + (int)simdgroup_index_in_threadgroup * 4;
                 float g[4], u[4];
-                qmv_fast_reg<T, GS, BITS>(wsh, ssh, bsh, x, KD, out_row, thread_index_in_simdgroup, g);
-                qmv_fast_reg<T, GS, BITS>(wsh + (size_t)N * kw2, ssh + (size_t)N * kg2, bsh + (size_t)N * kg2, x, KD, out_row, thread_index_in_simdgroup, u);
+                qmv_fast_reg<T, GS, BITS, PACKED_WORD_LOAD>(wsh, ssh, bsh, x, KD, out_row, thread_index_in_simdgroup, g);
+                qmv_fast_reg<T, GS, BITS, PACKED_WORD_LOAD>(wsh + (size_t)N * kw2, ssh + (size_t)N * kg2, bsh + (size_t)N * kg2, x, KD, out_row, thread_index_in_simdgroup, u);
                 if (thread_index_in_simdgroup == 0) {
                     for (int i = 0; i < 4; ++i) {
                         act[(size_t)BR * (size_t)N + (size_t)(out_row + i)] = mlx_silu(static_cast<T>(g[i])) * static_cast<T>(u[i]);
@@ -1137,8 +1177,8 @@ extension TrackFastMoEKernels {
         const size_t eoff = (size_t)e * (size_t)N;
         float g[4], u[4];
         if (FAST) {
-            qmv_fast_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
-            qmv_fast_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
+            qmv_fast_reg<T, GS, BITS, PACKED_WORD_LOAD>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
+            qmv_fast_reg<T, GS, BITS, PACKED_WORD_LOAD>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
         } else {
             qmv_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
             qmv_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
@@ -1176,7 +1216,7 @@ extension TrackFastMoEKernels {
         precondition(isFast(k: KD, n: N), "shared expert one-token path assumes qmv_fast")
         return (S == 1 ? gateUpActKernel1 : gateUpActKernel)(
             [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
-            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("BR", BR), ("VPT", S)],
+            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("PACKED_WORD_LOAD", gateUpActUsesPackedWordLoads(dtype: x.dtype, streams: S, inputSize: KD, outputSize: N, groupSize: groupSize, bits: bits, mode: shared.mode)), ("BR", BR), ("VPT", S)],
             grid: (32, (N / 8) * 2, BR + 1), threadGroup: (32, 2, 1),
             outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
     }
