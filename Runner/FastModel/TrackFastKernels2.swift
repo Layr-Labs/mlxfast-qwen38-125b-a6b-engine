@@ -134,18 +134,54 @@ extension TrackFastKernels {
             const uint lid = g * 32 + lane;
             float acc = 0.0f;
             if (lid < NT) {
-                for (int i = 0; i < N_READS; ++i) {
-                    const uint d = lid * N_READS + i;
-                    const uint src = TILE ? (row * H + d) : (base + d);
-                    InT r = residual[src];
-                    if (HAS_INJECT) {
-                        InT sp = out[row * H + d] * inj_t;
-                        r = r + sp;
+                // MLXFAST-PREFILLWIDE: Two bf16 values per word, same four elements per lane.
+                if constexpr (PREFILL_WIDE) {
+                    auto pair = [&](uint d) {
+                        const uint src = TILE ? (row * H + d) : (base + d);
+                        uint rw = *reinterpret_cast<const device uint*>(residual + src);
+                        const uint ow = HAS_INJECT
+                            ? *reinterpret_cast<const device uint*>(out + (row * H + d)) : 0;
+                        if (!HAS_INJECT) { *reinterpret_cast<device uint*>(stream + (base + d)) = rw; }
+                        // Consume one component at a time and reuse its bits in rw.
+                        {
+                            InT r = as_type<InT>(ushort(rw));
+                            if (HAS_INJECT) {
+                                InT sp = as_type<InT>(ushort(ow)) * inj_t;
+                                r = r + sp;
+                            }
+                            const float xf = static_cast<float>(r);
+                            acc += xf * xf;
+                            rw = (rw & 0xffff0000u) | uint(as_type<ushort>(r));
+                        }
+                        {
+                            InT r = as_type<InT>(ushort(rw >> 16));
+                            if (HAS_INJECT) {
+                                InT sp = as_type<InT>(ushort(ow >> 16)) * inj_t;
+                                r = r + sp;
+                            }
+                            const float xf = static_cast<float>(r);
+                            acc += xf * xf;
+                            rw = (rw & 0xffffu) | (uint(as_type<ushort>(r)) << 16);
+                        }
+                        if (HAS_INJECT) { *reinterpret_cast<device uint*>(stream + (base + d)) = rw; }
+                    };
+                    pair(lid * N_READS);
+                    pair(lid * N_READS + 2);
+                } else {
+                    for (int i = 0; i < N_READS; ++i) {
+                        const uint d = lid * N_READS + i;
+                        const uint src = TILE ? (row * H + d) : (base + d);
+                        InT r = residual[src];
+                        if (HAS_INJECT) {
+                            InT sp = out[row * H + d] * inj_t;
+                            r = r + sp;
+                        }
+                        stream[base + d] = r;
+                        const float xf = static_cast<float>(r);
+                        acc += xf * xf;
                     }
-                    stream[base + d] = r;
-                    const float xf = static_cast<float>(r);
-                    acc += xf * xf;
                 }
+                // MLXFAST-PREFILLWIDE: End paired injection; the scalar fallback is unchanged.
             }
             acc = simd_sum(acc);
             if (lane == 0) { local_sums[g] = acc; }
@@ -157,11 +193,33 @@ extension TrackFastKernels {
         for (uint g = 0; g < simd_groups; ++g) {
             const uint lid = g * 32 + lane;
             if (lid < NT) {
-                for (int i = 0; i < N_READS; ++i) {
-                    const uint d = lid * N_READS + i;
-                    InT n = static_cast<InT>(static_cast<float>(stream[base + d]) * inv_mean);
-                    normed[base + d] = n * scale[hc * H + d];
+                // MLXFAST-PREFILLWIDE: Reuse the existing second pass; no retained row values.
+                if constexpr (PREFILL_WIDE) {
+                    auto pair = [&](uint d) {
+                        uint rw = *reinterpret_cast<const device uint*>(stream + (base + d));
+                        const uint sw = *reinterpret_cast<const device uint*>(scale + (hc * H + d));
+                        {
+                            InT n = static_cast<InT>(static_cast<float>(as_type<InT>(ushort(rw))) * inv_mean);
+                            n = n * as_type<InT>(ushort(sw));
+                            rw = (rw & 0xffff0000u) | uint(as_type<ushort>(n));
+                        }
+                        {
+                            InT n = static_cast<InT>(static_cast<float>(as_type<InT>(ushort(rw >> 16))) * inv_mean);
+                            n = n * as_type<InT>(ushort(sw >> 16));
+                            rw = (rw & 0xffffu) | (uint(as_type<ushort>(n)) << 16);
+                        }
+                        *reinterpret_cast<device uint*>(normed + (base + d)) = rw;
+                    };
+                    pair(lid * N_READS);
+                    pair(lid * N_READS + 2);
+                } else {
+                    for (int i = 0; i < N_READS; ++i) {
+                        const uint d = lid * N_READS + i;
+                        InT n = static_cast<InT>(static_cast<float>(stream[base + d]) * inv_mean);
+                        normed[base + d] = n * scale[hc * H + d];
+                    }
                 }
+                // MLXFAST-PREFILLWIDE: End paired normalization.
             }
         }
         """
@@ -183,11 +241,17 @@ extension TrackFastKernels {
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024)
         let hasInject = out != nil
         if S >= wideNormMinS {
+            // MLXFAST-PREFILLWIDE: Exclude all S=1..8 decode/draft windows even if the
+            // wide-layout threshold is overridden. Four-element blocks and H % 4
+            // keep every word within a row; non-bf16 operands retain scalar access.
+            let prefillWide = S > 8 && residual.dtype == .bfloat16 && scale.dtype == .bfloat16
+                && (!hasInject || (out?.dtype == .bfloat16 && inject?.dtype == .bfloat16))
             let outs = injectNormWideKernel(
                 [residual, out ?? residual, inject ?? residual, scale],
                 template: [
                     ("InT", residual.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
                     ("HAS_INJECT", hasInject), ("TILE", tile), ("EPS_BITS", Int(eps.bitPattern)),
+                    ("PREFILL_WIDE", prefillWide), // MLXFAST-PREFILLWIDE
                 ],
                 grid: (32, hcCount, B * S), threadGroup: (32, 1, 1),
                 outputShapes: [[B, S, W], [B, S, W]],
