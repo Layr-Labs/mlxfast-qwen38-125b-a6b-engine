@@ -14,7 +14,7 @@ import MLXFast
 enum TrackFastMixerKernels {
     // MLXFAST-MIX2ROW: source-time choice for S == 1 only; use 1 for the
     // optional traffic/parallelism experiment, or 4 for the original ownership.
-    static let downRowsPerSimdgroup = 2
+    static let downRowsPerSimdgroup = 1
 
     static let header =
         TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader + TrackFastMoEKernels.regHelpers
