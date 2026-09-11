@@ -235,7 +235,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// inputs/outputs are appended here.
     nonisolated(unsafe) static var debugTaps: [(String, MLXArray)]? = nil
     /// Layers per partial dispatch inside a forward (0 = one dispatch per step).
-    nonisolated(unsafe) public static var asyncChunk: Int = 3
+    /// MLXFAST-ASYNC6: 3 -> 6. This halves the forced stream evaluations per
+    /// forward, letting the host thread run further ahead of the GPU. It is a
+    /// scheduling change only -- MLX's lazy graph yields identical values
+    /// regardless of when it is evaluated -- so it cannot alter arithmetic.
+    /// It is also a probe: every custom kernel launch hashes its whole source
+    /// string to build the library cache key (custom_kernel.cpp:50-52), roughly
+    /// 24 KB x ~700 launches per decode step of host work. If that host time is
+    /// on the critical path, fewer syncs should help; if it is already hidden
+    /// behind GPU work, this reads flat.
+    nonisolated(unsafe) public static var asyncChunk: Int = 6
     /// Layers in the first partial-dispatch chunk (0 = same as asyncChunk):
     /// the first dispatch lands right after the PLE layer, whose host row
     /// gather is the one host sync of the step.
