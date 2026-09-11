@@ -18,16 +18,6 @@ import Foundation
 import MLX
 
 enum TrackFastKernels {
-    /// A typed host scalar made once per (value, dtype): a fresh `MLXArray`
-    /// per call is a host allocation and a cast launch.
-    private static let scalarLock = NSLock()
-    nonisolated(unsafe) private static var typedScalars: [String: MLXArray] = [:]
-    static func scalar(_ v: Float, dtype: DType) -> MLXArray {
-        scalarLock.lock(); defer { scalarLock.unlock() }
-        let key = "\(v.bitPattern):\(dtype)"
-        if let a = typedScalars[key] { return a }
-        let a = MLXArray(v, dtype: dtype); eval(a); typedScalars[key] = a; return a
-    }
 
     struct GDNGeometry {
         let projWidth: Int  // PROJ_W
@@ -165,17 +155,8 @@ enum TrackFastKernels {
         const device float* beta_ = beta + b_idx * T_ * Hv;
         const device StT* i_state = state_in + (n * Dv + dv_idx) * Dk;
         float state[n_per_t];
-        // Each lane owns n_per_t consecutive state entries: one vector load /
-        // store per lane when that is a float4 (same values, one instruction
-        // instead of four strided ones; this kernel is load/store bound).
-        constexpr bool vec4 = (n_per_t == 4) && metal::is_same<StT, float>::value;
-        if constexpr (vec4) {
-            const float4 s4 = *reinterpret_cast<const device float4*>(i_state + 4 * dk_idx);
-            state[0] = s4.x; state[1] = s4.y; state[2] = s4.z; state[3] = s4.w;
-        } else {
-            for (int i = 0; i < n_per_t; ++i) {
-                state[i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);
-            }
+        for (int i = 0; i < n_per_t; ++i) {
+            state[i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);
         }
         for (int t = 0; t < T_; ++t) {
             float kv_mem = 0.0f;
@@ -206,12 +187,8 @@ enum TrackFastKernels {
             if (CAPTURE || t == T_ - 1) {
                 const uint slot = CAPTURE ? (b_idx * T_ + t) : b_idx;
                 device StT* o_state = state_out + ((slot * Hv + hv_idx) * Dv + dv_idx) * Dk;
-                if constexpr (vec4) {
-                    *reinterpret_cast<device float4*>(o_state + 4 * dk_idx) = float4(state[0], state[1], state[2], state[3]);
-                } else {
-                    for (int i = 0; i < n_per_t; ++i) {
-                        o_state[n_per_t * dk_idx + i] = static_cast<StT>(state[i]);
-                    }
+                for (int i = 0; i < n_per_t; ++i) {
+                    o_state[n_per_t * dk_idx + i] = static_cast<StT>(state[i]);
                 }
             }
             q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; g_ += Hv; beta_ += Hv;
@@ -220,141 +197,33 @@ enum TrackFastKernels {
 
     nonisolated(unsafe) static let leanKernel = MLXFast.metalKernel(
         name: "track_gdn_lean",
-        inputNames: ["q", "k", "v", "g", "beta", "state_in"],
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
         outputNames: ["y", "state_out"],
         source: leanSource, ensureRowContiguous: true)
-
-    // MLXFAST-GDNTILE: Two adjacent value rows share Q/K and gate loads in prefill.
-    // Keep the original grid/threadgroup; surplus SIMD groups return uniformly.
-    // Per lane: four extra FP32 state values, plus a second sum/compensation or
-    // delta/output pair. Actual register allocation and spills require profiling.
-    static let leanTwoRowSource = """
-        // MLXFAST-GDNTILE: Each row retains four consecutive key elements per lane.
-        const uint dv_idx = 2 * thread_position_in_grid.y;
-        if (dv_idx >= Dv) { return; }
-        const uint n = thread_position_in_grid.z;
-        const uint b_idx = n / Hv;
-        const uint hv_idx = n % Hv;
-        const uint hk_idx = hv_idx / (Hv / Hk);
-        constexpr int n_per_t = Dk / 32;
-        const int T_ = T;
-        const device InT* q_ = q + b_idx * T_ * Hk * Dk + hk_idx * Dk;
-        const device InT* k_ = k + b_idx * T_ * Hk * Dk + hk_idx * Dk;
-        const device InT* v_ = v + b_idx * T_ * Hv * Dv + hv_idx * Dv;
-        device InT* y_ = y + b_idx * T_ * Hv * Dv + hv_idx * Dv;
-        const uint dk_idx = thread_position_in_threadgroup.x;
-        const device float* g_ = g + b_idx * T_ * Hv;
-        const device float* beta_ = beta + b_idx * T_ * Hv;
-        const device StT* i_state = state_in + (n * Dv + dv_idx) * Dk;
-        float state0[n_per_t], state1[n_per_t];
-        for (int i = 0; i < n_per_t; ++i) {
-            state0[i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);
-            state1[i] = static_cast<float>(i_state[Dk + n_per_t * dk_idx + i]);
-        }
-        for (int t = 0; t < T_; ++t) {
-            const float decay = g_[hv_idx];
-            float kv_mem0 = 0.0f, kv_mem1 = 0.0f;
-            {
-                #pragma clang fp reassociate(off)
-                #pragma clang fp contract(off)
-                float kv_compensation0 = 0.0f, kv_compensation1 = 0.0f;
-                for (int i = 0; i < n_per_t; ++i) {
-                    const int s_idx = n_per_t * dk_idx + i;
-                    const float key = static_cast<float>(k_[s_idx]);
-                    {
-                        state0[i] = state0[i] * decay;
-                        auto product = state0[i] * key;
-                        auto corrected = product - kv_compensation0;
-                        auto next_sum = kv_mem0 + corrected;
-                        kv_compensation0 = (next_sum - kv_mem0) - corrected;
-                        kv_mem0 = next_sum;
-                    }
-                    {
-                        state1[i] = state1[i] * decay;
-                        auto product = state1[i] * key;
-                        auto corrected = product - kv_compensation1;
-                        auto next_sum = kv_mem1 + corrected;
-                        kv_compensation1 = (next_sum - kv_mem1) - corrected;
-                        kv_mem1 = next_sum;
-                    }
-                }
-            }
-            kv_mem0 = simd_sum(kv_mem0);
-            kv_mem1 = simd_sum(kv_mem1);
-            const float gate_beta = beta_[hv_idx];
-            const float delta0 = (static_cast<float>(v_[dv_idx]) - kv_mem0) * gate_beta;
-            const float delta1 = (static_cast<float>(v_[dv_idx + 1]) - kv_mem1) * gate_beta;
-            float out0 = 0.0f, out1 = 0.0f;
-            for (int i = 0; i < n_per_t; ++i) {
-                const int s_idx = n_per_t * dk_idx + i;
-                const float key = static_cast<float>(k_[s_idx]);
-                state0[i] = state0[i] + key * delta0;
-                state1[i] = state1[i] + key * delta1;
-                const float query = static_cast<float>(q_[s_idx]);
-                out0 += state0[i] * query;
-                out1 += state1[i] * query;
-            }
-            out0 = simd_sum(out0);
-            out1 = simd_sum(out1);
-            if (dk_idx == 0) {
-                y_[dv_idx] = static_cast<InT>(out0);
-                y_[dv_idx + 1] = static_cast<InT>(out1);
-            }
-            if (CAPTURE || t == T_ - 1) {
-                const uint slot = CAPTURE ? (b_idx * T_ + t) : b_idx;
-                device StT* o_state = state_out + ((slot * Hv + hv_idx) * Dv + dv_idx) * Dk;
-                for (int i = 0; i < n_per_t; ++i) {
-                    o_state[n_per_t * dk_idx + i] = static_cast<StT>(state0[i]);
-                    o_state[Dk + n_per_t * dk_idx + i] = static_cast<StT>(state1[i]);
-                }
-            }
-            q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; g_ += Hv; beta_ += Hv;
-        }
-        """
-
-    // MLXFAST-GDNTILE: Keep the one-row kernel intact for decode and comparison.
-    nonisolated(unsafe) static let leanTwoRowKernel = MLXFast.metalKernel(
-        name: "track_gdn_lean_two_row",
-        inputNames: ["q", "k", "v", "g", "beta", "state_in"],
-        outputNames: ["y", "state_out"],
-        source: leanTwoRowSource, ensureRowContiguous: true)
 
     /// The whole deltanet core: prep + recurrence. Returns y [B,T,Hv,Dv],
     /// the conv tails and the recurrent state (per position when `capture`).
     static func gdn(
         proj: MLXArray, convState: MLXArray, convW: MLXArray,
         negExpALog: MLXArray, dtBias: MLXArray, stateIn: MLXArray,
-        T: Int, capture: Bool, geometry g: GDNGeometry,
-        separateBA: (b: MLXArray, a: MLXArray)? = nil
+        T: Int, capture: Bool, geometry g: GDNGeometry
     ) -> (y: MLXArray, convOut: MLXArray, stateOut: MLXArray) {
         let B = proj.dim(0)
         let slots = capture ? B * T : B
         precondition(g.dk == 128 && g.dv == 128 && g.convDim % 128 == 0)
         let prof = TrackFastProfile.prefill != nil && T >= TrackFastProfile.minWindow
-        var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
-        let prep: [MLXArray]
-        if let separateBA {
-            // The same kernel body: only the two 48-wide gate rows move from
-            // offsets in the concatenated projection to their own buffers.
-            prep = TrackP12Prefill.gdnPrepSplit(
-                proj: proj, b: separateBA.b, a: separateBA.a, convState: convState,
-                convW: convW, negExpALog: negExpALog, dtBias: dtBias, T: T,
-                capture: capture, geometry: g)
-        } else {
-            prep = gdnPrep(
-                proj: proj, convState: convState, convW: convW, negExpALog: negExpALog,
-                dtBias: dtBias, T: T, capture: capture, geometry: g)
-        }
+        var pt = CFAbsoluteTimeGetCurrent()
+        let prep = gdnPrep(
+            proj: proj, convState: convState, convW: convW, negExpALog: negExpALog,
+            dtBias: dtBias, T: T, capture: capture, geometry: g)
         if prof { TrackFastProfile.tick("gdn.prep", &pt, prep) }
-        // Each prefill SIMD group owns two value rows; omit the unused grid rows.
-        let recurrence = T > 1 ? leanTwoRowKernel : leanKernel
-        let rec = recurrence(
-            [prep[0], prep[1], prep[2], prep[3], prep[4], stateIn],
+        let rec = leanKernel(
+            [prep[0], prep[1], prep[2], prep[3], prep[4], stateIn, MLXArray(Int32(T))],
             template: [
                 ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
-                ("Hk", g.hk), ("Hv", g.hv), ("CAPTURE", capture), ("T", T),
+                ("Hk", g.hk), ("Hv", g.hv), ("CAPTURE", capture),
             ],
-            grid: (32, T > 1 ? g.dv / 2 : g.dv, B * g.hv), threadGroup: (32, 4, 1),
+            grid: (32, g.dv, B * g.hv), threadGroup: (32, 4, 1),
             outputShapes: [[B, T, g.hv, g.dv], [slots, g.hv, g.dv, g.dk]],
             outputDTypes: [proj.dtype, stateIn.dtype])
         if prof { TrackFastProfile.tick("gdn.lean", &pt, rec) }

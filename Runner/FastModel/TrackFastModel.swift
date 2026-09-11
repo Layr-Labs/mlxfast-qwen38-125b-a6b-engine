@@ -168,12 +168,7 @@ struct TrackAttn {
 
 struct TrackMoE {
     let routerW32: MLXArray  // [E, H] float32
-    let routerW16: MLXArray  // [E, H] bf16: the values routerW32 was cast from
     let switchMLP: SwitchGLU
-    /// The same three loaded expert projections `switchMLP` itself calls, so
-    /// the sorted combine can run them without the closing scatter/unsort.
-    /// References to the loaded modules; no new or transformed weights.
-    let p12SortedParts: (gate: SwitchLinear, up: SwitchLinear, down: SwitchLinear)?
     /// The routed experts' quantized arrays, for the custom gather path.
     let expertGate: (w: MLXArray, s: MLXArray, b: MLXArray)
     let expertUp: (w: MLXArray, s: MLXArray, b: MLXArray)
@@ -195,8 +190,6 @@ struct TrackPLE {
     let normQueryScale: MLXArray
     let normConvScale: MLXArray
     let convW: MLXArray  // [wide, K, 1]
-    /// The same weight as `[wide, K]`, for the fused conv.
-    let convW2: MLXArray
     let dilation: Int
     let stateLength: Int
     let stateLayerIndex: Int
@@ -209,7 +202,6 @@ struct TrackLayer {
     let gdn: TrackGDN?
     let attn: TrackAttn?
     let moe: TrackMoE
-    let moePairReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let ple: TrackPLE?
 }
 
@@ -225,7 +217,6 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let hcCount: Int
     let hidden: Int
     let eps: Float
-    private let injectNormReplay: @Sendable ([MLXArray]) -> [MLXArray]
     let rotaryDims: Int
     let rotary: Qwen4ExpRotary
     let indexerBudget: Int
@@ -235,13 +226,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// inputs/outputs are appended here.
     nonisolated(unsafe) static var debugTaps: [(String, MLXArray)]? = nil
     /// Layers per partial dispatch inside a forward (0 = one dispatch per step).
-    nonisolated(unsafe) public static var asyncChunk: Int = 3
-    /// Layers in the first partial-dispatch chunk (0 = same as asyncChunk):
-    /// the first dispatch lands right after the PLE layer, whose host row
-    /// gather is the one host sync of the step.
-    nonisolated(unsafe) public static var asyncFirst: Int = 2
-    /// Layer count at an optional second dispatch (0 = none).
-    nonisolated(unsafe) public static var asyncSecond: Int = 0
+    nonisolated(unsafe) public static var asyncChunk: Int = 2
 
     /// Kill switch for A/B: `TRACK_FAST_FORWARD=0` routes every forward to the
     /// wrapped model.
@@ -256,13 +241,6 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         self.hcCount = cfg.hcCount
         self.hidden = cfg.hiddenSize
         self.eps = cfg.rmsNormEps
-        self.injectNormReplay = compile(shapeless: false) {
-            [hcCount = cfg.hcCount, hidden = cfg.hiddenSize, eps = cfg.rmsNormEps] inputs in
-            let result = TrackFastKernels.injectNorm(
-                residual: inputs[0], out: inputs[1], inject: inputs[2], scale: inputs[3],
-                hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
-            return [result.stream, result.normed]
-        }
         self.rotaryDims = cfg.rotaryDimensions
         self.rotary = Qwen4ExpRotary(dimensions: cfg.rotaryDimensions, base: cfg.ropeTheta)
         self.indexerBudget = cfg.indexerBudget
@@ -368,16 +346,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     static func bindMoE(_ m: Module, cfg: Qwen4ExpTextConfiguration) -> TrackMoE {
         let gate = m.trackChild("gate")
         let routerW: MLXArray
-        let routerW16: MLXArray
         switch TrackProj(gate) {
-        case .dense(let w):
-            routerW16 = w
-            routerW = w.asType(.float32)
+        case .dense(let w): routerW = w.asType(.float32)
         case .quant(let q):
-            routerW16 = dequantized(
+            routerW = dequantized(
                 q.weight, scales: q.scales, biases: q.biases, groupSize: q.groupSize,
-                bits: q.bits, mode: q.mode)
-            routerW = routerW16.asType(.float32)
+                bits: q.bits, mode: q.mode
+            ).asType(.float32)
         }
         guard let switchMLP = m.trackChild("switch_mlp") as? SwitchGLU else {
             preconditionFailure("TrackFastModel: switch_mlp is not a SwitchGLU")
@@ -395,14 +370,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let sd = TrackProj(shared.trackChild("down_proj"))
         let sharedGate = TrackProj(m.trackChild("shared_expert_gate"))
         return TrackMoE(
-            routerW32: routerW, routerW16: routerW16, switchMLP: switchMLP,
-            p12SortedParts: {
-                guard let g = switchMLP.trackChild("gate_proj") as? SwitchLinear,
-                    let u = switchMLP.trackChild("up_proj") as? SwitchLinear,
-                    let d = switchMLP.trackChild("down_proj") as? SwitchLinear
-                else { return nil }
-                return (gate: g, up: u, down: d)
-            }(),
+            routerW32: routerW, switchMLP: switchMLP,
             expertGate: expert("gate_proj"), expertUp: expert("up_proj"), expertDown: expert("down_proj"),
             expertGroupSize: qdown.groupSize, expertBits: qdown.bits,
             sharedGateUp: TrackMultiProj([sg, su]),
@@ -413,16 +381,14 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     static func bindPLE(_ ple: Qwen4ExpPLELayer, ordinal: Int, cfg: Qwen4ExpTextConfiguration)
         -> TrackPLE
     {
-        let convW = ple.trackChild("conv1d").trackArray("weight")
-        return TrackPLE(
+        TrackPLE(
             embedding: ple.pleEmbedding,
             keyProj: TrackProj(ple.trackChild("key_proj")),
             valueProj: TrackProj(ple.trackChild("value_proj")),
             normKeyScale: ple.trackChild("norm_key").trackArray("weight"),
             normQueryScale: ple.trackChild("norm_query").trackArray("weight"),
             normConvScale: ple.trackChild("norm_conv").trackArray("weight"),
-            convW: convW,
-            convW2: convW.reshaped(convW.dim(0), convW.dim(1)),
+            convW: ple.trackChild("conv1d").trackArray("weight"),
             dilation: cfg.ngramSize,
             stateLength: (cfg.pleConvKernelSize - 1) * cfg.ngramSize,
             stateLayerIndex: cfg.pleStateLayerIndex(ordinal: ordinal))
@@ -446,8 +412,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             ple = bindPLE(pleLayer, ordinal: ordinal, cfg: cfg)
         }
         return TrackLayer(
-            index: index, attnHC: attnHC, mlpHC: mlpHC, gdn: gdn, attn: attn, moe: moe,
-            moePairReplay: makeMoEPairReplay(moe), ple: ple)
+            index: index, attnHC: attnHC, mlpHC: mlpHC, gdn: gdn, attn: attn, moe: moe, ple: ple)
     }
 
     // MARK: forward pieces
@@ -520,20 +485,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         evaluation: CBv2RecurrentStateEvaluation, capture: Bool
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
-        // A wide window already runs the four input projections as four
-        // separate GEMMs (the split-K choice depends on N). `separate` drops
-        // only the concatenation that followed them: the prep kernel reads the
-        // beta/alpha gates from their own buffers and the gated RMS kernel
-        // reads z from its own, so every GEMM, shape and rounding is unchanged.
-        let separate =
-            TrackP12Prefill.splitGDN && TrackP12Prefill.eligible(x) && !capture
-            && g.proj.parts.count == 4
-        let geo = separate ? TrackP12Prefill.splitGeometry(g.geometry) : g.geometry
+        let geo = g.geometry
         let prof = TrackFastProfile.prefill != nil && S >= TrackFastProfile.minWindow
-        var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
-        let split = separate ? g.proj.parts.map { $0.apply(x) } : nil
-        let proj = split?[0] ?? g.proj.apply(x)  // [B,S,PROJ_W]
-        if prof { TrackFastProfile.tick("gdn.proj", &pt, split ?? [proj]) }
+        var pt = CFAbsoluteTimeGetCurrent()
+        let proj = g.proj.apply(x)  // [B,S,PROJ_W]
+        if prof { TrackFastProfile.tick("gdn.proj", &pt, [proj]) }
         let state = evaluation.inputState(modelLayerIndex: layerIndex)
         let convState =
             state?.conv ?? MLXArray.zeros([B, geo.convKernel - 1, geo.convDim], dtype: x.dtype)
@@ -541,12 +497,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             state?.ssm ?? MLXArray.zeros([B, geo.hv, geo.dv, geo.dk], dtype: .float32)
         let r = TrackFastKernels.gdn(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
-            dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo,
-            separateBA: split.map { (b: $0[2], a: $0[3]) })
+            dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo)
         if prof { TrackFastProfile.tick("gdn.prep+lean", &pt, [r.y, r.stateOut, r.convOut]) }
         let gated = TrackFastKernels.gatedRMS(
-            y: r.y, proj: split?[1] ?? proj, w: g.normW,
-            zOffset: separate ? 0 : g.zOffset, eps: 1e-6)
+            y: r.y, proj: proj, w: g.normW, zOffset: g.zOffset, eps: 1e-6)
         if prof { TrackFastProfile.tick("gdn.gatedRMS", &pt, [gated]) }
         do {
             if capture {
@@ -576,15 +530,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let heads = cfg.attentionHeads, kvHeads = cfg.kvHeads, d = cfg.headDim
-        // A wide window takes the indexer tape from the full `index_qk_proj`
-        // below (its GEMM rounding depends on N), so the fourth part of this
-        // concatenation -- the narrow indexer-K projection -- is an unread
-        // tail. The three kept projections and their offsets are unchanged.
-        let qkv =
-            TrackP12Prefill.omitUnusedIndexer && TrackP12Prefill.eligible(x) && S > 8
-            && a.qkv.parts.count == 4
-            ? concatenated(a.qkv.parts.prefix(3).map { $0.apply(x) }, axis: -1)
-            : a.qkv.apply(x)  // q | gate | k | v | [indexer k]
+        let qkv = a.qkv.apply(x)  // q | gate | k | v | indexer k
         // The indexer tape first: its truncation reads the pre-update offset.
         let idxKeys: MLXArray
         if S <= 8 {
@@ -605,30 +551,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return a.out.apply(out)
     }
 
-    /// Replay only the two opaque expert launches; routing and all current arrays stay live.
-    static func makeMoEPairReplay(_ m: TrackMoE) -> (@Sendable ([MLXArray]) -> [MLXArray])? {
-        guard let fused = m.sharedGateUp.fused, case .quant(let guq) = fused,
-            case .quant(let dq) = m.sharedDown, guq.biases != nil, dq.biases != nil
-        else { return nil }
-        return compile(shapeless: false) {
-            [groupSize = m.expertGroupSize, bits = m.expertBits, topK = m.topK,
-             guGroupSize = guq.groupSize, guBits = guq.bits, guMode = guq.mode,
-             downGroupSize = dq.groupSize, downBits = dq.bits, downMode = dq.mode] inputs in
-            let sharedGU = TrackQuantWeight(
-                weight: inputs[11], scales: inputs[12], biases: inputs[13],
-                groupSize: guGroupSize, bits: guBits, mode: guMode)
-            let act = TrackFastMoEKernels.gateUpAct(
-                wg: inputs[5], sg: inputs[6], bg: inputs[7],
-                wu: inputs[8], su: inputs[9], bu: inputs[10], shared: sharedGU,
-                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits)
-            let sharedDown = TrackQuantWeight(
-                weight: inputs[17], scales: inputs[18], biases: inputs[19],
-                groupSize: downGroupSize, bits: downBits, mode: downMode)
-            return [TrackFastMoEKernels.downCombine(
-                wd: inputs[14], sd: inputs[15], bd: inputs[16], sharedDown: sharedDown,
-                act: act, idx: inputs[1], w: inputs[2], gate: inputs[3], topK: topK,
-                groupSize: groupSize, bits: bits)]
-        }
+    private func moeForward(_ m: TrackMoE, _ x: MLXArray, inputF32: MLXArray? = nil) -> MLXArray {
+        Self.moeForwardShared(m, x, inputF32: inputF32)
     }
 
     /// Row index of each (token, expert) slot, one constant array per window size
@@ -644,23 +568,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return t
     }
 
-    static func moeForwardShared(
-        _ m: TrackMoE, _ x: MLXArray, inputF32: MLXArray? = nil,
-        replay: (@Sendable ([MLXArray]) -> [MLXArray])?
-    ) -> MLXArray {
+    static func moeForwardShared(_ m: TrackMoE, _ x: MLXArray, inputF32: MLXArray? = nil) -> MLXArray {
         let prof = TrackFastProfile.prefill != nil && x.dim(1) >= TrackFastProfile.minWindow
-        var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
-        let logits: MLXArray
-        if x.dim(0) == 1, x.dim(1) == 1, m.routerW16.dtype == .bfloat16, x.dim(2) % 128 == 0,
-            m.routerW16.dim(0) % 16 == 0, x.dim(2) < 16 * m.routerW16.dim(0), m.routerW16.dim(0) < 4096
-        {
-            // One token: MLX's float gemv arithmetic over the bf16 weight (the
-            // reference upcasts it to float32 and reads twice the bytes).
-            let xf = (inputF32 ?? x.asType(.float32)).reshaped(x.dim(2))
-            logits = TrackFastMoEKernels.routerGemv(x: xf, w: m.routerW16).reshaped(1, 1, -1)
-        } else {
-            logits = matmul(inputF32 ?? x.asType(.float32), m.routerW32.transposed())
-        }
+        var pt = CFAbsoluteTimeGetCurrent()
+        let logits = matmul(inputF32 ?? x.asType(.float32), m.routerW32.transposed())
         if prof { TrackFastProfile.tick("moe.router", &pt, [logits]) }
         // Top-k + softmax in one launch (argpartition's stable order, softmax_single_row).
         if x.dim(0) == 1, x.dim(1) <= 8,
@@ -684,16 +595,6 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights, gate]) }
             let flatIdx = idx.reshaped(S * K)
             let xrow = Self.xrowTable(S: S, K: K)
-            if let replay, StreamOrDevice.default.stream === Stream.gpu {
-                return replay([
-                    x2, flatIdx, weights.reshaped(S * K), gate, xrow,
-                    m.expertGate.w, m.expertGate.s, m.expertGate.b,
-                    m.expertUp.w, m.expertUp.s, m.expertUp.b,
-                    guq.weight, guq.scales, guq.biases!,
-                    m.expertDown.w, m.expertDown.s, m.expertDown.b,
-                    dq.weight, dq.scales, dq.biases!,
-                ])[0].reshaped(1, S, H)
-            }
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
                 wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b, shared: guq,
@@ -708,33 +609,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let idx = argPartition(-logits, kth: m.topK - 1, axis: -1)[.ellipsis, ..<m.topK]
         let weights = softmax(takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
         if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights]) }
-        let sharedAct: MLXArray
-        if TrackP12Prefill.splitShared, TrackP12Prefill.eligible(x),
-            m.sharedGateUp.parts.count == 2
-        {
-            // The same two GEMMs and the same `mlx_silu(gate) * up`, over the
-            // two outputs directly instead of over their concatenation.
-            let rows = x.dim(0) * x.dim(1)
-            let sgate = m.sharedGateUp.parts[0].apply(x)
-            let sup = m.sharedGateUp.parts[1].apply(x)
-            sharedAct = TrackFastKernels.swiglu2(
-                gate: sgate.reshaped(rows, m.sharedHidden),
-                up: sup.reshaped(rows, m.sharedHidden)
-            ).reshaped(x.dim(0), x.dim(1), m.sharedHidden)
-        } else {
-            sharedAct = TrackFastKernels.swiglu(gu: m.sharedGateUp.apply(x))
-        }
-        let shared = m.sharedDown.apply(sharedAct)
+        let gu = m.sharedGateUp.apply(x)
+        let shared = m.sharedDown.apply(TrackFastKernels.swiglu(gu: gu))
         let gate = m.sharedGate.apply(x)  // [B,S,1]
         if prof { TrackFastProfile.tick("moe.shared", &pt, [shared, gate]) }
-        // Read the routed rows through the permutation the sort already
-        // produced instead of materialising a scattered copy of them.
-        if let combined = TrackP12Prefill.sortedMoE(
-            m, x, indices: idx, weights: weights, shared: shared, gate: gate)
-        {
-            if prof { TrackFastProfile.tick("moe.sorted+combine", &pt, [combined]) }
-            return combined
-        }
         let routed = m.switchMLP(x, idx)  // [B,S,K,H]
         if prof { TrackFastProfile.tick("moe.switchMLP", &pt, [routed]) }
         // The combine kernel folds the K products in the association MLX's small
@@ -751,114 +629,47 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let wide = hcCount * hidden
         let contextLength = max(1, p.dilation - 1)
         let state = evaluation.inputState(modelLayerIndex: p.stateLayerIndex)
-        // Device-side context (prefill windows and the device row source).
-        func devicePrevious() -> MLXArray {
+        let previous =
             (state?.ssm
                 ?? MLXArray.full(
                     [1, contextLength], values: MLXArray(Int32(cfg.eosTokenId)), dtype: .int32))
-                .asType(ids.dtype)
-        }
+            .asType(ids.dtype)
         let convState =
             state?.conv ?? MLXArray.zeros([1, p.stateLength, wide], dtype: stream.dtype)
 
-        let embedded: MLXArray
-        // Host history for the decode/verify windows: the ids are hashed on the
-        // host (bit-for-bit the device hash) and the context is staged as a
-        // host-backed int32 array, so the only device sync of the step is the
-        // one on the fed token itself.
-        var hostHistory: [Int64]? = nil
-        if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
-            let rawPrev = state?.ssm
-            let ctx: [Int64] = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
-            let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
-            let history = ctx + toks
-            let gid = p.embedding.hostRowIds(history: [history], newCount: S)
-            let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
-            embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
-            hostHistory = history
-        } else {
-            embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
-        }
-        // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
-        // every other shape takes the three-launch PLE block below.
-        let full: MLXArray
-        let output: MLXArray
-        if S == 1, TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
-            convState.shape == [1, 9, wide], convState.dtype == stream.dtype,
-            let fused = TrackPLEFusion.forward(
-                p, embedded: embedded, stream: stream, convState: convState, eps: eps)
-        {
-            (full, output) = fused
-        } else {
-            let keyFlat = p.keyProj.apply(embedded)
-            let value = p.valueProj.apply(embedded)
-            // norm_key * norm_query, then MLX's own reduction over the last axis.
-            let prod = TrackFastPLEKernels.prod(
-                keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
-                hcCount: hcCount, hidden: hidden, eps: eps)
-            let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
-            // The two scalars the reference's `/` and `maximum` build, built the
-            // same way so they carry the same rounding into the activation dtype.
-            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
-            let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
-            let gn = TrackFastPLEKernels.gated(
-                g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
-                hcCount: hcCount, hidden: hidden, eps: eps)
-            let gated = gn.gated
-            full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
-            output = TrackFastPLEKernels.conv(
-                full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
-        }
+        let embedded = p.embedding(ids, previousContext: previous).asType(stream.dtype)
+        let key = groupNorm(p.keyProj.apply(embedded), scale: p.normKeyScale)
+            .reshaped(B, S, hcCount, hidden)
+        let value = p.valueProj.apply(embedded)
+        let query = groupNorm(stream, scale: p.normQueryScale).reshaped(B, S, hcCount, hidden)
+        var gate = (key * query).sum(axis: -1, keepDims: true) / Foundation.sqrt(Float(hidden))
+        let floor = MLXArray(Float(1e-6), dtype: gate.dtype)
+        gate = MLX.sqrt(maximum(MLX.abs(gate), floor)) * MLX.sign(gate)
+        let gated = (sigmoid(gate) * value[.ellipsis, .newAxis, 0...]).reshaped(B, S, wide)
+        let normed = groupNorm(gated, scale: p.normConvScale)
+        let full = concatenated([convState, normed], axis: 1)  // [1, n+S, wide]
+        let convolved = silu(
+            conv1d(full, p.convW, stride: 1, padding: 0, dilation: p.dilation, groups: wide))
+        let history = concatenated([previous, ids], axis: 1)
         do {
             if capture {
                 let n = p.stateLength
                 let convStack = asStrided(full, [S, n, wide], strides: [wide, wide, 1], offset: wide)
-                let contextStack: MLXArray
-                if let h = hostHistory {
-                    // Row s = the context after consuming window token s.
-                    var flat: [Int32] = []
-                    flat.reserveCapacity(S * contextLength)
-                    for s in 0 ..< S { flat.append(contentsOf: h[(s + 1) ..< (s + 1 + contextLength)].map(Int32.init)) }
-                    contextStack = MLXArray(flat).reshaped(S, contextLength)
-                } else {
-                    let history = concatenated([devicePrevious(), ids], axis: 1)
-                    contextStack = asStrided(
-                        history.asType(.int32), [S, contextLength], strides: [1, 1], offset: 1)
-                }
+                let contextStack = asStrided(
+                    history.asType(.int32), [S, contextLength], strides: [1, 1], offset: 1)
                 try evaluation.stageCaptured(
                     modelLayerIndex: p.stateLayerIndex, conv: convStack, ssm: contextStack,
                     positions: S)
             } else {
-                let ssm: MLXArray
-                if let h = hostHistory {
-                    ssm = MLXArray(h.suffix(contextLength).map(Int32.init)).reshaped(1, contextLength)
-                } else {
-                    let history = concatenated([devicePrevious(), ids], axis: 1)
-                    ssm = history[0..., (-contextLength)...].asType(.int32)
-                }
                 try evaluation.stage(
                     modelLayerIndex: p.stateLayerIndex,
                     conv: full[0..., (-p.stateLength)..., 0...],
-                    ssm: ssm)
+                    ssm: history[0..., (-contextLength)...].asType(.int32))
             }
         } catch {
             preconditionFailure("TrackFastModel: PLE stage failed: \(error)")
         }
-        return output
-    }
-
-    private func injectNorm(
-        residual: MLXArray, out: MLXArray?, inject: MLXArray?, scale: MLXArray, tile: Bool
-    ) -> (stream: MLXArray, normed: MLXArray) {
-        // Native replay does not key Swift task-local streams; trace and replay
-        // only on the canonical GPU stream. Other contexts retain the raw path.
-        if !tile, let out, let inject, StreamOrDevice.default.stream === Stream.gpu {
-            let result = injectNormReplay([residual, out, inject, scale])
-            return (result[0], result[1])
-        }
-        return TrackFastKernels.injectNorm(
-            residual: residual, out: out, inject: inject, scale: scale,
-            hcCount: hcCount, hidden: hidden, eps: eps, tile: tile)
+        return gated + convolved
     }
 
     /// Both tower streams. `caches` is the compact attention layout.
@@ -880,29 +691,29 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         var stream = residual
         let ropeTab = ropeTables(offset: offset, count: ids.dim(1), dtype: residual.dtype)
 
+        var profT = CFAbsoluteTimeGetCurrent()
         let profiling = TrackFastProfile.prefill != nil && ids.dim(1) >= TrackFastProfile.minWindow
-        var profT = profiling ? CFAbsoluteTimeGetCurrent() : 0
         if profiling { TrackFastProfile.windows += 1 }
         for layer in layers {
             var normed: MLXArray
             if let ple = layer.ple {
                 // Materialize the stream, add the PLE block, then norm.
-                (stream, _) = injectNorm(
+                (stream, _) = TrackFastKernels.injectNorm(
                     residual: residual, out: pendingOut, inject: pendingInject,
-                    scale: layer.attnHC.normScaleQ,
+                    scale: layer.attnHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
                     tile: tile)
                 stream =
                     stream
                     + pleForward(
                         ple, stream: stream, ids: ids, evaluation: evaluation, capture: capture)
-                (stream, normed) = injectNorm(
+                (stream, normed) = TrackFastKernels.injectNorm(
                     residual: stream, out: nil, inject: nil,
-                    scale: layer.attnHC.normScaleQ,
+                    scale: layer.attnHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
                     tile: false)
             } else {
-                (stream, normed) = injectNorm(
+                (stream, normed) = TrackFastKernels.injectNorm(
                     residual: residual, out: pendingOut, inject: pendingInject,
-                    scale: layer.attnHC.normScaleQ,
+                    scale: layer.attnHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
                     tile: tile)
             }
             tile = false
@@ -923,9 +734,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             Self.debugTaps?.append(("L\(layer.index).attn.out", attended))
             if profiling { TrackFastProfile.tick(layer.gdn != nil ? "gdn" : "attn", &profT, [attended]) }
-            (stream, normed) = injectNorm(
+            (stream, normed) = TrackFastKernels.injectNorm(
                 residual: stream, out: attended, inject: injectW,
-                scale: layer.mlpHC.normScaleQ,
+                scale: layer.mlpHC.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
                 tile: false)
             if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
@@ -933,24 +744,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             input = mm.input; injectW = mm.inject
             if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
-            pendingOut = Self.moeForwardShared(
-                layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay)
+            pendingOut = moeForward(layer.moe, input, inputF32: mm.inputF32)
             if profiling { TrackFastProfile.tick("moe", &profT, [pendingOut!]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
             pendingInject = injectW
             residual = stream
             // Dispatch the graph so far: the GPU starts on these layers while the
             // CPU keeps building the rest (the build is otherwise GPU-idle time).
-            if Self.asyncChunk > 0 {
-                let n = layer.index + 1
-                let first = Self.asyncFirst > 0 ? Self.asyncFirst : Self.asyncChunk
-                let second = Self.asyncSecond > first ? Self.asyncSecond : first
-                if n == first || n == second || (n > second && (n - second) % Self.asyncChunk == 0) { asyncEval(stream) }
+            if Self.asyncChunk > 0, (layer.index + 1) % Self.asyncChunk == 0 {
+                asyncEval(stream)
             }
         }
-        let (multi, finalNormed) = injectNorm(
+        let (multi, finalNormed) = TrackFastKernels.injectNorm(
             residual: residual, out: pendingOut, inject: pendingInject,
-            scale: finalMixer.normScaleQ,
+            scale: finalMixer.normScaleQ, hcCount: hcCount, hidden: hidden, eps: eps,
             tile: false)
         let mixed = hcMix(finalMixer, normed: finalNormed).input
         return (mixed, multi)
