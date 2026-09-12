@@ -19,8 +19,8 @@ enum TrackPrefillIndirect {
 
     private static let kernel = MLXFast.metalKernel(
         name: "track_prefill_indirect_activations",
-        inputNames: ["x", "w", "scales", "biases", "indices", "token_rows"],
-        outputNames: ["y"], source: source, header: metalHeader,
+        inputNames: ["x", "w", "scales", "biases", "indices", "token_rows", "gate"],
+        outputNames: ["y"], source: source, header: TrackFastKernels.exactHeader + metalHeader,
         ensureRowContiguous: true)
 
     static func apply(_ m: TrackMoE, x: MLXArray, indices: MLXArray)
@@ -49,24 +49,23 @@ enum TrackPrefillIndirect {
         let sortedIDs = flatIDs[order]
         let tokenRows = order.floorDivide(indices.dim(2))
         let rows = indices.size
-        func project(_ bank: (w: MLXArray, s: MLXArray, b: MLXArray)) -> MLXArray {
+        func project(_ bank: (w: MLXArray, s: MLXArray, b: MLXArray), gate: MLXArray? = nil) -> MLXArray {
             kernel(
-                [x, bank.w, bank.s, bank.b, sortedIDs, tokenRows],
-                template: [("T", x.dtype), ("M", rows), ("N", 640), ("K", 2560)],
+                [x, bank.w, bank.s, bank.b, sortedIDs, tokenRows, gate ?? x],
+                template: [("T", x.dtype), ("M", rows), ("N", 640), ("K", 2560), ("FUSE_SILU", gate != nil)],
                 grid: (10 * 32, ((rows + 31) / 32) * 2, 2),
                 threadGroup: (32, 2, 2),
                 outputShapes: [[rows, 1, 640]], outputDTypes: [.bfloat16])[0]
         }
-        let up = project(u)
         let gate = project(g)
-        return (compiledSiluProduct(gate, up), sortedIDs, inverse)
+        return (project(u, gate: gate), sortedIDs, inverse)
     }
 
     static let source = #"""
         threadgroup T Ws[64 * 72];
         threadgroup T As[32 * 72];
-        track_prefill_indirect<T, 32, 4, 32, 64, 64, 2, 2, true>(
-            x, w, scales, biases, indices, token_rows, y,
+        track_prefill_indirect<T, 32, 4, 32, 64, 64, 2, 2, true, FUSE_SILU>(
+            x, w, scales, biases, indices, token_rows, gate, y,
             M, N, K, Ws, As, threadgroup_position_in_grid,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
         """#
