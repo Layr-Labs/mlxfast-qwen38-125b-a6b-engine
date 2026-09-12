@@ -1304,7 +1304,8 @@ template <
     int BK,
     int WM,
     int WN,
-    bool transpose>
+    bool transpose,
+    bool FUSE_SILU = false>
 METAL_FUNC void track_prefill_indirect(
     const device T* x,
     const device uint32_t* w,
@@ -1312,6 +1313,7 @@ METAL_FUNC void track_prefill_indirect(
     const device T* biases,
     const device uint32_t* indices,
     const device uint32_t* token_rows,
+    const device T* gate,
     device T* y,
     int M,
     int N,
@@ -1480,6 +1482,18 @@ METAL_FUNC void track_prefill_indirect(
 
       if (sg_active) {
         device T* yn = y + size_t(tile_begin + tm) * N + y_col + tn;
+        if constexpr (FUSE_SILU) {
+          NAXTile<AccumType, TM, TN> Gtile;
+          const device T* gn = gate + size_t(tile_begin + tm) * N + y_col + tn;
+          Gtile.load_rows(gn, N, sgp_sm);
+          thread AccumType* acc = Dtile.elems();
+          const thread AccumType* g = Gtile.elems();
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < decltype(Dtile)::kElemsPerTile; ++i) {
+            acc[i] = static_cast<AccumType>(
+                mlx_silu(static_cast<T>(g[i])) * static_cast<T>(acc[i]));
+          }
+        }
         if constexpr (kAlignedM.value) {
           Dtile.store(yn, N);
         } else {
