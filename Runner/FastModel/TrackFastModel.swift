@@ -704,9 +704,19 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 groupSize: m.expertGroupSize, bits: m.expertBits
             ).reshaped(1, S, H)
         }
-        // Wide windows (prefill): MLX's own launches throughout.
-        let idx = argPartition(-logits, kth: m.topK - 1, axis: -1)[.ellipsis, ..<m.topK]
-        let weights = softmax(takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
+        let idx: MLXArray, weights: MLXArray
+        if TrackP12Prefill.eligible(x), x.dim(2) == 2560,
+            logits.dtype == .float32, logits.dim(-1) == 512, m.topK == 10,
+            StreamOrDevice.default.stream === Stream.gpu
+        {
+            let routed = TrackFastMoEKernels.route(
+                logits: logits, x: x, sharedGate: nil, topK: m.topK)
+            idx = routed.idx
+            weights = routed.w
+        } else {
+            idx = argPartition(-logits, kth: m.topK - 1, axis: -1)[.ellipsis, ..<m.topK]
+            weights = softmax(takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
+        }
         if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights]) }
         let sharedAct: MLXArray
         if TrackP12Prefill.splitShared, TrackP12Prefill.eligible(x),

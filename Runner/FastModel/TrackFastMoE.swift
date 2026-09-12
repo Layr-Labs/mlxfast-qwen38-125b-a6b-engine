@@ -852,7 +852,7 @@ extension TrackFastMoEKernels {
         let E = logits.dim(-1), KD = x.dim(-1)
         let lead = Array(logits.shape.dropLast())
         let R = lead.reduce(1, *)
-        precondition(topK <= 32 && topK <= E && R >= 1 && R <= 8 && KD % 256 == 0)
+        precondition(topK <= 32 && topK <= E && R >= 1 && (g == nil || R <= 8) && KD % 256 == 0)
         let simdgroups = g == nil ? 1 : 2
         let outs = (R == 1 ? routeKernel1 : routeKernel)(
             [logits.reshaped(R, E), x.reshaped(R, KD), g?.weight ?? x, g?.scales ?? x, g?.biases ?? x],
