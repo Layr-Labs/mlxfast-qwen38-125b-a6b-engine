@@ -954,7 +954,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    const bool STAGE_A = false>
 METAL_FUNC void qmm_t_nax_tgp_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -968,7 +969,8 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    threadgroup T* As = nullptr) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
 
@@ -1009,6 +1011,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
   constexpr short SK = 32;
+  constexpr int AS_padded = SK + 16 / sizeof(T);
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
@@ -1033,9 +1036,13 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   NAXTile<AccumType, TM, TN> Dtile;
   Dtile.clear();
 
-  x += tm * K;
+  if constexpr (!STAGE_A) {
+    x += tm * K;
+  }
 
-  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
+  // Shared A staging needs one branch for the whole threadgroup, including tails.
+  const bool aligned_m = STAGE_A ? (M - y_row >= BM) : !is_unaligned_sm;
+  dispatch_bool(aligned_m, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
       for (int k = 0; k < K; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1054,7 +1061,19 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
           volatile int compiler_barrier;
 
-          if constexpr (kAlignedM.value) {
+          if constexpr (STAGE_A) {
+            // Finish all reads before reusing As, then publish the next slab.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int a = lid; a < BM * SK; a += WM * WN * SIMD_SIZE) {
+              const int row = a / SK;
+              const int col = a % SK;
+              As[row * AS_padded + col] = (y_row + row < M)
+                  ? x[row * static_cast<int64_t>(K) + kk1 + col]
+                  : T(0);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            Atile.template load<T, AS_padded, 1>(As + tm * AS_padded);
+          } else if constexpr (kAlignedM.value) {
             Atile.load(x + kk1, K);
           } else {
             Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
@@ -1252,9 +1271,16 @@ template <
     uint simd_lid [[thread_index_in_simdgroup]]) {
   (void)lid;
 
+  // Stage A only for the host's wide-M dense bf16 tile; keep the original Ws.
+  constexpr bool stage_a = metal::is_same_v<T, bfloat16_t> &&
+      BM == 64 && BK == 64 && BN == 64 && WM == 2 && WN == 2;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int AS_size = stage_a ? BM * (32 + 16 / sizeof(T)) : 0;
 
-  threadgroup T Ws[BN * BK_padded];
+  // Disjoint regions; narrow-M and other dtypes allocate no activation storage.
+  threadgroup T shared_tiles[BN * BK_padded + AS_size];
+  threadgroup T* Ws = shared_tiles;
+  threadgroup T* As = shared_tiles + BN * BK_padded;
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1274,8 +1300,8 @@ template <
         b_strides,
         tid);
   }
-  qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
-      w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+  qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN, stage_a>(
+      w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid, As);
 }
 
 template <
