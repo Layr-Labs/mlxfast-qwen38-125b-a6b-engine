@@ -1,5 +1,5 @@
 // Decode GDN preparation, state transition and gated normalization in one launch.
-// Each threadgroup owns one value head; each SIMD group owns four value rows.
+// Each threadgroup owns one value head; each SIMD group interleaves two pairs of value rows.
 // Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
 // TrackFastKernels.prepSource, leanSource and gatedRMSSource.
 
@@ -47,7 +47,8 @@ enum TrackFastGDNDecode {
     }
 
     private static let source = #"""
-        static_assert(Dk == 128 && Dv == 128, "GDN head geometry");
+        static_assert(Dk == 128 && Dv == 128 && RPS % 2 == 0, "GDN paired head geometry");
+        static_assert(metal::is_same<StT, float>::value, "FP32 GDN state");
         const uint n = threadgroup_position_in_grid.z;
         const uint b_idx = n / Hv;
         const uint hv_idx = n % Hv;
@@ -121,51 +122,56 @@ enum TrackFastGDNDecode {
         const float gate_beta = gb_shared[1];
         threadgroup InT y_shared[Dv];
         threadgroup float norm_sums[32];
-        for (int r = 0; r < RPS; ++r) {
+        for (int r = 0; r < RPS; r += 2) {
             const uint dv_idx = sg * RPS + r;
             const device StT* i_state = state_in + (n * Dv + dv_idx) * Dk;
-            float state[4];
-            constexpr bool vec4 = metal::is_same<StT, float>::value;
-            if constexpr (vec4) {
-                const float4 s4 = *reinterpret_cast<const device float4*>(i_state + 4 * lane);
-                state[0] = s4.x; state[1] = s4.y; state[2] = s4.z; state[3] = s4.w;
-            } else {
-                for (int i = 0; i < 4; ++i) { state[i] = static_cast<float>(i_state[4 * lane + i]); }
-            }
-            float kv_mem = 0.0f;
+            const float4 s0 = *reinterpret_cast<const device float4*>(i_state + 4 * lane);
+            const float4 s1 = *reinterpret_cast<const device float4*>(i_state + Dk + 4 * lane);
+            float state0[4] = {s0.x, s0.y, s0.z, s0.w};
+            float state1[4] = {s1.x, s1.y, s1.z, s1.w};
+            float kv_mem0 = 0.0f, kv_mem1 = 0.0f;
             {
                 #pragma clang fp reassociate(off)
                 #pragma clang fp contract(off)
-                float kv_compensation = 0.0f;
+                float compensation0 = 0.0f, compensation1 = 0.0f;
                 for (int i = 0; i < 4; ++i) {
-                    const int s_idx = 4 * lane + i;
-                    state[i] = state[i] * gate_decay;
-                    auto product = state[i] * static_cast<float>(k_[s_idx]);
-                    auto corrected = product - kv_compensation;
-                    auto next_sum = kv_mem + corrected;
-                    kv_compensation = (next_sum - kv_mem) - corrected;
-                    kv_mem = next_sum;
+                    const float key = static_cast<float>(k_[4 * lane + i]);
+                    state0[i] = state0[i] * gate_decay;
+                    auto product0 = state0[i] * key;
+                    auto corrected0 = product0 - compensation0;
+                    auto sum0 = kv_mem0 + corrected0;
+                    compensation0 = (sum0 - kv_mem0) - corrected0;
+                    kv_mem0 = sum0;
+                    state1[i] = state1[i] * gate_decay;
+                    auto product1 = state1[i] * key;
+                    auto corrected1 = product1 - compensation1;
+                    auto sum1 = kv_mem1 + corrected1;
+                    compensation1 = (sum1 - kv_mem1) - corrected1;
+                    kv_mem1 = sum1;
                 }
             }
-            kv_mem = simd_sum(kv_mem);
-            const float delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * gate_beta;
-            float out = 0.0f;
+            kv_mem0 = simd_sum(kv_mem0);
+            kv_mem1 = simd_sum(kv_mem1);
+            const float delta0 = (static_cast<float>(v_[dv_idx]) - kv_mem0) * gate_beta;
+            const float delta1 = (static_cast<float>(v_[dv_idx + 1]) - kv_mem1) * gate_beta;
+            float out0 = 0.0f, out1 = 0.0f;
             for (int i = 0; i < 4; ++i) {
-                const int s_idx = 4 * lane + i;
-                state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
-                out += state[i] * static_cast<float>(q_[s_idx]);
+                const float key = static_cast<float>(k_[4 * lane + i]);
+                const float query = static_cast<float>(q_[4 * lane + i]);
+                state0[i] = state0[i] + key * delta0;
+                state1[i] = state1[i] + key * delta1;
+                out0 += state0[i] * query;
+                out1 += state1[i] * query;
             }
-            out = simd_sum(out);
+            out0 = simd_sum(out0);
+            out1 = simd_sum(out1);
             if (lane == 0) {
-                const InT value = static_cast<InT>(out);
-                y_shared[dv_idx] = value;
+                y_shared[dv_idx] = static_cast<InT>(out0);
+                y_shared[dv_idx + 1] = static_cast<InT>(out1);
             }
             device StT* o_state = state_out + (n * Dv + dv_idx) * Dk;
-            if constexpr (vec4) {
-                *reinterpret_cast<device float4*>(o_state + 4 * lane) = float4(state[0], state[1], state[2], state[3]);
-            } else {
-                for (int i = 0; i < 4; ++i) { o_state[4 * lane + i] = static_cast<StT>(state[i]); }
-            }
+            *reinterpret_cast<device float4*>(o_state + 4 * lane) = float4(state0[0], state0[1], state0[2], state0[3]);
+            *reinterpret_cast<device float4*>(o_state + Dk + 4 * lane) = float4(state1[0], state1[1], state1[2], state1[3]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float thread_x[4];
