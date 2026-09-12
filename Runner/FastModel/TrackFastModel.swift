@@ -597,6 +597,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         if S <= 8 {
             let idxStart = 2 * a.qWidth + 2 * a.kvWidth
             idxKeys = qkv[.ellipsis, idxStart ..< (idxStart + cfg.indexerHeadDim)]
+        } else if a.indexerQWidth == 512,
+            let liveKeys = TrackPrefillIndexer.apply(a.indexerFull, x: x)
+        {
+            idxKeys = liveKeys
         } else {
             idxKeys = a.indexerFull.apply(x)[.ellipsis, a.indexerQWidth...]
         }
