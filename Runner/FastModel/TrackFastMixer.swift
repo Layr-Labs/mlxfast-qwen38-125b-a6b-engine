@@ -129,7 +129,7 @@ enum TrackFastMixerKernels {
             int rows[4];
             for (int i = 0; i < 4; ++i) { const int s = (int)sg * 4 + i; rows[i] = d0 + (s & 1) + H * (s >> 1); }
             float r[4];
-            qmv_reg_rows<T, GS, BITS, false, (LW % get_pack_factor<BITS, 32>()) == 0>(wu, su, bu, act, LW, rows, lid, r);
+            qmv_reg_rows<T, GS, BITS, false>(wu, su, bu, act, LW, rows, lid, r);
             if (lid == 0) { for (int i = 0; i < 4; ++i) { res[(int)sg * 4 + i][0] = r[i]; } }
         } else {
             const int s = (int)sg * 4 + (int)(lid / 8);

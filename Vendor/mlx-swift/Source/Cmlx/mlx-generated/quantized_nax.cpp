@@ -852,43 +852,6 @@ struct QuantizedBlockLoader<
   }
 };
 
-// One group per lane. Keep only raw operands live across the current MMA.
-struct PackedNAXGroup32 {
-  uint4 words;
-  bfloat16_t scale;
-  bfloat16_t bias;
-
-  template <typename Loader>
-  void prefetch(const thread Loader& loader) thread {
-    static_assert(Loader::n_reads == 16 && Loader::pack_factor == 2);
-    // Four word loads also support batch offsets aligned to 4, not 16, bytes.
-    const device uint32_t* src =
-        reinterpret_cast<const device uint32_t*>(loader.src);
-    words = uint4(src[0], src[1], src[2], src[3]);
-    scale = *loader.scales;
-    bias = *loader.biases;
-  }
-
-  template <typename T>
-  void store(threadgroup T* dst) const thread {
-    static_assert(metal::is_same_v<T, bfloat16_t>);
-    const float s = float(scale);
-    const float b = float(bias);
-    float sc[2] = {s, s / 16.0f};
-    STEEL_PRAGMA_UNROLL
-    for (int j = 0; j < 4; j++) {
-      STEEL_PRAGMA_UNROLL
-      for (int i = 0; i < 4; i++) {
-        const uint8_t w = uint8_t(words[j] >> (8 * i));
-        dst[8 * j + 2 * i] =
-            static_cast<bfloat16_t>(sc[0] * (w & 0x0f) + b);
-        dst[8 * j + 2 * i + 1] =
-            static_cast<bfloat16_t>(sc[1] * (w & 0xf0) + b);
-      }
-    }
-  }
-};
-
 template <typename T>
 METAL_FUNC void adjust_matrix_offsets(
     const device T*& x,
@@ -1074,80 +1037,54 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      auto run = [&](auto kPrefetch) {
-        PackedNAXGroup32 packed_w;
-        if constexpr (kPrefetch.value) {
-          if (K > 0) {
-            packed_w.prefetch(loader_w);
-          }
-        }
-        for (int k = 0; k < K; k += BK) {
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          if constexpr (kPrefetch.value) {
-            packed_w.store(loader_w.dst);
-          } else if constexpr (kAlignedN.value) {
-            loader_w.load_unsafe();
-          } else {
-            loader_w.load_safe(short2(BK, tgp_bn));
-          }
-
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-
-          if constexpr (kPrefetch.value) {
-            if (k + BK < K) {
-              loader_w.next();
-              packed_w.prefetch(loader_w);
-            }
-          }
-
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<T, TN, TK> Btile;
-
-            volatile int compiler_barrier;
-
-            if constexpr (kAlignedM.value) {
-              Atile.load(x + kk1, K);
-            } else {
-              Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
-            }
-
-            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<transpose_a>{},
-                Btile,
-                metal::bool_constant<transpose_b>{});
-
-            (void)compiler_barrier;
-          }
-
-          x += BK;
-          if constexpr (!kPrefetch.value) {
-            loader_w.next();
-          }
+      for (int k = 0; k < K; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (kAlignedN.value) {
+          loader_w.load_unsafe();
+        } else {
+          loader_w.load_safe(short2(BK, tgp_bn));
         }
 
-        // Store results to device memory
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if constexpr (kAlignedM.value && kAlignedN.value) {
-          Dtile.store(y + tm * N + tn, N);
-        } else if (kAlignedM.value && sgp_sn == SN) {
-          Dtile.store(y + tm * N + tn, N);
-        } else {
-          Dtile.store_safe(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
+        STEEL_PRAGMA_NO_UNROLL
+        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          NAXTile<T, TM, TK> Atile;
+          NAXTile<T, TN, TK> Btile;
+
+          volatile int compiler_barrier;
+
+          if constexpr (kAlignedM.value) {
+            Atile.load(x + kk1, K);
+          } else {
+            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+          }
+
+          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+          tile_matmad_nax(
+              Dtile,
+              Atile,
+              metal::bool_constant<transpose_a>{},
+              Btile,
+              metal::bool_constant<transpose_b>{});
+
+          (void)compiler_barrier;
         }
-      };
-      if constexpr (
-          metal::is_same_v<T, bfloat16_t> && group_size == 32 && bits == 4 &&
-          aligned_N && BM == 64 && BN == 64 && BK == 64 && WM == 2 && WN == 2) {
-        dispatch_bool(M > 32 && K % BK == 0, run);
+
+        x += BK;
+        loader_w.next();
+      }
+
+      // Store results to device memory
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      if constexpr (kAlignedM.value && kAlignedN.value) {
+        Dtile.store(y + tm * N + tn, N);
+      } else if (kAlignedM.value && sgp_sn == SN) {
+        Dtile.store(y + tm * N + tn, N);
       } else {
-        run(metal::false_type{});
+        Dtile.store_safe(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
       }
     });
   });
@@ -1620,7 +1557,6 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
     const constant int& N,
     const constant int& K,
     threadgroup T* Ws,
-    threadgroup T* As,
     uint3 tid,
     uint simd_group_id,
     uint simd_lane_id) {
@@ -1634,8 +1570,6 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = (BK + 16 / sizeof(T));
-  // MLXFAST-ASTAGE: the A tile gets the same padded leading dimension Ws uses.
-  constexpr int BKA_padded = BK_padded;
   using loader_w_t = QuantizedBlockLoader<
       T, BN, BK, BK_padded, transpose, WM * WN * SIMD_SIZE, group_size, bits>;
 
@@ -1698,14 +1632,9 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
 
     NAXTile<AccumType, TM, TN> Dtile;
     Dtile.clear();
-    // MLXFAST-ASTAGE: one threadgroup-uniform base. The A rows this tile needs
-    // are staged cooperatively, so no simdgroup walks the device pointer itself.
-    const device T* xb = x + size_t(tile_begin) * K;
-    const short tgp_thread = short(simd_group_id * SIMD_SIZE + simd_lane_id);
-    const short a_row = tgp_thread / 4;            // 0..BM-1
-    const short a_col = (tgp_thread % 4) * 16;     // 0,16,32,48
-    threadgroup T* a_dst = As + a_row * BKA_padded + a_col;
-    const bool a_live = a_row < tile_m;
+    // Keep even inactive SIMD-group pointers within a real input row. Inactive
+    // groups still cooperate in weight loads and execute every barrier.
+    const device T* xn = x + size_t(tile_begin + (sg_active ? tm : 0)) * K;
 
     thread loader_w_t loader_w(
         wl + index * stride_w,
@@ -1721,63 +1650,12 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
     // This specialization is threadgroup-uniform. A partial BM tile uses
     // safe loads/stores even for a full first SM, with identical live values.
     dispatch_bool(tile_m == BM, [&](auto kAlignedM) {
-      // MLXFAST-APREFETCH: the A block is fetched into registers one K block
-      // ahead, so its device latency is hidden behind the current block's MMAs
-      // instead of standing between the two barriers. This is the same software
-      // pipeline `PackedNAXGroup32` already gives the weight block; A just did
-      // not have one. 16 bf16 per thread, statically indexed, so it stays in
-      // registers. The values published to `As` are byte for byte what the
-      // in-place copy published, only fetched earlier.
-      T a_buf[16];
-      PackedNAXGroup32 packed_w;
-      if (K_it > 0) {
-        packed_w.prefetch(loader_w);
-        if (a_live) {
-          const device T* a0 = xb + size_t(a_row) * K + a_col;
-          STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < 16; ++e) { a_buf[e] = a0[e]; }
-        }
-      }
       for (int k = 0; k < K_it; k++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        packed_w.store(loader_w.dst);
-        // MLXFAST-ASTAGE. Each simdgroup used to walk A itself: 16 rows of 64
-        // bytes at a 5,120-byte stride, per simdgroup, per kk1 -- and with
-        // WM = WN = 2 the pairs (0,1) and (2,3) issue IDENTICAL reads, so every
-        // A row of the tile is fetched twice. Staging it instead costs one
-        // cooperative, fully coalesced pass: 128 threads x 16 contiguous
-        // elements covers the whole BM x BK block, four threads to a row, one
-        // 128-byte line per row. It rides the barrier pair Ws already needs, so
-        // it adds no synchronization. Rows past `tile_m` are zeroed, which is
-        // what the `load_safe` path they replace produces for the same lanes;
-        // an out-of-range row can only ever reach its own Dtile row, and those
-        // rows are excluded by `store_slice` either way. Same values, same
-        // order, bit-identical output.
-        if (a_live) {
-          STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < 16; ++e) {
-            a_dst[e] = a_buf[e];
-          }
-        } else {
-          STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < 16; ++e) {
-            a_dst[e] = T(0);
-          }
-        }
+        loader_w.load_unsafe();
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // All lanes prefetch; Ws is not reused until the next reader barrier.
-        if (k + 1 < K_it) {
-          loader_w.next();
-          packed_w.prefetch(loader_w);
-          if (a_live) {
-            const device T* a_next = xb + BK + size_t(a_row) * K + a_col;
-            STEEL_PRAGMA_UNROLL
-            for (short e = 0; e < 16; ++e) { a_buf[e] = a_next[e]; }
-          }
-        }
-
-        STEEL_PRAGMA_UNROLL
+        STEEL_PRAGMA_NO_UNROLL
         for (int kk1 = 0; kk1 < BK; kk1 += SK) {
           if (sg_active) {
             NAXTile<T, TM, TK> Atile;
@@ -1785,8 +1663,11 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
 
             volatile int compiler_barrier;
 
-            Atile.template load<T, BKA_padded, 1>(
-                As + tm * BKA_padded + kk1);
+            if constexpr (kAlignedM.value) {
+              Atile.load(xn + kk1, K);
+            } else {
+              Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+            }
 
             Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
 
@@ -1801,7 +1682,8 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
           }
         }
 
-        xb += BK;
+        xn += BK;
+        loader_w.next();
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1856,13 +1738,6 @@ template <
       bits>;
 
   threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
-  // MLXFAST-ASTAGE: 32 x 72 bf16 = 4,608 B, only for the P17-eligible shape. An
-  // in-situ probe that added exactly this much untouched threadgroup memory to
-  // this kernel cost 0.8%, so the allocation is close to free here.
-  constexpr bool p17_shape =
-      metal::is_same_v<T, bfloat16_t> && group_size == 32 && bits == 4 &&
-      transpose && BM == 32 && BN == 64 && BK == 64 && WM == 2 && WN == 2;
-  threadgroup T As[p17_shape ? BM * BK_padded : 1];
 
   // P17 is a scheduling/load-address variant of THIS kernel, not a different
   // GEMM family. Ineligible shapes retain the original body byte for byte.
@@ -1873,7 +1748,7 @@ template <
         ((K == 2560 && N == 640) || (K == 640 && N == 2560))) {
       p17_affine_gather_qmm_rhs_nax<
           T, group_size, bits, BM, BN, BK, WM, WN, transpose>(
-          x, w, scales, biases, indices, y, M, N, K, Ws, As, tid,
+          x, w, scales, biases, indices, y, M, N, K, Ws, tid,
           simd_group_id, simd_lane_id);
       return;
     }

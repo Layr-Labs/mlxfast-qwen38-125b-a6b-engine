@@ -764,7 +764,7 @@ extension TrackFastMoEKernels {
         // Shared-expert gate (1 row, K = KD): one token routes to `qmv`'s small-N
         // branch (simdgroup 0), two to eight to `qmv_wide`'s short tile, which
         // folds K across the 8 slots of BOTH simdgroups.
-        if constexpr (HAS_GATE) {
+        if (HAS_GATE) {
             const device T* xr = x + (size_t)row * (size_t)KD;
             if constexpr (VPT == 1) {
                 track_inject_qmv<T, GS, BITS, KD, 1, 4>(wg, sgw, bgw, xr, gate + row, sg, lane);
@@ -852,7 +852,7 @@ extension TrackFastMoEKernels {
         let E = logits.dim(-1), KD = x.dim(-1)
         let lead = Array(logits.shape.dropLast())
         let R = lead.reduce(1, *)
-        precondition(topK <= 32 && topK <= E && R >= 1 && (g == nil || R <= 8) && KD % 256 == 0)
+        precondition(topK <= 32 && topK <= E && R >= 1 && R <= 8 && KD % 256 == 0)
         let simdgroups = g == nil ? 1 : 2
         let outs = (R == 1 ? routeKernel1 : routeKernel)(
             [logits.reshaped(R, E), x.reshaped(R, KD), g?.weight ?? x, g?.scales ?? x, g?.biases ?? x],
@@ -925,10 +925,7 @@ extension TrackFastMoEKernels {
         }
 
         // qmv_impl's normal branch (out_vec_size >= 8, full tile) likewise.
-        // MLXFAST-FULLTAIL: EXACT_TAIL says the caller's `in_vec_size` is a
-        // multiple of values_per_thread. See the tail block below for what that
-        // buys and why it stays bit-identical.
-        template <typename T, int group_size, int bits, bool EXACT_TAIL = false>
+        template <typename T, int group_size, int bits>
         METAL_FUNC void qmv_reg(
             const device uint32_t* w,
             const device T* scales,
@@ -974,34 +971,7 @@ extension TrackFastMoEKernels {
           }
           const int remaining = clamp(
               static_cast<int>(in_vec_size - k - simd_lid * values_per_thread), 0, values_per_thread);
-          // MLXFAST-FULLTAIL. When in_vec_size is a multiple of
-          // values_per_thread, `remaining` is provably 0 or values_per_thread and
-          // never a partial slice: in_vec_size - k is a multiple of
-          // values_per_thread (k advances by block_size = 32 * values_per_thread)
-          // and so is simd_lid * values_per_thread, so their difference is too,
-          // and the clamp leaves only the two endpoints. The _safe helpers then
-          // run the SAME arithmetic in the SAME order as the plain ones -- their
-          // bodies are identical with `N` in place of `values_per_thread` -- but
-          // over a RUNTIME trip count. That keeps x_thread dynamically indexed,
-          // which pins the array in thread-local scratch for the whole function
-          // instead of registers, and costs the main loop as well as the tail.
-          // K = 640 (down) is 2.5 blocks, so a fifth of that GEMV's work sits in
-          // this branch; K = 2560 puts a tenth there. Both are exact multiples of
-          // 8, so EXACT_TAIL erases the runtime-indexed code path entirely.
-          // Bit-identical by construction, not by tolerance.
-          if constexpr (EXACT_TAIL) {
-            if (remaining > 0) {
-              U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
-              for (int row = 0; row < results_per_simdgroup; row++) {
-                auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-                const device T* sl = scales + row * in_vec_size_g;
-                const device T* bl = biases + row * in_vec_size_g;
-                U s = sl[0];
-                U b = bl[0];
-                result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
-              }
-            }
-          } else if (remaining > 0) {
+          if (remaining > 0) {
             U sum = load_vector_safe<T, U, values_per_thread, bits>(x, x_thread, remaining);
             for (int row = 0; row < results_per_simdgroup; row++) {
               auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
@@ -1059,9 +1029,7 @@ extension TrackFastMoEKernels {
 
         // qmv_impl's normal branch over FOUR GIVEN rows (each row's walk is
         // independent of its neighbours), optional silu on the activations.
-        // EXACT_TAIL as in qmv_reg above: the caller's in_vec_size is a multiple
-        // of values_per_thread, so the runtime-indexed tail can be compiled away.
-        template <typename T, int group_size, int bits, bool SILU, bool EXACT_TAIL = false>
+        template <typename T, int group_size, int bits, bool SILU>
         METAL_FUNC void qmv_reg_rows(
             const device uint32_t* w,
             const device T* scales,
@@ -1111,18 +1079,7 @@ extension TrackFastMoEKernels {
           }
           const int remaining = clamp(
               static_cast<int>(in_vec_size - k - simd_lid * values_per_thread), 0, values_per_thread);
-          // MLXFAST-FULLTAIL, same argument as qmv_reg.
-          if constexpr (EXACT_TAIL) {
-            if (remaining > 0) {
-              U sum = SILU ? load_vector_silu<T, U, values_per_thread, bits>(x, x_thread)
-                           : load_vector<T, U, values_per_thread, bits>(x, x_thread);
-              for (int row = 0; row < results_per_simdgroup; row++) {
-                U s = sr[row][0];
-                U b = br[row][0];
-                result[row] += qdot<U, values_per_thread, bits>(wr[row], x_thread, s, b, sum);
-              }
-            }
-          } else if (remaining > 0) {
+          if (remaining > 0) {
             U sum = SILU ? load_vector_safe_silu<T, U, values_per_thread, bits>(x, x_thread, remaining)
                          : load_vector_safe<T, U, values_per_thread, bits>(x, x_thread, remaining);
             for (int row = 0; row < results_per_simdgroup; row++) {
@@ -1183,8 +1140,8 @@ extension TrackFastMoEKernels {
             qmv_fast_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
             qmv_fast_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
         } else {
-            qmv_reg<T, GS, BITS, (KD % get_pack_factor<BITS, 32>()) == 0>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
-            qmv_reg<T, GS, BITS, (KD % get_pack_factor<BITS, 32>()) == 0>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
+            qmv_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
+            qmv_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
         }
         if (thread_index_in_simdgroup == 0) {
             for (int i = 0; i < 4; ++i) {
@@ -1373,7 +1330,7 @@ extension TrackFastMoEKernels {
             const size_t eoff = (size_t)e * (size_t)H;
             const device T* xb = act + (size_t)z * (size_t)F;
             if (FAST) { qmv_fast_reg<T, GS, BITS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
-            else { qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
+            else { qmv_reg<T, GS, BITS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
             const float wk = w[z];
             if (lid == 0) {
                 for (int i = 0; i < 4; ++i) { prod[k][i] = static_cast<float>(static_cast<T>(res[i])) * wk; }
@@ -1386,7 +1343,7 @@ extension TrackFastMoEKernels {
             const device T* xs = act + (size_t)(BR + t) * (size_t)F;
             if constexpr (VPT == 1) {
                 float rs[4];
-                qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0>(wsd, ssd, bsd, xs, F, d0, lid, rs);
+                qmv_reg<T, GS, BITS>(wsd, ssd, bsd, xs, F, d0, lid, rs);
                 if (lid == 0) { for (int i = 0; i < 4; ++i) { shvT[i] = static_cast<float>(static_cast<T>(rs[i])); } }
             } else {
                 float rw[1];
