@@ -120,7 +120,6 @@ enum TrackFastGDNDecode {
         const float gate_decay = gb_shared[0];
         const float gate_beta = gb_shared[1];
         threadgroup InT y_shared[Dv];
-        threadgroup float norm_sums[32];
         for (int r = 0; r < RPS; ++r) {
             const uint dv_idx = sg * RPS + r;
             const device StT* i_state = state_in + (n * Dv + dv_idx) * Dk;
@@ -175,12 +174,12 @@ enum TrackFastGDNDecode {
                 thread_x[i] = static_cast<float>(y_shared[lane * 4 + i]);
                 acc += thread_x[i] * thread_x[i];
             }
+            // `simd_sum` already leaves the whole sum in every lane of this
+            // simdgroup, and the tail below runs on this same simdgroup, so the
+            // threadgroup round-trip and the barrier that guarded it are not
+            // needed: staging `acc` at index 0, zeroing the rest and folding
+            // `[acc, 0, ...]` returns `acc` unchanged.
             acc = simd_sum(acc);
-            norm_sums[lane] = lane == 0 ? acc : 0;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0) {
-            const float acc = simd_sum(norm_sums[lane]);
             const float inv_mean = metal::precise::rsqrt(acc / (float)Dv + as_type<float>((uint)EPS_BITS));
             for (int i = 0; i < 4; ++i) {
                 const uint d = lane * 4 + i;
