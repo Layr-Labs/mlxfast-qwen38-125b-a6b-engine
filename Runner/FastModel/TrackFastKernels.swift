@@ -187,10 +187,14 @@ enum TrackFastKernels {
                     const int s_idx = n_per_t * dk_idx + i;
                     state[i] = state[i] * g_[hv_idx];
                     auto product = state[i] * static_cast<float>(k_[s_idx]);
-                    auto corrected = product - kv_compensation;
-                    auto next_sum = kv_mem + corrected;
-                    kv_compensation = (next_sum - kv_mem) - corrected;
-                    kv_mem = next_sum;
+                    if constexpr (CAPTURE || T != 1) {
+                        auto corrected = product - kv_compensation;
+                        auto next_sum = kv_mem + corrected;
+                        kv_compensation = (next_sum - kv_mem) - corrected;
+                        kv_mem = next_sum;
+                    } else {
+                        kv_mem += product;
+                    }
                 }
             }
             kv_mem = simd_sum(kv_mem);
