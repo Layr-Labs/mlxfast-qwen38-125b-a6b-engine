@@ -492,7 +492,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // latency-bound launch; the fused mixer-head kernel carries the same
         // arithmetic. Wider windows route to `qmv_wide`, so they keep MLX's
         // own launch.
-        if normed.dim(1) == 1, hc.hasInject, case .quant(let iq)? = hc.inject, let ib = iq.biases {
+        // MLXFAST-MIXHEAD-WIDE: the fused mixer-head kernel is shape-generic (its
+        // `row` is thread_position_in_grid.y and the grid is (64, B*S, 1)), so the
+        // wide windows use it too. That removes the separate `siluHead` launch and
+        // the write+read of `act` on every wide mixer. The original S == 1 guard
+        // was justified by how MLX routes the 4-row inject GEMV, which is a
+        // property of that GEMV, not of the SiLU this kernel also computes.
+        if TrackFastKernels.mixerHeadWide, hc.hasInject, case .quant(let iq)? = hc.inject,
+            let ib = iq.biases
+        {
             let r = TrackFastKernels.mixerHead(
                 lo: lo, normed: normed, w: iq.weight, s: iq.scales, b: ib,
                 groupSize: iq.groupSize, bits: iq.bits, width: hc.lowrank)

@@ -18,6 +18,11 @@ import Foundation
 import MLX
 
 enum TrackFastKernels {
+    /// MLXFAST-MIXHEAD-WIDE: extend the fused mixer-head kernel to wide windows.
+    /// `TRACK_MIXER_HEAD_WIDE=0` restores the per-width branch.
+    nonisolated(unsafe) static let mixerHeadWide =
+        ProcessInfo.processInfo.environment["TRACK_MIXER_HEAD_WIDE"] != "0"
+
     /// A typed host scalar made once per (value, dtype): a fresh `MLXArray`
     /// per call is a host allocation and a cast launch.
     private static let scalarLock = NSLock()
