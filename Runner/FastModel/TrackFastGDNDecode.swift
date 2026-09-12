@@ -47,7 +47,7 @@ enum TrackFastGDNDecode {
     }
 
     private static let source = #"""
-        static_assert(Dk == 128 && Dv == 128, "GDN head geometry");
+        static_assert(Dk == 128 && Dv == 128 && RPS == 4, "GDN normalization geometry");
         const uint n = threadgroup_position_in_grid.z;
         const uint b_idx = n / Hv;
         const uint hv_idx = n % Hv;
@@ -121,6 +121,7 @@ enum TrackFastGDNDecode {
         const float gate_beta = gb_shared[1];
         threadgroup InT y_shared[Dv];
         threadgroup float norm_sums[32];
+        float norm_acc = 0.0f;
         for (int r = 0; r < RPS; ++r) {
             const uint dv_idx = sg * RPS + r;
             const device StT* i_state = state_in + (n * Dv + dv_idx) * Dk;
@@ -159,6 +160,8 @@ enum TrackFastGDNDecode {
             if (lane == 0) {
                 const InT value = static_cast<InT>(out);
                 y_shared[dv_idx] = value;
+                const float xf = static_cast<float>(value);
+                norm_acc += xf * xf;
             }
             device StT* o_state = state_out + (n * Dv + dv_idx) * Dk;
             if constexpr (vec4) {
@@ -167,24 +170,15 @@ enum TrackFastGDNDecode {
                 for (int i = 0; i < 4; ++i) { o_state[4 * lane + i] = static_cast<StT>(state[i]); }
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float thread_x[4];
-        if (sg == 0) {
-            float acc = 0.0f;
-            for (int i = 0; i < 4; ++i) {
-                thread_x[i] = static_cast<float>(y_shared[lane * 4 + i]);
-                acc += thread_x[i] * thread_x[i];
-            }
-            acc = simd_sum(acc);
-            norm_sums[lane] = lane == 0 ? acc : 0;
-        }
+        if (lane == 0) { norm_sums[sg] = norm_acc; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
-            const float acc = simd_sum(norm_sums[lane]);
+            const float first_sum = simd_sum(norm_sums[lane]);
+            const float acc = simd_sum(lane == 0 ? first_sum : 0.0f);
             const float inv_mean = metal::precise::rsqrt(acc / (float)Dv + as_type<float>((uint)EPS_BITS));
             for (int i = 0; i < 4; ++i) {
                 const uint d = lane * 4 + i;
-                InT normalized = w[d] * static_cast<InT>(thread_x[i] * inv_mean);
+                InT normalized = w[d] * static_cast<InT>(static_cast<float>(y_shared[d]) * inv_mean);
                 const float z = static_cast<float>(proj[b_idx * PW + Z_OFF + hv_idx * Dv + d]);
                 const float zg = mlx_sigmoid(z);
                 gated[n * Dv + d] = static_cast<InT>(zg * static_cast<float>(normalized));
