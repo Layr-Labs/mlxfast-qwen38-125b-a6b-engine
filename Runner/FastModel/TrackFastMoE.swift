@@ -779,12 +779,25 @@ extension TrackFastMoEKernels {
         threadgroup uint seli[K];
         if (sg == 0) {
         const device float* lr = logits + (size_t)row * (size_t)E;
-        // each lane owns E_PER experts: e = lane + 32 * j (strided so a tie at
-        // the same value resolves to the lowest index across lanes too)
+        // MLXFAST-BALLOTTIE: each lane owns a CONTIGUOUS run of experts,
+        // e = lane * E_PER + j, instead of the strided e = lane + 32 * j.
+        //
+        // The selection rule is unchanged -- largest logit, ties to the lowest
+        // expert index -- but contiguous ownership makes the tie-break cheap.
+        // Strided ownership needed a second full reduction (`simd_min` over the
+        // global index) because the lowest index could sit in any lane. With
+        // contiguous runs the lane ranges are ordered and disjoint, so among the
+        // lanes holding the max value the lowest index is always in the LOWEST
+        // such lane, and `ctz(simd_ballot(...))` names it in one instruction.
+        // Within a lane the strict `>` still takes the smallest j, hence the
+        // smallest e it owns. So the K-pass critical path keeps one log-depth
+        // reduction (simd_max) and drops the other for a ballot, a count and a
+        // shuffle. Selection is comparison, not summation: the chosen experts and
+        // their logits are bit-identical.
         float v[E_PER];
         bool taken[E_PER];
         for (int j = 0; j < E_PER; ++j) {
-            const int e = (int)lane + 32 * j;
+            const int e = (int)lane * E_PER + j;
             v[j] = (e < E) ? lr[e] : -INFINITY;
             taken[j] = (e >= E);
         }
@@ -795,10 +808,13 @@ extension TrackFastMoEKernels {
                 if (!taken[j] && (v[j] > bv)) { bv = v[j]; bj = j; }
             }
             const float gmax = simd_max(bv);
-            const uint cand = (bv == gmax && bj >= 0) ? (uint)(lane + 32 * bj) : 0xffffffffu;
-            const uint gidx = simd_min(cand);
+            const bool holds = (bv == gmax) && (bj >= 0);
+            const uint mask = (uint)((simd_vote::vote_t)simd_ballot(holds));
+            const uint win = (uint)ctz(mask);
+            const uint mye = (uint)(lane * E_PER + (bj >= 0 ? bj : 0));
+            const uint gidx = simd_shuffle(mye, win);
             if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
-            if (gidx == (uint)(lane + 32 * bj) && bj >= 0) { taken[bj] = true; }
+            if (holds && lane == win) { taken[bj] = true; }
         }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
