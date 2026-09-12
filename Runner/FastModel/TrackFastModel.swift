@@ -545,32 +545,21 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             state?.conv ?? MLXArray.zeros([B, geo.convKernel - 1, geo.convDim], dtype: x.dtype)
         let ssm =
             state?.ssm ?? MLXArray.zeros([B, geo.hv, geo.dv, geo.dk], dtype: .float32)
-        let gated: MLXArray, convOut: MLXArray, stateOut: MLXArray
-        if let fused = TrackFastGDNDecode.apply(
+        let r = TrackFastKernels.gdn(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
-            dtBias: g.dtBias, stateIn: ssm, normW: g.normW, zOffset: g.zOffset,
-            eps: 1e-6, capture: capture, geometry: geo)
-        {
-            (gated, convOut, stateOut) = (fused.gated, fused.convOut, fused.stateOut)
-            if prof { TrackFastProfile.tick("gdn.decodeFused", &pt, [gated, stateOut, convOut]) }
-        } else {
-            let r = TrackFastKernels.gdn(
-                proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
-                dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo,
-                separateBA: split.map { (b: $0[2], a: $0[3]) })
-            if prof { TrackFastProfile.tick("gdn.prep+lean", &pt, [r.y, r.stateOut, r.convOut]) }
-            gated = TrackFastKernels.gatedRMS(
-                y: r.y, proj: split?[1] ?? proj, w: g.normW,
-                zOffset: separate ? 0 : g.zOffset, eps: 1e-6)
-            (convOut, stateOut) = (r.convOut, r.stateOut)
-            if prof { TrackFastProfile.tick("gdn.gatedRMS", &pt, [gated]) }
-        }
+            dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo,
+            separateBA: split.map { (b: $0[2], a: $0[3]) })
+        if prof { TrackFastProfile.tick("gdn.prep+lean", &pt, [r.y, r.stateOut, r.convOut]) }
+        let gated = TrackFastKernels.gatedRMS(
+            y: r.y, proj: split?[1] ?? proj, w: g.normW,
+            zOffset: separate ? 0 : g.zOffset, eps: 1e-6)
+        if prof { TrackFastProfile.tick("gdn.gatedRMS", &pt, [gated]) }
         do {
             if capture {
                 try evaluation.stageCaptured(
-                    modelLayerIndex: layerIndex, conv: convOut, ssm: stateOut, positions: S)
+                    modelLayerIndex: layerIndex, conv: r.convOut, ssm: r.stateOut, positions: S)
             } else {
-                try evaluation.stage(modelLayerIndex: layerIndex, conv: convOut, ssm: stateOut)
+                try evaluation.stage(modelLayerIndex: layerIndex, conv: r.convOut, ssm: r.stateOut)
             }
         } catch {
             preconditionFailure("TrackFastModel: recurrent stage failed at layer \(layerIndex): \(error)")
@@ -690,8 +679,6 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // reference upcasts it to float32 and reads twice the bytes).
             let xf = (inputF32 ?? x.asType(.float32)).reshaped(x.dim(2))
             logits = TrackFastMoEKernels.routerGemv(x: xf, w: m.routerW16).reshaped(1, 1, -1)
-        } else if inputF32 == nil, let wide = TrackPrefillRouter.apply(x: x, w: m.routerW16) {
-            logits = wide
         } else {
             logits = matmul(inputF32 ?? x.asType(.float32), m.routerW32.transposed())
         }
