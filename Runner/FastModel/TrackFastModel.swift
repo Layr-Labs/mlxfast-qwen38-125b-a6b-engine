@@ -228,6 +228,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     private let injectNormReplay: @Sendable ([MLXArray]) -> [MLXArray]
     let rotaryDims: Int
     let rotary: Qwen4ExpRotary
+    private let rotaryTableCache = TrackRotaryTableCache()
     let indexerBudget: Int
     let attentionScale: Float
 
@@ -572,6 +573,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
+        if let cached = rotaryTableCache.get(
+            rotary: rotary, offset: offset, count: count, dtype: dtype, capacity: indexerBudget)
+        {
+            return cached
+        }
         let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
         return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
     }
