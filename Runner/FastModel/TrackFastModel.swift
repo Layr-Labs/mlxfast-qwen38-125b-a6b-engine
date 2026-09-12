@@ -213,6 +213,130 @@ struct TrackLayer {
     let ple: TrackPLE?
 }
 
+private struct TrackQuantGeometry {
+    let groupSize: Int
+    let bits: Int
+    let mode: QuantizationMode
+    let weightShape: [Int]
+    let scaleShape: [Int]
+    let biasShape: [Int]?
+    let weightType: DType
+    let scaleType: DType
+    let biasType: DType?
+
+    init(_ quant: TrackQuantWeight) {
+        groupSize = quant.groupSize
+        bits = quant.bits
+        mode = quant.mode
+        weightShape = quant.weight.shape
+        scaleShape = quant.scales.shape
+        biasShape = quant.biases?.shape
+        weightType = quant.weight.dtype
+        scaleType = quant.scales.dtype
+        biasType = quant.biases?.dtype
+    }
+
+    func matches(_ quant: TrackQuantWeight) -> Bool {
+        groupSize == quant.groupSize && bits == quant.bits && mode == quant.mode
+            && weightShape == quant.weight.shape && scaleShape == quant.scales.shape
+            && biasShape == quant.biases?.shape
+            && weightType == quant.weight.dtype && scaleType == quant.scales.dtype
+            && biasType == quant.biases?.dtype
+    }
+}
+
+private struct TrackArrayGeometry {
+    let shape: [Int]
+    let type: DType
+
+    init(_ array: MLXArray) {
+        shape = array.shape
+        type = array.dtype
+    }
+
+    func matches(_ array: MLXArray) -> Bool {
+        shape == array.shape && type == array.dtype
+    }
+}
+
+private struct TrackWholeGDNReplay {
+    let call: @Sendable ([MLXArray]) -> [MLXArray]
+    let attnDown: TrackQuantGeometry
+    let attnInject: TrackQuantGeometry
+    let attnUp: TrackQuantGeometry
+    let gdnProj: TrackQuantGeometry
+    let gdnOut: TrackQuantGeometry
+    let mlpDown: TrackQuantGeometry
+    let mlpInject: TrackQuantGeometry
+    let mlpUp: TrackQuantGeometry
+    let sharedGate: TrackQuantGeometry
+    let sharedGateUp: TrackQuantGeometry
+    let sharedDown: TrackQuantGeometry
+    let attnNorm: TrackArrayGeometry
+    let convW: TrackArrayGeometry
+    let negExpALog: TrackArrayGeometry
+    let dtBias: TrackArrayGeometry
+    let gdnNorm: TrackArrayGeometry
+    let mlpNorm: TrackArrayGeometry
+    let routerW16: TrackArrayGeometry
+    let expertGate: [TrackArrayGeometry]
+    let expertUp: [TrackArrayGeometry]
+    let expertDown: [TrackArrayGeometry]
+    let gdnGeometry: TrackFastKernels.GDNGeometry
+    let gdnZOffset: Int
+    let topK: Int
+    let expertGroupSize: Int
+    let expertBits: Int
+
+    func supports(
+        attnDown: TrackQuantWeight, attnInject: TrackQuantWeight, attnUp: TrackQuantWeight,
+        gdnProj: TrackQuantWeight, gdnOut: TrackQuantWeight,
+        mlpDown: TrackQuantWeight, mlpInject: TrackQuantWeight, mlpUp: TrackQuantWeight,
+        layer: TrackLayer, gdn: TrackGDN, sharedGate: TrackQuantWeight,
+        sharedGateUp: TrackQuantWeight, sharedDown: TrackQuantWeight
+    ) -> Bool {
+        self.attnDown.matches(attnDown)
+            && self.attnInject.matches(attnInject)
+            && self.attnUp.matches(attnUp)
+            && self.gdnProj.matches(gdnProj)
+            && self.gdnOut.matches(gdnOut)
+            && self.mlpDown.matches(mlpDown)
+            && self.mlpInject.matches(mlpInject)
+            && self.mlpUp.matches(mlpUp)
+            && self.sharedGate.matches(sharedGate)
+            && self.sharedGateUp.matches(sharedGateUp)
+            && self.sharedDown.matches(sharedDown)
+            && attnNorm.matches(layer.attnHC.normScaleQ)
+            && convW.matches(gdn.convW)
+            && negExpALog.matches(gdn.negExpALog)
+            && dtBias.matches(gdn.dtBias)
+            && gdnNorm.matches(gdn.normW)
+            && mlpNorm.matches(layer.mlpHC.normScaleQ)
+            && routerW16.matches(layer.moe.routerW16)
+            && zip(expertGate, [layer.moe.expertGate.w, layer.moe.expertGate.s, layer.moe.expertGate.b])
+                .allSatisfy { $0.0.matches($0.1) }
+            && zip(expertUp, [layer.moe.expertUp.w, layer.moe.expertUp.s, layer.moe.expertUp.b])
+                .allSatisfy { $0.0.matches($0.1) }
+            && zip(expertDown, [layer.moe.expertDown.w, layer.moe.expertDown.s, layer.moe.expertDown.b])
+                .allSatisfy { $0.0.matches($0.1) }
+            && gdnGeometry.projWidth == gdn.geometry.projWidth
+            && gdnGeometry.convDim == gdn.geometry.convDim
+            && gdnGeometry.convKernel == gdn.geometry.convKernel
+            && gdnGeometry.hk == gdn.geometry.hk && gdnGeometry.hv == gdn.geometry.hv
+            && gdnGeometry.dk == gdn.geometry.dk && gdnGeometry.dv == gdn.geometry.dv
+            && gdnGeometry.bOffset == gdn.geometry.bOffset
+            && gdnGeometry.aOffset == gdn.geometry.aOffset
+            && gdnZOffset == gdn.zOffset
+            && topK == layer.moe.topK
+            && expertGroupSize == layer.moe.expertGroupSize
+            && expertBits == layer.moe.expertBits
+    }
+}
+
+private struct TrackWholeGDNParameters {
+    let arrays: [MLXArray]
+}
+
 // MARK: - The model
 
 public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
@@ -226,6 +350,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let hidden: Int
     let eps: Float
     private let injectNormReplay: @Sendable ([MLXArray]) -> [MLXArray]
+    private let wholeGDNReplay: TrackWholeGDNReplay?
+    private let wholeGDNParameters: [TrackWholeGDNParameters?]
     let rotaryDims: Int
     let rotary: Qwen4ExpRotary
     let indexerBudget: Int
@@ -282,6 +408,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             built.append(Self.bind(layer: layer, index: index, cfg: cfg))
         }
         self.layers = built
+        let replay = built.lazy.compactMap { Self.makeWholeGDNReplay($0, cfg: cfg) }.first
+        self.wholeGDNReplay = replay
+        self.wholeGDNParameters = built.map { layer in
+            guard let replay else { return nil }
+            return Self.bindWholeGDNParameters(layer, replay: replay, hidden: cfg.hiddenSize)
+        }
         self.finalMixer = Self.bindHC(tower.trackChild("hyper_connection_mixer"), cfg: cfg)
         super.init()
     }
@@ -631,6 +763,166 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
     }
 
+    private static func quantWithBias(_ projection: TrackProj) -> TrackQuantWeight? {
+        guard case .quant(let quant) = projection, quant.biases != nil else { return nil }
+        return quant
+    }
+
+    private static func makeWholeGDNReplay(_ layer: TrackLayer, cfg: Qwen4ExpTextConfiguration)
+        -> TrackWholeGDNReplay?
+    {
+        guard let gdn = layer.gdn, layer.moePairReplay != nil,
+            let attnDown = quantWithBias(layer.attnHC.down),
+            let attnInject = layer.attnHC.inject.flatMap(quantWithBias),
+            let attnUp = quantWithBias(layer.attnHC.up),
+            layer.attnHC.hasInject,
+            case .quant(let gdnProj)? = gdn.proj.fused, gdnProj.biases != nil,
+            let gdnOut = quantWithBias(gdn.out),
+            let mlpDown = quantWithBias(layer.mlpHC.down),
+            let mlpInject = layer.mlpHC.inject.flatMap(quantWithBias),
+            let mlpUp = quantWithBias(layer.mlpHC.up),
+            layer.mlpHC.hasInject,
+            case .quant(let sharedGateUp)? = layer.moe.sharedGateUp.fused,
+            sharedGateUp.biases != nil,
+            let sharedDown = quantWithBias(layer.moe.sharedDown)
+        else { return nil }
+
+        guard let sharedGate = quantWithBias(layer.moe.sharedGate) else { return nil }
+
+        let replay = compile(shapeless: false) {
+            [hcCount = cfg.hcCount, hidden = cfg.hiddenSize, eps = cfg.rmsNormEps,
+             attnDownGroup = attnDown.groupSize, attnDownBits = attnDown.bits, attnDownMode = attnDown.mode,
+             attnInjectGroup = attnInject.groupSize, attnInjectBits = attnInject.bits, attnInjectMode = attnInject.mode,
+             attnUpGroup = attnUp.groupSize, attnUpBits = attnUp.bits, attnUpMode = attnUp.mode,
+             gdnProjGroup = gdnProj.groupSize, gdnProjBits = gdnProj.bits, gdnProjMode = gdnProj.mode,
+             gdnOutGroup = gdnOut.groupSize, gdnOutBits = gdnOut.bits, gdnOutMode = gdnOut.mode,
+             gdnGeometry = gdn.geometry, gdnZOffset = gdn.zOffset,
+             mlpDownGroup = mlpDown.groupSize, mlpDownBits = mlpDown.bits, mlpDownMode = mlpDown.mode,
+             mlpInjectGroup = mlpInject.groupSize, mlpInjectBits = mlpInject.bits, mlpInjectMode = mlpInject.mode,
+             mlpUpGroup = mlpUp.groupSize, mlpUpBits = mlpUp.bits, mlpUpMode = mlpUp.mode,
+             routerExperts = layer.moe.routerW16.dim(0), topK = layer.moe.topK,
+             expertGroup = layer.moe.expertGroupSize, expertBits = layer.moe.expertBits,
+             gateGroup = sharedGate.groupSize, gateBits = sharedGate.bits, gateMode = sharedGate.mode,
+             sharedGUGroup = sharedGateUp.groupSize, sharedGUBits = sharedGateUp.bits,
+             sharedGUMode = sharedGateUp.mode,
+             sharedDownGroup = sharedDown.groupSize, sharedDownBits = sharedDown.bits,
+             sharedDownMode = sharedDown.mode] inputs in
+            let firstNorm = TrackFastKernels.injectNorm(
+                residual: inputs[0], out: inputs[1], inject: inputs[2], scale: inputs[3],
+                hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
+            let attnDownQ = TrackQuantWeight(
+                weight: inputs[4], scales: inputs[5], biases: inputs[6],
+                groupSize: attnDownGroup, bits: attnDownBits, mode: attnDownMode)
+            let attnInjectQ = TrackQuantWeight(
+                weight: inputs[7], scales: inputs[8], biases: inputs[9],
+                groupSize: attnInjectGroup, bits: attnInjectBits, mode: attnInjectMode)
+            let attnUpQ = TrackQuantWeight(
+                weight: inputs[10], scales: inputs[11], biases: inputs[12],
+                groupSize: attnUpGroup, bits: attnUpBits, mode: attnUpMode)
+            let attnNorm2 = firstNorm.normed.reshaped(1, hcCount * hidden)
+            let attnLow = TrackFastMixerKernels.downInject(
+                normed: attnNorm2, down: attnDownQ, inject: attnInjectQ)
+            let attnMix = TrackFastMixerKernels.upMix(
+                act: attnLow.act, normed: attnNorm2, up: attnUpQ, inj: attnLow.inj,
+                hcCount: hcCount, hidden: hidden, hasInject: true)
+            let attnInput = attnMix.input.reshaped(1, 1, hidden)
+
+            let gdnProjQ = TrackQuantWeight(
+                weight: inputs[13], scales: inputs[14], biases: inputs[15],
+                groupSize: gdnProjGroup, bits: gdnProjBits, mode: gdnProjMode)
+            let projected = gdnProjQ.apply(attnInput)
+            let recurrence = TrackFastKernels.gdn(
+                proj: projected, convState: inputs[53], convW: inputs[16],
+                negExpALog: inputs[17], dtBias: inputs[18], stateIn: inputs[54],
+                T: 1, capture: false, geometry: gdnGeometry)
+            let gated = TrackFastKernels.gatedRMS(
+                y: recurrence.y, proj: projected, w: inputs[19], zOffset: gdnZOffset, eps: 1e-6)
+            let gdnOutQ = TrackQuantWeight(
+                weight: inputs[20], scales: inputs[21], biases: inputs[22],
+                groupSize: gdnOutGroup, bits: gdnOutBits, mode: gdnOutMode)
+            let attended = gdnOutQ.apply(gated)
+
+            let secondNorm = TrackFastKernels.injectNorm(
+                residual: firstNorm.stream, out: attended, inject: attnMix.inject.reshaped(1, 1, hcCount),
+                scale: inputs[23], hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
+            let mlpDownQ = TrackQuantWeight(
+                weight: inputs[24], scales: inputs[25], biases: inputs[26],
+                groupSize: mlpDownGroup, bits: mlpDownBits, mode: mlpDownMode)
+            let mlpInjectQ = TrackQuantWeight(
+                weight: inputs[27], scales: inputs[28], biases: inputs[29],
+                groupSize: mlpInjectGroup, bits: mlpInjectBits, mode: mlpInjectMode)
+            let mlpUpQ = TrackQuantWeight(
+                weight: inputs[30], scales: inputs[31], biases: inputs[32],
+                groupSize: mlpUpGroup, bits: mlpUpBits, mode: mlpUpMode)
+            let mlpNorm2 = secondNorm.normed.reshaped(1, hcCount * hidden)
+            let mlpLow = TrackFastMixerKernels.downInject(
+                normed: mlpNorm2, down: mlpDownQ, inject: mlpInjectQ)
+            let mlpMix = TrackFastMixerKernels.upMix(
+                act: mlpLow.act, normed: mlpNorm2, up: mlpUpQ, inj: mlpLow.inj,
+                hcCount: hcCount, hidden: hidden, hasInject: true, emitF32: true)
+            let mlpInput = mlpMix.input.reshaped(1, hidden)
+            let logits = TrackFastMoEKernels.routerGemv(
+                x: mlpMix.inputF32.reshaped(hidden), w: inputs[33]).reshaped(1, routerExperts)
+
+            let gateQ = TrackQuantWeight(
+                weight: inputs[34], scales: inputs[35], biases: inputs[36],
+                groupSize: gateGroup, bits: gateBits, mode: gateMode)
+            let route = TrackFastMoEKernels.route(
+                logits: logits, x: mlpInput, sharedGate: gateQ, topK: topK)
+            let flatIndex = route.idx.reshaped(topK)
+            let sharedGU = TrackQuantWeight(
+                weight: inputs[44], scales: inputs[45], biases: inputs[46],
+                groupSize: sharedGUGroup, bits: sharedGUBits, mode: sharedGUMode)
+            let activation = TrackFastMoEKernels.gateUpAct(
+                wg: inputs[38], sg: inputs[39], bg: inputs[40],
+                wu: inputs[41], su: inputs[42], bu: inputs[43], shared: sharedGU,
+                x: mlpInput, idx: flatIndex, xrow: inputs[37],
+                groupSize: expertGroup, bits: expertBits)
+            let sharedDownQ = TrackQuantWeight(
+                weight: inputs[50], scales: inputs[51], biases: inputs[52],
+                groupSize: sharedDownGroup, bits: sharedDownBits, mode: sharedDownMode)
+            let moeOutput = TrackFastMoEKernels.downCombine(
+                wd: inputs[47], sd: inputs[48], bd: inputs[49], sharedDown: sharedDownQ,
+                act: activation, idx: flatIndex, w: route.w.reshaped(topK), gate: route.gate,
+                topK: topK, groupSize: expertGroup, bits: expertBits)
+            return [
+                secondNorm.stream, moeOutput.reshaped(1, 1, hidden),
+                mlpMix.inject.reshaped(1, 1, hcCount), recurrence.convOut, recurrence.stateOut,
+            ]
+        }
+        return TrackWholeGDNReplay(
+            call: replay, attnDown: TrackQuantGeometry(attnDown),
+            attnInject: TrackQuantGeometry(attnInject), attnUp: TrackQuantGeometry(attnUp),
+            gdnProj: TrackQuantGeometry(gdnProj), gdnOut: TrackQuantGeometry(gdnOut),
+            mlpDown: TrackQuantGeometry(mlpDown), mlpInject: TrackQuantGeometry(mlpInject),
+            mlpUp: TrackQuantGeometry(mlpUp), sharedGate: TrackQuantGeometry(sharedGate),
+            sharedGateUp: TrackQuantGeometry(sharedGateUp),
+            sharedDown: TrackQuantGeometry(sharedDown),
+            attnNorm: TrackArrayGeometry(layer.attnHC.normScaleQ),
+            convW: TrackArrayGeometry(gdn.convW), negExpALog: TrackArrayGeometry(gdn.negExpALog),
+            dtBias: TrackArrayGeometry(gdn.dtBias), gdnNorm: TrackArrayGeometry(gdn.normW),
+            mlpNorm: TrackArrayGeometry(layer.mlpHC.normScaleQ),
+            routerW16: TrackArrayGeometry(layer.moe.routerW16),
+            expertGate: [
+                TrackArrayGeometry(layer.moe.expertGate.w),
+                TrackArrayGeometry(layer.moe.expertGate.s),
+                TrackArrayGeometry(layer.moe.expertGate.b),
+            ],
+            expertUp: [
+                TrackArrayGeometry(layer.moe.expertUp.w),
+                TrackArrayGeometry(layer.moe.expertUp.s),
+                TrackArrayGeometry(layer.moe.expertUp.b),
+            ],
+            expertDown: [
+                TrackArrayGeometry(layer.moe.expertDown.w),
+                TrackArrayGeometry(layer.moe.expertDown.s),
+                TrackArrayGeometry(layer.moe.expertDown.b),
+            ],
+            gdnGeometry: gdn.geometry, gdnZOffset: gdn.zOffset,
+            topK: layer.moe.topK, expertGroupSize: layer.moe.expertGroupSize,
+            expertBits: layer.moe.expertBits)
+    }
+
     /// Row index of each (token, expert) slot, one constant array per window size
     /// (uploading it per step was one host copy per layer).
     nonisolated(unsafe) private static var xrowTables: [Int: MLXArray] = [:]
@@ -847,6 +1139,84 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return output
     }
 
+    private static func bindWholeGDNParameters(
+        _ layer: TrackLayer, replay: TrackWholeGDNReplay, hidden: Int
+    ) -> TrackWholeGDNParameters? {
+        guard layer.index > 0, let gdn = layer.gdn, layer.ple == nil,
+            layer.moePairReplay != nil,
+            let attnDown = Self.quantWithBias(layer.attnHC.down),
+            let attnInject = layer.attnHC.inject.flatMap(Self.quantWithBias),
+            let attnUp = Self.quantWithBias(layer.attnHC.up), layer.attnHC.hasInject,
+            case .quant(let gdnProj)? = gdn.proj.fused, gdnProj.biases != nil,
+            let gdnOut = Self.quantWithBias(gdn.out),
+            let mlpDown = Self.quantWithBias(layer.mlpHC.down),
+            let mlpInject = layer.mlpHC.inject.flatMap(Self.quantWithBias),
+            let mlpUp = Self.quantWithBias(layer.mlpHC.up), layer.mlpHC.hasInject,
+            let sharedGate = Self.quantWithBias(layer.moe.sharedGate),
+            case .quant(let sharedGateUp)? = layer.moe.sharedGateUp.fused,
+            sharedGateUp.biases != nil,
+            let sharedDown = Self.quantWithBias(layer.moe.sharedDown),
+            layer.moe.routerW16.dtype == .bfloat16,
+            hidden % 128 == 0, layer.moe.routerW16.dim(0) % 16 == 0,
+            hidden < 16 * layer.moe.routerW16.dim(0), layer.moe.routerW16.dim(0) < 4096,
+            replay.supports(
+                attnDown: attnDown, attnInject: attnInject, attnUp: attnUp,
+                gdnProj: gdnProj, gdnOut: gdnOut,
+                mlpDown: mlpDown, mlpInject: mlpInject, mlpUp: mlpUp,
+                layer: layer, gdn: gdn, sharedGate: sharedGate,
+                sharedGateUp: sharedGateUp, sharedDown: sharedDown)
+        else { return nil }
+
+        let xrow = Self.xrowTable(S: 1, K: layer.moe.topK)
+        return TrackWholeGDNParameters(arrays: [
+            layer.attnHC.normScaleQ,
+            attnDown.weight, attnDown.scales, attnDown.biases!,
+            attnInject.weight, attnInject.scales, attnInject.biases!,
+            attnUp.weight, attnUp.scales, attnUp.biases!,
+            gdnProj.weight, gdnProj.scales, gdnProj.biases!,
+            gdn.convW, gdn.negExpALog, gdn.dtBias, gdn.normW,
+            gdnOut.weight, gdnOut.scales, gdnOut.biases!,
+            layer.mlpHC.normScaleQ,
+            mlpDown.weight, mlpDown.scales, mlpDown.biases!,
+            mlpInject.weight, mlpInject.scales, mlpInject.biases!,
+            mlpUp.weight, mlpUp.scales, mlpUp.biases!,
+            layer.moe.routerW16,
+            sharedGate.weight, sharedGate.scales, sharedGate.biases!,
+            xrow,
+            layer.moe.expertGate.w, layer.moe.expertGate.s, layer.moe.expertGate.b,
+            layer.moe.expertUp.w, layer.moe.expertUp.s, layer.moe.expertUp.b,
+            sharedGateUp.weight, sharedGateUp.scales, sharedGateUp.biases!,
+            layer.moe.expertDown.w, layer.moe.expertDown.s, layer.moe.expertDown.b,
+            sharedDown.weight, sharedDown.scales, sharedDown.biases!,
+        ])
+    }
+
+    private func wholeGDNLayer(
+        _ layer: TrackLayer, residual: MLXArray, pendingOut: MLXArray?,
+        pendingInject: MLXArray?, evaluation: CBv2RecurrentStateEvaluation,
+        tile: Bool, capture: Bool, profiling: Bool
+    ) -> (stream: MLXArray, pendingOut: MLXArray, pendingInject: MLXArray, conv: MLXArray, ssm: MLXArray)? {
+        guard !tile, !capture, !profiling, Self.debugTaps == nil,
+            StreamOrDevice.default.stream === Stream.gpu,
+            TrackFastKernels.wideNormMinS > 1,
+            residual.dim(0) == 1, residual.dim(1) == 1, residual.dtype == .bfloat16,
+            let previousOut = pendingOut, let previousInject = pendingInject,
+            let replay = wholeGDNReplay, let parameters = wholeGDNParameters[layer.index],
+            let gdn = layer.gdn
+        else { return nil }
+
+        let state = evaluation.inputState(modelLayerIndex: layer.index)
+        let conv = state?.conv
+            ?? MLXArray.zeros(
+                [1, gdn.geometry.convKernel - 1, gdn.geometry.convDim], dtype: residual.dtype)
+        let ssm = state?.ssm
+            ?? MLXArray.zeros(
+                [1, gdn.geometry.hv, gdn.geometry.dv, gdn.geometry.dk], dtype: .float32)
+        let result = replay.call(
+            [residual, previousOut, previousInject] + parameters.arrays + [conv, ssm])
+        return (result[0], result[1], result[2], result[3], result[4])
+    }
+
     private func injectNorm(
         residual: MLXArray, out: MLXArray?, inject: MLXArray?, scale: MLXArray, tile: Bool
     ) -> (stream: MLXArray, normed: MLXArray) {
@@ -884,6 +1254,31 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         var profT = profiling ? CFAbsoluteTimeGetCurrent() : 0
         if profiling { TrackFastProfile.windows += 1 }
         for layer in layers {
+            if let replayed = wholeGDNLayer(
+                layer, residual: residual, pendingOut: pendingOut, pendingInject: pendingInject,
+                evaluation: evaluation, tile: tile, capture: capture, profiling: profiling)
+            {
+                do {
+                    try evaluation.stage(
+                        modelLayerIndex: layer.index, conv: replayed.conv, ssm: replayed.ssm)
+                } catch {
+                    preconditionFailure(
+                        "TrackFastModel: recurrent stage failed at layer \(layer.index): \(error)")
+                }
+                stream = replayed.stream
+                pendingOut = replayed.pendingOut
+                pendingInject = replayed.pendingInject
+                residual = stream
+                if Self.asyncChunk > 0 {
+                    let n = layer.index + 1
+                    let first = Self.asyncFirst > 0 ? Self.asyncFirst : Self.asyncChunk
+                    let second = Self.asyncSecond > first ? Self.asyncSecond : first
+                    if n == first || n == second || (n > second && (n - second) % Self.asyncChunk == 0) {
+                        asyncEval(stream)
+                    }
+                }
+                continue
+            }
             var normed: MLXArray
             if let ple = layer.ple {
                 // Materialize the stream, add the PLE block, then norm.
