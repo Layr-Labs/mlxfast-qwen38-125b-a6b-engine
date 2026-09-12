@@ -176,6 +176,76 @@ template <typename T, int D, int V = D>
   }
 }
 
+METAL_FUNC void sdpa_qwen_paired_heads(
+    const device bfloat16_t* queries,
+    const device bfloat16_t* keys,
+    const device bfloat16_t* values,
+    device bfloat16_t* out,
+    device float* sums,
+    device float* maxs,
+    int N,
+    size_t k_head_stride,
+    size_t k_seq_stride,
+    size_t v_head_stride,
+    size_t v_seq_stride,
+    float scale,
+    uint3 tid,
+    uint3 tpg,
+    uint head_pair,
+    uint lane) {
+  if (head_pair >= 6) {
+    return;
+  }
+  const int kv_head = tid.y * tpg.x + tid.x;
+  const int first_head = kv_head * 12 + head_pair * 2;
+  const int block = tid.z;
+  keys += kv_head * k_head_stride + block * k_seq_stride + lane * 8;
+  values += kv_head * v_head_stride + block * v_seq_stride + lane * 8;
+  float q[2][8];
+  float o[2][8] = {};
+  float max_score[2] = {Limits<float>::finite_min, Limits<float>::finite_min};
+  float sum_exp_score[2] = {};
+  for (int h = 0; h < 2; ++h) {
+    for (int i = 0; i < 8; ++i) {
+      q[h][i] = scale * queries[(first_head + h) * 256 + lane * 8 + i];
+    }
+  }
+  for (int token = block; token < N; token += blocks) {
+    float k[8], v[8];
+    for (int i = 0; i < 8; ++i) {
+      k[i] = keys[i];
+      v[i] = values[i];
+    }
+    for (int h = 0; h < 2; ++h) {
+      float score = 0;
+      for (int i = 0; i < 8; ++i) {
+        score += q[h][i] * k[i];
+      }
+      score = simd_sum(score);
+      float new_max = max(max_score[h], score);
+      float factor = fast::exp(max_score[h] - new_max);
+      float exp_score = fast::exp(score - new_max);
+      max_score[h] = new_max;
+      sum_exp_score[h] = sum_exp_score[h] * factor + exp_score;
+      for (int i = 0; i < 8; ++i) {
+        o[h][i] = o[h][i] * factor + exp_score * v[i];
+      }
+    }
+    keys += blocks * int(k_seq_stride);
+    values += blocks * int(v_seq_stride);
+  }
+  for (int h = 0; h < 2; ++h) {
+    const int slot = (first_head + h) * blocks + block;
+    if (lane == 0) {
+      sums[slot] = sum_exp_score[h];
+      maxs[slot] = max_score[h];
+    }
+    for (int i = 0; i < 8; ++i) {
+      out[slot * 256 + lane * 8 + i] = bfloat16_t(o[h][i]);
+    }
+  }
+}
+
 template <typename T, int D, int V = D>
 [[kernel]] void sdpa_vector_2pass_1(
     const device T* queries [[buffer(0)]],
@@ -204,6 +274,16 @@ template <typename T, int D, int V = D>
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (D == 256 && V == 256 && is_same<T, bfloat16_t>::value) {
+    if (!has_mask && !has_sinks && !do_causal && !query_transposed &&
+        tptg.y == 12 && tptg.z == 1 && N >= 1024) {
+      sdpa_qwen_paired_heads(
+          queries, keys, values, out, sums, maxs, N,
+          k_head_stride, k_seq_stride, v_head_stride, v_seq_stride,
+          scale, tid, tpg, tidtg.y, simd_lid);
+      return;
+    }
+  }
   constexpr int BD = 32;
   constexpr int qk_per_thread = D / BD;
   constexpr int v_per_thread = V / BD;
