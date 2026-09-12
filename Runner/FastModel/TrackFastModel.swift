@@ -620,7 +620,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: inputs[5], sg: inputs[6], bg: inputs[7],
                 wu: inputs[8], su: inputs[9], bu: inputs[10], shared: sharedGU,
-                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits)
+                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits,
+                preparedSums: inputs.count == 21 ? inputs[20] : nil)
             let sharedDown = TrackQuantWeight(
                 weight: inputs[17], scales: inputs[18], biases: inputs[19],
                 groupSize: downGroupSize, bits: downBits, mode: downMode)
@@ -677,27 +678,34 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // gate|up + SwiGLU for the routed and the shared expert, down + combine.
             let S = x.dim(1), K = m.topK, H = x.dim(2)
             let x2 = x.reshaped(S, H)
+            let prepareSums = S == 1 && H == 2560 && x.dtype == .bfloat16
+                && m.expertGate.w.dim(1) == 640 && m.expertGroupSize == 32 && m.expertBits == 4
+                && guq.rows == 1280 && guq.groupSize == 32 && guq.bits == 4 && guq.mode == .affine
             let r = TrackFastMoEKernels.route(
-                logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, topK: K)
+                logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, topK: K,
+                prepareSums: prepareSums)
             let (idx, weights) = (r.idx, r.w)
             let gate = gateQ != nil ? r.gate : m.sharedGate.apply(x).reshaped(S)
             if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights, gate]) }
             let flatIdx = idx.reshaped(S * K)
             let xrow = Self.xrowTable(S: S, K: K)
             if let replay, StreamOrDevice.default.stream === Stream.gpu {
-                return replay([
+                var inputs: [MLXArray] = [
                     x2, flatIdx, weights.reshaped(S * K), gate, xrow,
                     m.expertGate.w, m.expertGate.s, m.expertGate.b,
                     m.expertUp.w, m.expertUp.s, m.expertUp.b,
                     guq.weight, guq.scales, guq.biases!,
                     m.expertDown.w, m.expertDown.s, m.expertDown.b,
                     dq.weight, dq.scales, dq.biases!,
-                ])[0].reshaped(1, S, H)
+                ]
+                if let sums = r.preparedSums { inputs.append(sums) }
+                return replay(inputs)[0].reshaped(1, S, H)
             }
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
                 wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b, shared: guq,
-                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits)
+                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits,
+                preparedSums: r.preparedSums)
             return TrackFastMoEKernels.downCombine(
                 wd: m.expertDown.w, sd: m.expertDown.s, bd: m.expertDown.b, sharedDown: dq,
                 act: act, idx: flatIdx, w: weights.reshaped(S * K), gate: gate, topK: K,
