@@ -226,6 +226,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let hidden: Int
     let eps: Float
     private let injectNormReplay: @Sendable ([MLXArray]) -> [MLXArray]
+    /// The mixer's two launches as one compiled graph, one variant per template
+    /// combination the tower uses: the attention block (inject, no f32 stream),
+    /// the MLP block (inject and the f32 stream) and the final mixer (no
+    /// inject). nil when the tower has no quantized mixer to build them from.
+    private let mixerReplayInject: (@Sendable ([MLXArray]) -> [MLXArray])?
+    private let mixerReplayInjectF32: (@Sendable ([MLXArray]) -> [MLXArray])?
+    private let mixerReplayPlain: (@Sendable ([MLXArray]) -> [MLXArray])?
     let rotaryDims: Int
     let rotary: Qwen4ExpRotary
     let indexerBudget: Int
@@ -283,6 +290,49 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         self.layers = built
         self.finalMixer = Self.bindHC(tower.trackChild("hyper_connection_mixer"), cfg: cfg)
+        // The mixer runs the same two kernels on every block, so one compiled
+        // graph per template combination serves the whole tower with the
+        // weights as inputs.
+        var replayInject: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+        var replayInjectF32: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+        var replayPlain: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+        if let sample = built.first, case .quant(let dq) = sample.attnHC.down,
+            case .quant(let uq) = sample.attnHC.up
+        {
+            func makeReplay(hasInject: Bool, emitF32: Bool)
+                -> @Sendable ([MLXArray]) -> [MLXArray]
+            {
+                compile(shapeless: false) {
+                    [hcCount = cfg.hcCount, hidden = cfg.hiddenSize,
+                     dgs = dq.groupSize, dbits = dq.bits, dmode = dq.mode,
+                     ugs = uq.groupSize, ubits = uq.bits, umode = uq.mode] inputs in
+                    let down = TrackQuantWeight(
+                        weight: inputs[1], scales: inputs[2], biases: inputs[3],
+                        groupSize: dgs, bits: dbits, mode: dmode)
+                    let inject = hasInject
+                        ? TrackQuantWeight(
+                            weight: inputs[4], scales: inputs[5], biases: inputs[6],
+                            groupSize: dgs, bits: dbits, mode: dmode)
+                        : nil
+                    let up = TrackQuantWeight(
+                        weight: inputs[7], scales: inputs[8], biases: inputs[9],
+                        groupSize: ugs, bits: ubits, mode: umode)
+                    let d = TrackFastMixerKernels.downInject(
+                        normed: inputs[0], down: down, inject: inject)
+                    let u = TrackFastMixerKernels.upMix(
+                        act: d.act, normed: inputs[0], up: up, inj: d.inj,
+                        hcCount: hcCount, hidden: hidden,
+                        hasInject: hasInject, emitF32: emitF32)
+                    return [u.input, u.inject, u.inputF32]
+                }
+            }
+            replayInject = makeReplay(hasInject: true, emitF32: false)
+            replayInjectF32 = makeReplay(hasInject: true, emitF32: true)
+            replayPlain = makeReplay(hasInject: false, emitF32: false)
+        }
+        self.mixerReplayInject = replayInject
+        self.mixerReplayInjectF32 = replayInjectF32
+        self.mixerReplayPlain = replayPlain
         super.init()
     }
 
@@ -473,6 +523,26 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             if hc.hasInject, case .quant(let q)? = hc.inject, q.biases != nil { injQ = q }
             if !hc.hasInject || injQ != nil {
                 let n2 = normed.reshaped(S, hcCount * hidden)
+                // The compiled graph for this template combination, when the
+                // debug taps are off; the taps record intermediates a graph
+                // would have to trace.
+                let replay = Self.debugTaps == nil
+                    ? (hc.hasInject
+                        ? (emitF32 ? mixerReplayInjectF32 : mixerReplayInject)
+                        : mixerReplayPlain)
+                    : nil
+                if let replay {
+                    // Slots 4...6 are the inject weight; the no-inject variant
+                    // ignores them and `downInject` falls back to `down`.
+                    let inj = injQ ?? dq
+                    let out = replay([
+                        n2, dq.weight, dq.scales, dq.biases!,
+                        inj.weight, inj.scales, inj.biases!,
+                        uq.weight, uq.scales, uq.biases!,
+                    ])
+                    let f32 = emitF32 ? out[2].reshaped(1, S, hidden) : nil
+                    return (out[0].reshaped(1, S, hidden), out[1].reshaped(1, S, hcCount), f32)
+                }
                 let d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
                 let u = TrackFastMixerKernels.upMix(
                     act: d.act, normed: n2, up: uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
