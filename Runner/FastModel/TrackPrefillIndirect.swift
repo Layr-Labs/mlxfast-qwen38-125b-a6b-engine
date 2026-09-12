@@ -64,7 +64,7 @@ enum TrackPrefillIndirect {
 
     static let source = #"""
         threadgroup T Ws[64 * 72];
-        threadgroup T As[32 * 72];
+        alignas(16) threadgroup T As[32 * 72];
         track_prefill_indirect<T, 32, 4, 32, 64, 64, 2, 2, true>(
             x, w, scales, biases, indices, token_rows, y,
             M, N, K, Ws, As, threadgroup_position_in_grid,

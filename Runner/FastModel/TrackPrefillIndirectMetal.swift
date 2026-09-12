@@ -1414,14 +1414,14 @@ METAL_FUNC void track_prefill_indirect(
         simd_lane_id);
 
     dispatch_bool(tile_m == BM, [&](auto kAlignedM) {
-      T a_buf[16];
+      uint4 a_buf[2];
       PackedNAXGroup32 packed_w;
       if (K_it > 0) {
         packed_w.prefetch(loader_w);
         if (a_live) {
           const device T* a0 = xb;
           STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < 16; ++e) { a_buf[e] = a0[e]; }
+          for (short e = 0; e < 2; ++e) { a_buf[e] = reinterpret_cast<const device uint4*>(a0)[e]; }
         }
       }
       for (int k = 0; k < K_it; k++) {
@@ -1429,13 +1429,13 @@ METAL_FUNC void track_prefill_indirect(
         packed_w.store(loader_w.dst);
         if (a_live) {
           STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < 16; ++e) {
-            a_dst[e] = a_buf[e];
+          for (short e = 0; e < 2; ++e) {
+            reinterpret_cast<threadgroup uint4*>(a_dst)[e] = a_buf[e];
           }
         } else {
           STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < 16; ++e) {
-            a_dst[e] = T(0);
+          for (short e = 0; e < 2; ++e) {
+            reinterpret_cast<threadgroup uint4*>(a_dst)[e] = uint4(0);
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1446,7 +1446,7 @@ METAL_FUNC void track_prefill_indirect(
           if (a_live) {
             const device T* a_next = xb + BK;
             STEEL_PRAGMA_UNROLL
-            for (short e = 0; e < 16; ++e) { a_buf[e] = a_next[e]; }
+            for (short e = 0; e < 2; ++e) { a_buf[e] = reinterpret_cast<const device uint4*>(a_next)[e]; }
           }
         }
 
