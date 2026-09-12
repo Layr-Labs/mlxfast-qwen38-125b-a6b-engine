@@ -690,6 +690,14 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // reference upcasts it to float32 and reads twice the bytes).
             let xf = (inputF32 ?? x.asType(.float32)).reshaped(x.dim(2))
             logits = TrackFastMoEKernels.routerGemv(x: xf, w: m.routerW16).reshaped(1, 1, -1)
+        } else if x.dim(0) == 1, x.dim(1) >= 2, x.dim(1) <= 8,
+            m.routerW16.dtype == .bfloat16, x.dim(2) % 128 == 0,
+            m.routerW16.dim(0) % 16 == 0, StreamOrDevice.default.stream === Stream.gpu
+        {
+            // Two to eight tokens: the same bf16 weight the one-token path
+            // reads, loaded once and streamed against the window's rows.
+            let xf = (inputF32 ?? x.asType(.float32)).reshaped(x.dim(1), x.dim(2))
+            logits = TrackWideRouter.apply(x: xf, w: m.routerW16).reshaped(1, x.dim(1), -1)
         } else if inputF32 == nil, let wide = TrackPrefillRouter.apply(x: x, w: m.routerW16) {
             logits = wide
         } else {
@@ -1197,5 +1205,75 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentCaptureMTPForwardable {
         }
         return base.cbv2ForwardWithHiddenCaptured(
             tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
+    }
+}
+
+// MARK: - the router GEMV for windows of two to eight tokens
+//
+// `TrackFastMoEKernels.routerGemv` reads the bf16 router weight directly for a
+// one-token window. A wider window had no such path and fell through to a
+// float32 matmul over `routerW32`, which holds the same values at twice the
+// width. This is that kernel's body with the weight loaded once per tile and
+// the window's rows streamed against it, so a row's arithmetic is the
+// one-token kernel's exactly. It carries its own header, so no kernel that
+// already exists has its source text changed.
+enum TrackWideRouter {
+    static let source = """
+        constexpr int TM = 4, TN = 4, SN = 32, blockM = 16, blockN = 128;
+        const int tid_x = (int)threadgroup_position_in_grid.x;
+        const int simd_gid = (int)simdgroup_index_in_threadgroup;
+        const int simd_lid = (int)thread_index_in_simdgroup;
+        float result[TM][VPT] = {0};
+        float inter[TN];
+        float v_coeff[VPT][TN];
+        const int thrN = simd_lid;
+        const int simdM = simd_gid;
+        int bm = simdM * TM;
+        int bn = thrN * TN;
+        int out_row = tid_x * blockM + bm;
+        if (out_row >= N) return;
+        out_row = out_row + TM <= N ? out_row : N - TM;
+        const device T* mat = w + (size_t)out_row * (size_t)K;
+        const int n_iter = K / blockN;
+        for (int i = 0; i < n_iter; ++i) {
+            for (int v = 0; v < VPT; ++v) {
+                for (int tn = 0; tn < TN; tn++) { v_coeff[v][tn] = x[(size_t)v * (size_t)K + bn + tn]; }
+            }
+            int mat_offset = 0;
+            for (int tm = 0; tm < TM; tm++) {
+                for (int tn = 0; tn < TN; tn++) { inter[tn] = static_cast<float>(mat[mat_offset + bn + tn]); }
+                for (int v = 0; v < VPT; ++v) {
+                    for (int tn = 0; tn < TN; tn++) { result[tm][v] += inter[tn] * v_coeff[v][tn]; }
+                }
+                mat_offset += K;
+            }
+            bn += blockN;
+        }
+        for (int tm = 0; tm < TM; tm++) {
+            for (int v = 0; v < VPT; ++v) {
+                for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+                    result[tm][v] += simd_shuffle_down(result[tm][v], sn);
+                }
+            }
+        }
+        if (simd_lid == 0) {
+            for (int tm = 0; tm < TM; tm++) {
+                for (int v = 0; v < VPT; ++v) { out[(size_t)v * (size_t)N + out_row + tm] = result[tm][v]; }
+            }
+        }
+        """
+    nonisolated(unsafe) static let kernel = MLXFast.metalKernel(
+        name: "track_router_gemv_wide", inputNames: ["x", "w"], outputNames: ["out"],
+        source: source, header: "", ensureRowContiguous: true)
+
+    /// x float32 [S, K], w bf16 [N, K] -> logits float32 [S, N].
+    static func apply(x: MLXArray, w: MLXArray) -> MLXArray {
+        let K = w.dim(1), N = w.dim(0), S = x.dim(0)
+        precondition(x.dtype == .float32 && w.dtype == .bfloat16 && x.dim(1) == K)
+        precondition(K % 128 == 0 && K > 64 && N % 16 == 0 && S >= 1 && S <= 8)
+        return kernel(
+            [x, w], template: [("T", w.dtype), ("K", K), ("N", N), ("VPT", S)],
+            grid: (32 * (N / 16), 1, 4), threadGroup: (32, 1, 4),
+            outputShapes: [[S, N]], outputDTypes: [.float32])[0]
     }
 }
