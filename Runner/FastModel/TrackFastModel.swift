@@ -918,10 +918,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             var normed: MLXArray
             if let ple = layer.ple {
                 // Materialize the stream, add the PLE block, then norm.
-                (stream, _) = injectNorm(
+                if let materialized = TrackStreamMaterialize.apply(
                     residual: residual, out: pendingOut, inject: pendingInject,
-                    scale: layer.attnHC.normScaleQ,
-                    tile: tile)
+                    tile: tile, hidden: hidden, hcCount: hcCount)
+                {
+                    stream = materialized
+                } else {
+                    (stream, _) = injectNorm(
+                        residual: residual, out: pendingOut, inject: pendingInject,
+                        scale: layer.attnHC.normScaleQ, tile: tile)
+                }
                 stream =
                     stream
                     + pleForward(
