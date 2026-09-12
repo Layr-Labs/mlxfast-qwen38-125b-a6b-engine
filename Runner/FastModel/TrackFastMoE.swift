@@ -777,14 +777,7 @@ extension TrackFastMoEKernels {
         }
         threadgroup float selv[K];
         threadgroup uint seli[K];
-        // MLXFAST-ROUTESG1: for one token the shared-gate GEMV above runs on
-        // simdgroup 0 alone (`track_inject_qmv` returns at once on simdgroup 1),
-        // and the top-K walk used to queue behind it on the same simdgroup. Run
-        // the walk on simdgroup 1 instead so the two latency chains overlap; the
-        // walk's arithmetic, tie rule and the softmax below are untouched. Wide
-        // windows keep the gate on both simdgroups and the walk on simdgroup 0.
-        constexpr uint SEL_SG = (VPT == 1) ? 1u : 0u;
-        if (sg == SEL_SG) {
+        if (sg == 0) {
         const device float* lr = logits + (size_t)row * (size_t)E;
         // each lane owns E_PER experts: e = lane + 32 * j (strided so a tie at
         // the same value resolves to the lowest index across lanes too)
