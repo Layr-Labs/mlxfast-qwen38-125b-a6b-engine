@@ -777,14 +777,12 @@ extension TrackFastMoEKernels {
         }
         threadgroup float selv[K];
         threadgroup uint seli[K];
-        // MLXFAST-ROUTESG1: for one token the shared-gate GEMV above runs on
-        // simdgroup 0 alone (`track_inject_qmv` returns at once on simdgroup 1),
-        // and the top-K walk used to queue behind it on the same simdgroup. Run
-        // the walk on simdgroup 1 instead so the two latency chains overlap; the
-        // walk's arithmetic, tie rule and the softmax below are untouched. Wide
-        // windows keep the gate on both simdgroups and the walk on simdgroup 0.
-        constexpr uint SEL_SG = (VPT == 1) ? 1u : 0u;
-        if (sg == SEL_SG) {
+        // MLXFAST-ROUTESG1: at VPT == 1 the gate GEMV occupies simdgroup 0 alone
+        // (the small-N `track_inject_qmv` retires simdgroup 1 immediately), so the
+        // top-K walk is issued on simdgroup 1 to overlap the two independent
+        // latency-bound chains. Wide windows keep the original ownership.
+        constexpr uint WALK_SG = (VPT == 1) ? 1u : 0u;
+        if (sg == WALK_SG) {
         const device float* lr = logits + (size_t)row * (size_t)E;
         // each lane owns E_PER experts: e = lane + 32 * j (strided so a tie at
         // the same value resolves to the lowest index across lanes too)
@@ -809,7 +807,7 @@ extension TrackFastMoEKernels {
         }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg != 0) { return; }
+        if (sg != WALK_SG) { return; }
         // softmax_single_row over the K selected logits (AccT = float)
         constexpr int N_READS = 4;
         float ld[N_READS];
