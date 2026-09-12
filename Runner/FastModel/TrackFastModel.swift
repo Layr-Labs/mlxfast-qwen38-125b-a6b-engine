@@ -1160,6 +1160,21 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentLanguageModelPrefillForwardable {
     }
 }
 
+extension TrackQwen4ExpFastModel {
+    /// A window wider than the deepest verify window is a prefill chunk. The
+    /// engine keeps only the last row of a prefill chunk's logits
+    /// (`narrowPrefillOutput`), so the head is evaluated on that row alone.
+    /// Verify windows are at most `maximumDepth + 1` rows and keep every row,
+    /// because the column scorer reads each one.
+    fileprivate func headForHiddenForward(_ mixed: MLXArray) -> MLXArray {
+        let rows = mixed.dim(1)
+        guard rows > TrackQwen4ExpInlineMTPAssistant.maximumDepth + 1 else {
+            return base.head(mixed)
+        }
+        return base.head(mixed[0..., (rows - 1)..., 0...])
+    }
+}
+
 extension TrackQwen4ExpFastModel: CBv2RecurrentMTPForwardable {
     public var cbv2MTPTargetIdentity: ObjectIdentifier { ObjectIdentifier(base) }
 
@@ -1171,7 +1186,7 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentMTPForwardable {
             tokens, inputEmbeddings: nil, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds, capture: false)
         {
-            return (base.head(s.mixed), s.multi)
+            return (headForHiddenForward(s.mixed), s.multi)
         }
         return base.cbv2ForwardWithHidden(
             tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
@@ -1193,7 +1208,7 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentCaptureMTPForwardable {
             tokens, inputEmbeddings: nil, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds, capture: true)
         {
-            return (base.head(s.mixed), s.multi)
+            return (headForHiddenForward(s.mixed), s.multi)
         }
         return base.cbv2ForwardWithHiddenCaptured(
             tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
