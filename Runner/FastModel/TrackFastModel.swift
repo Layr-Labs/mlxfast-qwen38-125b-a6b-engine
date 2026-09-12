@@ -945,7 +945,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 let n = layer.index + 1
                 let first = Self.asyncFirst > 0 ? Self.asyncFirst : Self.asyncChunk
                 let second = Self.asyncSecond > first ? Self.asyncSecond : first
-                if n == first || n == second || (n > second && (n - second) % Self.asyncChunk == 0) { asyncEval(stream) }
+                if n == first || n == second || (n > second && (n - second) % Self.asyncChunk == 0) {
+                    if ids.dim(1) == 1 {
+                        // Queue the completed layer, including its pending MoE output,
+                        // while the host constructs the next decode layers.
+                        asyncEval([stream, pendingOut!, injectW])
+                    } else {
+                        asyncEval(stream)
+                    }
+                }
             }
         }
         let (multi, finalNormed) = injectNorm(
