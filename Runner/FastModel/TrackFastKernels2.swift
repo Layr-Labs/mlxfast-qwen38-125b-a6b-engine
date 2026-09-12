@@ -98,7 +98,7 @@ extension TrackFastKernels {
         if (lane == 0) { local_sums[sg] = acc; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         acc = simd_sum(local_sums[lane]);
-        const float inv_mean = metal::precise::rsqrt(acc / (float)H + as_type<float>((uint)EPS_BITS));
+        const float inv_mean = metal::precise::rsqrt(acc / (float)H + eps);
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
             InT n = static_cast<InT>(thread_x[i] * inv_mean);
@@ -108,71 +108,9 @@ extension TrackFastKernels {
 
     nonisolated(unsafe) static let injectNormKernel = MLXFast.metalKernel(
         name: "track_inject_norm",
-        inputNames: ["residual", "out", "inject", "scale"],
+        inputNames: ["residual", "out", "inject", "scale", "eps"],
         outputNames: ["stream", "normed"],
         source: injectNormSource, header: exactHeader, ensureRowContiguous: true)
-
-
-    /// Wide-window variant (prefill): ONE simdgroup per (row, stream). Lane l
-    /// plays virtual thread 32g + l of the 640-thread layout for g = 0..NT/32-1,
-    /// so every partial sits in the same lane and the same `simd_sum` as the
-    /// reference `rms_single_row`; the per-simdgroup partials are then folded
-    /// by the same 32-lane `simd_sum` over `local_sums`. Same arithmetic, 20x
-    /// fewer threads per row: the 640-thread threadgroups were occupancy-bound.
-    static let injectNormWideSource = """
-        constexpr int N_READS = 4;
-        constexpr uint NT = H / N_READS;
-        constexpr uint simd_groups = (H + 32 * N_READS - 1) / (32 * N_READS);
-        const uint row = thread_position_in_grid.z;
-        const uint hc = thread_position_in_grid.y;
-        const uint lane = thread_index_in_simdgroup;
-        threadgroup float local_sums[32];
-        const uint base = row * W + hc * H;
-        InT inj_t = InT(0);
-        if (HAS_INJECT) { inj_t = inject[row * HC + hc]; }
-        for (uint g = 0; g < simd_groups; ++g) {
-            const uint lid = g * 32 + lane;
-            float acc = 0.0f;
-            if (lid < NT) {
-                for (int i = 0; i < N_READS; ++i) {
-                    const uint d = lid * N_READS + i;
-                    const uint src = TILE ? (row * H + d) : (base + d);
-                    InT r = residual[src];
-                    if (HAS_INJECT) {
-                        InT sp = out[row * H + d] * inj_t;
-                        r = r + sp;
-                    }
-                    stream[base + d] = r;
-                    const float xf = static_cast<float>(r);
-                    acc += xf * xf;
-                }
-            }
-            acc = simd_sum(acc);
-            if (lane == 0) { local_sums[g] = acc; }
-        }
-        if (lane >= simd_groups) { local_sums[lane] = 0; }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        const float total = simd_sum(local_sums[lane]);
-        const float inv_mean = metal::precise::rsqrt(total / (float)H + as_type<float>((uint)EPS_BITS));
-        for (uint g = 0; g < simd_groups; ++g) {
-            const uint lid = g * 32 + lane;
-            if (lid < NT) {
-                for (int i = 0; i < N_READS; ++i) {
-                    const uint d = lid * N_READS + i;
-                    InT n = static_cast<InT>(static_cast<float>(stream[base + d]) * inv_mean);
-                    normed[base + d] = n * scale[hc * H + d];
-                }
-            }
-        }
-        """
-
-    nonisolated(unsafe) static let injectNormWideKernel = MLXFast.metalKernel(
-        name: "track_inject_norm_wide",
-        inputNames: ["residual", "out", "inject", "scale"],
-        outputNames: ["stream", "normed"],
-        source: injectNormWideSource, ensureRowContiguous: true)
-
-    nonisolated(unsafe) static var wideNormMinS = 9
 
     static func injectNorm(
         residual: MLXArray, out: MLXArray?, inject: MLXArray?, scale: MLXArray,
@@ -182,23 +120,11 @@ extension TrackFastKernels {
         let W = hcCount * hidden
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024)
         let hasInject = out != nil
-        if S >= wideNormMinS {
-            let outs = injectNormWideKernel(
-                [residual, out ?? residual, inject ?? residual, scale],
-                template: [
-                    ("InT", residual.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
-                    ("HAS_INJECT", hasInject), ("TILE", tile), ("EPS_BITS", Int(eps.bitPattern)),
-                ],
-                grid: (32, hcCount, B * S), threadGroup: (32, 1, 1),
-                outputShapes: [[B, S, W], [B, S, W]],
-                outputDTypes: [residual.dtype, residual.dtype])
-            return (outs[0], outs[1])
-        }
         let outs = injectNormKernel(
-            [residual, out ?? residual, inject ?? residual, scale],
+            [residual, out ?? residual, inject ?? residual, scale, MLXArray(eps)],
             template: [
                 ("InT", residual.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
-                ("HAS_INJECT", hasInject), ("TILE", tile), ("EPS_BITS", Int(eps.bitPattern)),
+                ("HAS_INJECT", hasInject), ("TILE", tile),
             ],
             grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
             outputShapes: [[B, S, W], [B, S, W]],
@@ -300,7 +226,7 @@ extension TrackFastKernels {
         if (lane == 0) { local_sums[0] = acc; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         acc = simd_sum(local_sums[lane]);
-        const float inv_mean = metal::precise::rsqrt(acc / (float)Dv + as_type<float>((uint)EPS_BITS));
+        const float inv_mean = metal::precise::rsqrt(acc / (float)Dv + eps);
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
             InT n = w[d] * static_cast<InT>(thread_x[i] * inv_mean);
@@ -312,7 +238,7 @@ extension TrackFastKernels {
 
     nonisolated(unsafe) static let gatedRMSKernel = MLXFast.metalKernel(
         name: "track_gated_rms",
-        inputNames: ["y", "proj", "w"],
+        inputNames: ["y", "proj", "w", "eps"],
         outputNames: ["out"],
         source: gatedRMSSource, header: exactHeader, ensureRowContiguous: true)
 
@@ -322,10 +248,10 @@ extension TrackFastKernels {
         let B = y.dim(0), S = y.dim(1), Hv = y.dim(2), Dv = y.dim(3)
         precondition(Dv == 128)
         return gatedRMSKernel(
-            [y, proj, w],
+            [y, proj, w, MLXArray(eps)],
             template: [
                 ("InT", y.dtype), ("Hv", Hv), ("Dv", Dv), ("PW", proj.dim(2)),
-                ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)),
+                ("Z_OFF", zOffset),
             ],
             grid: (32, Hv, B * S), threadGroup: (32, 1, 1),
             outputShapes: [[B, S, Hv * Dv]], outputDTypes: [y.dtype])[0]
@@ -374,7 +300,7 @@ extension TrackFastKernels {
         if (lane == 0) { local_sums[sg] = acc; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         acc = simd_sum(local_sums[lane]);
-        const float inv_mean = metal::precise::rsqrt(acc / (float)D + as_type<float>((uint)EPS_BITS));
+        const float inv_mean = metal::precise::rsqrt(acc / (float)D + eps);
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
             const InT wgt = isQ ? qnorm[d] : knorm[d];
@@ -409,7 +335,7 @@ extension TrackFastKernels {
 
     nonisolated(unsafe) static let attnPrepKernel = MLXFast.metalKernel(
         name: "track_attn_prep",
-        inputNames: ["qkv", "qnorm", "knorm", "cosb", "sinb"],
+        inputNames: ["qkv", "qnorm", "knorm", "cosb", "sinb", "eps"],
         outputNames: ["qout", "kout", "vout"],
         source: attnPrepSource, header: exactHeader, ensureRowContiguous: true)
 
@@ -420,10 +346,10 @@ extension TrackFastKernels {
         let B = qkv.dim(0), S = qkv.dim(1)
         precondition(headDim % 4 == 0 && rotaryDims % 8 == 0 && cos.dim(1) == rotaryDims)
         let outs = attnPrepKernel(
-            [qkv, qNorm, kNorm, cos, sin],
+            [qkv, qNorm, kNorm, cos, sin, MLXArray(eps)],
             template: [
                 ("InT", qkv.dtype), ("D", headDim), ("HQ", heads), ("HK", kvHeads), ("S", S),
-                ("QW", qkv.dim(2)), ("ROT", rotaryDims), ("EPS_BITS", Int(eps.bitPattern)),
+                ("QW", qkv.dim(2)), ("ROT", rotaryDims),
             ],
             grid: (headDim / 4, heads + 2 * kvHeads, B * S), threadGroup: (headDim / 4, 1, 1),
             outputShapes: [[B, heads, S, headDim], [B, kvHeads, S, headDim], [B, kvHeads, S, headDim]],
@@ -558,8 +484,7 @@ extension TrackFastKernels {
 //       the loads pipeline, with the accumulation order unchanged.
 
 extension TrackFastKernels {
-    static let mixerHeadHeader = TrackFastMoEKernels.helpersCore + exactHeader + mixerHeadHeaderTail
-    static let mixerHeadHeaderTail = #"""
+    static let mixerHeadHeader = TrackFastMoEKernels.helpers + exactHeader + #"""
 
         // `qmv_impl`'s `out_vec_size < num_simdgroups * results_per_simdgroup`
         // branch with compile-time sizes and the K walk unrolled. Same lanes,
@@ -626,124 +551,7 @@ extension TrackFastKernels {
           constexpr int k_end = NFULL * block_size;
           const int remaining = clamp(
               static_cast<int>(in_vec_size - k_end - simd_lid * values_per_thread), 0, values_per_thread);
-          // MLXFAST-FULLTAIL. in_vec_size is a template constant here, so when it
-          // is a multiple of values_per_thread the clamp above can only yield 0 or
-          // values_per_thread -- never a partial slice. The _safe helpers then run
-          // the SAME arithmetic in the SAME order (their bodies are the plain ones
-          // with `N` for `values_per_thread`), but over a RUNTIME trip count, which
-          // keeps x_thread dynamically indexed and so pins it in thread-local
-          // scratch for the whole function rather than registers. Compile that
-          // branch away. Bit-identical by construction.
-          if constexpr (in_vec_size % values_per_thread == 0) {
-            if (remaining > 0) {
-              U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
-              for (int row = 0; row < NR; row++) {
-                auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-                const device T* sl = scales + row * in_vec_size_g;
-                const device T* bl = biases + row * in_vec_size_g;
-                U s = sl[0];
-                U b = bl[0];
-                result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
-              }
-            }
-          } else if (remaining > 0) {
-            U sum = load_vector_safe<T, U, values_per_thread, bits>(x, x_thread, remaining);
-            for (int row = 0; row < NR; row++) {
-              auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-              const device T* sl = scales + row * in_vec_size_g;
-              const device T* bl = biases + row * in_vec_size_g;
-              U s = sl[0];
-              U b = bl[0];
-              result[row] += qdot_safe<U, values_per_thread, bits>(wl, x_thread, s, b, sum, remaining);
-            }
-          }
-          for (int row = 0; row < NR; row++) {
-            result[row] = simd_sum(result[row]);
-            if (simd_lid == 0) {
-              y[row] = static_cast<T>(result[row]);
-            }
-          }
-        }
-
-        // MLXFAST-INJSPLIT: one original small-N row per simdgroup. ROW changes
-        // only the base addresses. Lane-to-K mapping, ascending block updates,
-        // qdot/qdot_safe, and simd_sum are verbatim from track_inject_qmv above.
-        // UNR is a scheduling hint only; never split or reassociate the sum.
-        template <typename T, int group_size, int bits, int in_vec_size, int ROW, int UNR = 8>
-        METAL_FUNC void track_inject_qmv_row(
-            const device uint32_t* w,
-            const device T* scales,
-            const device T* biases,
-            const device T* x,
-            device T* y,
-            uint simd_lid) {
-          constexpr int results_per_simdgroup = 1;
-          constexpr int packs_per_thread = 1;
-          constexpr int pack_factor = get_pack_factor<bits, 32>();
-          constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
-          constexpr int values_per_thread = pack_factor * packs_per_thread;
-          constexpr int block_size = values_per_thread * SIMD_SIZE;
-          constexpr int scale_step_per_thread = group_size / values_per_thread;
-          static_assert(ROW >= 0 && ROW < 4, "inject row");
-          static_assert(in_vec_size > block_size, "K walk");
-
-          const device uint8_t* ws = (const device uint8_t*)w;
-          typedef float U;
-          thread U x_thread[values_per_thread];
-          thread U result[results_per_simdgroup] = {0};
-
-          constexpr int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
-          constexpr int in_vec_size_g = in_vec_size / group_size;
-          constexpr int out_row = ROW;
-          ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-          scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-          biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-          x += simd_lid * values_per_thread;
-          y += out_row;
-
-          // for (k = 0; k < in_vec_size - block_size; k += block_size)
-          constexpr int NFULL = (in_vec_size - 1) / block_size;
-          constexpr int NR = 1;
-          #pragma clang loop unroll_count(UNR)
-          for (int i = 0; i < NFULL; i++) {
-            U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
-            for (int row = 0; row < NR; row++) {
-              auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-              const device T* sl = scales + row * in_vec_size_g;
-              const device T* bl = biases + row * in_vec_size_g;
-              U s = sl[0];
-              U b = bl[0];
-              result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
-            }
-            ws += block_size * bytes_per_pack / pack_factor;
-            scales += block_size / group_size;
-            biases += block_size / group_size;
-            x += block_size;
-          }
-          constexpr int k_end = NFULL * block_size;
-          const int remaining = clamp(
-              static_cast<int>(in_vec_size - k_end - simd_lid * values_per_thread), 0, values_per_thread);
-          // MLXFAST-FULLTAIL. in_vec_size is a template constant here, so when it
-          // is a multiple of values_per_thread the clamp above can only yield 0 or
-          // values_per_thread -- never a partial slice. The _safe helpers then run
-          // the SAME arithmetic in the SAME order (their bodies are the plain ones
-          // with `N` for `values_per_thread`), but over a RUNTIME trip count, which
-          // keeps x_thread dynamically indexed and so pins it in thread-local
-          // scratch for the whole function rather than registers. Compile that
-          // branch away. Bit-identical by construction.
-          if constexpr (in_vec_size % values_per_thread == 0) {
-            if (remaining > 0) {
-              U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
-              for (int row = 0; row < NR; row++) {
-                auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-                const device T* sl = scales + row * in_vec_size_g;
-                const device T* bl = biases + row * in_vec_size_g;
-                U s = sl[0];
-                U b = bl[0];
-                result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
-              }
-            }
-          } else if (remaining > 0) {
+          if (remaining > 0) {
             U sum = load_vector_safe<T, U, values_per_thread, bits>(x, x_thread, remaining);
             for (int row = 0; row < NR; row++) {
               auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);

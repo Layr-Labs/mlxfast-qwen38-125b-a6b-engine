@@ -478,8 +478,7 @@ template <typename T, int D>
   typedef float U;
 
   thread U o[elem_per_thread] = {0};
-  constexpr bool batch_components = metal::is_same_v<T, bfloat16_t> && D == 256;
-  threadgroup U outputs[BN * BD * (batch_components ? elem_per_thread : 1)];
+  threadgroup U outputs[BN * BD];
 
   // Adjust positions
   const int head_idx = tid.x;
@@ -521,23 +520,12 @@ template <typename T, int D>
   }
 
   // Use shared memory to transpose and reduce the final block
-  if constexpr (batch_components) {
-    for (int i = 0; i < elem_per_thread; i++) {
-      outputs[i * BN * BD + simd_lid * BD + simd_gid] = o[i];
-    }
+  for (int i = 0; i < elem_per_thread; i++) {
+    outputs[simd_lid * BD + simd_gid] = o[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = 0; i < elem_per_thread; i++) {
-      o[i] = simd_sum(outputs[i * BN * BD + simd_gid * BD + simd_lid]);
-      o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
-    }
-  } else {
-    for (int i = 0; i < elem_per_thread; i++) {
-      outputs[simd_lid * BD + simd_gid] = o[i];
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
-      o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+    o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
   // And write the output
