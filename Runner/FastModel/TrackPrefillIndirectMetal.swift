@@ -1361,29 +1361,34 @@ METAL_FUNC void track_prefill_indirect(
   const short tn = SN * (simd_group_id % WN);
   using AccumType = float;
 
-  uint32_t index;
+  uint32_t index = 0;
   short offset;
   uint32_t index_next = indices[y_row];
   short offset_next = 0;
   int n = 0;
   while (n < tgp_bm) {
-    n++;
-    offset = offset_next;
-    index = index_next;
-    offset_next = tgp_bm;
-    for (; n < tgp_bm; n++) {
-      if (indices[y_row + n] != index) {
-        offset_next = n;
-        index_next = indices[y_row + n];
-        break;
+    int tile_begin = 0;
+    int tile_end = 0;
+    if (simd_lane_id == 0) {
+      n++;
+      offset = offset_next;
+      index = index_next;
+      offset_next = tgp_bm;
+      for (; n < tgp_bm; n++) {
+        if (indices[y_row + n] != index) {
+          offset_next = n;
+          index_next = indices[y_row + n];
+          break;
+        }
       }
+      p17_sorted_expert_tile<BM>(
+          indices, M, y_row, offset, offset_next, index, tile_begin, tile_end);
     }
+    n = simd_broadcast(n, 0);
+    index = simd_broadcast(index, 0);
+    tile_begin = simd_broadcast(tile_begin, 0);
+    tile_end = simd_broadcast(tile_end, 0);
     threadgroup_barrier(mem_flags::mem_none);
-
-    int tile_begin;
-    int tile_end;
-    p17_sorted_expert_tile<BM>(
-        indices, M, y_row, offset, offset_next, index, tile_begin, tile_end);
     if (tile_begin == tile_end) {
       continue;  // Uniform over the ENTIRE threadgroup; no barrier is skipped by a subset.
     }
