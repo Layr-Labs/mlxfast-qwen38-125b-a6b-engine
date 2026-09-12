@@ -248,8 +248,17 @@ template <typename T, int D, int V = D>
           score += q_hi[h].w * k_hi.w;
           score = simd_sum(score);
           const float next_maximum = max(maximum[h], score);
-          const float factor = fast::exp(maximum[h] - next_maximum);
-          const float exp_score = fast::exp(score - next_maximum);
+          float factor;
+          float exp_score;
+          if (isfinite(maximum[h]) && isfinite(score)) {
+            const float decay = fast::exp(min(maximum[h], score) - next_maximum);
+            const bool raised_max = score > maximum[h];
+            factor = raised_max ? decay : 1.0f;
+            exp_score = raised_max ? 1.0f : decay;
+          } else {
+            factor = fast::exp(maximum[h] - next_maximum);
+            exp_score = fast::exp(score - next_maximum);
+          }
           maximum[h] = next_maximum;
           denominator[h] = denominator[h] * factor + exp_score;
           o_lo[h] = o_lo[h] * factor + exp_score * v_lo;
@@ -352,8 +361,22 @@ template <typename T, int D, int V = D>
 
       // Update the accumulators
       U new_max = max(max_score, score);
-      U factor = fast::exp(max_score - new_max);
-      U exp_score = fast::exp(score - new_max);
+      U factor;
+      U exp_score;
+      if constexpr (D == 256 && V == 256 && metal::is_same_v<T, bfloat16_t>) {
+        if (isfinite(max_score) && isfinite(score)) {
+          const U decay = fast::exp(min(max_score, score) - new_max);
+          const bool raised_max = score > max_score;
+          factor = raised_max ? decay : U(1);
+          exp_score = raised_max ? U(1) : decay;
+        } else {
+          factor = fast::exp(max_score - new_max);
+          exp_score = fast::exp(score - new_max);
+        }
+      } else {
+        factor = fast::exp(max_score - new_max);
+        exp_score = fast::exp(score - new_max);
+      }
 
       max_score = new_max;
       sum_exp_score = sum_exp_score * factor + exp_score;
