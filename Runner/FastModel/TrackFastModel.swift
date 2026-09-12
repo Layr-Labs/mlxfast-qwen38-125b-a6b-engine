@@ -823,11 +823,18 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } else {
             let keyFlat = p.keyProj.apply(embedded)
             let value = p.valueProj.apply(embedded)
-            // norm_key * norm_query, then MLX's own reduction over the last axis.
-            let prod = TrackFastPLEKernels.prod(
+            let dot: MLXArray
+            if let fused = TrackPLEDot.apply(
                 keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
                 hcCount: hcCount, hidden: hidden, eps: eps)
-            let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
+            {
+                dot = fused
+            } else {
+                let prod = TrackFastPLEKernels.prod(
+                    keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
+                    hcCount: hcCount, hidden: hidden, eps: eps)
+                dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
+            }
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
             let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
