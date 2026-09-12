@@ -175,7 +175,8 @@ enum TrackP12Prefill {
         else { return nil }
         let B = x.dim(0), S = x.dim(1), H = x.dim(2), K = indices.dim(-1)
         let expanded = MLX.expandedDimensions(x, axes: [-2, -3])
-        let (sortedX, sortedIDs, inverse) = gatherSort(x: expanded, indices: indices)
+        let (sortedX, sortedIDs, inverse) = TrackPrefillExpertSort.sortedInputs(
+            x: expanded, indices: indices)
         let up = parts.up(sortedX, sortedIDs, sortedIndices: true)
         let gateAct = parts.gate(sortedX, sortedIDs, sortedIndices: true)
         let activated = compiledSiluProduct(gateAct, up)
