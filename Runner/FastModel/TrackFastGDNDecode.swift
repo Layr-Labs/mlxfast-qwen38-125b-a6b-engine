@@ -18,7 +18,8 @@ enum TrackFastGDNDecode {
         zOffset: Int, eps: Float, capture: Bool, geometry g: TrackFastKernels.GDNGeometry
     ) -> (gated: MLXArray, stateOut: MLXArray, convOut: MLXArray)? {
         guard !capture, proj.ndim == 3, proj.dim(1) == 1, proj.dtype == .bfloat16,
-            stateIn.dtype == .float32, g.dk == 128, g.dv == 128,
+            stateIn.dtype == .float32 || stateIn.dtype == .float16,
+            g.dk == 128, g.dv == 128,
             g.hk > 0, g.hv % g.hk == 0, g.convKernel > 1,
             g.convDim == (2 * g.hk + g.hv) * 128, g.projWidth == proj.dim(2),
             zOffset >= 0, zOffset + g.hv * g.dv <= g.projWidth,

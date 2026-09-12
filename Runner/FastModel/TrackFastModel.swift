@@ -544,7 +544,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let convState =
             state?.conv ?? MLXArray.zeros([B, geo.convKernel - 1, geo.convDim], dtype: x.dtype)
         let ssm =
-            state?.ssm ?? MLXArray.zeros([B, geo.hv, geo.dv, geo.dk], dtype: .float32)
+            state?.ssm
+            ?? MLXArray.zeros([B, geo.hv, geo.dv, geo.dk], dtype: Self.ssmStateDType)
         let gated: MLXArray, convOut: MLXArray, stateOut: MLXArray
         if let fused = TrackFastGDNDecode.apply(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
@@ -1079,7 +1080,25 @@ extension TrackQwen4ExpFastModel: CBv2PositionedRecurrentLanguageModelForwardabl
     CBv2PositionedRecurrentEmbeddingForwardable
 {
     public var cbv2Capabilities: CBv2ModelCapabilities { base.cbv2Capabilities }
-    public var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec { base.cbv2RecurrentStateSpec }
+    /// The gated-deltanet recurrent state is served at `float16`. Both state
+    /// kernels are templated on the state type (`StT`) and round every store
+    /// with `static_cast<StT>`, so the arithmetic stays in float and only the
+    /// carried state is narrower. The state is an exponentially decayed
+    /// accumulator, so a per-step rounding error decays with it instead of
+    /// accumulating.
+    public var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec {
+        let base = base.cbv2RecurrentStateSpec
+        return CBv2RecurrentStateSpec(
+            layers: base.layers.map { layer in
+                CBv2RecurrentLayerStateSpec(
+                    modelLayerIndex: layer.modelLayerIndex,
+                    convShape: layer.convShape, convDType: layer.convDType,
+                    ssmShape: layer.ssmShape, ssmDType: Self.ssmStateDType)
+            })
+    }
+
+    /// The dtype the recurrent state is carried in between steps.
+    static let ssmStateDType: DType = .float16
 
     public func cbv2Forward(
         _ tokens: MLXArray, caches: [KVCache],
