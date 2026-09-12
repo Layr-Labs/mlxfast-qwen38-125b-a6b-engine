@@ -545,32 +545,21 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             state?.conv ?? MLXArray.zeros([B, geo.convKernel - 1, geo.convDim], dtype: x.dtype)
         let ssm =
             state?.ssm ?? MLXArray.zeros([B, geo.hv, geo.dv, geo.dk], dtype: .float32)
-        let gated: MLXArray, convOut: MLXArray, stateOut: MLXArray
-        if let fused = TrackFastGDNDecode.apply(
+        let r = TrackFastKernels.gdn(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
-            dtBias: g.dtBias, stateIn: ssm, normW: g.normW, zOffset: g.zOffset,
-            eps: 1e-6, capture: capture, geometry: geo)
-        {
-            (gated, convOut, stateOut) = (fused.gated, fused.convOut, fused.stateOut)
-            if prof { TrackFastProfile.tick("gdn.decodeFused", &pt, [gated, stateOut, convOut]) }
-        } else {
-            let r = TrackFastKernels.gdn(
-                proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
-                dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo,
-                separateBA: split.map { (b: $0[2], a: $0[3]) })
-            if prof { TrackFastProfile.tick("gdn.prep+lean", &pt, [r.y, r.stateOut, r.convOut]) }
-            gated = TrackFastKernels.gatedRMS(
-                y: r.y, proj: split?[1] ?? proj, w: g.normW,
-                zOffset: separate ? 0 : g.zOffset, eps: 1e-6)
-            (convOut, stateOut) = (r.convOut, r.stateOut)
-            if prof { TrackFastProfile.tick("gdn.gatedRMS", &pt, [gated]) }
-        }
+            dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo,
+            separateBA: split.map { (b: $0[2], a: $0[3]) })
+        if prof { TrackFastProfile.tick("gdn.prep+lean", &pt, [r.y, r.stateOut, r.convOut]) }
+        let gated = TrackFastKernels.gatedRMS(
+            y: r.y, proj: split?[1] ?? proj, w: g.normW,
+            zOffset: separate ? 0 : g.zOffset, eps: 1e-6)
+        if prof { TrackFastProfile.tick("gdn.gatedRMS", &pt, [gated]) }
         do {
             if capture {
                 try evaluation.stageCaptured(
-                    modelLayerIndex: layerIndex, conv: convOut, ssm: stateOut, positions: S)
+                    modelLayerIndex: layerIndex, conv: r.convOut, ssm: r.stateOut, positions: S)
             } else {
-                try evaluation.stage(modelLayerIndex: layerIndex, conv: convOut, ssm: stateOut)
+                try evaluation.stage(modelLayerIndex: layerIndex, conv: r.convOut, ssm: r.stateOut)
             }
         } catch {
             preconditionFailure("TrackFastModel: recurrent stage failed at layer \(layerIndex): \(error)")
@@ -973,7 +962,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 tile: false)
             if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
-            let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
+            // Only a SINGLE-TOKEN window may drop the float32 twin. At S == 1
+            // `moeForwardShared` takes its `routerGemv` branch unconditionally
+            // and never reads it, so the store is dead. At S > 1 the twin must
+            // stay non-nil or branch 2's `inputF32 == nil` guard becomes
+            // eligible and the M5-gated `TrackPrefillRouter` would replace the
+            // `matmul(routerW32)` this tree is validated against on the ranked
+            // box. See apply-deadf32.py.
+            let mm = hcMix(
+                layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc",
+                emitF32: normed.dim(1) != 1)
             input = mm.input; injectW = mm.inject
             if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
