@@ -92,18 +92,30 @@ enum TrackP12Prefill {
     /// convolution window, the conv-tail store -- is the original source, and
     /// `PROJ_W` is now the QKV row pitch (10240) rather than the concatenated
     /// one (16480).
+    private static let splitPrepSource = addressVariant(
+        TrackFastKernels.prepSource,
+        [
+            ("row[B_OFF + hh]", "b_gate[bt * Hv + hh]"),
+            ("row[A_OFF + hh]", "a_gate[bt * Hv + hh]"),
+        ])
+
     nonisolated(unsafe) private static let splitPrepKernel = MLXFast.metalKernel(
         name: "track_p12_gdn_prep_split_inputs",
         inputNames: [
             "proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "b_gate", "a_gate",
         ],
         outputNames: ["qn", "kn", "vv", "g", "beta", "conv_out"],
-        source: addressVariant(
-            TrackFastKernels.prepSource,
-            [
-                ("row[B_OFF + hh]", "b_gate[bt * Hv + hh]"),
-                ("row[A_OFF + hh]", "a_gate[bt * Hv + hh]"),
-            ]),
+        source: splitPrepSource,
+        header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
+
+    private static let temporalPrep = on("TRACK_GDN_TEMPORAL_PREP")
+    nonisolated(unsafe) private static let temporalPrepKernel = MLXFast.metalKernel(
+        name: "track_gdn_temporal_prep",
+        inputNames: [
+            "proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "b_gate", "a_gate",
+        ],
+        outputNames: ["qn", "kn", "vv", "g", "beta", "conv_out"],
+        source: TrackGDNTemporalPrep.source(splitPrepSource),
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
     static func gdnPrepSplit(
@@ -117,7 +129,12 @@ enum TrackP12Prefill {
         precondition(b.dim(2) == g.hv && a.dim(2) == g.hv)
         precondition(b.dtype == proj.dtype && a.dtype == proj.dtype)
         precondition(g.dk == 128 && g.dv == 128 && g.convDim % 128 == 0)
-        return splitPrepKernel(
+        let reuseWindow = temporalPrep && eligible(proj) && !capture
+            && T == proj.dim(1) && g.convKernel == 4
+            && g.hk == 16 && g.hv == 48 && g.convDim == 10240
+            && convW.dtype == proj.dtype
+        let kernel = reuseWindow ? temporalPrepKernel : splitPrepKernel
+        return kernel(
             [proj, convState, convW, negExpALog, dtBias, b, a],
             template: [
                 ("InT", proj.dtype), ("T", T), ("Dk", g.dk), ("Dv", g.dv), ("Hk", g.hk),
@@ -125,7 +142,8 @@ enum TrackP12Prefill {
                 ("CONV_DIM", g.convDim), ("B_OFF", g.bOffset), ("A_OFF", g.aOffset),
                 ("CAPTURE", capture),
             ],
-            grid: (32, g.convDim / 128, B * T), threadGroup: (32, 4, 1),
+            grid: (32, g.convDim / 128, B * (reuseWindow ? (T + 1) / 2 : T)),
+            threadGroup: (32, 4, 1),
             outputShapes: [
                 [B, T, g.hk, g.dk], [B, T, g.hk, g.dk], [B, T, g.hv, g.dv],
                 [B, T, g.hv], [B, T, g.hv], [slots, g.convKernel - 1, g.convDim],
