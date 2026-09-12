@@ -36,16 +36,21 @@ enum TrackFastMixerKernels {
         // MLXFAST-MIX2ROW: the wide path retains its original four-row ownership.
         constexpr int RPS = VPT == 1 ? \(downRowsPerSimdgroup) : 4;
         static_assert(RPS == 1 || RPS == 2 || RPS == 4, "down row ownership");
-        constexpr int NT = ND / (2 * RPS);
+        // MLXFAST-MIX1SG: the one-token path puts one simdgroup in each threadgroup
+        // (SGS == 1), so the launch holds twice as many, half-sized threadgroups covering
+        // the same rows. The wide path keeps its original two-simdgroup threadgroup.
+        constexpr int SGS = VPT == 1 ? 1 : 2;
+        constexpr int NT = ND / (SGS * RPS);
         if (tile < NT) {
             if constexpr (VPT == 1) {
                 float r[RPS];
-                qmv_fast_reg<T, GS, BITS, RPS>(wd, sd, bd, normed, KD, tile * (2 * RPS) + (int)sg * RPS, lid, r);
+                const int out_row = (tile * SGS + (int)sg) * RPS;
+                qmv_fast_reg<T, GS, BITS, RPS>(wd, sd, bd, normed, KD, out_row, lid, r);
                 if (lid == 0) {
                     for (int i = 0; i < RPS; ++i) {
                         const T l = static_cast<T>(r[i]);
-                        lo[tile * (2 * RPS) + (int)sg * RPS + i] = l;
-                        act[tile * (2 * RPS) + (int)sg * RPS + i] = mlx_silu(l);
+                        lo[out_row + i] = l;
+                        act[out_row + i] = mlx_silu(l);
                     }
                 }
             } else {
@@ -64,7 +69,7 @@ enum TrackFastMixerKernels {
             if constexpr (VPT == 1) {
                 // MLXFAST-INJSPLIT: only ownership changes; each row keeps its K walk.
                 static_assert(HC == 4, "one-row inject tiles require four HC rows");
-                const int row = (tile - NT) * 2 + (int)sg;
+                const int row = (tile - NT) * SGS + (int)sg;
                 switch (row) {
                     case 0: track_inject_qmv_row<T, GS, BITS, KD, 0>(wi, si, bi, normed, inj, lid); break;
                     case 1: track_inject_qmv_row<T, GS, BITS, KD, 1>(wi, si, bi, normed, inj, lid); break;
@@ -105,13 +110,18 @@ enum TrackFastMixerKernels {
         let rowsPerSimdgroup = S == 1 ? downRowsPerSimdgroup : 4
         // MLXFAST-INJSPLIT: add two inject tiles only to the one-token path.
         let tiles = ND / (2 * rowsPerSimdgroup) + (inject != nil ? (S == 1 ? 2 : 1) : 0)
+        // MLXFAST-MIX1SG: one simdgroup per threadgroup on the one-token path.
+        let sgPerTg = S == 1 ? 1 : 2
+        let tiles1 = S == 1
+            ? ND / rowsPerSimdgroup + (inject != nil ? 4 : 0)
+            : tiles
         let outs = (S == 1 ? downInjectKernel1 : downInjectKernel)(
             [normed, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
             template: [
                 ("T", normed.dtype), ("GS", down.groupSize), ("BITS", down.bits), ("KD", KD), ("ND", ND),
                 ("HC", HC), ("VPT", S), ("HAS_INJECT", inject != nil),
             ],
-            grid: (32, tiles * 2, 1), threadGroup: (32, 2, 1),
+            grid: (32, tiles1 * sgPerTg, 1), threadGroup: (32, sgPerTg, 1),
             outputShapes: [[S, ND], [S, ND], [S, HC]], outputDTypes: [normed.dtype, normed.dtype, normed.dtype])
         return (outs[0], outs[1], outs[2])
     }
