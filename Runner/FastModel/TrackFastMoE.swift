@@ -1345,6 +1345,20 @@ extension TrackFastMoEKernels {
                 grid: (32, N / rows, BR + 1), threadGroup: (32, 2, 1),
                 outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
         }
+        // Two-token top-K selections are unique within each token. A shared
+        // routed expert can load each packed weight once for both inputs.
+        if x.dtype == .bfloat16 && S == 2 && BR == 20 && KD == 2560 && N == 640
+            && groupSize == 32 && bits == 4 && shared.mode == .affine
+        {
+            return expertOverlapReuseKernel(
+                [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
+                template: [
+                    ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N),
+                    ("KD", KD), ("BR", BR), ("VPT", S), ("RPS", 2),
+                ],
+                grid: (32, N / 4, BR + 1), threadGroup: (32, 2, 1),
+                outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
+        }
         return (S == 1 ? gateUpActKernel1 : gateUpActKernel)(
             [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
             template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("BR", BR), ("VPT", S)],
@@ -2345,4 +2359,167 @@ extension TrackFastMoEKernels {
         }
         """#
 
+}
+
+// Share routed expert weight loads only across the two tokens of a verification
+// window. The original slot order and shared expert qmv_wide arithmetic remain.
+extension TrackFastMoEKernels {
+    static let expertOverlapReuseHelpers = #"""
+// Two input vectors, one set of packed affine-4 weights. Each result retains
+// the exact qdot< float, 16, 4 > expression, K-loop order and SIMD reduction.
+template <typename T, int group_size, int bits, int rows>
+METAL_FUNC void qmv_fast_reg_two_inputs(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    const int in_vec_size,
+    const int out_row,
+    uint simd_lid,
+    thread float (&result0)[rows],
+    thread float (&result1)[rows]) {
+  static_assert(bits == 4, "Packed weight reuse currently supports affine4 only");
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const device uint8_t* ws = reinterpret_cast<const device uint8_t*>(w)
+      + out_row * in_vec_size_w + simd_lid * 8;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  thread float a[values_per_thread], b[values_per_thread];
+  for (int row = 0; row < rows; ++row) {
+    result0[row] = 0;
+    result1[row] = 0;
+  }
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    float sum0 = load_vector<T, float, values_per_thread, bits>(x0, a);
+    float sum1 = load_vector<T, float, values_per_thread, bits>(x1, b);
+    for (int row = 0; row < rows; ++row) {
+      const device uint16_t* packed = reinterpret_cast<const device uint16_t*>(ws + row * in_vec_size_w);
+      float scale = scales[row * in_vec_size_g];
+      float bias = biases[row * in_vec_size_g];
+      float accum0 = 0;
+      float accum1 = 0;
+      for (int i = 0; i < values_per_thread / 4; ++i) {
+        uint16_t word = packed[i];
+        accum0 +=
+            (a[4 * i] * (word & 0x000f) +
+             a[4 * i + 1] * (word & 0x00f0) +
+             a[4 * i + 2] * (word & 0x0f00) +
+             a[4 * i + 3] * (word & 0xf000));
+        accum1 +=
+            (b[4 * i] * (word & 0x000f) +
+             b[4 * i + 1] * (word & 0x00f0) +
+             b[4 * i + 2] * (word & 0x0f00) +
+             b[4 * i + 3] * (word & 0xf000));
+      }
+      result0[row] += scale * accum0 + sum0 * bias;
+      result1[row] += scale * accum1 + sum1 * bias;
+    }
+    ws += block_size / 2;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    x0 += block_size;
+    x1 += block_size;
+  }
+  for (int row = 0; row < rows; ++row) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+  }
+}
+
+"""#
+
+    static let expertOverlapReuseSource = #"""
+        const uint z = threadgroup_position_in_grid.z;
+        if (z == (uint)BR) {
+            // Shared expert: gate rows [0, N) and up rows [N, 2N) of the fused
+            // shared matrix, all S tokens. One token routes to `qmv_fast`, two to
+            // eight to `qmv_wide` (full tiles), exactly as the separate launches.
+            const uint kw2 = (uint)KD / 8;
+            const uint kg2 = (uint)KD / GS;
+            const int tile = (int)threadgroup_position_in_grid.y;
+            if constexpr (VPT == 1) {
+                const int out_row = tile * 8 + (int)simdgroup_index_in_threadgroup * 4;
+                float g[4], u[4];
+                qmv_fast_reg<T, GS, BITS>(wsh, ssh, bsh, x, KD, out_row, thread_index_in_simdgroup, g);
+                qmv_fast_reg<T, GS, BITS>(wsh + (size_t)N * kw2, ssh + (size_t)N * kg2, bsh + (size_t)N * kg2, x, KD, out_row, thread_index_in_simdgroup, u);
+                if (thread_index_in_simdgroup == 0) {
+                    for (int i = 0; i < 4; ++i) {
+                        act[(size_t)BR * (size_t)N + (size_t)(out_row + i)] = mlx_silu(static_cast<T>(g[i])) * static_cast<T>(u[i]);
+                    }
+                }
+            } else {
+                const int row = tile * 8 + (int)simdgroup_index_in_threadgroup * 4 + (int)(thread_index_in_simdgroup / 8);
+                float g[VPT], u[VPT];
+                qmv_wide_reg_full<T, GS, BITS, VPT, 8, false>(wsh, ssh, bsh, x, KD, VPT, row, thread_index_in_simdgroup, g);
+                qmv_wide_reg_full<T, GS, BITS, VPT, 8, false>(wsh + (size_t)N * kw2, ssh + (size_t)N * kg2, bsh + (size_t)N * kg2, x, KD, VPT, row, thread_index_in_simdgroup, u);
+                if ((thread_index_in_simdgroup % 8) == 0) {
+                    for (int v = 0; v < VPT; ++v) {
+                        act[(size_t)(BR + v) * (size_t)N + (size_t)row] = mlx_silu(static_cast<T>(g[v])) * static_cast<T>(u[v]);
+                    }
+                }
+            }
+            return;
+        }
+
+        static_assert(VPT == 2, "Weight sharing is a two-token specialization");
+        constexpr uint K = BR / 2;
+        const uint lid = thread_index_in_simdgroup;
+        const uint e = idx[z];
+        // The router's top-K indices are unique within each token. A matched
+        // first-token slot owns both outputs; its second-token peer skips.
+        const uint other_base = z < K ? K : 0;
+        const uint match = simd_min((lid < K && idx[other_base + lid] == e) ? lid : K);
+        if (z >= K && match < K) { return; }
+        const uint r = xrow[z];
+        const uint kw = (uint)KD / 8;
+        const uint kg = (uint)KD / GS;
+        const int out_row = (int)threadgroup_position_in_grid.y * 8
+            + (int)simdgroup_index_in_threadgroup * 4;
+        const size_t eoff = (size_t)e * (size_t)N;
+        const device T* xb = x + (size_t)r * (size_t)KD;
+        if (match < K) {
+            const uint peer = K + match;
+            const device T* xp = x + (size_t)xrow[peer] * (size_t)KD;
+            for (int part = 0; part < 4; part += RPS) {
+                float g0[RPS], g1[RPS], u0[RPS], u1[RPS];
+                qmv_fast_reg_two_inputs<T, GS, BITS, RPS>(
+                    wg + eoff * kw, sg + eoff * kg, bg + eoff * kg,
+                    xb, xp, KD, out_row + part, lid, g0, g1);
+                qmv_fast_reg_two_inputs<T, GS, BITS, RPS>(
+                    wu + eoff * kw, su + eoff * kg, bu + eoff * kg,
+                    xb, xp, KD, out_row + part, lid, u0, u1);
+                if (lid == 0) {
+                    for (int i = 0; i < RPS; ++i) {
+                        act[(size_t)z * N + out_row + part + i] = mlx_silu(static_cast<T>(g0[i])) * static_cast<T>(u0[i]);
+                        act[(size_t)peer * N + out_row + part + i] = mlx_silu(static_cast<T>(g1[i])) * static_cast<T>(u1[i]);
+                    }
+                }
+            }
+        } else {
+            float g[4], u[4];
+            qmv_fast_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, lid, g);
+            qmv_fast_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, lid, u);
+            if (lid == 0) {
+                for (int i = 0; i < 4; ++i) {
+                    act[(size_t)z * N + out_row + i] = mlx_silu(static_cast<T>(g[i])) * static_cast<T>(u[i]);
+                }
+            }
+        }
+
+"""#
+
+    nonisolated(unsafe) static let expertOverlapReuseKernel = MLXFast.metalKernel(
+        name: "track_moe_expert_overlap_reuse",
+        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
+        outputNames: ["act"],
+        source: expertOverlapReuseSource,
+        header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideHelpers + expertOverlapReuseHelpers,
+        ensureRowContiguous: true)
 }
