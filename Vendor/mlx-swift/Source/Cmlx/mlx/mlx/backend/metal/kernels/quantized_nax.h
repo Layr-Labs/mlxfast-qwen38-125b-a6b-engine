@@ -941,7 +941,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    const int STAGING_BK = BK>
 METAL_FUNC void qmm_t_nax_tgp_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -958,13 +959,15 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
     uint simd_lid [[thread_index_in_simdgroup]]) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
+  static_assert(STAGING_BK == BK || STAGING_BK == 2 * BK,
+                "Stage one or two weight blocks");
 
   (void)lid;
 
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int BK_padded = (STAGING_BK + 16 / sizeof(T));
 
   using loader_w_t = QuantizedBlockLoader<
       T,
@@ -1024,7 +1027,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      for (int k = 0; k < K; k += BK) {
+      for (int k = 0; k < K; k += STAGING_BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
@@ -1032,10 +1035,22 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
           loader_w.load_safe(short2(BK, tgp_bn));
         }
 
+        // Keep each loader step at BK to preserve quantization-group traversal.
+        if constexpr (STAGING_BK == 2 * BK) {
+          loader_w.next();
+          loader_w.dst += BK;
+          if constexpr (kAlignedN.value) {
+            loader_w.load_unsafe();
+          } else {
+            loader_w.load_safe(short2(BK, tgp_bn));
+          }
+          loader_w.dst -= BK;
+        }
+
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         STEEL_PRAGMA_NO_UNROLL
-        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+        for (int kk1 = 0; kk1 < STAGING_BK; kk1 += SK) {
           NAXTile<T, TM, TK> Atile;
           NAXTile<T, TN, TK> Btile;
 
@@ -1059,7 +1074,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
           (void)compiler_barrier;
         }
 
-        x += BK;
+        x += STAGING_BK;
         loader_w.next();
       }
 
@@ -1239,7 +1254,11 @@ template <
     uint simd_lid [[thread_index_in_simdgroup]]) {
   (void)lid;
 
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  // The host keeps its launch geometry; only dense bf16 weight staging grows.
+  constexpr bool widen_staging = metal::is_same_v<T, bfloat16_t> &&
+      BM == 64 && BK == 64 && BN == 64 && WM == 2 && WN == 2;
+  constexpr int STAGING_BK = widen_staging ? 2 * BK : BK;
+  constexpr int BK_padded = (STAGING_BK + 16 / sizeof(T));
 
   threadgroup T Ws[BN * BK_padded];
 
@@ -1260,6 +1279,15 @@ template <
         s_strides,
         b_strides,
         tid);
+  }
+  if constexpr (widen_staging) {
+    // The host only guarantees K % 64 == 0. All threads take this branch alike.
+    if (K % STAGING_BK == 0) {
+      qmm_t_nax_tgp_impl<
+          T, group_size, bits, aligned_N, BM, BK, BN, WM, WN, STAGING_BK>(
+          w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+      return;
+    }
   }
   qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
       w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
