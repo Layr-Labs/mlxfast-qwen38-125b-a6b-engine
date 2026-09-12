@@ -230,7 +230,60 @@ template <typename T, int D, int V = D>
         q_lo[h] = static_cast<float>(scale) * float4(qp[0]);
         q_hi[h] = static_cast<float>(scale) * float4(qp[1]);
       }
-      for (int token = block; token < N; token += blocks) {
+      // Two tokens' keys are fetched together so their score reductions
+      // overlap instead of running back to back. Values stay per token, so the
+      // pair costs one extra key register pair and nothing else. Each head
+      // still folds its tokens in ascending order.
+      const int k_step = blocks * int(k_seq_stride);
+      const int v_step = blocks * int(v_seq_stride);
+      int token = block;
+      for (; token + blocks < N; token += 2 * blocks) {
+        const device metal::vec<T, 4>* ka = (const device metal::vec<T, 4>*)kp;
+        const device metal::vec<T, 4>* kb = (const device metal::vec<T, 4>*)(kp + k_step);
+        const float4 k_lo0 = float4(ka[0]);
+        const float4 k_hi0 = float4(ka[1]);
+        const float4 k_lo1 = float4(kb[0]);
+        const float4 k_hi1 = float4(kb[1]);
+        float score[2][2];
+        for (int h = 0; h < 2; ++h) {
+          float s0 = q_lo[h].x * k_lo0.x;
+          s0 += q_lo[h].y * k_lo0.y;
+          s0 += q_lo[h].z * k_lo0.z;
+          s0 += q_lo[h].w * k_lo0.w;
+          s0 += q_hi[h].x * k_hi0.x;
+          s0 += q_hi[h].y * k_hi0.y;
+          s0 += q_hi[h].z * k_hi0.z;
+          s0 += q_hi[h].w * k_hi0.w;
+          float s1 = q_lo[h].x * k_lo1.x;
+          s1 += q_lo[h].y * k_lo1.y;
+          s1 += q_lo[h].z * k_lo1.z;
+          s1 += q_lo[h].w * k_lo1.w;
+          s1 += q_hi[h].x * k_hi1.x;
+          s1 += q_hi[h].y * k_hi1.y;
+          s1 += q_hi[h].z * k_hi1.z;
+          s1 += q_hi[h].w * k_hi1.w;
+          score[h][0] = simd_sum(s0);
+          score[h][1] = simd_sum(s1);
+        }
+        for (int u = 0; u < 2; ++u) {
+          const device metal::vec<T, 4>* vv =
+              (const device metal::vec<T, 4>*)(vp + u * v_step);
+          const float4 v_lo = float4(vv[0]);
+          const float4 v_hi = float4(vv[1]);
+          for (int h = 0; h < 2; ++h) {
+            const float next_maximum = max(maximum[h], score[h][u]);
+            const float factor = fast::exp(maximum[h] - next_maximum);
+            const float exp_score = fast::exp(score[h][u] - next_maximum);
+            maximum[h] = next_maximum;
+            denominator[h] = denominator[h] * factor + exp_score;
+            o_lo[h] = o_lo[h] * factor + exp_score * v_lo;
+            o_hi[h] = o_hi[h] * factor + exp_score * v_hi;
+          }
+        }
+        kp += 2 * k_step;
+        vp += 2 * v_step;
+      }
+      for (; token < N; token += blocks) {
         const device metal::vec<T, 4>* kv4 = (const device metal::vec<T, 4>*)kp;
         const device metal::vec<T, 4>* vv4 = (const device metal::vec<T, 4>*)vp;
         const float4 k_lo = float4(kv4[0]);
@@ -255,8 +308,8 @@ template <typename T, int D, int V = D>
           o_lo[h] = o_lo[h] * factor + exp_score * v_lo;
           o_hi[h] = o_hi[h] * factor + exp_score * v_hi;
         }
-        kp += blocks * int(k_seq_stride);
-        vp += blocks * int(v_seq_stride);
+        kp += k_step;
+        vp += v_step;
       }
       for (int h = 0; h < 2; ++h) {
         const uint offset = (head0 + h) * blocks + block;
