@@ -105,13 +105,23 @@ enum TrackFastGDNDecode {
                 }
             }
         }
-        if (sg == 0 && lane == 0) {
+        // MLXFAST-GDNGBSG: simdgroup 0 owns the q-channel convolution above, so
+        // the decay and beta scalars queued behind it on the same simdgroup.
+        // They read none of that work's results, so they run on a simdgroup that
+        // is otherwise idle until the barrier, and on one lane each so the two
+        // transcendental chains issue together. Threadgroup size is fixed at
+        // Dv / 4 == 32 simdgroups by the dispatch, so simdgroup 3 always exists.
+        // Operands, arithmetic and rounding are unchanged.
+        if (sg == 3 && lane < 2) {
             const device InT* row = proj + b_idx * PW;
-            const InT b_raw = row[B_OFF + hv_idx];
-            gb_shared[1] = static_cast<float>(mlx_sigmoid(b_raw));
-            const InT ax = row[A_OFF + hv_idx] + dt_bias[hv_idx];
-            const InT sp = mlx_logaddexp0(ax);
-            gb_shared[0] = metal::precise::exp(neg_exp_alog[hv_idx] * sp);
+            if (lane == 0) {
+                const InT b_raw = row[B_OFF + hv_idx];
+                gb_shared[1] = static_cast<float>(mlx_sigmoid(b_raw));
+            } else {
+                const InT ax = row[A_OFF + hv_idx] + dt_bias[hv_idx];
+                const InT sp = mlx_logaddexp0(ax);
+                gb_shared[0] = metal::precise::exp(neg_exp_alog[hv_idx] * sp);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const threadgroup InT* q_ = q_shared;
