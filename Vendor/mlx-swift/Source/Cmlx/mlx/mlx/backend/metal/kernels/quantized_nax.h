@@ -1087,7 +1087,13 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
             }
           }
 
-          STEEL_PRAGMA_NO_UNROLL
+          // MLXFAST-UNROLLDENSE. BK = 64 and SK = 32, so this walk has exactly
+          // two iterations. The pragma asked the compiler not to unroll a
+          // two-trip loop whose body is one A tile load, one B tile load and
+          // three tile_matmads; unrolling it lets the two bodies schedule as
+          // one straight-line block. Compiler hint only - no value, order or
+          // dispatch changes. Kept in step with the mlx-generated twin.
+          STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             NAXTile<T, TM, TK> Atile;
             NAXTile<T, TN, TK> Btile;
