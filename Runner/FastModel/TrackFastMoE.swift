@@ -2339,3 +2339,72 @@ extension TrackFastMoEKernels {
         """#
 
 }
+
+// MARK: the router GEMV for windows of two to eight tokens
+//
+// `routerGemvSource` reads the bf16 router weight directly for one token. A
+// wider window had no such path and fell through to MLX's float32 matmul over
+// `routerW32`, which reads the same values at twice the width. This is the same
+// kernel body with the weight loaded once and the window's rows streamed
+// against it, so a row's arithmetic is the one-token kernel's exactly.
+extension TrackFastMoEKernels {
+    static let routerGemvWideSource = """
+        constexpr int TM = 4, TN = 4, SN = 32, blockM = 16, blockN = 128;
+        const int tid_x = (int)threadgroup_position_in_grid.x;
+        const int simd_gid = (int)simdgroup_index_in_threadgroup;
+        const int simd_lid = (int)thread_index_in_simdgroup;
+        float result[TM][VPT] = {0};
+        float inter[TN];
+        float v_coeff[VPT][TN];
+        const int thrN = simd_lid;
+        const int simdM = simd_gid;
+        int bm = simdM * TM;
+        int bn = thrN * TN;
+        int out_row = tid_x * blockM + bm;
+        if (out_row >= N) return;
+        out_row = out_row + TM <= N ? out_row : N - TM;
+        const device T* mat = w + (size_t)out_row * (size_t)K;
+        const int n_iter = K / blockN;
+        for (int i = 0; i < n_iter; ++i) {
+            for (int v = 0; v < VPT; ++v) {
+                for (int tn = 0; tn < TN; tn++) { v_coeff[v][tn] = x[(size_t)v * (size_t)K + bn + tn]; }
+            }
+            int mat_offset = 0;
+            for (int tm = 0; tm < TM; tm++) {
+                for (int tn = 0; tn < TN; tn++) { inter[tn] = static_cast<float>(mat[mat_offset + bn + tn]); }
+                for (int v = 0; v < VPT; ++v) {
+                    for (int tn = 0; tn < TN; tn++) { result[tm][v] += inter[tn] * v_coeff[v][tn]; }
+                }
+                mat_offset += K;
+            }
+            bn += blockN;
+        }
+        for (int tm = 0; tm < TM; tm++) {
+            for (int v = 0; v < VPT; ++v) {
+                for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+                    result[tm][v] += simd_shuffle_down(result[tm][v], sn);
+                }
+            }
+        }
+        if (simd_lid == 0) {
+            for (int tm = 0; tm < TM; tm++) {
+                for (int v = 0; v < VPT; ++v) { out[(size_t)v * (size_t)N + out_row + tm] = result[tm][v]; }
+            }
+        }
+        """
+    nonisolated(unsafe) static let routerGemvWideKernel = MLXFast.metalKernel(
+        name: "track_router_gemv_wide", inputNames: ["x", "w"], outputNames: ["out"],
+        source: routerGemvWideSource, header: "", ensureRowContiguous: true)
+
+    /// x float32 [S, K], w bf16 [N, K] -> logits float32 [S, N]. Each row is
+    /// the one-token kernel's own accumulation over that row.
+    static func routerGemvWide(x: MLXArray, w: MLXArray) -> MLXArray {
+        let K = w.dim(1), N = w.dim(0), S = x.dim(0)
+        precondition(x.dtype == .float32 && w.dtype == .bfloat16 && x.dim(1) == K)
+        precondition(K % 128 == 0 && K > 64 && N % 16 == 0 && S >= 1 && S <= 8)
+        return routerGemvWideKernel(
+            [x, w], template: [("T", w.dtype), ("K", K), ("N", N), ("VPT", S)],
+            grid: (32 * (N / 16), 1, 4), threadGroup: (32, 1, 4),
+            outputShapes: [[S, N]], outputDTypes: [.float32])[0]
+    }
+}

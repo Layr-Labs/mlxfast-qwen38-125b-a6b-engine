@@ -690,6 +690,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // reference upcasts it to float32 and reads twice the bytes).
             let xf = (inputF32 ?? x.asType(.float32)).reshaped(x.dim(2))
             logits = TrackFastMoEKernels.routerGemv(x: xf, w: m.routerW16).reshaped(1, 1, -1)
+        } else if x.dim(0) == 1, x.dim(1) >= 2, x.dim(1) <= 8,
+            m.routerW16.dtype == .bfloat16, x.dim(2) % 128 == 0,
+            m.routerW16.dim(0) % 16 == 0, StreamOrDevice.default.stream === Stream.gpu
+        {
+            // Two to eight tokens: the same bf16 weight the one-token path
+            // reads, loaded once and streamed against the window's rows. The
+            // float32 copy this replaces holds the same values at twice the
+            // width.
+            let xf = (inputF32 ?? x.asType(.float32)).reshaped(x.dim(1), x.dim(2))
+            logits = TrackFastMoEKernels.routerGemvWide(x: xf, w: m.routerW16)
+                .reshaped(1, x.dim(1), -1)
         } else if inputF32 == nil, let wide = TrackPrefillRouter.apply(x: x, w: m.routerW16) {
             logits = wide
         } else {
