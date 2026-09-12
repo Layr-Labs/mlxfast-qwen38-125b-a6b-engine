@@ -172,6 +172,31 @@ extension TrackFastKernels {
         outputNames: ["stream", "normed"],
         source: injectNormWideSource, ensureRowContiguous: true)
 
+    private static let retainWideNormValues =
+        ProcessInfo.processInfo.environment["TRACK_WIDE_NORM_RETAIN_VALUES"] != "0"
+
+    static let injectNormRetainedSource: String = {
+        var source = injectNormWideSource
+        let replacements = [
+            ("InT inj_t = InT(0);", "InT cached[simd_groups * N_READS];\nInT inj_t = InT(0);"),
+            ("stream[base + d] = r;", "stream[base + d] = r;\ncached[g * N_READS + i] = r;"),
+            ("static_cast<float>(stream[base + d])", "static_cast<float>(cached[g * N_READS + i])"),
+        ]
+        for (old, new) in replacements {
+            precondition(source.components(separatedBy: old).count == 2)
+            source = source.replacingOccurrences(of: old, with: new)
+        }
+        let loop = "for (uint g = 0; g < simd_groups; ++g) {"
+        precondition(source.components(separatedBy: loop).count == 3)
+        return source.replacingOccurrences(of: loop, with: "#pragma clang loop unroll(full)\n" + loop)
+    }()
+
+    nonisolated(unsafe) private static let injectNormRetainedKernel = MLXFast.metalKernel(
+        name: "track_inject_norm_retained_values",
+        inputNames: ["residual", "out", "inject", "scale"],
+        outputNames: ["stream", "normed"], source: injectNormRetainedSource,
+        ensureRowContiguous: true)
+
     nonisolated(unsafe) static var wideNormMinS = 9
 
     static func injectNorm(
@@ -183,7 +208,10 @@ extension TrackFastKernels {
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024)
         let hasInject = out != nil
         if S >= wideNormMinS {
-            let outs = injectNormWideKernel(
+            let retainValues = retainWideNormValues && B == 1 && residual.dtype == .bfloat16
+                && hidden == 2560 && hcCount == 4
+            let kernel = retainValues ? injectNormRetainedKernel : injectNormWideKernel
+            let outs = kernel(
                 [residual, out ?? residual, inject ?? residual, scale],
                 template: [
                     ("InT", residual.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
