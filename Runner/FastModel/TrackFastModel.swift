@@ -509,6 +509,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             Self.debugTaps?.append((tag + ".act", act))
             Self.debugTaps?.append((tag + ".w", w))
         }
+        if emitF32, let r = TrackPrefillRouterInput.apply(
+            w: w, normed: normed, inj: inj, hcCount: hcCount, hidden: hidden,
+            hasInject: hc.hasInject)
+        {
+            return (r.input, r.inject, r.inputF32)
+        }
         let r = TrackFastKernels.hcMix(
             w: w, normed: normed, inj: inj, hcCount: hcCount, hidden: hidden,
             hasInject: hc.hasInject)
