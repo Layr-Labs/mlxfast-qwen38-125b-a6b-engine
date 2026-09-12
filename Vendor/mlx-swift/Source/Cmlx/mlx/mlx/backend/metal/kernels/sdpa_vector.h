@@ -500,15 +500,22 @@ template <typename T, int D>
   max_score = simd_max(max_score);
 
   // Reduce the d
+  const bool reuse_factors = metal::is_same_v<T, bfloat16_t> && D == 256 &&
+      blocks >= BN && blocks <= 4 * BN;
+  U factors[4];
   for (int b = 0; b < blocks / BN; ++b) {
     U factor = fast::exp(maxs[simd_lid + BN * b] - max_score);
+    if (reuse_factors) {
+      factors[b] = factor;
+    }
     sum_exp_score += factor * sums[simd_lid + BN * b];
   }
   sum_exp_score = simd_sum(sum_exp_score);
 
   // Reduce the sum exp and partials
   for (int b = 0; b < blocks / BN; ++b) {
-    U factor = fast::exp(maxs[simd_gid] - max_score);
+    U factor = reuse_factors ? simd_broadcast(factors[b], simd_gid)
+                            : fast::exp(maxs[simd_gid] - max_score);
 
     // Update the output accumulator
     for (int i = 0; i < elem_per_thread; i++) {
