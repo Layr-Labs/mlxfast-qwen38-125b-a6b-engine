@@ -45,6 +45,44 @@ let qwen38A6BTensorInventoryURL = qwen38A6BRepositoryRoot
 let qwen38A6BReferenceManifestURL = qwen38A6BRepositoryRoot
     .appendingPathComponent("fixtures/reference_qwen3_8_125b_a6b_4bit.sha256")
 
+/// The served MTP head's source (David ruling 2026-09-12): the publisher's
+/// 8-bit conversion of the same checkpoint, two shards of it.
+let qwen38A6BMTPHeadSourceRepository = "Vontra/Qwen3.8-Flash-Next-MLX-8bit-MTP"
+let qwen38A6BMTPHeadSourceRevision = "9c306179562765396e197a8a7a5de1b6b761c41a"
+
+let qwen38A6BMTPHeadManifestURL = qwen38A6BRepositoryRoot
+    .appendingPathComponent("fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256")
+
+let qwen38A6BMTPHeadInventoryURL = qwen38A6BRepositoryRoot
+    .appendingPathComponent("fixtures/qwen3_8_125b_a6b_mtp_8bit_inventory.json")
+
+func qwen38A6BMTPHeadInventoryObject() throws -> [String: Any] {
+    guard let object = try JSONSerialization.jsonObject(
+        with: try Data(contentsOf: qwen38A6BMTPHeadInventoryURL)
+    ) as? [String: Any] else {
+        throw MLXFastError.invalidInput(
+            "Qwen 3.8 125B A6B MTP head inventory fixture must be a JSON object"
+        )
+    }
+    return object
+}
+
+/// The `<sha256> <bytes> <path>` records of a reference manifest, comment
+/// and blank lines skipped.
+func qwen38A6BManifestRecords(_ url: URL) throws -> [(sha256: String, bytes: Int, path: String)] {
+    let text = try String(contentsOf: url, encoding: .utf8)
+    var records: [(sha256: String, bytes: Int, path: String)] = []
+    for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+        if line.hasPrefix("#") { continue }
+        let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+        guard fields.count == 3, let bytes = Int(fields[1]) else {
+            throw MLXFastError.invalidInput("malformed manifest record: \(line)")
+        }
+        records.append((String(fields[0]), bytes, String(fields[2])))
+    }
+    return records
+}
+
 func qwen38A6BTrackContractObject() throws -> [String: Any] {
     guard let object = try JSONSerialization.jsonObject(
         with: try Data(contentsOf: qwen38A6BTrackContractURL)

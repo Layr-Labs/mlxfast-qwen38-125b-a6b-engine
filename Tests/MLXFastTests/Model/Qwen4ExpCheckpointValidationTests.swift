@@ -208,8 +208,13 @@ func quantizationSpecRejectsEveryShapeOfBlockDrift() throws {
 /// `makeRuntimeConfigData` REBUILDS the emitted `quantization` from a parsed
 /// `{group_size, bits, mode}` triple, which is lossless only because the Qwen
 /// block has exactly three keys. Copying that shape here would emit a config
-/// declaring uniform 4-bit for the 120 tensors the shards were written at 8 --
-/// right names, right shapes, wrong numerics, and nothing downstream notices.
+/// declaring uniform 4-bit for tensors the shards were written at 8 -- right
+/// names, right shapes, wrong numerics, and nothing downstream notices.
+///
+/// Since 2026-09-12 the tree DOES carry 8-bit tensors: the served head. Its
+/// per-module entries are emitted from the pinned geometry, one for each of
+/// the head's quantized projections, keyed `mtp.*` the way the runtime walks
+/// its module tree. The tower's scalars stay uniform 4-bit.
 @Test
 func emittedRuntimeConfigCarriesTheUniformQuantizationBlock() throws {
     let data = try SwiftTransform.makeRuntimeConfigData(
@@ -235,8 +240,22 @@ func emittedRuntimeConfigCarriesTheUniformQuantizationBlock() throws {
     }
     #expect(
         overrideKeys.count
-            == Qwen4ExpCheckpointValidation.expectedQuantizationOverrideCount)
-    #expect(overrideKeys.isEmpty, "this target carries no per-tensor override")
+            == Qwen4ExpCheckpointValidation.expectedMTPQuantizedModuleCount)
+    #expect(
+        Set(overrideKeys)
+            == Set(Qwen4ExpCheckpointValidation.runtimeHeadQuantizationOverrides().keys))
+    for key in overrideKeys {
+        // Runtime module paths: the checkpoint's `language_model.` prefix is
+        // gone, and every entry is the served head's own width.
+        #expect(key.hasPrefix("mtp."), "\(key)")
+        #expect(!key.hasPrefix("language_model."), "\(key)")
+        let entry = try #require(quantization[key] as? [String: Any])
+        #expect(entry["bits"] as? Int == Geometry.mtpHeadServedQuantizationBits)
+        #expect(entry["group_size"] as? Int == Geometry.quantizationGroupSize)
+        #expect(entry["mode"] as? String == Geometry.quantizationMode)
+    }
+    // The tower is untouched: no entry names a tower module.
+    #expect(!overrideKeys.contains { $0.hasPrefix("model.") || $0.hasPrefix("lm_head") })
 }
 
 /// The legacy `.gemma4` family emits the projection and tied-head sidecars;
@@ -687,4 +706,199 @@ func transformRejectsInventoryAndPackingDrift() throws {
             $0["language_model.model.layers.0.experts.switch_glu.gate_proj.weight"] =
                 quantized.init(dtype: "U32", shape: [90_112, 352])
         })
+}
+
+// MARK: - The served head (David ruling 2026-09-12)
+
+/// The head the transform SERVES is the publisher's 8-bit conversion of the
+/// same 76 tensors. Same names, same scale and bias shapes, packed columns
+/// doubled. Both tables come out of one builder, so they cannot drift apart.
+@Test
+func servedHeadInventoryIsTheEmbeddedHeadAtEightBits() throws {
+    let embedded = Qwen4ExpCheckpointValidation.expectedHeadInventory(
+        bits: Geometry.quantizationBits)
+    let served = Qwen4ExpCheckpointValidation.expectedHeadInventory(
+        bits: Geometry.mtpHeadServedQuantizationBits)
+    #expect(embedded.count == Qwen4ExpCheckpointValidation.expectedMTPTensorCount)
+    #expect(Set(embedded.keys) == Set(served.keys))
+    #expect(embedded.keys.allSatisfy { $0.hasPrefix("language_model.mtp.") })
+
+    // The source table's head IS the embedded table, entry for entry.
+    let source = Qwen4ExpCheckpointValidation.expectedTensorInventory()
+    for (name, metadata) in embedded {
+        #expect(source[name] == metadata, "\(name)")
+    }
+
+    var packed = 0
+    for (name, metadata) in served {
+        let embeddedMetadata = try #require(embedded[name])
+        #expect(metadata.dtype == embeddedMetadata.dtype, "\(name)")
+        if metadata.dtype == "U32" {
+            packed += 1
+            #expect(metadata.shape.dropLast() == embeddedMetadata.shape.dropLast(), "\(name)")
+            #expect(metadata.shape.last == embeddedMetadata.shape.last.map { $0 * 2 }, "\(name)")
+        } else {
+            #expect(metadata.shape == embeddedMetadata.shape, "\(name)")
+        }
+    }
+    #expect(packed == Qwen4ExpCheckpointValidation.expectedMTPQuantizedModuleCount)
+    // Read off the pinned 8-bit shards: hidden 2560 packs to 640 U32 columns.
+    #expect(served["language_model.mtp.fc_hidden.weight"]?.shape == [2_560, 640])
+    #expect(served["language_model.mtp.fc_hidden.scales"]?.shape == [2_560, 80])
+    #expect(
+        served["language_model.mtp.layers.0.mlp.switch_mlp.gate_proj.weight"]?.shape
+            == [512, 640, 640])
+    #expect(
+        served["language_model.mtp.layers.0.mlp.switch_mlp.down_proj.weight"]?.shape
+            == [512, 2_560, 160])
+    #expect(served["language_model.mtp.layers.0.self_attn.o_proj.weight"]?.shape == [2_560, 1_536])
+}
+
+@Test
+func servedHeadOverridesNameEveryQuantizedHeadModuleOnce() throws {
+    let stems = Qwen4ExpCheckpointValidation.headQuantizedModuleStems()
+    #expect(stems.count == Qwen4ExpCheckpointValidation.expectedMTPQuantizedModuleCount)
+    #expect(stems == stems.sorted())
+    #expect(Set(stems).count == stems.count)
+    #expect(stems.contains("language_model.mtp.fc_embedding"))
+    #expect(stems.contains("language_model.mtp.layers.0.mlp.switch_mlp.up_proj"))
+    #expect(stems.contains("language_model.mtp.layers.0.self_attn.indexer.index_qk_proj"))
+    // The router is unquantized and the norms carry no scales: no entry.
+    #expect(!stems.contains("language_model.mtp.layers.0.mlp.gate"))
+    #expect(!stems.contains("language_model.mtp.pre_fc_norm_hidden"))
+
+    let overrides = Qwen4ExpCheckpointValidation.runtimeHeadQuantizationOverrides()
+    #expect(overrides.count == stems.count)
+    for stem in stems {
+        let key = String(stem.dropFirst("language_model.".count))
+        let entry = try #require(overrides[key])
+        #expect(entry["bits"] as? Int == 8)
+        #expect(entry["group_size"] as? Int == 32)
+        #expect(entry["mode"] as? String == "affine")
+    }
+}
+
+/// The head source's own config: the publisher's 8-bit conversion declares
+/// the same two-block shape at 8 bits. Anything else is the wrong artifact.
+@Test
+func headSourceQuantizationSpecPinsEightBits() throws {
+    let eightBit: [String: Any] = ["group_size": 32, "bits": 8, "mode": "affine"]
+    let spec = try Qwen4ExpCheckpointValidation.headSourceQuantizationSpec(
+        fromConfigRoot: pinnedSourceConfig(quantization: eightBit, quantizationConfig: eightBit))
+    #expect(spec.bits == 8)
+    #expect(spec.groupSize == 32)
+    #expect(spec.overrides.isEmpty)
+
+    // The 4-bit target itself is refused as a head source, and so is a
+    // promoted or re-grouped variant.
+    #expect(throws: MLXFastError.self) {
+        _ = try Qwen4ExpCheckpointValidation.headSourceQuantizationSpec(
+            fromConfigRoot: pinnedSourceConfig())
+    }
+    var promoted = eightBit
+    promoted["language_model.mtp.fc_hidden"] = ["group_size": 32, "bits": 4]
+    #expect(throws: MLXFastError.self) {
+        _ = try Qwen4ExpCheckpointValidation.headSourceQuantizationSpec(
+            fromConfigRoot: pinnedSourceConfig(quantization: promoted, quantizationConfig: promoted))
+    }
+    let regrouped: [String: Any] = ["group_size": 64, "bits": 8, "mode": "affine"]
+    #expect(throws: MLXFastError.self) {
+        _ = try Qwen4ExpCheckpointValidation.headSourceQuantizationSpec(
+            fromConfigRoot: pinnedSourceConfig(quantization: regrouped, quantizationConfig: regrouped))
+    }
+}
+
+/// Synthetic head-source metadata: the served inventory laid out across two
+/// shards the way the pinned 8-bit checkpoint lays it out, with the tower
+/// tensors that share those shards alongside. Metadata only; no bytes.
+private func headSourceMetadata(
+    mutate: (inout [String: Qwen4ExpCheckpointValidation.ExpectedTensorMetadata]) -> Void = { _ in }
+) -> (index: CheckpointIndex, headers: [String: SafetensorsHeader]) {
+    var inventory = Qwen4ExpCheckpointValidation.expectedHeadInventory(
+        bits: Geometry.mtpHeadServedQuantizationBits)
+    // A tower tensor the pinned shard 41 also carries; the head validator
+    // must look past it.
+    inventory["language_model.lm_head.weight"] =
+        Qwen4ExpCheckpointValidation.ExpectedTensorMetadata(dtype: "U32", shape: [248_320, 640])
+    mutate(&inventory)
+
+    let first = "model-00041-of-00042.safetensors"
+    let second = "model-00042-of-00042.safetensors"
+    var weightMap: [String: String] = [:]
+    var tensors: [String: [String: SafetensorInfo]] = [first: [:], second: [:]]
+    for (name, metadata) in inventory {
+        let shard = name.contains(".mlp.switch_mlp.") || name.contains("lm_head") ? first : second
+        weightMap[name] = shard
+        tensors[shard, default: [:]][name] = SafetensorInfo(
+            name: name, dtype: metadata.dtype, shape: metadata.shape, dataStart: 0, dataEnd: 1)
+    }
+    return (
+        CheckpointIndex(raw: ["weight_map": weightMap], weightMap: weightMap),
+        [
+            first: SafetensorsHeader(headerLength: 8, metadata: ["format": "mlx"], tensors: tensors[first, default: [:]]),
+            second: SafetensorsHeader(headerLength: 8, metadata: ["format": "mlx"], tensors: tensors[second, default: [:]]),
+        ]
+    )
+}
+
+private func eightBitHeadSpec() throws -> Qwen4ExpTransformQuantizationSpec {
+    let eightBit: [String: Any] = ["group_size": 32, "bits": 8, "mode": "affine"]
+    return try Qwen4ExpCheckpointValidation.headSourceQuantizationSpec(
+        fromConfigRoot: pinnedSourceConfig(quantization: eightBit, quantizationConfig: eightBit))
+}
+
+@Test
+func headSourceValidationAcceptsTheServedHeadAcrossItsTwoShards() throws {
+    let metadata = headSourceMetadata()
+    try Qwen4ExpCheckpointValidation.validateHeadSource(
+        index: metadata.index, headers: metadata.headers, quantization: try eightBitHeadSpec())
+}
+
+@Test
+func headSourceValidationRejectsTheWrongHead() throws {
+    let spec = try eightBitHeadSpec()
+    func rejected(
+        _ mutate: (inout [String: Qwen4ExpCheckpointValidation.ExpectedTensorMetadata]) -> Void
+    ) -> Bool {
+        let metadata = headSourceMetadata(mutate: mutate)
+        do {
+            try Qwen4ExpCheckpointValidation.validateHeadSource(
+                index: metadata.index, headers: metadata.headers, quantization: spec)
+            return false
+        } catch {
+            return true
+        }
+    }
+    typealias Metadata = Qwen4ExpCheckpointValidation.ExpectedTensorMetadata
+    // The 4-bit head offered as the served head: right names, right leading
+    // dimensions, half the packed columns. Exactly the substitution the
+    // width check exists to refuse.
+    #expect(
+        rejected {
+            $0["language_model.mtp.fc_hidden.weight"] = Metadata(dtype: "U32", shape: [2_560, 320])
+        })
+    // A head tensor missing from the shards.
+    #expect(rejected { $0.removeValue(forKey: "language_model.mtp.layers.0.self_attn.k_proj.biases") })
+    // A head tensor that is not the head's: an embedding of its own.
+    #expect(
+        rejected {
+            $0["language_model.mtp.embed_tokens.weight"] = Metadata(dtype: "U32", shape: [248_320, 640])
+        })
+    // Wrong dtype on a norm.
+    #expect(
+        rejected {
+            $0["language_model.mtp.layers.0.self_attn.q_norm.weight"] = Metadata(dtype: "F32", shape: [256])
+        })
+    // Scales and biases that disagree.
+    #expect(
+        rejected {
+            $0["language_model.mtp.fc_hidden.biases"] = Metadata(dtype: "BF16", shape: [2_560, 40])
+        })
+    // And the 4-bit target's own spec is not a served-head spec at all.
+    let fourBit = try Qwen4ExpCheckpointValidation.quantizationSpec(fromConfigRoot: pinnedSourceConfig())
+    let metadata = headSourceMetadata()
+    #expect(throws: MLXFastError.self) {
+        try Qwen4ExpCheckpointValidation.validateHeadSource(
+            index: metadata.index, headers: metadata.headers, quantization: fourBit)
+    }
 }
