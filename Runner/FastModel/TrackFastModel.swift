@@ -226,6 +226,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let hidden: Int
     let eps: Float
     private let injectNormReplay: @Sendable ([MLXArray]) -> [MLXArray]
+    /// The hyper-connection mixer's two launches, captured as one compiled
+    /// graph. One variant per template combination the tower actually uses:
+    /// the attention block (inject, no f32 stream), the MLP block (inject and
+    /// the f32 stream) and the final mixer (no inject). nil when the tower has
+    /// no quantized mixer to build them from.
+    private let mixerReplayInject: (@Sendable ([MLXArray]) -> [MLXArray])?
+    private let mixerReplayInjectF32: (@Sendable ([MLXArray]) -> [MLXArray])?
+    private let mixerReplayPlain: (@Sendable ([MLXArray]) -> [MLXArray])?
+    /// The gated-deltanet block's four launches as one compiled graph: the
+    /// fused input projection, the prep/recurrence pair, the gated output norm
+    /// and the output projection. The recurrent state rides in and out as
+    /// arrays, so the staging call stays outside the graph. nil when the tower
+    /// has no quantized deltanet block to build it from.
+    private let gdnReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let rotaryDims: Int
     let rotary: Qwen4ExpRotary
     let indexerBudget: Int
@@ -283,6 +297,82 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         self.layers = built
         self.finalMixer = Self.bindHC(tower.trackChild("hyper_connection_mixer"), cfg: cfg)
+        // The mixer launches are the same two kernels on every block, so one
+        // compiled graph per template combination serves the whole tower; the
+        // weights ride in as inputs.
+        var replayInject: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+        var replayInjectF32: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+        var replayPlain: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+        if let sample = built.first, case .quant(let dq) = sample.attnHC.down,
+            case .quant(let uq) = sample.attnHC.up
+        {
+            func makeReplay(hasInject: Bool, emitF32: Bool)
+                -> @Sendable ([MLXArray]) -> [MLXArray]
+            {
+                compile(shapeless: false) {
+                    [hcCount = cfg.hcCount, hidden = cfg.hiddenSize,
+                     dgs = dq.groupSize, dbits = dq.bits, dmode = dq.mode,
+                     ugs = uq.groupSize, ubits = uq.bits, umode = uq.mode] inputs in
+                    let down = TrackQuantWeight(
+                        weight: inputs[1], scales: inputs[2], biases: inputs[3],
+                        groupSize: dgs, bits: dbits, mode: dmode)
+                    let inject = hasInject
+                        ? TrackQuantWeight(
+                            weight: inputs[4], scales: inputs[5], biases: inputs[6],
+                            groupSize: dgs, bits: dbits, mode: dmode)
+                        : nil
+                    let up = TrackQuantWeight(
+                        weight: inputs[7], scales: inputs[8], biases: inputs[9],
+                        groupSize: ugs, bits: ubits, mode: umode)
+                    let d = TrackFastMixerKernels.splitEligible(
+                        S: inputs[0].dim(0), KD: inputs[0].dim(1), ND: down.rows,
+                        groupSize: down.groupSize)
+                        ? TrackFastMixerKernels.downInjectSplit(
+                            normed: inputs[0], down: down, inject: inject)
+                        : TrackFastMixerKernels.downInject(
+                            normed: inputs[0], down: down, inject: inject)
+                    let u = TrackFastMixerKernels.upMix(
+                        act: d.act, normed: inputs[0], up: up, inj: d.inj,
+                        hcCount: hcCount, hidden: hidden,
+                        hasInject: hasInject, emitF32: emitF32)
+                    return [u.input, u.inject, u.inputF32]
+                }
+            }
+            replayInject = makeReplay(hasInject: true, emitF32: false)
+            replayInjectF32 = makeReplay(hasInject: true, emitF32: true)
+            replayPlain = makeReplay(hasInject: false, emitF32: false)
+        }
+        self.mixerReplayInject = replayInject
+        self.mixerReplayInjectF32 = replayInjectF32
+        self.mixerReplayPlain = replayPlain
+        // Every deltanet block shares one geometry, so one compiled graph
+        // serves all of them with the weights as inputs.
+        var gdnR: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+        if let g = built.compactMap({ $0.gdn }).first,
+            let fusedProj = g.proj.fused, case .quant(let pq) = fusedProj,
+            case .quant(let oq) = g.out, pq.biases != nil, oq.biases != nil
+        {
+            gdnR = compile(shapeless: false) {
+                [geo = g.geometry, zOffset = g.zOffset,
+                 pgs = pq.groupSize, pbits = pq.bits, pmode = pq.mode,
+                 ogs = oq.groupSize, obits = oq.bits, omode = oq.mode] inputs in
+                let projW = TrackQuantWeight(
+                    weight: inputs[1], scales: inputs[2], biases: inputs[3],
+                    groupSize: pgs, bits: pbits, mode: pmode)
+                let outW = TrackQuantWeight(
+                    weight: inputs[9], scales: inputs[10], biases: inputs[11],
+                    groupSize: ogs, bits: obits, mode: omode)
+                let proj = projW.apply(inputs[0])
+                let r = TrackFastKernels.gdn(
+                    proj: proj, convState: inputs[4], convW: inputs[5],
+                    negExpALog: inputs[6], dtBias: inputs[7], stateIn: inputs[8],
+                    T: inputs[0].dim(1), capture: false, geometry: geo)
+                let gated = TrackFastKernels.gatedRMS(
+                    y: r.y, proj: proj, w: inputs[12], zOffset: zOffset, eps: 1e-6)
+                return [outW.apply(gated), r.convOut, r.stateOut]
+            }
+        }
+        self.gdnReplay = gdnR
         super.init()
     }
 
@@ -473,7 +563,29 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             if hc.hasInject, case .quant(let q)? = hc.inject, q.biases != nil { injQ = q }
             if !hc.hasInject || injQ != nil {
                 let n2 = normed.reshaped(S, hcCount * hidden)
-                let d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
+                // The compiled graph for this template combination, when the
+                // debug taps are off (they would have to be traced).
+                let replay = Self.debugTaps == nil
+                    ? (hc.hasInject
+                        ? (emitF32 ? mixerReplayInjectF32 : mixerReplayInject)
+                        : mixerReplayPlain)
+                    : nil
+                if let replay {
+                    // Slots 4...6 are the inject weight; the no-inject variant
+                    // ignores them, and `downInject` falls back to `down`.
+                    let inj = injQ ?? dq
+                    let out = replay([
+                        n2, dq.weight, dq.scales, dq.biases!,
+                        inj.weight, inj.scales, inj.biases!,
+                        uq.weight, uq.scales, uq.biases!,
+                    ])
+                    let f32 = emitF32 ? out[2].reshaped(1, S, hidden) : nil
+                    return (out[0].reshaped(1, S, hidden), out[1].reshaped(1, S, hcCount), f32)
+                }
+                let d = TrackFastMixerKernels.splitEligible(
+                    S: S, KD: n2.dim(1), ND: dq.rows, groupSize: dq.groupSize)
+                    ? TrackFastMixerKernels.downInjectSplit(normed: n2, down: dq, inject: injQ)
+                    : TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
                 let u = TrackFastMixerKernels.upMix(
                     act: d.act, normed: n2, up: uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
                     hasInject: hc.hasInject, emitF32: emitF32)
@@ -537,14 +649,34 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let geo = separate ? TrackP12Prefill.splitGeometry(g.geometry) : g.geometry
         let prof = TrackFastProfile.prefill != nil && S >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
-        let split = separate ? g.proj.parts.map { $0.apply(x) } : nil
-        let proj = split?[0] ?? g.proj.apply(x)  // [B,S,PROJ_W]
-        if prof { TrackFastProfile.tick("gdn.proj", &pt, split ?? [proj]) }
         let state = evaluation.inputState(modelLayerIndex: layerIndex)
         let convState =
             state?.conv ?? MLXArray.zeros([B, geo.convKernel - 1, geo.convDim], dtype: x.dtype)
         let ssm =
             state?.ssm ?? MLXArray.zeros([B, geo.hv, geo.dv, geo.dk], dtype: .float32)
+        // The decode-width block as one compiled graph: same four launches,
+        // same geometry, the recurrent state in and out as arrays. Skipped for
+        // the split-prefill shape, for capture, and while profiling, because
+        // each of those changes what the block runs.
+        if !separate, !capture, !prof, S <= 8, B == 1, let replay = gdnReplay,
+            let fusedProj = g.proj.fused, case .quant(let pq) = fusedProj,
+            case .quant(let oq) = g.out, let pb = pq.biases, let ob = oq.biases
+        {
+            let out = replay([
+                x, pq.weight, pq.scales, pb, convState, g.convW, g.negExpALog, g.dtBias, ssm,
+                oq.weight, oq.scales, ob, g.normW,
+            ])
+            do {
+                try evaluation.stage(modelLayerIndex: layerIndex, conv: out[1], ssm: out[2])
+            } catch {
+                preconditionFailure(
+                    "TrackFastModel: recurrent stage failed at layer \(layerIndex): \(error)")
+            }
+            return out[0]
+        }
+        let split = separate ? g.proj.parts.map { $0.apply(x) } : nil
+        let proj = split?[0] ?? g.proj.apply(x)  // [B,S,PROJ_W]
+        if prof { TrackFastProfile.tick("gdn.proj", &pt, split ?? [proj]) }
         let r = TrackFastKernels.gdn(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
             dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo,

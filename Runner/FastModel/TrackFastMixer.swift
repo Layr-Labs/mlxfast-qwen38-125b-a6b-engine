@@ -94,6 +94,97 @@ enum TrackFastMixerKernels {
         outputNames: ["lo", "act", "inj"],
         source: downInjectSource, header: header1, ensureRowContiguous: true)
 
+    /// Groups of K each threadgroup walks, as a divisor of the row's group
+    /// count. Eight keeps every slice a whole number of groups at the mixer's
+    /// K and multiplies the resident threadgroup count by the same factor.
+    static let downSplitK = 8
+
+    /// The low-rank rows with K split across threadgroups, then one pass that
+    /// sums the slices and applies the activation.
+    ///
+    /// The row walk, the decode and the lane reduction inside a slice are
+    /// `downInject`'s. What changes is that a row's groups are summed as
+    /// `downSplitK` partials instead of one running total, so the float
+    /// addition is regrouped. The inject rows are not split: their tile runs
+    /// the whole of K on the first slice.
+    static let downSplitSource = """
+        const int tile = (int)threadgroup_position_in_grid.y;
+        const int kc = (int)threadgroup_position_in_grid.z;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint lid = thread_index_in_simdgroup;
+        constexpr int NT = ND / 8;
+        constexpr int G = KD / GS;
+        constexpr int GC = G / KSPLIT;
+        if (tile < NT) {
+            const int row = tile * 8 + (int)sg * 4 + (int)(lid / 8);
+            float r[VPT];
+            qmv_wide_reg_range<T, GS, BITS, VPT, 8, false>(
+                wd, sd, bd, normed, KD, VPT, row, kc * GC, (kc + 1) * GC, lid, r);
+            if ((lid % 8) == 0) {
+                for (int v = 0; v < VPT; ++v) {
+                    part[((size_t)kc * VPT + v) * ND + row] = r[v];
+                }
+            }
+        } else if (HAS_INJECT && kc == 0) {
+            threadgroup float fp[8 * VPT];
+            float r[VPT];
+            bool valid = false; int row = 0;
+            qmv_wide_reg_partial<T, GS, BITS, VPT, 8>(wi, si, bi, normed, KD, HC, VPT, fp, sg, lid, r, valid, row);
+            if (valid) {
+                for (int v = 0; v < VPT; ++v) { inj[v * HC + row] = static_cast<T>(r[v]); }
+            }
+        }
+        """
+    static let downReduceSource = """
+        const uint i = thread_position_in_grid.x;
+        if (i >= (uint)(VPT * ND)) return;
+        float s = 0.0f;
+        for (int c = 0; c < KSPLIT; ++c) { s += part[(size_t)c * VPT * ND + i]; }
+        const T l = static_cast<T>(s);
+        lo[i] = l;
+        act[i] = mlx_silu(l);
+        """
+    nonisolated(unsafe) static let downSplitKernel = MLXFast.metalKernel(
+        name: "track_mixer_down_split",
+        inputNames: ["normed", "wd", "sd", "bd", "wi", "si", "bi"],
+        outputNames: ["part", "inj"],
+        source: downSplitSource, header: header, ensureRowContiguous: true)
+    nonisolated(unsafe) static let downReduceKernel = MLXFast.metalKernel(
+        name: "track_mixer_down_reduce",
+        inputNames: ["part"], outputNames: ["lo", "act"],
+        source: downReduceSource, header: header, ensureRowContiguous: true)
+
+    /// True when the split path's slice arithmetic divides evenly.
+    static func splitEligible(S: Int, KD: Int, ND: Int, groupSize: Int) -> Bool {
+        S >= 2 && S <= 8 && ND % 8 == 0 && (KD / groupSize) % downSplitK == 0
+    }
+
+    static func downInjectSplit(
+        normed: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?
+    ) -> (lo: MLXArray, act: MLXArray, inj: MLXArray) {
+        let S = normed.dim(0), KD = normed.dim(1), ND = down.rows
+        let HC = inject?.rows ?? 4
+        let inj = inject ?? down
+        let NT = ND / 8
+        let first = downSplitKernel(
+            [normed, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
+            template: [
+                ("T", normed.dtype), ("GS", down.groupSize), ("BITS", down.bits), ("KD", KD),
+                ("ND", ND), ("HC", HC), ("VPT", S), ("HAS_INJECT", inject != nil),
+                ("KSPLIT", downSplitK),
+            ],
+            grid: (32, (NT + 1) * 2, downSplitK), threadGroup: (32, 2, 1),
+            outputShapes: [[downSplitK * S * ND], [S, HC]],
+            outputDTypes: [.float32, normed.dtype])
+        let second = downReduceKernel(
+            [first[0]],
+            template: [("T", normed.dtype), ("ND", ND), ("VPT", S), ("KSPLIT", downSplitK)],
+            grid: (S * ND, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[S, ND], [S, ND]],
+            outputDTypes: [normed.dtype, normed.dtype])
+        return (second[0], second[1], first[1])
+    }
+
     static func downInject(
         normed: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?
     ) -> (lo: MLXArray, act: MLXArray, inj: MLXArray) {
