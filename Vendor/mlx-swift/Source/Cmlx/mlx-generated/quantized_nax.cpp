@@ -999,6 +999,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
     const device T* x,
     device T* y,
     threadgroup T* Ws,
+    threadgroup T* As,
     const constant int& K,
     const constant int& N,
     const constant int& M,
@@ -1015,6 +1016,17 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
+  // MLXFAST-ASTAGE-DENSE: stage the A tile the way the P17 gather now does.
+  // With WM = WN = 2 the simdgroup pairs (0,1) and (2,3) share `tm`, so today
+  // every A row of the tile is fetched from device memory TWICE per kk1 step.
+  // Staging it costs one cooperative pass per k block (128 threads x 16
+  // contiguous elements, four threads to a row, two passes for BM = 64) and
+  // rides the barrier pair Ws already needs, so it adds no synchronization.
+  // Rows at or past the M edge are zeroed, exactly what the `load_safe` branch
+  // it replaces produces for those lanes; those rows only reach their own Dtile
+  // rows and the store masks them either way. Same values, same order.
+  constexpr bool a_stage = metal::is_same_v<T, bfloat16_t> && group_size == 32 &&
+      bits == 4 && aligned_N && BM == 64 && BN == 64 && BK == 64 && WM == 2 && WN == 2;
 
   using loader_w_t = QuantizedBlockLoader<
       T,
@@ -1034,6 +1046,8 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   auto wl = (const device uint8_t*)w;
 
+  // MLXFAST-ASTAGE-DENSE: threadgroup-uniform A base for the staged copy.
+  const device T* xb_stage = x + y_row * static_cast<int64_t>(K);
   x += y_row * static_cast<int64_t>(K);
   wl += y_col * K_w;
   scales += y_col * K_g;
@@ -1062,6 +1076,13 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   const short sgp_sn = aligned_N ? SN : min(int(SN), N - (y_col + tn));
 
+  // MLXFAST-ASTAGE-DENSE addressing: threadgroup-uniform, so every simdgroup
+  // stages the same rows and reads its own slice back from threadgroup memory.
+  const short tgp_thread = short(simd_gid * SIMD_SIZE + simd_lid);
+  const short a_row0 = short(tgp_thread / 4);        // 0..31
+  const short a_col = short((tgp_thread % 4) * 16);  // 0,16,32,48
+  const short tgp_sm = short(min(BM, M - y_row));
+
   const short tgp_bn = aligned_N ? BN : min(BN, int(N - (y_col)));
   const bool is_unaligned_bn = aligned_N ? false : (tgp_bn != BN);
 
@@ -1076,6 +1097,32 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
       auto run = [&](auto kPrefetch) {
         PackedNAXGroup32 packed_w;
+        // MLXFAST-APREFETCH-DENSE. The staged A block is fetched one K block
+        // ahead into registers, so its device latency is hidden behind the
+        // current block's MMAs instead of standing between the two barriers
+        // that bracket it. This is the same software pipeline
+        // `PackedNAXGroup32` already gives the weight block, and the same
+        // second step the sibling P17 gather carries; A just did not have one.
+        // 16 bf16 per thread per pass, statically indexed, so it stays in
+        // registers. The values published to `As` are byte for byte what the
+        // in-place copy published, only fetched earlier, and `xb_stage` is a
+        // read-only input for the whole loop, so the read time cannot matter.
+        T a_buf[a_stage ? BM / 32 : 1][16];
+        if constexpr (a_stage) {
+          if (K > 0) {
+            STEEL_PRAGMA_UNROLL
+            for (short pass = 0; pass < BM / 32; ++pass) {
+              const short r = short(a_row0 + pass * 32);
+              if (r < tgp_sm) {
+                const device T* a0 = xb_stage + size_t(r) * K + a_col;
+                STEEL_PRAGMA_UNROLL
+                for (short e = 0; e < 16; ++e) {
+                  a_buf[pass][e] = a0[e];
+                }
+              }
+            }
+          }
+        }
         if constexpr (kPrefetch.value) {
           if (K > 0) {
             packed_w.prefetch(loader_w);
@@ -1091,12 +1138,48 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
             loader_w.load_safe(short2(BK, tgp_bn));
           }
 
+          if constexpr (a_stage) {
+            STEEL_PRAGMA_UNROLL
+            for (short pass = 0; pass < BM / 32; ++pass) {
+              const short r = short(a_row0 + pass * 32);
+              threadgroup T* dst = As + r * BK_padded + a_col;
+              if (r < tgp_sm) {
+                STEEL_PRAGMA_UNROLL
+                for (short e = 0; e < 16; ++e) {
+                  dst[e] = a_buf[pass][e];
+                }
+              } else {
+                STEEL_PRAGMA_UNROLL
+                for (short e = 0; e < 16; ++e) {
+                  dst[e] = T(0);
+                }
+              }
+            }
+          }
+
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
           if constexpr (kPrefetch.value) {
             if (k + BK < K) {
               loader_w.next();
               packed_w.prefetch(loader_w);
+            }
+          }
+
+          if constexpr (a_stage) {
+            if (k + BK < K) {
+              STEEL_PRAGMA_UNROLL
+              for (short pass = 0; pass < BM / 32; ++pass) {
+                const short r = short(a_row0 + pass * 32);
+                if (r < tgp_sm) {
+                  const device T* a_next =
+                      xb_stage + size_t(r) * K + (k + BK) + a_col;
+                  STEEL_PRAGMA_UNROLL
+                  for (short e = 0; e < 16; ++e) {
+                    a_buf[pass][e] = a_next[e];
+                  }
+                }
+              }
             }
           }
 
@@ -1107,7 +1190,9 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
             volatile int compiler_barrier;
 
-            if constexpr (kAlignedM.value) {
+            if constexpr (a_stage) {
+              Atile.template load<T, BK_padded, 1>(As + tm * BK_padded + kk1);
+            } else if constexpr (kAlignedM.value) {
               Atile.load(x + kk1, K);
             } else {
               Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
@@ -1318,6 +1403,11 @@ template <
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
   threadgroup T Ws[BN * BK_padded];
+  // MLXFAST-ASTAGE-DENSE: BM x BK_padded bf16 = 9,216 B for the eligible shape
+  // only, alongside the 9,216 B `Ws` already allocates.
+  constexpr bool a_stage = metal::is_same_v<T, bfloat16_t> && group_size == 32 &&
+      bits == 4 && aligned_N && BM == 64 && BN == 64 && BK == 64 && WM == 2 && WN == 2;
+  threadgroup T As[a_stage ? BM * BK_padded : 1];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1338,7 +1428,7 @@ template <
         tid);
   }
   qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
-      w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+      w, scales, biases, x, y, Ws, As, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
 template <
@@ -1443,6 +1533,11 @@ template <
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
   threadgroup T Ws[BN * BK_padded];
+  // MLXFAST-ASTAGE-DENSE: same staged A tile as `affine_qmm_t_nax`; the two
+  // launchers share this body, so both must supply the buffer.
+  constexpr bool a_stage = metal::is_same_v<T, bfloat16_t> && group_size == 32 &&
+      bits == 4 && aligned_N && BM == 64 && BN == 64 && BK == 64 && WM == 2 && WN == 2;
+  threadgroup T As[a_stage ? BM * BK_padded : 1];
 
   adjust_matrix_offsets<T>(
       x,
@@ -1467,7 +1562,7 @@ template <
       b_strides,
       tid);
   qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
-      w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+      w, scales, biases, x, y, Ws, As, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
 template <
