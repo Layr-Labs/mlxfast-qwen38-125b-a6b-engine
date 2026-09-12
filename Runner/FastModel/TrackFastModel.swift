@@ -709,8 +709,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             logits.dtype == .float32, logits.dim(-1) == 512, m.topK == 10,
             StreamOrDevice.default.stream === Stream.gpu
         {
-            let routed = TrackFastMoEKernels.route(
-                logits: logits, x: x, sharedGate: nil, topK: m.topK)
+            let routed = TrackFastMoEKernels.routePrefill(logits: logits, topK: m.topK)
             idx = routed.idx
             weights = routed.w
         } else {
