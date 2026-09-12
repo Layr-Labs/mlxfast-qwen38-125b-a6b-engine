@@ -631,6 +631,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         guard let fused = m.sharedGateUp.fused, case .quant(let guq) = fused,
             case .quant(let dq) = m.sharedDown, guq.biases != nil, dq.biases != nil
         else { return nil }
+        let activateSharedGate: Bool
+        if case .quant(let gate) = m.sharedGate, gate.biases != nil {
+            activateSharedGate = true
+        } else {
+            activateSharedGate = false
+        }
         return compile(shapeless: false) {
             [groupSize = m.expertGroupSize, bits = m.expertBits, topK = m.topK,
              guGroupSize = guq.groupSize, guBits = guq.bits, guMode = guq.mode,
@@ -648,7 +654,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             return [TrackFastMoEKernels.downCombine(
                 wd: inputs[14], sd: inputs[15], bd: inputs[16], sharedDown: sharedDown,
                 act: act, idx: inputs[1], w: inputs[2], gate: inputs[3], topK: topK,
-                groupSize: groupSize, bits: bits)]
+                groupSize: groupSize, bits: bits,
+                gateActivated: activateSharedGate && inputs[0].dim(0) == 1)]
         }
     }
 
@@ -701,7 +708,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let S = x.dim(1), K = m.topK, H = x.dim(2)
             let x2 = x.reshaped(S, H)
             let r = TrackFastMoEKernels.route(
-                logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, topK: K)
+                logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, topK: K,
+                activateGate: S == 1 && gateQ != nil)
             let (idx, weights) = (r.idx, r.w)
             let gate = gateQ != nil ? r.gate : m.sharedGate.apply(x).reshaped(S)
             if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights, gate]) }
@@ -724,7 +732,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             return TrackFastMoEKernels.downCombine(
                 wd: m.expertDown.w, sd: m.expertDown.s, bd: m.expertDown.b, sharedDown: dq,
                 act: act, idx: flatIdx, w: weights.reshaped(S * K), gate: gate, topK: K,
-                groupSize: m.expertGroupSize, bits: m.expertBits
+                groupSize: m.expertGroupSize, bits: m.expertBits,
+                gateActivated: S == 1 && gateQ != nil
             ).reshaped(1, S, H)
         }
         let idx: MLXArray, weights: MLXArray

@@ -803,6 +803,9 @@ extension TrackFastMoEKernels {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg != 0) { return; }
+        if constexpr (ACTIVATE_GATE && HAS_GATE) {
+            if (lane == 0) { gate[row] = mlx_sigmoid(gate[row]); }
+        }
         // softmax_single_row over the K selected logits (AccT = float)
         constexpr int N_READS = 4;
         float ld[N_READS];
@@ -843,8 +846,8 @@ extension TrackFastMoEKernels {
         source: routeSource, header: TrackFastKernels.mixerHeadHeader + wideDecls, ensureRowContiguous: true)
 
     /// logits f32 [..., E] -> (idx uint32 [..., K], w f32 [..., K])
-    /// Also the shared-expert gate logit per row: x [..., KD] x sharedGate [1, KD] -> gate [...] (pre-sigmoid).
-    static func route(logits: MLXArray, x: MLXArray, sharedGate: TrackQuantWeight?, topK: Int)
+    /// Also returns the shared gate logit, or its activation when requested for one row.
+    static func route(logits: MLXArray, x: MLXArray, sharedGate: TrackQuantWeight?, topK: Int, activateGate: Bool = false)
         -> (idx: MLXArray, w: MLXArray, gate: MLXArray)
     {
         precondition(logits.dtype == .float32 && (sharedGate == nil || (sharedGate!.rows == 1 && sharedGate!.bits == 4)))
@@ -856,7 +859,7 @@ extension TrackFastMoEKernels {
         let simdgroups = g == nil ? 1 : 2
         let outs = (R == 1 ? routeKernel1 : routeKernel)(
             [logits.reshaped(R, E), x.reshaped(R, KD), g?.weight ?? x, g?.scales ?? x, g?.biases ?? x],
-            template: [("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32), ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R), ("HAS_GATE", g != nil)],
+            template: [("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32), ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R), ("HAS_GATE", g != nil), ("ACTIVATE_GATE", activateGate && R == 1 && g != nil)],
             grid: (32, R * simdgroups, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[R, topK], [R, topK], [R]], outputDTypes: [.uint32, .float32, x.dtype])
         return (outs[0].reshaped(lead + [topK]), outs[1].reshaped(lead + [topK]), outs[2].reshaped(lead))
@@ -1399,7 +1402,7 @@ extension TrackFastMoEKernels {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sgi == 0 && lid == 0) {
-            const T sg = mlx_sigmoid(gate[t]);
+            const T sg = GATE_ACTIVATED ? gate[t] : mlx_sigmoid(gate[t]);
             for (int i = 0; i < 4; ++i) {
                 float col[K];
                 for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
@@ -1431,10 +1434,11 @@ extension TrackFastMoEKernels {
     static let downCombineSimdgroups =
         ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 2
 
-    /// act [BR + S, F] (routed slots, then the shared expert per token), gate [S] pre-sigmoid.
+    /// act [BR + S, F] holds routed slots and shared rows; gateActivated declares the gate representation.
     static func downCombine(
         wd: MLXArray, sd: MLXArray, bd: MLXArray, sharedDown: TrackQuantWeight, act: MLXArray,
-        idx: MLXArray, w: MLXArray, gate: MLXArray, topK: Int, groupSize: Int, bits: Int
+        idx: MLXArray, w: MLXArray, gate: MLXArray, topK: Int, groupSize: Int, bits: Int,
+        gateActivated: Bool = false
     ) -> MLXArray {
         let BR = idx.dim(0), F = act.dim(1), H = wd.dim(1)
         let S = BR / topK
@@ -1443,7 +1447,7 @@ extension TrackFastMoEKernels {
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
-            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg)],
+            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("GATE_ACTIVATED", gateActivated)],
             grid: (32, (H / 4) * ksg, S), threadGroup: (32, ksg, 1),
             outputShapes: [[S, H]], outputDTypes: [act.dtype])[0]
     }
