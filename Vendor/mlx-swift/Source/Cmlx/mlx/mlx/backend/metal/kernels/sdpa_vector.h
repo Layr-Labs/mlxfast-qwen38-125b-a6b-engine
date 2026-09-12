@@ -478,14 +478,18 @@ template <typename T, int D>
   typedef float U;
 
   thread U o[elem_per_thread] = {0};
-  constexpr bool batch_components = metal::is_same_v<T, bfloat16_t> && D == 256;
-  threadgroup U outputs[BN * BD * (batch_components ? elem_per_thread : 1)];
+  constexpr bool direct_reduction = metal::is_same_v<T, bfloat16_t> && D == 256;
+  threadgroup U outputs[direct_reduction ? 1 : BN * BD];
+  // Assign a whole output slice to each SIMD group on the BF16 D256 path.
+  // Lane l still accumulates blocks l, l + BN, ... before the same SIMD sum.
+  const uint block_lane = direct_reduction ? simd_lid : simd_gid;
+  const uint component_group = direct_reduction ? simd_gid : simd_lid;
 
   // Adjust positions
   const int head_idx = tid.x;
   const int q_seq_idx = tid.y;
   const int q_offset = head_idx * tpg.y + q_seq_idx;
-  partials += q_offset * blocks * D + simd_gid * D + simd_lid * elem_per_thread;
+  partials += q_offset * blocks * D + block_lane * D + component_group * elem_per_thread;
   sums += q_offset * blocks;
   maxs += q_offset * blocks;
   out += q_offset * D + simd_gid * elem_per_thread;
@@ -509,7 +513,7 @@ template <typename T, int D>
 
   // Reduce the sum exp and partials
   for (int b = 0; b < blocks / BN; ++b) {
-    U factor = fast::exp(maxs[simd_gid] - max_score);
+    U factor = fast::exp(maxs[block_lane] - max_score);
 
     // Update the output accumulator
     for (int i = 0; i < elem_per_thread; i++) {
@@ -520,14 +524,10 @@ template <typename T, int D>
     partials += BN * D;
   }
 
-  // Use shared memory to transpose and reduce the final block
-  if constexpr (batch_components) {
+  // Each lane already owns the block partial needed by its output SIMD group.
+  if constexpr (direct_reduction) {
     for (int i = 0; i < elem_per_thread; i++) {
-      outputs[i * BN * BD + simd_lid * BD + simd_gid] = o[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = 0; i < elem_per_thread; i++) {
-      o[i] = simd_sum(outputs[i * BN * BD + simd_gid * BD + simd_lid]);
+      o[i] = simd_sum(o[i]);
       o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
     }
   } else {
