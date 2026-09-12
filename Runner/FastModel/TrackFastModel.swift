@@ -705,6 +705,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // are BF16): MLX's own GEMV keeps it; a quantized one rides in `route`.
             var gateQ: TrackQuantWeight? = nil
             if case .quant(let gq) = m.sharedGate, gq.biases != nil { gateQ = gq }
+            // A dense bf16 gate rides in `route` too, for a one-token window:
+            // the kernel's float accumulator rounds to the same bf16 the
+            // separate GEMV produced.
+            var gateDense: MLXArray? = nil
+            if gateQ == nil, case .dense(let dw) = m.sharedGate, x.dim(1) == 1,
+                dw.dim(0) == 1, dw.dtype == x.dtype, x.dim(2) % 128 == 0
+            {
+                gateDense = dw
+            }
             // Decode windows: three launches over MLX's own GEMV arithmetic for the
             // window size (per-row `qmv_fast` / `qmv` for the gathered experts, `qmv`
             // or `qmv_wide` for the shared expert): top-k + softmax + shared gate,
@@ -712,9 +721,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let S = x.dim(1), K = m.topK, H = x.dim(2)
             let x2 = x.reshaped(S, H)
             let r = TrackFastMoEKernels.route(
-                logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, topK: K)
+                logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ,
+                denseGate: gateDense, topK: K)
             let (idx, weights) = (r.idx, r.w)
-            let gate = gateQ != nil ? r.gate : m.sharedGate.apply(x).reshaped(S)
+            let gate =
+                (gateQ != nil || gateDense != nil)
+                ? r.gate : m.sharedGate.apply(x).reshaped(S)
             if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights, gate]) }
             let flatIdx = idx.reshaped(S * K)
             let xrow = Self.xrowTable(S: S, K: K)

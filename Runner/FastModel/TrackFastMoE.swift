@@ -775,16 +775,28 @@ extension TrackFastMoEKernels {
                 if (valid) { gate[row] = static_cast<T>(r[0]); }
             }
         }
+        // A dense (unquantized) shared-expert gate: one row, KD wide. Simdgroup
+        // 1 walks it in four-element blocks while simdgroup 0 runs the top-k,
+        // and the float accumulator is rounded to T exactly as the separate
+        // GEMV's output was.
+        if constexpr (HAS_DGATE) {
+            if (sg == 1) {
+                const device T* xr = x + (size_t)row * (size_t)KD;
+                float acc = 0.0f;
+                for (int i = (int)lane * 4; i < KD; i += 128) {
+                    float p = 0.0f;
+                    for (int t = 0; t < 4; ++t) {
+                        p += static_cast<float>(xr[i + t]) * static_cast<float>(dgw[i + t]);
+                    }
+                    acc += p;
+                }
+                for (ushort s2 = 16; s2 >= 1; s2 >>= 1) { acc += simd_shuffle_down(acc, s2); }
+                if (lane == 0) { gate[row] = static_cast<T>(acc); }
+            }
+        }
         threadgroup float selv[K];
         threadgroup uint seli[K];
-        // MLXFAST-ROUTESG1: for one token the shared-gate GEMV above runs on
-        // simdgroup 0 alone (`track_inject_qmv` returns at once on simdgroup 1),
-        // and the top-K walk used to queue behind it on the same simdgroup. Run
-        // the walk on simdgroup 1 instead so the two latency chains overlap; the
-        // walk's arithmetic, tie rule and the softmax below are untouched. Wide
-        // windows keep the gate on both simdgroups and the walk on simdgroup 0.
-        constexpr uint SEL_SG = (VPT == 1) ? 1u : 0u;
-        if (sg == SEL_SG) {
+        if (sg == 0) {
         const device float* lr = logits + (size_t)row * (size_t)E;
         // each lane owns E_PER experts: e = lane + 32 * j (strided so a tie at
         // the same value resolves to the lowest index across lanes too)
@@ -839,31 +851,36 @@ extension TrackFastMoEKernels {
 
     nonisolated(unsafe) static let routeKernel = MLXFast.metalKernel(
         name: "track_moe_route",
-        inputNames: ["logits", "x", "wg", "sgw", "bgw"],
+        inputNames: ["logits", "x", "wg", "sgw", "bgw", "dgw"],
         outputNames: ["idx", "w", "gate"],
         source: routeSource, header: TrackFastKernels.mixerHeadHeader + wideHelpers, ensureRowContiguous: true)
     /// One-token instantiation: same source, wide bodies replaced by their declarations.
     nonisolated(unsafe) static let routeKernel1 = MLXFast.metalKernel(
         name: "track_moe_route_1",
-        inputNames: ["logits", "x", "wg", "sgw", "bgw"],
+        inputNames: ["logits", "x", "wg", "sgw", "bgw", "dgw"],
         outputNames: ["idx", "w", "gate"],
         source: routeSource, header: TrackFastKernels.mixerHeadHeader + wideDecls, ensureRowContiguous: true)
 
     /// logits f32 [..., E] -> (idx uint32 [..., K], w f32 [..., K])
     /// Also the shared-expert gate logit per row: x [..., KD] x sharedGate [1, KD] -> gate [...] (pre-sigmoid).
-    static func route(logits: MLXArray, x: MLXArray, sharedGate: TrackQuantWeight?, topK: Int)
-        -> (idx: MLXArray, w: MLXArray, gate: MLXArray)
-    {
+    static func route(
+        logits: MLXArray, x: MLXArray, sharedGate: TrackQuantWeight?,
+        denseGate: MLXArray? = nil, topK: Int
+    ) -> (idx: MLXArray, w: MLXArray, gate: MLXArray) {
         precondition(logits.dtype == .float32 && (sharedGate == nil || (sharedGate!.rows == 1 && sharedGate!.bits == 4)))
+        precondition(sharedGate == nil || denseGate == nil, "one shared-expert gate form at a time")
         let g = sharedGate
+        let dg = denseGate
         let E = logits.dim(-1), KD = x.dim(-1)
         let lead = Array(logits.shape.dropLast())
         let R = lead.reduce(1, *)
         precondition(topK <= 32 && topK <= E && R >= 1 && (g == nil || R <= 8) && KD % 256 == 0)
-        let simdgroups = g == nil ? 1 : 2
+        precondition(dg == nil || (dg!.size == KD && dg!.dtype == x.dtype && KD % 128 == 0))
+        let simdgroups = (g == nil && dg == nil) ? 1 : 2
         let outs = (R == 1 ? routeKernel1 : routeKernel)(
-            [logits.reshaped(R, E), x.reshaped(R, KD), g?.weight ?? x, g?.scales ?? x, g?.biases ?? x],
-            template: [("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32), ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R), ("HAS_GATE", g != nil)],
+            [logits.reshaped(R, E), x.reshaped(R, KD), g?.weight ?? x, g?.scales ?? x, g?.biases ?? x,
+             dg?.reshaped(KD) ?? x],
+            template: [("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32), ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R), ("HAS_GATE", g != nil), ("HAS_DGATE", dg != nil)],
             grid: (32, R * simdgroups, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[R, topK], [R, topK], [R]], outputDTypes: [.uint32, .float32, x.dtype])
         return (outs[0].reshaped(lead + [topK]), outs[1].reshaped(lead + [topK]), outs[2].reshaped(lead))
