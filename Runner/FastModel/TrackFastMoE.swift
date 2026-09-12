@@ -446,6 +446,25 @@ METAL_FUNC void qmv_fast_impl(
   for (int k = 0; k < in_vec_size; k += block_size) {
     U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
+    // MLXFAST-QMVPF: stage next block's packed weight bytes + scale/bias into
+    // thread registers while the current block's qdot chain retires
+    // (output-invariant reorder; arithmetic unchanged).
+    const device uint8_t* wnext = ws + block_size * bytes_per_pack / pack_factor;
+    const device T* snext = scales + block_size / group_size;
+    const device T* bnext = biases + block_size / group_size;
+    U s0_pref = (k + block_size < in_vec_size) ? snext[0] : (U)0;
+    U b0_pref = (k + block_size < in_vec_size) ? bnext[0] : (U)0;
+    uint32_t w_pref[results_per_simdgroup * 2];
+    if (k + block_size < in_vec_size) {
+      STEEL_PRAGMA_UNROLL
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        const device uint32_t* wp =
+            (const device uint32_t*)(wnext + row * in_vec_size_w);
+        w_pref[2 * row] = wp[0];
+        w_pref[2 * row + 1] = wp[1];
+      }
+    }
+
     for (int row = 0; row < results_per_simdgroup; row++) {
       auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
       const device T* sl = scales + row * in_vec_size_g;
@@ -455,6 +474,7 @@ METAL_FUNC void qmv_fast_impl(
       U b = bl[0];
       result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
     }
+    (void)w_pref; (void)s0_pref; (void)b0_pref;
 
     ws += block_size * bytes_per_pack / pack_factor;
     scales += block_size / group_size;
@@ -469,6 +489,8 @@ METAL_FUNC void qmv_fast_impl(
     }
   }
 }
+
+
 
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_impl(
@@ -1429,7 +1451,7 @@ extension TrackFastMoEKernels {
     /// array into threadgroup memory. Every product and the fold order are
     /// unchanged, so the output is bit-identical for any value.
     static let downCombineSimdgroups =
-        ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 2
+        ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 5
 
     /// act [BR + S, F] (routed slots, then the shared expert per token), gate [S] pre-sigmoid.
     static func downCombine(

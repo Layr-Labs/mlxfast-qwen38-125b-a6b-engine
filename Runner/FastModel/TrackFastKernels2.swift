@@ -626,27 +626,7 @@ extension TrackFastKernels {
           constexpr int k_end = NFULL * block_size;
           const int remaining = clamp(
               static_cast<int>(in_vec_size - k_end - simd_lid * values_per_thread), 0, values_per_thread);
-          // MLXFAST-FULLTAIL. in_vec_size is a template constant here, so when it
-          // is a multiple of values_per_thread the clamp above can only yield 0 or
-          // values_per_thread -- never a partial slice. The _safe helpers then run
-          // the SAME arithmetic in the SAME order (their bodies are the plain ones
-          // with `N` for `values_per_thread`), but over a RUNTIME trip count, which
-          // keeps x_thread dynamically indexed and so pins it in thread-local
-          // scratch for the whole function rather than registers. Compile that
-          // branch away. Bit-identical by construction.
-          if constexpr (in_vec_size % values_per_thread == 0) {
-            if (remaining > 0) {
-              U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
-              for (int row = 0; row < NR; row++) {
-                auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-                const device T* sl = scales + row * in_vec_size_g;
-                const device T* bl = biases + row * in_vec_size_g;
-                U s = sl[0];
-                U b = bl[0];
-                result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
-              }
-            }
-          } else if (remaining > 0) {
+          if (remaining > 0) {
             U sum = load_vector_safe<T, U, values_per_thread, bits>(x, x_thread, remaining);
             for (int row = 0; row < NR; row++) {
               auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
@@ -723,27 +703,7 @@ extension TrackFastKernels {
           constexpr int k_end = NFULL * block_size;
           const int remaining = clamp(
               static_cast<int>(in_vec_size - k_end - simd_lid * values_per_thread), 0, values_per_thread);
-          // MLXFAST-FULLTAIL. in_vec_size is a template constant here, so when it
-          // is a multiple of values_per_thread the clamp above can only yield 0 or
-          // values_per_thread -- never a partial slice. The _safe helpers then run
-          // the SAME arithmetic in the SAME order (their bodies are the plain ones
-          // with `N` for `values_per_thread`), but over a RUNTIME trip count, which
-          // keeps x_thread dynamically indexed and so pins it in thread-local
-          // scratch for the whole function rather than registers. Compile that
-          // branch away. Bit-identical by construction.
-          if constexpr (in_vec_size % values_per_thread == 0) {
-            if (remaining > 0) {
-              U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
-              for (int row = 0; row < NR; row++) {
-                auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-                const device T* sl = scales + row * in_vec_size_g;
-                const device T* bl = biases + row * in_vec_size_g;
-                U s = sl[0];
-                U b = bl[0];
-                result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
-              }
-            }
-          } else if (remaining > 0) {
+          if (remaining > 0) {
             U sum = load_vector_safe<T, U, values_per_thread, bits>(x, x_thread, remaining);
             for (int row = 0; row < NR; row++) {
               auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);

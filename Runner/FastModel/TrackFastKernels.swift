@@ -177,6 +177,7 @@ enum TrackFastKernels {
                 state[i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);
             }
         }
+        float kreg[4];
         for (int t = 0; t < T_; ++t) {
             float kv_mem = 0.0f;
             {
@@ -186,7 +187,7 @@ enum TrackFastKernels {
                 for (int i = 0; i < n_per_t; ++i) {
                     const int s_idx = n_per_t * dk_idx + i;
                     state[i] = state[i] * g_[hv_idx];
-                    auto product = state[i] * static_cast<float>(k_[s_idx]);
+                    auto product = state[i] * kreg[i];
                     auto corrected = product - kv_compensation;
                     auto next_sum = kv_mem + corrected;
                     kv_compensation = (next_sum - kv_mem) - corrected;
@@ -198,7 +199,7 @@ enum TrackFastKernels {
             float out = 0.0f;
             for (int i = 0; i < n_per_t; ++i) {
                 const int s_idx = n_per_t * dk_idx + i;
-                state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
+                state[i] = state[i] + kreg[i] * delta;
                 out += state[i] * static_cast<float>(q_[s_idx]);
             }
             out = simd_sum(out);
