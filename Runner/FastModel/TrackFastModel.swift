@@ -701,8 +701,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             case .quant(let guq) = m.sharedGateUp.fused ?? .dense(x),
             case .quant(let dq) = m.sharedDown, guq.biases != nil, dq.biases != nil
         {
-            // The shared-expert gate is a bf16 Linear on this checkpoint (router gates
-            // are BF16): MLX's own GEMV keeps it; a quantized one rides in `route`.
+            // A one-token dense shared gate uses MLX's dot-product path.
+            // Its exact dot and the route can share a dispatch at this geometry.
             var gateQ: TrackQuantWeight? = nil
             if case .quant(let gq) = m.sharedGate, gq.biases != nil { gateQ = gq }
             // Decode windows: three launches over MLX's own GEMV arithmetic for the
@@ -711,10 +711,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // gate|up + SwiGLU for the routed and the shared expert, down + combine.
             let S = x.dim(1), K = m.topK, H = x.dim(2)
             let x2 = x.reshaped(S, H)
-            let r = TrackFastMoEKernels.route(
+            let denseRoute: (idx: MLXArray, w: MLXArray, gate: MLXArray)?
+            if case .dense(let weight) = m.sharedGate {
+                denseRoute = TrackFastDenseGateRoute.apply(
+                    logits: logits, x: x2, weight: weight, topK: K)
+            } else {
+                denseRoute = nil
+            }
+            let r = denseRoute ?? TrackFastMoEKernels.route(
                 logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, topK: K)
             let (idx, weights) = (r.idx, r.w)
-            let gate = gateQ != nil ? r.gate : m.sharedGate.apply(x).reshaped(S)
+            let gate = denseRoute != nil || gateQ != nil ? r.gate : m.sharedGate.apply(x).reshaped(S)
             if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights, gate]) }
             let flatIdx = idx.reshaped(S * K)
             let xrow = Self.xrowTable(S: S, K: K)
