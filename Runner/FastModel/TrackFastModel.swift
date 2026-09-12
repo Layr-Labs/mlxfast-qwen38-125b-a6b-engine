@@ -878,7 +878,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// next mixer consumes it.
     func fastStreams(
         _ ids: MLXArray, inputEmbeddings: MLXArray?, caches: [Qwen4ExpCBv2LayerCache],
-        recurrentState: [CBv2RecurrentStateEvaluation], offset: Int, capture: Bool
+        recurrentState: [CBv2RecurrentStateEvaluation], offset: Int, capture: Bool,
+        lastPositionOnly: Bool
     ) -> (mixed: MLXArray, multi: MLXArray) {
         precondition(recurrentState.count == 1)
         let evaluation = recurrentState[0]
@@ -937,6 +938,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 residual: stream, out: attended, inject: injectW,
                 scale: layer.mlpHC.normScaleQ,
                 tile: false)
+            if lastPositionOnly, !capture, ids.dim(1) > 1, layer.index == layers.count - 1 {
+                stream = stream[0..., (-1)..., 0...]
+                normed = normed[0..., (-1)..., 0...]
+            }
             if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
             let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
@@ -997,7 +1002,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     func streamsOrDelegate(
         _ tokens: MLXArray, inputEmbeddings: MLXArray?, caches: [KVCache],
-        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, capture: Bool
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, capture: Bool,
+        lastPositionOnly: Bool = false
     ) -> (mixed: MLXArray, multi: MLXArray)? {
         guard let plan = fastPlan(
             tokens: tokens, caches: caches, recurrentState: recurrentState,
@@ -1005,7 +1011,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         else { return nil }
         return fastStreams(
             tokens, inputEmbeddings: inputEmbeddings, caches: plan.caches,
-            recurrentState: recurrentState, offset: plan.offset, capture: capture)
+            recurrentState: recurrentState, offset: plan.offset, capture: capture,
+            lastPositionOnly: lastPositionOnly)
     }
 }
 
@@ -1111,7 +1118,8 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentLanguageModelPrefillForwardable {
         }
         if let s = streamsOrDelegate(
             inputs, inputEmbeddings: inputEmbedding, caches: cache ?? [],
-            recurrentState: recurrentState, positionIds: positionIds, capture: false)
+            recurrentState: recurrentState, positionIds: positionIds, capture: false,
+            lastPositionOnly: true)
         {
             switch requirement {
             case .evaluationOnly:
