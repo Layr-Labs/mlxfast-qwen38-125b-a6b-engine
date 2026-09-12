@@ -142,6 +142,33 @@ enum TrackPLEFusion {
         outputNames: ["out"], source: convolutionSource,
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
+    private static let coalescedConvolution =
+        ProcessInfo.processInfo.environment["TRACK_PLE_COALESCED_CONV"] != "0"
+
+    static let coalescedConvolutionSource = """
+        {
+        #pragma clang fp contract(off)
+        constexpr uint W = 10240;
+        const uint c = thread_position_in_grid.x;
+        if (c >= W) { return; }
+        float acc = float(full[c]) * float(weight[c * 4]);
+        const float p1 = float(full[3 * W + c]) * float(weight[c * 4 + 1]);
+        const float p2 = float(full[6 * W + c]) * float(weight[c * 4 + 2]);
+        const float p3 = float(full[9 * W + c]) * float(weight[c * 4 + 3]);
+        acc += p1;
+        acc += p2;
+        acc += p3;
+        const InT convolved = InT(acc);
+        const InT activated = mlx_silu(convolved);
+        out[c] = gated[c] + activated;
+        }
+        """
+
+    private static let coalescedConvolutionKernel = MLXFast.metalKernel(
+        name: "track_ple_coalesced_convolution", inputNames: ["full", "weight", "gated"],
+        outputNames: ["out"], source: coalescedConvolutionSource,
+        header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
+
     static func supports(_ p: TrackPLE, stream: MLXArray, hidden: Int, hcCount: Int) -> Bool {
         // Guard the exact geometry; every other path builds the original chain.
         hidden == 2560 && hcCount == 4 && stream.shape == [1, 1, 10240]
@@ -171,9 +198,11 @@ enum TrackPLEFusion {
             grid: (640, 4, 1), threadGroup: (640, 1, 1),
             outputShapes: [[1, 1, 10240], [1, 10, 10240]],
             outputDTypes: [stream.dtype, stream.dtype])
-        let output = convolutionKernel(
+        let kernel = coalescedConvolution ? coalescedConvolutionKernel : convolutionKernel
+        let output = kernel(
             [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
-            grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
+            grid: coalescedConvolution ? (10240, 1, 1) : (32, 1, 4 * 10240),
+            threadGroup: coalescedConvolution ? (256, 1, 1) : (32, 1, 4),
             outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
         return (r[1], output)
     }
