@@ -161,11 +161,7 @@ enum TrackP12Prefill {
             ]),
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
-    /// `SwitchGLU.projectExperts` without its closing `scatterUnsort`, then
-    /// the re-addressed combine. Same modules, same call order (up, then
-    /// gate), same `sortedIndices: true` gather_qmm dispatches, same
-    /// `compiledSiluProduct`. Returns nil whenever anything differs from the
-    /// audited contract, in which case the caller keeps the original path.
+    /// Keep the sorted expert rows through gate/up, down and the combine.
     static func sortedMoE(
         _ m: TrackMoE, _ x: MLXArray, indices: MLXArray, weights: MLXArray,
         shared: MLXArray, gate: MLXArray
@@ -176,9 +172,14 @@ enum TrackP12Prefill {
         let B = x.dim(0), S = x.dim(1), H = x.dim(2), K = indices.dim(-1)
         let expanded = MLX.expandedDimensions(x, axes: [-2, -3])
         let (sortedX, sortedIDs, inverse) = gatherSort(x: expanded, indices: indices)
-        let up = parts.up(sortedX, sortedIDs, sortedIndices: true)
-        let gateAct = parts.gate(sortedX, sortedIDs, sortedIndices: true)
-        let activated = compiledSiluProduct(gateAct, up)
+        let activated: MLXArray
+        if let fused = TrackPrefillGateUp.apply(m, x: sortedX, indices: sortedIDs) {
+            activated = fused
+        } else {
+            let up = parts.up(sortedX, sortedIDs, sortedIndices: true)
+            let gateAct = parts.gate(sortedX, sortedIDs, sortedIndices: true)
+            activated = compiledSiluProduct(gateAct, up)
+        }
         let down = parts.down(activated, sortedIDs, sortedIndices: true)
         guard down.ndim == 3, down.dim(0) == B * S * K, down.dim(1) == 1, down.dim(2) == H,
             inverse.size == B * S * K
