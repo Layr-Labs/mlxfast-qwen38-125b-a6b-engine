@@ -1728,8 +1728,23 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
       // not have one. 16 bf16 per thread, statically indexed, so it stays in
       // registers. The values published to `As` are byte for byte what the
       // in-place copy published, only fetched earlier.
+      // MLXFAST-DEEP2: a second register pipeline stage for the K loop. The
+      // staging geometry, the barrier count and the threadgroup footprint are
+      // unchanged: one Ws slot, one As slot, one barrier pair per block. What
+      // changes is the fetch distance. The single-stage pipeline fetches block
+      // k+1 into registers after block k is published, so one block of device
+      // latency overlaps one block of MMA work. Here two register sets
+      // alternate: while block k computes, block k+2 is already in flight and
+      // block k+1 is sitting in registers. The loader's device walk stays
+      // sequential and a block is published from the same set it was fetched
+      // into, so the bytes staged into Ws and As, and the kk1 order the MMAs
+      // reduce them in, are exactly what the single-stage pipeline produced.
+      // The extra state is 16 bf16 and one packed weight group per thread:
+      // statically indexed, register resident, no threadgroup memory.
       T a_buf[16];
+      T a_buf1[16];
       PackedNAXGroup32 packed_w;
+      PackedNAXGroup32 packed_w1;
       if (K_it > 0) {
         packed_w.prefetch(loader_w);
         if (a_live) {
@@ -1738,9 +1753,17 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
           for (short e = 0; e < 16; ++e) { a_buf[e] = a0[e]; }
         }
       }
+      if (K_it > 1) {
+        loader_w.next();
+        packed_w1.prefetch(loader_w);
+        if (a_live) {
+          const device T* a1 = xb + BK + size_t(a_row) * K + a_col;
+          STEEL_PRAGMA_UNROLL
+          for (short e = 0; e < 16; ++e) { a_buf1[e] = a1[e]; }
+        }
+      }
       for (int k = 0; k < K_it; k++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        packed_w.store(loader_w.dst);
         // MLXFAST-ASTAGE. Each simdgroup used to walk A itself: 16 rows of 64
         // bytes at a 5,120-byte stride, per simdgroup, per kk1 -- and with
         // WM = WN = 2 the pairs (0,1) and (2,3) issue IDENTICAL reads, so every
@@ -1753,30 +1776,56 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
         // an out-of-range row can only ever reach its own Dtile row, and those
         // rows are excluded by `store_slice` either way. Same values, same
         // order, bit-identical output.
-        if (a_live) {
-          STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < 16; ++e) {
-            a_dst[e] = a_buf[e];
+        if ((k & 1) == 0) {
+          packed_w.store(loader_w.dst);
+          if (a_live) {
+            STEEL_PRAGMA_UNROLL
+            for (short e = 0; e < 16; ++e) {
+              a_dst[e] = a_buf[e];
+            }
+          } else {
+            STEEL_PRAGMA_UNROLL
+            for (short e = 0; e < 16; ++e) {
+              a_dst[e] = T(0);
+            }
           }
         } else {
-          STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < 16; ++e) {
-            a_dst[e] = T(0);
+          packed_w1.store(loader_w.dst);
+          if (a_live) {
+            STEEL_PRAGMA_UNROLL
+            for (short e = 0; e < 16; ++e) {
+              a_dst[e] = a_buf1[e];
+            }
+          } else {
+            STEEL_PRAGMA_UNROLL
+            for (short e = 0; e < 16; ++e) {
+              a_dst[e] = T(0);
+            }
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // All lanes prefetch; Ws is not reused until the next reader barrier.
-        if (k + 1 < K_it) {
+        // Prefetch the block two trips ahead into the set just published, so
+        // its device latency rides the current and the next block's MMAs. The
+        // guard is the same in both arms: the loader only ever walks forward.
+        if (k + 2 < K_it) {
           loader_w.next();
-          packed_w.prefetch(loader_w);
-          if (a_live) {
-            const device T* a_next = xb + BK + size_t(a_row) * K + a_col;
-            STEEL_PRAGMA_UNROLL
-            for (short e = 0; e < 16; ++e) { a_buf[e] = a_next[e]; }
+          if ((k & 1) == 0) {
+            packed_w.prefetch(loader_w);
+            if (a_live) {
+              const device T* a_next = xb + 2 * BK + size_t(a_row) * K + a_col;
+              STEEL_PRAGMA_UNROLL
+              for (short e = 0; e < 16; ++e) { a_buf[e] = a_next[e]; }
+            }
+          } else {
+            packed_w1.prefetch(loader_w);
+            if (a_live) {
+              const device T* a_next = xb + 2 * BK + size_t(a_row) * K + a_col;
+              STEEL_PRAGMA_UNROLL
+              for (short e = 0; e < 16; ++e) { a_buf1[e] = a_next[e]; }
+            }
           }
         }
-
         STEEL_PRAGMA_UNROLL
         for (int kk1 = 0; kk1 < BK; kk1 += SK) {
           if (sg_active) {
