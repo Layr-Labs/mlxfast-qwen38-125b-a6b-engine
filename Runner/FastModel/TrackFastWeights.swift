@@ -15,8 +15,30 @@ struct TrackQuantWeight {
 
     var rows: Int { weight.dim(0) }
 
+    /// Row count past which the repository's own wide replica is used instead
+    /// of MLX's op at decode widths.
+    ///
+    /// `TrackFastMoEKernels.wideCheck` is `qmv_wide_impl` reproduced verbatim
+    /// -- same lane-to-group assignment, same decode, same shuffle ladder -- so
+    /// it returns the same bits as the op it stands in for, and it is one
+    /// launch either way. It carries four buffers where the op carries its
+    /// shape and stride tables as well, and at wide row counts that is worth a
+    /// few percent. At narrow row counts the two measure the same, so the
+    /// threshold keeps those on the op.
+    static let wideReplicaMinRows = 8192
+
     func apply(_ x: MLXArray) -> MLXArray {
-        quantizedMM(
+        if bits == 4, mode == .affine, let b = biases, x.ndim == 3, x.dim(0) == 1,
+            x.dim(1) >= 2, x.dim(1) <= 8, weight.dim(0) >= Self.wideReplicaMinRows,
+            weight.dim(0) % 8 == 0
+        {
+            let S = x.dim(1), K = x.dim(2)
+            return TrackFastMoEKernels.wideCheck(
+                w: weight, scales: scales, biases: b, x: x.reshaped(S, K),
+                groupSize: groupSize, bits: bits
+            ).reshaped(1, S, weight.dim(0))
+        }
+        return quantizedMM(
             x, weight, scales: scales, biases: biases, transpose: true,
             groupSize: groupSize, bits: bits, mode: mode)
     }
