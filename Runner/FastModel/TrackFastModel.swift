@@ -550,6 +550,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
             dtBias: g.dtBias, stateIn: ssm, normW: g.normW, zOffset: g.zOffset,
             eps: 1e-6, capture: capture, geometry: geo)
+            ?? TrackFastGDNVerify.apply(
+                proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
+                dtBias: g.dtBias, stateIn: ssm, normW: g.normW, zOffset: g.zOffset,
+                eps: 1e-6, capture: capture, geometry: geo)
         {
             (gated, convOut, stateOut) = (fused.gated, fused.convOut, fused.stateOut)
             if prof { TrackFastProfile.tick("gdn.decodeFused", &pt, [gated, stateOut, convOut]) }
