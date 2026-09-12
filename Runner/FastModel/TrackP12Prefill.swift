@@ -29,9 +29,9 @@
 //     indexer tape from the full `index_qk_proj` instead, because the GEMM
 //     rounding there depends on N).
 //
-// EXACTNESS. The two re-addressed Metal kernels are generated from the
-// original kernel sources by textual substitution of the address expression
-// alone, with a precondition that the anchor still occurs exactly once, so a
+// EXACTNESS. The derived Metal kernels are generated from the original
+// kernel sources by textual substitution of explicitly listed expressions,
+// with a precondition that each anchor still occurs exactly once, so a
 // later edit of the original kernel fails the build instead of silently
 // diverging. The SwiGLU kernels compute `mlx_silu(gate) * up` in both
 // layouts. Every GEMM keeps its own M/N/K and therefore its own split-K
@@ -60,6 +60,7 @@ enum TrackP12Prefill {
 
     static let splitGDN = on("TRACK_P12_SPLIT_GDN_INPUTS")
     static let sortedCombine = on("TRACK_P12_SORTED_COMBINE")
+    private static let broadcastSharedGate = on("TRACK_P12_BROADCAST_SHARED_GATE")
     static let splitShared = on("TRACK_P12_SPLIT_SHARED_INPUTS")
     static let omitUnusedIndexer = on("TRACK_P12_OMIT_UNUSED_INDEXER")
     static let splitAttention = on("TRACK_P12_SPLIT_ATTN_INPUTS")
@@ -71,7 +72,7 @@ enum TrackP12Prefill {
     }
 
     /// Reuse an existing kernel body literally, replacing only the listed
-    /// address expressions. Fails closed if an anchor is no longer unique.
+    /// kernel expressions. Fails closed if an anchor is no longer unique.
     private static func addressVariant(
         _ source: String, _ replacements: [(String, String)]
     ) -> String {
@@ -183,7 +184,8 @@ enum TrackP12Prefill {
     /// `track_moe_combine` with the routed row address taken through the
     /// inverse permutation the expert sort already produced. The float32
     /// products stay in original (token, slot) order and the K reduction is
-    /// still the same small-column tree -- only the load address changes.
+    /// still the same small-column tree. Each SIMD group shares the same
+    /// BF16-rounded sigmoid, computed by its first lane.
     nonisolated(unsafe) private static let sortedCombineKernel = MLXFast.metalKernel(
         name: "track_p12_moe_sorted_combine",
         inputNames: ["routed", "w", "shared", "gate", "inverse_order"],
@@ -194,7 +196,17 @@ enum TrackP12Prefill {
                 (
                     "routed[(row * K + k) * H + d]",
                     "routed[static_cast<uint>(inverse_order[row * K + k]) * H + d]"
-                )
+                ),
+                (
+                    "const InT sg = mlx_sigmoid(gate[row]);",
+                    broadcastSharedGate ? """
+                        float shared_sigmoid = 0.0f;
+                        if (thread_index_in_simdgroup == 0) {
+                            shared_sigmoid = static_cast<float>(mlx_sigmoid(gate[row]));
+                        }
+                        const InT sg = static_cast<InT>(simd_broadcast(shared_sigmoid, 0));
+                        """ : "const InT sg = mlx_sigmoid(gate[row]);"
+                ),
             ]),
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
