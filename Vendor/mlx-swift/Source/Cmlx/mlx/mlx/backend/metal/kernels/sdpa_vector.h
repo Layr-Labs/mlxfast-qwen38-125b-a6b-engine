@@ -204,62 +204,6 @@ template <typename T, int D, int V = D>
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  // Two query heads reuse each K/V load while retaining their own block walk.
-  if constexpr (metal::is_same_v<T, bfloat16_t> && D == 256 && V == 256) {
-    const uint gqa = tptg.y;
-    if (N >= 1024 && tptg.z == 1 && gqa % 2 == 0 && !has_mask && !has_sinks) {
-      const uint pair = tidtg.y;
-      if (pair >= gqa / 2) { return; }
-      const uint kv = tid.x;
-      const uint batch = tid.y;
-      const uint block = tid.z;
-      const uint kv_batch = batch * tpg.x + kv;
-      const uint head0 = (batch * tpg.x + kv) * gqa + pair * 2;
-      const device T* kp = keys + kv_batch * k_head_stride + block * k_seq_stride + simd_lid * 8;
-      const device T* vp = values + kv_batch * v_head_stride + block * v_seq_stride + simd_lid * 8;
-      float q_pair[2][8];
-      float output_pair[2][8] = {{0}, {0}};
-      float maximum[2] = {Limits<float>::finite_min, Limits<float>::finite_min};
-      float denominator[2] = {0, 0};
-      for (int h = 0; h < 2; ++h) {
-        const device T* qp = queries + (head0 + h) * D + simd_lid * 8;
-        for (int j = 0; j < 8; ++j) { q_pair[h][j] = static_cast<float>(scale) * qp[j]; }
-      }
-      for (int token = block; token < N; token += blocks) {
-        float key_values[8], value_values[8];
-        for (int j = 0; j < 8; ++j) {
-          key_values[j] = kp[j];
-          value_values[j] = vp[j];
-        }
-        for (int h = 0; h < 2; ++h) {
-          float score = 0;
-          for (int j = 0; j < 8; ++j) { score += q_pair[h][j] * key_values[j]; }
-          score = simd_sum(score);
-          const float next_maximum = max(maximum[h], score);
-          const float factor = fast::exp(maximum[h] - next_maximum);
-          const float exp_score = fast::exp(score - next_maximum);
-          maximum[h] = next_maximum;
-          denominator[h] = denominator[h] * factor + exp_score;
-          for (int j = 0; j < 8; ++j) {
-            output_pair[h][j] = output_pair[h][j] * factor + exp_score * value_values[j];
-          }
-        }
-        kp += blocks * int(k_seq_stride);
-        vp += blocks * int(v_seq_stride);
-      }
-      for (int h = 0; h < 2; ++h) {
-        const uint offset = (head0 + h) * blocks + block;
-        if (simd_lid == 0) {
-          sums[offset] = denominator[h];
-          maxs[offset] = maximum[h];
-        }
-        device T* destination = out + offset * V + simd_lid * 8;
-        for (int j = 0; j < 8; ++j) { destination[j] = static_cast<T>(output_pair[h][j]); }
-      }
-      return;
-    }
-  }
-
   constexpr int BD = 32;
   constexpr int qk_per_thread = D / BD;
   constexpr int v_per_thread = V / BD;
@@ -534,8 +478,7 @@ template <typename T, int D>
   typedef float U;
 
   thread U o[elem_per_thread] = {0};
-  constexpr bool batch_components = metal::is_same_v<T, bfloat16_t> && D == 256;
-  threadgroup U outputs[BN * BD * (batch_components ? elem_per_thread : 1)];
+  threadgroup U outputs[BN * BD];
 
   // Adjust positions
   const int head_idx = tid.x;
@@ -577,23 +520,12 @@ template <typename T, int D>
   }
 
   // Use shared memory to transpose and reduce the final block
-  if constexpr (batch_components) {
-    for (int i = 0; i < elem_per_thread; i++) {
-      outputs[i * BN * BD + simd_lid * BD + simd_gid] = o[i];
-    }
+  for (int i = 0; i < elem_per_thread; i++) {
+    outputs[simd_lid * BD + simd_gid] = o[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = 0; i < elem_per_thread; i++) {
-      o[i] = simd_sum(outputs[i * BN * BD + simd_gid * BD + simd_lid]);
-      o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
-    }
-  } else {
-    for (int i = 0; i < elem_per_thread; i++) {
-      outputs[simd_lid * BD + simd_gid] = o[i];
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
-      o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+    o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
   // And write the output
