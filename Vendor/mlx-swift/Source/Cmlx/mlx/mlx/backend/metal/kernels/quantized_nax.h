@@ -978,7 +978,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    const bool interleave_dense = false>
 METAL_FUNC void qmm_t_nax_tgp_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1102,12 +1103,30 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
             Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
 
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<transpose_a>{},
-                Btile,
-                metal::bool_constant<transpose_b>{});
+            if constexpr (interleave_dense && TM == 2 && TN == 2 && TK == 2) {
+              // Alternate independent rectangles; each keeps k0, k16 order.
+              STEEL_PRAGMA_UNROLL
+              for (short kk = 0; kk < TK; ++kk) {
+                STEEL_PRAGMA_UNROLL
+                for (short mm = 0; mm < TM; ++mm) {
+                  BaseNAXFrag::mma(
+                      Dtile.frag_at(mm, 0),
+                      Dtile.frag_at(mm, 1),
+                      Atile.frag_at(mm, kk),
+                      metal::bool_constant<transpose_a>{},
+                      Btile.frag_at(0, kk),
+                      Btile.frag_at(1, kk),
+                      metal::bool_constant<transpose_b>{});
+                }
+              }
+            } else {
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<transpose_a>{},
+                  Btile,
+                  metal::bool_constant<transpose_b>{});
+            }
 
             (void)compiler_barrier;
           }
@@ -1324,7 +1343,7 @@ template <
         b_strides,
         tid);
   }
-  qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
+  qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN, true>(
       w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
