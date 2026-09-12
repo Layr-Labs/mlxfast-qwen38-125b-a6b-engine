@@ -38,9 +38,9 @@ enum TrackFastGDNDecode {
                 ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
                 ("Hk", g.hk), ("Hv", g.hv), ("KC", g.convKernel), ("CONV_DIM", g.convDim),
                 ("PW", g.projWidth), ("B_OFF", g.bOffset), ("A_OFF", g.aOffset),
-                ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)), ("RPS", 4),
+                ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)), ("RPS", 8),
             ],
-            grid: (32, g.dv / 4, B * g.hv), threadGroup: (32, g.dv / 4, 1),
+            grid: (32, g.dv / 8, B * g.hv), threadGroup: (32, g.dv / 8, 1),
             outputShapes: [[B, g.hv, g.dv, g.dk], [B, 1, g.hv * g.dv], [B, g.convKernel - 1, g.convDim]],
             outputDTypes: [stateIn.dtype, proj.dtype, proj.dtype])
         return (result[1], result[0], result[2])
