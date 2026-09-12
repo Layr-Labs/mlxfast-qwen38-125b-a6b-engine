@@ -1715,6 +1715,14 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
       // not have one. 16 bf16 per thread, statically indexed, so it stays in
       // registers. The values published to `As` are byte for byte what the
       // in-place copy published, only fetched earlier.
+      // Padded As rows remain zero for every K block of this expert tile.
+      // Reinitialize per tile; the existing publication barrier precedes readers.
+      if (!a_live) {
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < 16; ++e) {
+          a_dst[e] = T(0);
+        }
+      }
       T a_buf[16];
       PackedNAXGroup32 packed_w;
       if (K_it > 0) {
@@ -1744,11 +1752,6 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
           STEEL_PRAGMA_UNROLL
           for (short e = 0; e < 16; ++e) {
             a_dst[e] = a_buf[e];
-          }
-        } else {
-          STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < 16; ++e) {
-            a_dst[e] = T(0);
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
