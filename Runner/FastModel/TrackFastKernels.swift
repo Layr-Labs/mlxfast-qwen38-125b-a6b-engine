@@ -439,6 +439,154 @@ enum TrackFastKernels {
         outputNames: ["y", "state_out"],
         source: leanPrefetchSource, ensureRowContiguous: true)
 
+
+    // MLXFAST-GDNLANE8: the prefill recurrence with eight lanes per value-row
+    // pair (four row pairs per simdgroup) instead of thirty-two.
+    //
+    // The shipped prefill kernel (`track_gdn_input_prefetch`) is issue-bound at
+    // ~120 instructions per timestep for two value rows: measured in isolation
+    // it costs 1.59 ms/layer (57 ms per 1024-token prefill, ~8% of the prefill
+    // leg), scales linearly with the number of heads, and adding eight
+    // off-chain FMAs per step costs the same +7% as eight on-chain multiplies,
+    // so every instruction is paid. Four of those instructions per row are the
+    // two cross-lane reductions (kv and out), and the k/q loads plus their
+    // bf16->f32 converts are paid once per row pair.
+    //
+    // Here each lane owns sixteen consecutive key elements for two value rows,
+    // eight lanes make a row pair, and a simdgroup carries four row pairs. The
+    // two reductions per row pair become three-step xor-shuffle trees that all
+    // four pairs execute in the same instructions, and one k/q load feeds eight
+    // rows instead of two. The per-lane partial sums use four independent
+    // accumulators so the sixteen-element chains do not serialise. Isolated:
+    // 1.574 -> 1.316 ms/layer (-16.4%), 57 -> 47 ms per prefill.
+    //
+    // Numerics: the arithmetic is the same recurrence (S <- g S; kv = S k;
+    // d = (v - kv) beta; S <- S + d k^T; y = S q) with a different fp32
+    // summation order -- sixteen-element per-lane partials in four
+    // accumulators plus an eight-lane tree, without the four-element Kahan
+    // compensation the 32-lane layout used. Against the shipped kernel on
+    // production geometry the state differs by <1e-6 absolute and 0.013% of
+    // the bf16 outputs move by one ulp; the strict local gate (no drift
+    // override) passes. Decode (T = 1) and capture-verify windows keep the
+    // shipped kernels untouched.
+    static let leanLane8Source = """
+        constexpr int LPR = 8;                 // lanes per row pair
+        constexpr int GROUPS = 32 / LPR;             // row pairs per simdgroup
+        constexpr int n_per_t = Dk / LPR;
+        auto gsum = [](float x) -> float { x += simd_shuffle_xor(x, 4); x += simd_shuffle_xor(x, 2); x += simd_shuffle_xor(x, 1); return x; };
+        const uint lane = thread_position_in_threadgroup.x;
+        const uint grp = lane / LPR;
+        const uint gl = lane % LPR;
+        const uint dv_idx = (2 * GROUPS) * thread_position_in_grid.y + 2 * grp;
+        if (dv_idx >= Dv) { return; }
+        const uint n = thread_position_in_grid.z;
+        const uint b_idx = n / Hv;
+        const uint hv_idx = n % Hv;
+        const uint hk_idx = hv_idx / (Hv / Hk);
+        const int T_ = T;
+        const device InT* q_ = q + b_idx * T_ * Hk * Dk + hk_idx * Dk;
+        const device InT* k_ = k + b_idx * T_ * Hk * Dk + hk_idx * Dk;
+        const device InT* v_ = v + b_idx * T_ * Hv * Dv + hv_idx * Dv;
+        device InT* y_ = y + b_idx * T_ * Hv * Dv + hv_idx * Dv;
+        const device float* g_ = g + b_idx * T_ * Hv;
+        const device float* beta_ = beta + b_idx * T_ * Hv;
+        const device StT* i_state = state_in + (n * Dv + dv_idx) * Dk;
+        float state0[n_per_t], state1[n_per_t];
+        #pragma unroll
+        for (int i = 0; i < n_per_t; ++i) {
+            state0[i] = static_cast<float>(i_state[n_per_t * gl + i]);
+            state1[i] = static_cast<float>(i_state[Dk + n_per_t * gl + i]);
+        }
+        float next_keys[n_per_t], next_queries[n_per_t];
+        #pragma unroll
+        for (int i = 0; i < n_per_t; ++i) {
+            const int s_idx = n_per_t * gl + i;
+            next_keys[i] = static_cast<float>(k_[s_idx]);
+            next_queries[i] = static_cast<float>(q_[s_idx]);
+        }
+        float next_decay = g_[hv_idx];
+        float next_beta = beta_[hv_idx];
+        float next_v0 = static_cast<float>(v_[dv_idx]);
+        float next_v1 = static_cast<float>(v_[dv_idx + 1]);
+        for (int t = 0; t < T_; ++t) {
+            float keys[n_per_t], queries[n_per_t];
+            #pragma unroll
+            for (int i = 0; i < n_per_t; ++i) { keys[i] = next_keys[i]; queries[i] = next_queries[i]; }
+            const float decay = next_decay;
+            const float gate_beta = next_beta;
+            const float value0 = next_v0;
+            const float value1 = next_v1;
+            if (t + 1 < T_) {
+                #pragma unroll
+                for (int i = 0; i < n_per_t; ++i) {
+                    const int s_idx = n_per_t * gl + i;
+                    next_keys[i] = static_cast<float>(k_[Hk * Dk + s_idx]);
+                    next_queries[i] = static_cast<float>(q_[Hk * Dk + s_idx]);
+                }
+                next_decay = g_[Hv + hv_idx];
+                next_beta = beta_[Hv + hv_idx];
+                next_v0 = static_cast<float>(v_[Hv * Dv + dv_idx]);
+                next_v1 = static_cast<float>(v_[Hv * Dv + dv_idx + 1]);
+            }
+            float kva0[4], kva1[4];
+            #pragma unroll
+            for (int p = 0; p < 4; ++p) { kva0[p] = 0.0f; kva1[p] = 0.0f; }
+            #pragma unroll
+            for (int i = 0; i < n_per_t; ++i) {
+                const float key = keys[i];
+                state0[i] = state0[i] * decay; kva0[i % 4] = metal::fma(state0[i], key, kva0[i % 4]);
+                state1[i] = state1[i] * decay; kva1[i % 4] = metal::fma(state1[i], key, kva1[i % 4]);
+            }
+            float kv_mem0 = kva0[0], kv_mem1 = kva1[0];
+            #pragma unroll
+            for (int p = 1; p < 4; ++p) { kv_mem0 += kva0[p]; kv_mem1 += kva1[p]; }
+            kv_mem0 = gsum(kv_mem0);
+            kv_mem1 = gsum(kv_mem1);
+            const float delta0 = (value0 - kv_mem0) * gate_beta;
+            const float delta1 = (value1 - kv_mem1) * gate_beta;
+            float oa0[4], oa1[4];
+            #pragma unroll
+            for (int p = 0; p < 4; ++p) { oa0[p] = 0.0f; oa1[p] = 0.0f; }
+            #pragma unroll
+            for (int i = 0; i < n_per_t; ++i) {
+                const float key = keys[i];
+                state0[i] = metal::fma(key, delta0, state0[i]);
+                state1[i] = metal::fma(key, delta1, state1[i]);
+                const float query = queries[i];
+                oa0[i % 4] = metal::fma(state0[i], query, oa0[i % 4]);
+                oa1[i % 4] = metal::fma(state1[i], query, oa1[i % 4]);
+            }
+            float out0 = oa0[0], out1 = oa1[0];
+            #pragma unroll
+            for (int p = 1; p < 4; ++p) { out0 += oa0[p]; out1 += oa1[p]; }
+            out0 = gsum(out0);
+            out1 = gsum(out1);
+            if (gl == 0) {
+                y_[dv_idx] = static_cast<InT>(out0);
+                y_[dv_idx + 1] = static_cast<InT>(out1);
+            }
+            if (CAPTURE || t == T_ - 1) {
+                const uint slot = CAPTURE ? (b_idx * T_ + t) : b_idx;
+                device StT* o_state = state_out + ((slot * Hv + hv_idx) * Dv + dv_idx) * Dk;
+                #pragma unroll
+                for (int i = 0; i < n_per_t; ++i) {
+                    o_state[n_per_t * gl + i] = static_cast<StT>(state0[i]);
+                    o_state[Dk + n_per_t * gl + i] = static_cast<StT>(state1[i]);
+                }
+            }
+            q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; g_ += Hv; beta_ += Hv;
+        }
+        """
+
+    nonisolated(unsafe) private static let leanLane8Kernel = MLXFast.metalKernel(
+        name: "track_gdn_lane8",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in"],
+        outputNames: ["y", "state_out"],
+        source: leanLane8Source, ensureRowContiguous: true)
+
+    private static let lane8Enabled =
+        ProcessInfo.processInfo.environment["TRACK_GDN_LANE8"] != "0"
+
     /// The whole deltanet core: prep + recurrence. Returns y [B,T,Hv,Dv],
     /// the conv tails and the recurrent state (per position when `capture`).
     static func gdn(
@@ -466,16 +614,18 @@ enum TrackFastKernels {
                 dtBias: dtBias, T: T, capture: capture, geometry: g)
         }
         if prof { TrackFastProfile.tick("gdn.prep", &pt, prep) }
-        // Each prefill SIMD group owns two value rows; omit the unused grid rows.
-        let recurrence = prefetchGDNInputs && T > 8 && !capture
-            ? leanPrefetchKernel : (T > 1 ? leanTwoRowKernel : leanKernel)
+        // Wide non-capture windows: MLXFAST-GDNLANE8 (eight value rows per
+        // simdgroup). Otherwise each SIMD group owns two value rows (one at T=1).
+        let lane8 = lane8Enabled && T > 8 && !capture
+        let recurrence = lane8 ? leanLane8Kernel : (prefetchGDNInputs && T > 8 && !capture
+            ? leanPrefetchKernel : (T > 1 ? leanTwoRowKernel : leanKernel))
         let rec = recurrence(
             [prep[0], prep[1], prep[2], prep[3], prep[4], stateIn],
             template: [
                 ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
                 ("Hk", g.hk), ("Hv", g.hv), ("CAPTURE", capture), ("T", T),
             ],
-            grid: (32, T > 1 ? g.dv / 2 : g.dv, B * g.hv), threadGroup: (32, 4, 1),
+            grid: (32, lane8 ? g.dv / 8 : (T > 1 ? g.dv / 2 : g.dv), B * g.hv), threadGroup: (32, 4, 1),
             outputShapes: [[B, T, g.hv, g.dv], [slots, g.hv, g.dv, g.dk]],
             outputDTypes: [proj.dtype, stateIn.dtype])
         if prof { TrackFastProfile.tick("gdn.lean", &pt, rec) }
