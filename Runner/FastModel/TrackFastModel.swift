@@ -148,6 +148,8 @@ struct TrackGDN {
     let geometry: TrackFastKernels.GDNGeometry
     let zOffset: Int
     let valueDim: Int
+    /// Replay the opaque one-token kernel with the current tensors as inputs.
+    let decodeReplay: TrackFastGDNDecode.Replay
 }
 
 struct TrackAttn {
@@ -324,7 +326,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             bOffset: proj.offsets[2], aOffset: proj.offsets[3])
         return TrackGDN(
             proj: proj, convW: convW, negExpALog: negExpALog, dtBias: dtBias, normW: normW,
-            out: out, geometry: geometry, zOffset: proj.offsets[1], valueDim: valueDim)
+            out: out, geometry: geometry, zOffset: proj.offsets[1], valueDim: valueDim,
+            decodeReplay: TrackFastGDNDecode.makeReplay(
+                geometry: geometry, zOffset: proj.offsets[1], eps: 1e-6))
     }
 
     static func bindAttn(_ m: Module, cfg: Qwen4ExpTextConfiguration) -> TrackAttn {
@@ -549,7 +553,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         if let fused = TrackFastGDNDecode.apply(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
             dtBias: g.dtBias, stateIn: ssm, normW: g.normW, zOffset: g.zOffset,
-            eps: 1e-6, capture: capture, geometry: geo)
+            eps: 1e-6, capture: capture, geometry: geo, replay: g.decodeReplay)
         {
             (gated, convOut, stateOut) = (fused.gated, fused.convOut, fused.stateOut)
             if prof { TrackFastProfile.tick("gdn.decodeFused", &pt, [gated, stateOut, convOut]) }

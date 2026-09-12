@@ -6,6 +6,8 @@
 import MLX
 
 enum TrackFastGDNDecode {
+    typealias Replay = @Sendable ([MLXArray]) -> [MLXArray]
+
     private static let kernel = MLXFast.metalKernel(
         name: "track_gdn_decode_complete",
         inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w"],
@@ -15,7 +17,8 @@ enum TrackFastGDNDecode {
     static func apply(
         proj: MLXArray, convState: MLXArray, convW: MLXArray,
         negExpALog: MLXArray, dtBias: MLXArray, stateIn: MLXArray, normW: MLXArray,
-        zOffset: Int, eps: Float, capture: Bool, geometry g: TrackFastKernels.GDNGeometry
+        zOffset: Int, eps: Float, capture: Bool, geometry g: TrackFastKernels.GDNGeometry,
+        replay: Replay? = nil
     ) -> (gated: MLXArray, stateOut: MLXArray, convOut: MLXArray)? {
         guard !capture, proj.ndim == 3, proj.dim(1) == 1, proj.dtype == .bfloat16,
             stateIn.dtype == .float32, g.dk == 128, g.dv == 128,
@@ -32,8 +35,29 @@ enum TrackFastGDNDecode {
             negExpALog.shape == [g.hv], dtBias.shape == [g.hv], normW.shape == [g.dv],
             convState.dtype == proj.dtype
         else { return nil }
-        let result = kernel(
-            [proj, convState, convW, negExpALog, dtBias, stateIn, normW],
+        let inputs = [proj, convState, convW, negExpALog, dtBias, stateIn, normW]
+        let result: [MLXArray]
+        if let replay, StreamOrDevice.default.stream === Stream.gpu {
+            result = replay(inputs)
+        } else {
+            result = dispatch(inputs, geometry: g, zOffset: zOffset, eps: eps)
+        }
+        return (result[1], result[0], result[2])
+    }
+
+    /// Cache only the opaque decode kernel graph; every tensor remains an input.
+    static func makeReplay(geometry g: TrackFastKernels.GDNGeometry, zOffset: Int, eps: Float) -> Replay {
+        compile(shapeless: false) { inputs in
+            dispatch(inputs, geometry: g, zOffset: zOffset, eps: eps)
+        }
+    }
+
+    private static func dispatch(
+        _ inputs: [MLXArray], geometry g: TrackFastKernels.GDNGeometry, zOffset: Int, eps: Float
+    ) -> [MLXArray] {
+        let proj = inputs[0], stateIn = inputs[5], B = proj.dim(0)
+        return kernel(
+            inputs,
             template: [
                 ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
                 ("Hk", g.hk), ("Hv", g.hv), ("KC", g.convKernel), ("CONV_DIM", g.convDim),
@@ -43,7 +67,6 @@ enum TrackFastGDNDecode {
             grid: (32, g.dv / 4, B * g.hv), threadGroup: (32, g.dv / 4, 1),
             outputShapes: [[B, g.hv, g.dv, g.dk], [B, 1, g.hv * g.dv], [B, g.convKernel - 1, g.convDim]],
             outputDTypes: [stateIn.dtype, proj.dtype, proj.dtype])
-        return (result[1], result[0], result[2])
     }
 
     private static let source = #"""
