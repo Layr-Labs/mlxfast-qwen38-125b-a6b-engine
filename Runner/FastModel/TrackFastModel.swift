@@ -136,6 +136,7 @@ struct TrackHC {
     let up: TrackProj
     let lowrank: Int
     let hasInject: Bool
+    let mixerReplay: TrackHCMixerReplay?
 }
 
 struct TrackGDN {
@@ -296,7 +297,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let q = (scale * MLXArray(Float(1) / Float(cfg.hcCount), dtype: scale.dtype))
         return TrackHC(
             normScaleQ: q, down: down, inject: inject, up: up, lowrank: cfg.hcLowrank,
-            hasInject: inject != nil)
+            hasInject: inject != nil,
+            mixerReplay: TrackHCMixerReplay(
+                down: down, up: up, inject: inject, hcCount: cfg.hcCount, hidden: cfg.hiddenSize))
     }
 
     static func bindGDN(_ m: Module, cfg: Qwen4ExpTextConfiguration) -> TrackGDN {
@@ -472,6 +475,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             var injQ: TrackQuantWeight? = nil
             if hc.hasInject, case .quant(let q)? = hc.inject, q.biases != nil { injQ = q }
             if !hc.hasInject || injQ != nil {
+                if Self.debugTaps == nil, StreamOrDevice.default.stream === Stream.gpu,
+                    let replay = hc.mixerReplay
+                {
+                    return replay.call(normed, emitF32: emitF32)
+                }
                 let n2 = normed.reshaped(S, hcCount * hidden)
                 let d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
                 let u = TrackFastMixerKernels.upMix(
