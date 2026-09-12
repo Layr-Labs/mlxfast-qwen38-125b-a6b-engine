@@ -259,8 +259,25 @@ template <typename T, int D, int V = D>
     sum_exp_score = 1;
   }
 
+  constexpr bool prefetch_kv = D == 256 && V == 256;
+  thread T current_k[qk_per_thread];
+  thread T current_v[v_per_thread];
+  if constexpr (prefetch_kv) {
+    if (block_idx < N) {
+      for (int j = 0; j < qk_per_thread; ++j) { current_k[j] = keys[j]; }
+      for (int j = 0; j < v_per_thread; ++j) { current_v[j] = values[j]; }
+    }
+  }
   // For each key
   for (int i = block_idx; i < N; i += blocks) {
+    thread T next_k[qk_per_thread];
+    thread T next_v[v_per_thread];
+    if constexpr (prefetch_kv) {
+      if (i + blocks < N) {
+        for (int j = 0; j < qk_per_thread; ++j) { next_k[j] = keys[blocks * int(k_seq_stride) + j]; }
+        for (int j = 0; j < v_per_thread; ++j) { next_v[j] = values[blocks * int(v_seq_stride) + j]; }
+      }
+    }
     bool use_key = true;
     if (do_causal) {
       use_key = i <= (N - q_seq_len + int(q_seq_idx));
@@ -273,7 +290,7 @@ template <typename T, int D, int V = D>
       // Compute the i-th score
       U score = 0;
       for (int i = 0; i < qk_per_thread; i++) {
-        score += q[i] * keys[i];
+        score += q[i] * (prefetch_kv ? current_k[i] : keys[i]);
       }
       score = simd_sum(score);
 
@@ -291,7 +308,14 @@ template <typename T, int D, int V = D>
 
       // Update the output accumulator
       for (int i = 0; i < v_per_thread; i++) {
-        o[i] = o[i] * factor + exp_score * values[i];
+        o[i] = o[i] * factor + exp_score * (prefetch_kv ? current_v[i] : values[i]);
+      }
+    }
+
+    if constexpr (prefetch_kv) {
+      if (i + blocks < N) {
+        for (int j = 0; j < qk_per_thread; ++j) { current_k[j] = next_k[j]; }
+        for (int j = 0; j < v_per_thread; ++j) { current_v[j] = next_v[j]; }
       }
     }
 
