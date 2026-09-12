@@ -1705,6 +1705,9 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
     const short a_row = tgp_thread / 4;            // 0..BM-1
     const short a_col = (tgp_thread % 4) * 16;     // 0,16,32,48
     threadgroup T* a_dst = As + a_row * BKA_padded + a_col;
+    // MLXFAST-DBUF: the A tile is double buffered with the same layout: the
+    // second K block's rows live one BM stride past the first block's.
+    threadgroup T* a_dst1 = a_dst + BM * BKA_padded;
     const bool a_live = a_row < tile_m;
 
     thread loader_w_t loader_w(
@@ -1713,6 +1716,17 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
         biases + index * stride_s,
         K,
         Ws,
+        simd_group_id,
+        simd_lane_id);
+    // MLXFAST-DBUF: a second K-block loader, staged into the Ws buffer that
+    // follows the first. It owns the odd blocks, so it starts one block ahead
+    // of `loader_w` and advances two blocks per loop trip.
+    thread loader_w_t loader_w1(
+        wl + index * stride_w,
+        scales + index * stride_s,
+        biases + index * stride_s,
+        K,
+        Ws + BN * BK_padded,
         simd_group_id,
         simd_lane_id);
 
@@ -1729,7 +1743,9 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
       // registers. The values published to `As` are byte for byte what the
       // in-place copy published, only fetched earlier.
       T a_buf[16];
+      T a_buf1[16];
       PackedNAXGroup32 packed_w;
+      PackedNAXGroup32 packed_w1;
       if (K_it > 0) {
         packed_w.prefetch(loader_w);
         if (a_live) {
@@ -1738,9 +1754,26 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
           for (short e = 0; e < 16; ++e) { a_buf[e] = a0[e]; }
         }
       }
-      for (int k = 0; k < K_it; k++) {
+      if (K_it > 1) {
+        loader_w1.next();
+        packed_w1.prefetch(loader_w1);
+        if (a_live) {
+          const device T* a1 = xb + BK + size_t(a_row) * K + a_col;
+          STEEL_PRAGMA_UNROLL
+          for (short e = 0; e < 16; ++e) { a_buf1[e] = a1[e]; }
+        }
+      }
+      // MLXFAST-DBUF: two K blocks per barrier pair. Both blocks' stores sit
+      // between the same two barriers, and block k's MMAs still run before
+      // block k+1's, each in ascending kk1 order, so Dtile accumulates exactly
+      // the sequence it did before. Only the number of synchronization points
+      // halves. `loader_w` owns the even blocks and `loader_w1` the odd ones,
+      // so each advances two blocks per trip.
+      int k = 0;
+      for (; k + 1 < K_it; k += 2) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         packed_w.store(loader_w.dst);
+        packed_w1.store(loader_w1.dst);
         // MLXFAST-ASTAGE. Each simdgroup used to walk A itself: 16 rows of 64
         // bytes at a 5,120-byte stride, per simdgroup, per kk1 -- and with
         // WM = WN = 2 the pairs (0,1) and (2,3) issue IDENTICAL reads, so every
@@ -1758,6 +1791,105 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
           for (short e = 0; e < 16; ++e) {
             a_dst[e] = a_buf[e];
           }
+          STEEL_PRAGMA_UNROLL
+          for (short e = 0; e < 16; ++e) {
+            a_dst1[e] = a_buf1[e];
+          }
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short e = 0; e < 16; ++e) {
+            a_dst[e] = T(0);
+          }
+          STEEL_PRAGMA_UNROLL
+          for (short e = 0; e < 16; ++e) {
+            a_dst1[e] = T(0);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // All lanes prefetch; neither buffer is reused until the next reader
+        // barrier of the following trip.
+        if (k + 2 < K_it) {
+          loader_w.next();
+          loader_w.next();
+          packed_w.prefetch(loader_w);
+          if (a_live) {
+            const device T* a_next = xb + 2 * BK + size_t(a_row) * K + a_col;
+            STEEL_PRAGMA_UNROLL
+            for (short e = 0; e < 16; ++e) { a_buf[e] = a_next[e]; }
+          }
+        }
+        if (k + 3 < K_it) {
+          loader_w1.next();
+          loader_w1.next();
+          packed_w1.prefetch(loader_w1);
+          if (a_live) {
+            const device T* a_next1 = xb + 3 * BK + size_t(a_row) * K + a_col;
+            STEEL_PRAGMA_UNROLL
+            for (short e = 0; e < 16; ++e) { a_buf1[e] = a_next1[e]; }
+          }
+        }
+
+        STEEL_PRAGMA_UNROLL
+        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          if (sg_active) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, BR, BC> Btile;
+
+            volatile int compiler_barrier;
+
+            Atile.template load<T, BKA_padded, 1>(
+                As + tm * BKA_padded + kk1);
+
+            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<transpose>{});
+
+            (void)compiler_barrier;
+          }
+        }
+
+        STEEL_PRAGMA_UNROLL
+        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          if (sg_active) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, BR, BC> Btile;
+
+            volatile int compiler_barrier;
+
+            Atile.template load<T, BKA_padded, 1>(
+                As + BM * BKA_padded + tm * BKA_padded + kk1);
+
+            Btile.template load<T, BK_padded, 1>(
+                Ws + BN * BK_padded + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<transpose>{});
+
+            (void)compiler_barrier;
+          }
+        }
+
+        xb += 2 * BK;
+      }
+      // An odd K_it leaves exactly one block for the single-buffer path.
+      if (k < K_it) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        packed_w.store(loader_w.dst);
+        if (a_live) {
+          STEEL_PRAGMA_UNROLL
+          for (short e = 0; e < 16; ++e) {
+            a_dst[e] = a_buf[e];
+          }
         } else {
           STEEL_PRAGMA_UNROLL
           for (short e = 0; e < 16; ++e) {
@@ -1765,17 +1897,6 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // All lanes prefetch; Ws is not reused until the next reader barrier.
-        if (k + 1 < K_it) {
-          loader_w.next();
-          packed_w.prefetch(loader_w);
-          if (a_live) {
-            const device T* a_next = xb + BK + size_t(a_row) * K + a_col;
-            STEEL_PRAGMA_UNROLL
-            for (short e = 0; e < 16; ++e) { a_buf[e] = a_next[e]; }
-          }
-        }
 
         STEEL_PRAGMA_UNROLL
         for (int kk1 = 0; kk1 < BK; kk1 += SK) {
@@ -1855,14 +1976,21 @@ template <
       group_size,
       bits>;
 
-  threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
-  // MLXFAST-ASTAGE: 32 x 72 bf16 = 4,608 B, only for the P17-eligible shape. An
-  // in-situ probe that added exactly this much untouched threadgroup memory to
-  // this kernel cost 0.8%, so the allocation is close to free here.
   constexpr bool p17_shape =
       metal::is_same_v<T, bfloat16_t> && group_size == 32 && bits == 4 &&
       transpose && BM == 32 && BN == 64 && BK == 64 && WM == 2 && WN == 2;
-  threadgroup T As[p17_shape ? BM * BK_padded : 1];
+  // MLXFAST-DBUF: the P17 body stages two K blocks per barrier pair, so its Ws
+  // and As are double buffers. Every other shape keeps its original allocation.
+  constexpr int Ws_elems =
+      (transpose ? BN * BK_padded : BK * BN_padded) * (p17_shape ? 2 : 1);
+  constexpr int As_elems =
+      (p17_shape ? BM * BK_padded : 1) * (p17_shape ? 2 : 1);
+  threadgroup T Ws[Ws_elems];
+  // MLXFAST-ASTAGE: 32 x 72 bf16 = 4,608 B per buffer, only for the
+  // P17-eligible shape. An in-situ probe that added exactly this much untouched
+  // threadgroup memory to this kernel cost 0.8%, so the allocation is close to
+  // free here.
+  threadgroup T As[As_elems];
 
   // P17 is a scheduling/load-address variant of THIS kernel, not a different
   // GEMM family. Ineligible shapes retain the original body byte for byte.
