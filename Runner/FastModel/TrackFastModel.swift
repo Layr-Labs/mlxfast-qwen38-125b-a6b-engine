@@ -153,6 +153,7 @@ struct TrackGDN {
 struct TrackAttn {
     /// q rows (all heads), gate rows (all heads), k rows, v rows, indexer k rows.
     let qkv: TrackMultiProj
+    let wideQKV: TrackProj?
     /// The whole `index_qk_proj` (q and k rows), for wide windows: the GEMM
     /// path's rounding depends on N, so the tape must come from the full
     /// projection to stay exact there.
@@ -360,7 +361,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let out = TrackProj(m.trackChild("o_proj"))
         let qkv = TrackMultiProj([qReordered, k, v, indexerK])
         return TrackAttn(
-            qkv: qkv, indexerFull: idxProj, indexerQWidth: idxSplit,
+            qkv: qkv, wideQKV: TrackPrefillAttention.prepare(qkv),
+            indexerFull: idxProj, indexerQWidth: idxSplit,
             qNormW: qNormW, kNormW: kNormW, indexerK: indexerK, out: out,
             qWidth: heads * d, kvWidth: kvHeads * d)
     }
@@ -578,7 +580,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let heads = cfg.attentionHeads, kvHeads = cfg.kvHeads, d = cfg.headDim
         let splitInputs: [MLXArray]?
         let qkv: MLXArray
-        if TrackP12Prefill.splitAttention && TrackP12Prefill.eligible(x)
+        if let wide = TrackPrefillAttention.apply(a.wideQKV, x: x) {
+            splitInputs = nil
+            qkv = wide
+        } else if TrackP12Prefill.splitAttention && TrackP12Prefill.eligible(x)
             && a.qkv.parts.count == 4
         {
             let parts = a.qkv.parts.prefix(3).map { $0.apply(x) }
