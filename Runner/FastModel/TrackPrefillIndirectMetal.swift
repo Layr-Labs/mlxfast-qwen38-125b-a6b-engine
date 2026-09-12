@@ -1305,11 +1305,14 @@ template <
     int WM,
     int WN,
     bool transpose>
-METAL_FUNC void track_prefill_indirect(
+METAL_FUNC void track_prefill_fused_gate_up(
     const device T* x,
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
+    const device uint32_t* up_w,
+    const device T* up_scales,
+    const device T* up_biases,
     const device uint32_t* indices,
     const device uint32_t* token_rows,
     device T* y,
@@ -1317,6 +1320,7 @@ METAL_FUNC void track_prefill_indirect(
     int N,
     int K,
     threadgroup T* Ws,
+    threadgroup T* Us,
     threadgroup T* As,
     uint3 tid,
     uint simd_group_id,
@@ -1348,6 +1352,9 @@ METAL_FUNC void track_prefill_indirect(
   wl += size_t(y_col) * K_w;
   scales += size_t(y_col) * K_g;
   biases += size_t(y_col) * K_g;
+  auto ul = (const device uint8_t*)up_w + size_t(y_col) * K_w;
+  up_scales += size_t(y_col) * K_g;
+  up_biases += size_t(y_col) * K_g;
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
@@ -1393,6 +1400,8 @@ METAL_FUNC void track_prefill_indirect(
 
     NAXTile<AccumType, TM, TN> Dtile;
     Dtile.clear();
+    NAXTile<AccumType, TM, TN> Utile;
+    Utile.clear();
 
     const short tgp_thread = short(simd_group_id * SIMD_SIZE + simd_lane_id);
     const short a_row = tgp_thread / 4;            // 0..BM-1
@@ -1412,12 +1421,18 @@ METAL_FUNC void track_prefill_indirect(
         Ws,
         simd_group_id,
         simd_lane_id);
+    thread loader_w_t loader_u(
+        ul + index * stride_w,
+        up_scales + index * stride_s,
+        up_biases + index * stride_s,
+        K, Us, simd_group_id, simd_lane_id);
 
     dispatch_bool(tile_m == BM, [&](auto kAlignedM) {
       T a_buf[16];
-      PackedNAXGroup32 packed_w;
+      PackedNAXGroup32 packed_w, packed_u;
       if (K_it > 0) {
         packed_w.prefetch(loader_w);
+        packed_u.prefetch(loader_u);
         if (a_live) {
           const device T* a0 = xb;
           STEEL_PRAGMA_UNROLL
@@ -1427,6 +1442,7 @@ METAL_FUNC void track_prefill_indirect(
       for (int k = 0; k < K_it; k++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         packed_w.store(loader_w.dst);
+        packed_u.store(loader_u.dst);
         if (a_live) {
           STEEL_PRAGMA_UNROLL
           for (short e = 0; e < 16; ++e) {
@@ -1442,7 +1458,9 @@ METAL_FUNC void track_prefill_indirect(
 
         if (k + 1 < K_it) {
           loader_w.next();
+          loader_u.next();
           packed_w.prefetch(loader_w);
+          packed_u.prefetch(loader_u);
           if (a_live) {
             const device T* a_next = xb + BK;
             STEEL_PRAGMA_UNROLL
@@ -1470,6 +1488,14 @@ METAL_FUNC void track_prefill_indirect(
                 Btile,
                 metal::bool_constant<transpose>{});
 
+            Btile.template load<T, BK_padded, 1>(Us + tn * BK_padded + kk1);
+            tile_matmad_nax(
+                Utile,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<transpose>{});
+
             (void)compiler_barrier;
           }
         }
@@ -1479,6 +1505,14 @@ METAL_FUNC void track_prefill_indirect(
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
       if (sg_active) {
+        // Match each projection's bf16 store before evaluating compiled SwiGLU.
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < Dtile.kElemsPerTile; ++e) {
+          const T gate_value = static_cast<T>(Dtile.elems()[e]);
+          const T up_value = static_cast<T>(Utile.elems()[e]);
+          const T activated = mlx_silu(gate_value) * up_value;
+          Dtile.elems()[e] = static_cast<AccumType>(activated);
+        }
         device T* yn = y + size_t(tile_begin + tm) * N + y_col + tn;
         if constexpr (kAlignedM.value) {
           Dtile.store(yn, N);
