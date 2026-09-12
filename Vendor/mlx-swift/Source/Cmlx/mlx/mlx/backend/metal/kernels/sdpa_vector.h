@@ -204,83 +204,19 @@ template <typename T, int D, int V = D>
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  // Two query heads reuse each K/V load while retaining their own block walk.
-  // K/V/Q move in 16-byte vector loads; the score keeps its sequential
-  // component order so the accumulated value is unchanged.
-  if constexpr (metal::is_same_v<T, bfloat16_t> && D == 256 && V == 256) {
-    const uint gqa = tptg.y;
-    if (N >= 1024 && tptg.z == 1 && gqa % 2 == 0 && !has_mask && !has_sinks) {
-      const uint pair = tidtg.y;
-      if (pair >= gqa / 2) { return; }
-      const uint kv = tid.x;
-      const uint batch = tid.y;
-      const uint block = tid.z;
-      const uint kv_batch = batch * tpg.x + kv;
-      const uint head0 = (batch * tpg.x + kv) * gqa + pair * 2;
-      const device T* kp = keys + kv_batch * k_head_stride + block * k_seq_stride + simd_lid * 8;
-      const device T* vp = values + kv_batch * v_head_stride + block * v_seq_stride + simd_lid * 8;
-      float4 q_lo[2], q_hi[2];
-      float4 o_lo[2] = {float4(0), float4(0)};
-      float4 o_hi[2] = {float4(0), float4(0)};
-      float maximum[2] = {Limits<float>::finite_min, Limits<float>::finite_min};
-      float denominator[2] = {0, 0};
-      for (int h = 0; h < 2; ++h) {
-        const device metal::vec<T, 4>* qp =
-            (const device metal::vec<T, 4>*)(queries + (head0 + h) * D + simd_lid * 8);
-        q_lo[h] = static_cast<float>(scale) * float4(qp[0]);
-        q_hi[h] = static_cast<float>(scale) * float4(qp[1]);
-      }
-      for (int token = block; token < N; token += blocks) {
-        const device metal::vec<T, 4>* kv4 = (const device metal::vec<T, 4>*)kp;
-        const device metal::vec<T, 4>* vv4 = (const device metal::vec<T, 4>*)vp;
-        const float4 k_lo = float4(kv4[0]);
-        const float4 k_hi = float4(kv4[1]);
-        const float4 v_lo = float4(vv4[0]);
-        const float4 v_hi = float4(vv4[1]);
-        for (int h = 0; h < 2; ++h) {
-          float score = q_lo[h].x * k_lo.x;
-          score += q_lo[h].y * k_lo.y;
-          score += q_lo[h].z * k_lo.z;
-          score += q_lo[h].w * k_lo.w;
-          score += q_hi[h].x * k_hi.x;
-          score += q_hi[h].y * k_hi.y;
-          score += q_hi[h].z * k_hi.z;
-          score += q_hi[h].w * k_hi.w;
-          score = simd_sum(score);
-          const float next_maximum = max(maximum[h], score);
-          const float factor = fast::exp(maximum[h] - next_maximum);
-          const float exp_score = fast::exp(score - next_maximum);
-          maximum[h] = next_maximum;
-          denominator[h] = denominator[h] * factor + exp_score;
-          o_lo[h] = o_lo[h] * factor + exp_score * v_lo;
-          o_hi[h] = o_hi[h] * factor + exp_score * v_hi;
-        }
-        kp += blocks * int(k_seq_stride);
-        vp += blocks * int(v_seq_stride);
-      }
-      for (int h = 0; h < 2; ++h) {
-        const uint offset = (head0 + h) * blocks + block;
-        if (simd_lid == 0) {
-          sums[offset] = denominator[h];
-          maxs[offset] = maximum[h];
-        }
-        device metal::vec<T, 4>* destination =
-            (device metal::vec<T, 4>*)(out + offset * V + simd_lid * 8);
-        destination[0] = static_cast<metal::vec<T, 4>>(o_lo[h]);
-        destination[1] = static_cast<metal::vec<T, 4>>(o_hi[h]);
-      }
-      return;
-    }
-  }
-
   constexpr int BD = 32;
   constexpr int qk_per_thread = D / BD;
   constexpr int v_per_thread = V / BD;
+  // MLXFAST-SDPAVEC: 16-byte vector access is legal only when each thread owns exactly
+  // 8 contiguous head-dim components and the base offsets stay 8-element aligned.
+  constexpr bool vec_ok = metal::is_same_v<T, bfloat16_t> && D == 256 && V == 256;
 
   typedef float U;
 
   thread U q[qk_per_thread];
   thread U o[v_per_thread] = {0};
+  thread float4 q_lo = float4(0), q_hi = float4(0);
+  thread float4 o_lo = float4(0), o_hi = float4(0);
 
   // Adjust positions
   const int kv_head_idx = tid.x;
@@ -317,8 +253,17 @@ template <typename T, int D, int V = D>
   maxs += o_offset * blocks + block_idx;
 
   // Read the query
-  for (int i = 0; i < qk_per_thread; i++) {
-    q[i] = static_cast<U>(scale) * queries[i];
+  if constexpr (vec_ok) {
+    const device metal::vec<T, 4>* qv4 = (const device metal::vec<T, 4>*)queries;
+    const float4 qa = float4(qv4[0]);
+    const float4 qb = float4(qv4[1]);
+    const float s = static_cast<float>(scale);
+    q_lo = float4(qa.x * s, qa.y * s, qa.z * s, qa.w * s);
+    q_hi = float4(qb.x * s, qb.y * s, qb.z * s, qb.w * s);
+  } else {
+    for (int i = 0; i < qk_per_thread; i++) {
+      q[i] = static_cast<U>(scale) * queries[i];
+    }
   }
 
   U max_score = Limits<U>::finite_min;
@@ -341,8 +286,23 @@ template <typename T, int D, int V = D>
     if (use_key) {
       // Compute the i-th score
       U score = 0;
-      for (int i = 0; i < qk_per_thread; i++) {
-        score += q[i] * keys[i];
+      if constexpr (vec_ok) {
+        const device metal::vec<T, 4>* kv4 = (const device metal::vec<T, 4>*)keys;
+        const float4 k_lo = float4(kv4[0]);
+        const float4 k_hi = float4(kv4[1]);
+        // written out in the ORIGINAL component order: no reassociation
+        score = q_lo.x * k_lo.x;
+        score += q_lo.y * k_lo.y;
+        score += q_lo.z * k_lo.z;
+        score += q_lo.w * k_lo.w;
+        score += q_hi.x * k_hi.x;
+        score += q_hi.y * k_hi.y;
+        score += q_hi.z * k_hi.z;
+        score += q_hi.w * k_hi.w;
+      } else {
+        for (int i = 0; i < qk_per_thread; i++) {
+          score += q[i] * keys[i];
+        }
       }
       score = simd_sum(score);
 
@@ -359,8 +319,22 @@ template <typename T, int D, int V = D>
       sum_exp_score = sum_exp_score * factor + exp_score;
 
       // Update the output accumulator
-      for (int i = 0; i < v_per_thread; i++) {
-        o[i] = o[i] * factor + exp_score * values[i];
+      if constexpr (vec_ok) {
+        const device metal::vec<T, 4>* vv4 = (const device metal::vec<T, 4>*)values;
+        const float4 v_lo = float4(vv4[0]);
+        const float4 v_hi = float4(vv4[1]);
+        o_lo.x = o_lo.x * factor + exp_score * v_lo.x;
+        o_lo.y = o_lo.y * factor + exp_score * v_lo.y;
+        o_lo.z = o_lo.z * factor + exp_score * v_lo.z;
+        o_lo.w = o_lo.w * factor + exp_score * v_lo.w;
+        o_hi.x = o_hi.x * factor + exp_score * v_hi.x;
+        o_hi.y = o_hi.y * factor + exp_score * v_hi.y;
+        o_hi.z = o_hi.z * factor + exp_score * v_hi.z;
+        o_hi.w = o_hi.w * factor + exp_score * v_hi.w;
+      } else {
+        for (int i = 0; i < v_per_thread; i++) {
+          o[i] = o[i] * factor + exp_score * values[i];
+        }
       }
     }
 
@@ -381,8 +355,18 @@ template <typename T, int D, int V = D>
     maxs[0] = max_score;
   }
 
-  for (int i = 0; i < v_per_thread; i++) {
-    out[i] = static_cast<T>(o[i]);
+  if constexpr (vec_ok) {
+    device metal::vec<T, 4>* dst = (device metal::vec<T, 4>*)out;
+    dst[0] = metal::vec<T, 4>(
+        static_cast<T>(o_lo.x), static_cast<T>(o_lo.y),
+        static_cast<T>(o_lo.z), static_cast<T>(o_lo.w));
+    dst[1] = metal::vec<T, 4>(
+        static_cast<T>(o_hi.x), static_cast<T>(o_hi.y),
+        static_cast<T>(o_hi.z), static_cast<T>(o_hi.w));
+  } else {
+    for (int i = 0; i < v_per_thread; i++) {
+      out[i] = static_cast<T>(o[i]);
+    }
   }
 }
 
