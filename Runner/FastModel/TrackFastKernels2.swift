@@ -365,7 +365,6 @@ extension TrackFastKernels {
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
         threadgroup float local_sums[32];
-        threadgroup InT vec[D];
 
         const bool isQ = h < HQ;
         const bool isV = h >= HQ + HK;
@@ -393,6 +392,27 @@ extension TrackFastKernels {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         acc = simd_sum(local_sums[lane]);
         const float inv_mean = metal::precise::rsqrt(acc / (float)D + as_type<float>((uint)EPS_BITS));
+        if constexpr (D == 256 && ROT == 64 && (sizeof(InT) == 2 || sizeof(InT) == 4)) {
+            device InT* dst = isQ ? (qout + ((b * HQ + hh) * S + s) * D) : (kout + ((b * HK + hh) * S + s) * D);
+            for (int i = 0; i < N_READS; ++i) {
+                const uint d = lid * N_READS + i;
+                const InT wgt = isQ ? qnorm[d] : knorm[d];
+                const InT normalized = wgt * static_cast<InT>(thread_x[i] * inv_mean);
+                InT o = normalized;
+                if (d < ROT) {
+                    using Word = metal::conditional_t<sizeof(InT) == 2, ushort, uint>;
+                    const InT partner = as_type<InT>(simd_shuffle_xor(as_type<Word>(normalized), 8));
+                    const InT c = cosb[s * ROT + d];
+                    const InT sn = sinb[s * ROT + d];
+                    InT t1 = normalized * c;
+                    InT t2 = (d < ROT / 2 ? -partner : partner) * sn;
+                    o = t1 + t2;
+                }
+                dst[d] = o;
+            }
+            return;
+        }
+        threadgroup InT vec[D];
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
             const InT wgt = isQ ? qnorm[d] : knorm[d];
