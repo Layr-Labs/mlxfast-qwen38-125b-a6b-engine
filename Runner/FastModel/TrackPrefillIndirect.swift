@@ -59,7 +59,7 @@ enum TrackPrefillIndirect {
             outputShapes: [[2 * maxT]], outputDTypes: [.uint32])[0]
     }
 
-    static func apply(_ m: TrackMoE, x: MLXArray, indices: MLXArray)
+    static func apply(_ m: TrackMoE, x: MLXArray, indices: MLXArray, includeShared: Bool = false)
         -> (activated: MLXArray, sortedIDs: MLXArray, inverse: MLXArray, tiles: MLXArray)?
     {
         guard enabled, supportsNAX, StreamOrDevice.default.stream == Stream.gpu,
@@ -78,6 +78,8 @@ enum TrackPrefillIndirect {
             g.s.dtype == .bfloat16, g.b.dtype == .bfloat16,
             u.s.dtype == .bfloat16, u.b.dtype == .bfloat16
         else { return nil }
+
+        if includeShared && !TrackPrefillShared.supports(m, x: x) { return nil }
 
         let flatIDs = indices.flattened()
         let sortedIDs: MLXArray
@@ -98,6 +100,12 @@ enum TrackPrefillIndirect {
         let experts = g.w.dim(0)
         let tiles = tileTable(sortedIDs: sortedIDs, rows: rows, experts: experts)
         let maxT = maxTiles(rows: rows, experts: experts)
+        if includeShared {
+            guard let activated = TrackPrefillShared.gateUp(
+                m, x: x, sortedIDs: sortedIDs, tokenRows: tokenRows, tiles: tiles, maxTiles: maxT)
+            else { return nil }
+            return (activated, sortedIDs, inverse, tiles)
+        }
         let activated = gateUpKernel(
             [x, g.w, g.s, g.b, u.w, u.s, u.b, sortedIDs, tokenRows, tiles],
             template: [("T", x.dtype), ("N", 640), ("K", 2560), ("SILU", true)],
@@ -109,17 +117,26 @@ enum TrackPrefillIndirect {
 
     /// The down projection over the same tile table. `activated` already holds
     /// one row per sorted assignment, so the row gather is the identity.
-    static func down(_ m: TrackMoE, activated: MLXArray, sortedIDs: MLXArray, tiles: MLXArray)
+    static func down(
+        _ m: TrackMoE, activated: MLXArray, sortedIDs: MLXArray, tiles: MLXArray,
+        sharedRows: Int = 0
+    )
         -> MLXArray?
     {
         let d = m.expertDown
         let rows = sortedIDs.size
-        guard activated.ndim == 3, activated.dim(0) == rows, activated.dim(1) == 1,
+        guard sharedRows >= 0,
+            activated.ndim == 3, activated.dim(0) == rows + sharedRows, activated.dim(1) == 1,
             activated.dim(2) == 640, activated.dtype == .bfloat16,
             d.w.shape == [512, 2560, 80], d.s.shape == [512, 2560, 20], d.b.shape == d.s.shape,
             d.w.dtype == .uint32, d.s.dtype == .bfloat16, d.b.dtype == .bfloat16
         else { return nil }
         let maxT = maxTiles(rows: rows, experts: d.w.dim(0))
+        if sharedRows > 0 {
+            return TrackPrefillShared.down(
+                m, activated: activated, sortedIDs: sortedIDs, tokenRows: identityRows(rows),
+                tiles: tiles, maxTiles: maxT, sharedRows: sharedRows)
+        }
         return kernel(
             [activated, d.w, d.s, d.b, sortedIDs, identityRows(rows), tiles],
             template: [("T", activated.dtype), ("N", 2560), ("K", 640)],

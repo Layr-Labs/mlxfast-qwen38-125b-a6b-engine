@@ -198,6 +198,24 @@ enum TrackP12Prefill {
             ]),
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
+    static func sharedMoE(_ m: TrackMoE, _ x: MLXArray, indices: MLXArray, weights: MLXArray)
+        -> MLXArray?
+    {
+        guard sortedCombine, eligible(x), weights.dtype == .float32,
+            m.p12SortedParts != nil, !m.switchMLP.hasFusedGateUp,
+            let indirect = TrackPrefillIndirect.apply(m, x: x, indices: indices, includeShared: true),
+            let down = TrackPrefillIndirect.down(
+                m, activated: indirect.activated, sortedIDs: indirect.sortedIDs,
+                tiles: indirect.tiles, sharedRows: x.dim(1))
+        else { return nil }
+        let s = x.dim(1), h = x.dim(2), r = indices.size
+        return sortedCombineKernel(
+            [down[..<r], weights, down[r...], m.sharedGate.apply(x), indirect.inverse],
+            template: [("InT", down.dtype), ("K", indices.dim(-1)), ("H", h)],
+            grid: (h, s, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, s, h]], outputDTypes: [down.dtype])[0]
+    }
+
     /// Keep sorted expert rows through the projections and weighted combine.
     static func sortedMoE(
         _ m: TrackMoE, _ x: MLXArray, indices: MLXArray, weights: MLXArray,

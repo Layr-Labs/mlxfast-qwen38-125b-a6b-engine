@@ -752,6 +752,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             weights = softmax(takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
         }
         if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights]) }
+        if let combined = TrackP12Prefill.sharedMoE(m, x, indices: idx, weights: weights) {
+            if prof { TrackFastProfile.tick("moe.shared+sorted+combine", &pt, [combined]) }
+            return combined
+        }
         let sharedAct: MLXArray
         if x.dim(1) > 8, let fusedGU = m.sharedGateUp.fused {
             // MLXFAST-SHAREDFUSE: wide windows run gate|up as ONE N = 1280 GEMM.
