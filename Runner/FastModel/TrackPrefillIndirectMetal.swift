@@ -1304,7 +1304,8 @@ template <
     int BK,
     int WM,
     int WN,
-    bool transpose>
+    bool transpose,
+    bool HAS_TILE_WORKLIST = false>
 METAL_FUNC void track_prefill_indirect(
     const device T* x,
     const device uint32_t* w,
@@ -1320,7 +1321,8 @@ METAL_FUNC void track_prefill_indirect(
     threadgroup T* As,
     uint3 tid,
     uint simd_group_id,
-    uint simd_lane_id) {
+    uint simd_lane_id,
+    const device uint32_t* tile_worklist = nullptr) {
   static_assert(
       transpose && BM == 32 && BN == 64 && BK == 64 && WM == 2 && WN == 2,
       "P17 requires the original 32x64x64 NAX tile and 2x2 SIMD layout");
@@ -1342,7 +1344,7 @@ METAL_FUNC void track_prefill_indirect(
   const size_t stride_s = size_t(N) * K_g;
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
-  const short tgp_bm = short(min(BM, M - y_row));
+  const short tgp_bm = HAS_TILE_WORKLIST ? 1 : short(min(BM, M - y_row));
 
   auto wl = (const device uint8_t*)w;
   wl += size_t(y_col) * K_w;
@@ -1363,29 +1365,34 @@ METAL_FUNC void track_prefill_indirect(
 
   uint32_t index;
   short offset;
-  uint32_t index_next = indices[y_row];
+  uint32_t index_next = HAS_TILE_WORKLIST ? 0u : indices[y_row];
   short offset_next = 0;
   int n = 0;
   while (n < tgp_bm) {
-    n++;
-    offset = offset_next;
-    index = index_next;
-    offset_next = tgp_bm;
-    for (; n < tgp_bm; n++) {
-      if (indices[y_row + n] != index) {
-        offset_next = n;
-        index_next = indices[y_row + n];
-        break;
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_none);
-
     int tile_begin;
     int tile_end;
-    p17_sorted_expert_tile<BM>(
-        indices, M, y_row, offset, offset_next, index, tile_begin, tile_end);
-    if (tile_begin == tile_end) {
-      continue;  // Uniform over the ENTIRE threadgroup; no barrier is skipped by a subset.
+    if constexpr (HAS_TILE_WORKLIST) {
+      ++n;
+      index = tile_worklist[tid.y * 3];
+      tile_begin = int(tile_worklist[tid.y * 3 + 1]);
+      tile_end = int(tile_worklist[tid.y * 3 + 2]);
+      if (tile_begin == tile_end) { return; }
+    } else {
+      n++;
+      offset = offset_next;
+      index = index_next;
+      offset_next = tgp_bm;
+      for (; n < tgp_bm; n++) {
+        if (indices[y_row + n] != index) {
+          offset_next = n;
+          index_next = indices[y_row + n];
+          break;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_none);
+      p17_sorted_expert_tile<BM>(
+          indices, M, y_row, offset, offset_next, index, tile_begin, tile_end);
+      if (tile_begin == tile_end) { continue; }
     }
     const short tile_m = short(tile_end - tile_begin);
     const short sgp_sm = short(min(int(SM), max(0, int(tile_m) - int(tm))));

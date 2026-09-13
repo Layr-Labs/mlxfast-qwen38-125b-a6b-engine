@@ -73,13 +73,13 @@ enum TrackPrefillSort {
     private static let scatterKernel = MLXFast.metalKernel(
         name: "track_route_counting_scatter",
         inputNames: ["ids", "counts"],
-        outputNames: ["sorted_ids", "token_rows", "inverse"],
+        outputNames: ["sorted_ids", "token_rows", "inverse", "tile_worklist"],
         source: scatterSource, header: "", ensureRowContiguous: true)
 
     /// `(sortedIDs, tokenRows, inverse)` for `flatIDs` over `E` expert ids,
     /// or nil when the shape is outside the supported window.
     static func apply(flatIDs: MLXArray, experts E: Int, topK: Int)
-        -> (sortedIDs: MLXArray, tokenRows: MLXArray, inverse: MLXArray)?
+        -> (sortedIDs: MLXArray, tokenRows: MLXArray, inverse: MLXArray, tileWorklist: MLXArray)?
     {
         let R = flatIDs.size
         guard enabled, flatIDs.ndim == 1, flatIDs.dtype == .uint32, topK > 0,
@@ -96,9 +96,9 @@ enum TrackPrefillSort {
             [flatIDs, counts],
             template: [("E", E), ("BLK", blockSize), ("R", R), ("NB", nBlocks), ("TOPK", topK)],
             grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
-            outputShapes: [[R], [R], [R]],
-            outputDTypes: [.uint32, .uint32, .uint32])
-        return (outs[0], outs[1], outs[2])
+            outputShapes: [[R], [R], [R], [R / 32 + E, 3]],
+            outputDTypes: [.uint32, .uint32, .uint32, .uint32])
+        return (outs[0], outs[1], outs[2], outs[3])
     }
 
     // MARK: - kernels
@@ -160,6 +160,20 @@ enum TrackPrefillSort {
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint b = t; b < (uint)E; b += BLK) { sA[b] = sB[b]; }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (blk == 0) {
+            for (uint b = t; b < (uint)E; b += BLK) {
+                const uint end = sA[b];
+                const uint begin = end - tot[b];
+                const uint first = begin / 32 + b;
+                const uint limit = end / 32 + b + 1;
+                for (uint slot = first; slot < limit; ++slot) {
+                    const uint row = begin + (slot - first) * 32;
+                    tile_worklist[slot * 3] = b;
+                    tile_worklist[slot * 3 + 1] = min(row, end);
+                    tile_worklist[slot * 3 + 2] = min(row + 32, end);
+                }
+            }
         }
         if (gi >= (uint)R) { return; }
         const uint v = vals[t];

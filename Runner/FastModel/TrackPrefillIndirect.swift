@@ -19,7 +19,7 @@ enum TrackPrefillIndirect {
 
     private static let kernel = MLXFast.metalKernel(
         name: "track_prefill_indirect_activations",
-        inputNames: ["x", "w", "scales", "biases", "indices", "token_rows"],
+        inputNames: ["x", "w", "scales", "biases", "indices", "token_rows", "tile_worklist"],
         outputNames: ["y"], source: source, header: metalHeader,
         ensureRowContiguous: true)
 
@@ -47,23 +47,28 @@ enum TrackPrefillIndirect {
         let sortedIDs: MLXArray
         let inverse: MLXArray
         let tokenRows: MLXArray
+        let tileWorklist: MLXArray?
         if let c = TrackPrefillSort.apply(
             flatIDs: flatIDs, experts: g.w.dim(0), topK: indices.dim(2))
         {
             // The identical permutation in two launches (see TrackPrefillSort).
             (sortedIDs, tokenRows, inverse) = (c.sortedIDs, c.tokenRows, c.inverse)
+            tileWorklist = c.tileWorklist
         } else {
+            tileWorklist = nil
             let order = argSort(flatIDs)
             inverse = argSort(order)
             sortedIDs = flatIDs[order]
             tokenRows = order.floorDivide(indices.dim(2))
         }
         let rows = indices.size
+        let tiles = tileWorklist?.dim(0) ?? ((rows + 31) / 32)
         func project(_ bank: (w: MLXArray, s: MLXArray, b: MLXArray)) -> MLXArray {
             kernel(
-                [x, bank.w, bank.s, bank.b, sortedIDs, tokenRows],
-                template: [("T", x.dtype), ("M", rows), ("N", 640), ("K", 2560)],
-                grid: (10 * 32, ((rows + 31) / 32) * 2, 2),
+                [x, bank.w, bank.s, bank.b, sortedIDs, tokenRows, tileWorklist ?? sortedIDs],
+                template: [("T", x.dtype), ("M", rows), ("N", 640), ("K", 2560),
+                           ("HAS_TILE_WORKLIST", tileWorklist != nil)],
+                grid: (10 * 32, tiles * 2, 2),
                 threadGroup: (32, 2, 2),
                 outputShapes: [[rows, 1, 640]], outputDTypes: [.bfloat16])[0]
         }
@@ -75,9 +80,9 @@ enum TrackPrefillIndirect {
     static let source = #"""
         threadgroup T Ws[64 * 72];
         threadgroup T As[32 * 72];
-        track_prefill_indirect<T, 32, 4, 32, 64, 64, 2, 2, true>(
+        track_prefill_indirect<T, 32, 4, 32, 64, 64, 2, 2, true, HAS_TILE_WORKLIST>(
             x, w, scales, biases, indices, token_rows, y,
             M, N, K, Ws, As, threadgroup_position_in_grid,
-            simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+            simdgroup_index_in_threadgroup, thread_index_in_simdgroup, tile_worklist);
         """#
 }
