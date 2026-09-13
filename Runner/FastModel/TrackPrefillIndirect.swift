@@ -26,10 +26,19 @@ enum TrackPrefillIndirect {
         outputNames: ["y"], source: sourceGU.replacingOccurrences(of: "y0, y1, N, K", with: "y, y, N, K"),
         header: metalHeader, ensureRowContiguous: true)
 
+<<<<<<< Updated upstream
     private static let kernel = MLXFast.metalKernel(
         name: "track_prefill_indirect_activations",
         inputNames: ["x", "w", "scales", "biases", "indices", "token_rows", "tiles"],
         outputNames: ["y"], source: source, header: metalHeader,
+=======
+    /// Down projection: 128x32 weight blocks (20 column tiles over N = 2560,
+    /// 20 K steps over K = 640); the 64x64 block `source` remains the reference.
+    private static let kernel = MLXFast.metalKernel(
+        name: "track_prefill_indirect_down",
+        inputNames: ["x", "w", "scales", "biases", "indices", "token_rows", "tiles"],
+        outputNames: ["y"], source: sourceDown, header: metalHeader,
+>>>>>>> Stashed changes
         ensureRowContiguous: true)
 
     /// `[2 * maxTiles]` of `[begin, end)` row ranges, one 32-row tile per slot,
@@ -121,7 +130,11 @@ enum TrackPrefillIndirect {
         return kernel(
             [activated, d.w, d.s, d.b, sortedIDs, identityRows(rows), tiles],
             template: [("T", activated.dtype), ("N", 2560), ("K", 640)],
+<<<<<<< Updated upstream
             grid: (40 * 32, maxT * 2, 2),
+=======
+            grid: ((2560 / downBlockN) * 32, maxT * 2, 2),
+>>>>>>> Stashed changes
             threadGroup: (32, 2, 2),
             outputShapes: [[rows, 1, 2560]], outputDTypes: [.bfloat16])[0]
     }
@@ -147,6 +160,20 @@ enum TrackPrefillIndirect {
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
         """#
 
+<<<<<<< Updated upstream
+=======
+    static let downBlockN = 128
+
+    static let sourceDown = #"""
+        threadgroup T Ws[128 * 40];
+        threadgroup T As[32 * 40];
+        track_prefill_indirect<T, 32, 4, 32, 128, 32, 2, 2, true>(
+            x, w, scales, biases, indices, token_rows, tiles, y,
+            N, K, Ws, As, threadgroup_position_in_grid,
+            simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+        """#
+
+>>>>>>> Stashed changes
     static let source = #"""
         threadgroup T Ws[64 * 72];
         threadgroup T As[32 * 72];

@@ -1272,8 +1272,9 @@ METAL_FUNC void track_prefill_indirect(
     uint simd_group_id,
     uint simd_lane_id) {
   static_assert(
-      transpose && BM == 32 && BN == 64 && BK == 64 && WM == 2 && WN == 2,
-      "P17 requires the original 32x64x64 NAX tile and 2x2 SIMD layout");
+      transpose && BM == 32 && WM == 2 && WN == 2 &&
+          ((BN == 64 && BK == 64) || (BN == 128 && BK == 32)),
+      "P17 tile: 32 rows, 2x2 SIMD layout, 64x64 or 128x32 weight block");
   static_assert(
       metal::is_same_v<T, bfloat16_t> && group_size == 32 && bits == 4,
       "P17 requires unchanged bf16 / affine group-32 / 4-bit operands");
@@ -1327,9 +1328,11 @@ METAL_FUNC void track_prefill_indirect(
     NAXTile<AccumType, TM, TN> Dtile;
     Dtile.clear();
 
+    constexpr short A_PER_THREAD = (BM * BK) / (WM * WN * SIMD_SIZE);  // 16 or 8
+    constexpr short A_SPLIT = BK / A_PER_THREAD;                        // threads per row
     const short tgp_thread = short(simd_group_id * SIMD_SIZE + simd_lane_id);
-    const short a_row = tgp_thread / 4;            // 0..BM-1
-    const short a_col = (tgp_thread % 4) * 16;     // 0,16,32,48
+    const short a_row = tgp_thread / A_SPLIT;              // 0..BM-1
+    const short a_col = (tgp_thread % A_SPLIT) * A_PER_THREAD;
     threadgroup T* a_dst = As + a_row * BKA_padded + a_col;
     const bool a_live = a_row < tile_m;
     const device T* xb = x;
@@ -1347,14 +1350,14 @@ METAL_FUNC void track_prefill_indirect(
         simd_lane_id);
 
     dispatch_bool(tile_m == BM, [&](auto kAlignedM) {
-      T a_buf[16];
+      T a_buf[A_PER_THREAD];
       PackedNAXGroup32 packed_w;
       if (K_it > 0) {
         packed_w.prefetch(loader_w);
         if (a_live) {
           const device T* a0 = xb;
           STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < 16; ++e) { a_buf[e] = a0[e]; }
+          for (short e = 0; e < A_PER_THREAD; ++e) { a_buf[e] = a0[e]; }
         }
       }
       for (int k = 0; k < K_it; k++) {
@@ -1362,12 +1365,12 @@ METAL_FUNC void track_prefill_indirect(
         packed_w.store(loader_w.dst);
         if (a_live) {
           STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < 16; ++e) {
+          for (short e = 0; e < A_PER_THREAD; ++e) {
             a_dst[e] = a_buf[e];
           }
         } else {
           STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < 16; ++e) {
+          for (short e = 0; e < A_PER_THREAD; ++e) {
             a_dst[e] = T(0);
           }
         }
@@ -1379,7 +1382,7 @@ METAL_FUNC void track_prefill_indirect(
           if (a_live) {
             const device T* a_next = xb + BK;
             STEEL_PRAGMA_UNROLL
-            for (short e = 0; e < 16; ++e) { a_buf[e] = a_next[e]; }
+            for (short e = 0; e < A_PER_THREAD; ++e) { a_buf[e] = a_next[e]; }
           }
         }
 
@@ -1469,8 +1472,14 @@ METAL_FUNC void track_prefill_indirect_gu(
     uint simd_group_id,
     uint simd_lane_id) {
   static_assert(
+<<<<<<< Updated upstream
       transpose && BM == 32 && BN == 64 && BK == 64 && WM == 2 && WN == 2,
       "P17 requires the original 32x64x64 NAX tile and 2x2 SIMD layout");
+=======
+      transpose && BM == 32 && WM == 2 && WN == 2 &&
+          ((BN == 64 && BK == 64) || (BN == 128 && BK == 32)),
+      "P17 tile: 32 rows, 2x2 SIMD layout, 64x64 or 128x32 weight block");
+>>>>>>> Stashed changes
   static_assert(
       metal::is_same_v<T, bfloat16_t> && group_size == 32 && bits == 4,
       "P17 requires unchanged bf16 / affine group-32 / 4-bit operands");
@@ -1528,9 +1537,17 @@ METAL_FUNC void track_prefill_indirect_gu(
     Dtile0.clear();
     Dtile1.clear();
 
+<<<<<<< Updated upstream
     const short tgp_thread = short(simd_group_id * SIMD_SIZE + simd_lane_id);
     const short a_row = tgp_thread / 4;            // 0..BM-1
     const short a_col = (tgp_thread % 4) * 16;     // 0,16,32,48
+=======
+    constexpr short A_PER_THREAD = (BM * BK) / (WM * WN * SIMD_SIZE);  // 16 or 8
+    constexpr short A_SPLIT = BK / A_PER_THREAD;                        // threads per row
+    const short tgp_thread = short(simd_group_id * SIMD_SIZE + simd_lane_id);
+    const short a_row = tgp_thread / A_SPLIT;              // 0..BM-1
+    const short a_col = (tgp_thread % A_SPLIT) * A_PER_THREAD;
+>>>>>>> Stashed changes
     threadgroup T* a_dst = As + a_row * BKA_padded + a_col;
     const bool a_live = a_row < tile_m;
     const device T* xb = x;
@@ -1556,7 +1573,11 @@ METAL_FUNC void track_prefill_indirect_gu(
         simd_lane_id);
 
     dispatch_bool(tile_m == BM, [&](auto kAlignedM) {
+<<<<<<< Updated upstream
       T a_buf[16];
+=======
+      T a_buf[A_PER_THREAD];
+>>>>>>> Stashed changes
       PackedNAXGroup32 packed_w0;
       PackedNAXGroup32 packed_w1;
       if (K_it > 0) {
@@ -1565,7 +1586,11 @@ METAL_FUNC void track_prefill_indirect_gu(
         if (a_live) {
           const device T* a0 = xb;
           STEEL_PRAGMA_UNROLL
+<<<<<<< Updated upstream
           for (short e = 0; e < 16; ++e) { a_buf[e] = a0[e]; }
+=======
+          for (short e = 0; e < A_PER_THREAD; ++e) { a_buf[e] = a0[e]; }
+>>>>>>> Stashed changes
         }
       }
       for (int k = 0; k < K_it; k++) {
@@ -1574,12 +1599,20 @@ METAL_FUNC void track_prefill_indirect_gu(
         packed_w1.store(loader_w1.dst);
         if (a_live) {
           STEEL_PRAGMA_UNROLL
+<<<<<<< Updated upstream
           for (short e = 0; e < 16; ++e) {
+=======
+          for (short e = 0; e < A_PER_THREAD; ++e) {
+>>>>>>> Stashed changes
             a_dst[e] = a_buf[e];
           }
         } else {
           STEEL_PRAGMA_UNROLL
+<<<<<<< Updated upstream
           for (short e = 0; e < 16; ++e) {
+=======
+          for (short e = 0; e < A_PER_THREAD; ++e) {
+>>>>>>> Stashed changes
             a_dst[e] = T(0);
           }
         }
@@ -1593,7 +1626,11 @@ METAL_FUNC void track_prefill_indirect_gu(
           if (a_live) {
             const device T* a_next = xb + BK;
             STEEL_PRAGMA_UNROLL
+<<<<<<< Updated upstream
             for (short e = 0; e < 16; ++e) { a_buf[e] = a_next[e]; }
+=======
+            for (short e = 0; e < A_PER_THREAD; ++e) { a_buf[e] = a_next[e]; }
+>>>>>>> Stashed changes
           }
         }
 
