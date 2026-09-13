@@ -241,7 +241,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// gather is the one host sync of the step.
     nonisolated(unsafe) public static var asyncFirst: Int = 2
     /// Layer count at an optional second dispatch (0 = none).
-    nonisolated(unsafe) public static var asyncSecond: Int = 0
+    nonisolated(unsafe) public static var asyncSecond: Int = 48
 
     /// Kill switch for A/B: `TRACK_FAST_FORWARD=0` routes every forward to the
     /// wrapped model.
