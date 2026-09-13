@@ -59,6 +59,11 @@ enum TrackFastGDNDecode {
         threadgroup InT k_shared[Dk];
         threadgroup InT v_shared[Dv];
         threadgroup float gb_shared[2];
+        float4 next_state;
+        if constexpr (metal::is_same<StT, float>::value) {
+            const device StT* first_state = state_in + (n * Dv + sg * RPS) * Dk;
+            next_state = *reinterpret_cast<const device float4*>(first_state + 4 * lane);
+        }
         if (sg < 3) {
             const uint vec = sg == 0 ? hk_idx : (sg == 1 ? Hk + hk_idx : 2 * Hk + hv_idx);
             const device InT* proj_b = proj + b_idx * PW;
@@ -127,7 +132,10 @@ enum TrackFastGDNDecode {
             float state[4];
             constexpr bool vec4 = metal::is_same<StT, float>::value;
             if constexpr (vec4) {
-                const float4 s4 = *reinterpret_cast<const device float4*>(i_state + 4 * lane);
+                const float4 s4 = next_state;
+                if (r + 1 < RPS) {
+                    next_state = *reinterpret_cast<const device float4*>(i_state + Dk + 4 * lane);
+                }
                 state[0] = s4.x; state[1] = s4.y; state[2] = s4.z; state[3] = s4.w;
             } else {
                 for (int i = 0; i < 4; ++i) { state[i] = static_cast<float>(i_state[4 * lane + i]); }
