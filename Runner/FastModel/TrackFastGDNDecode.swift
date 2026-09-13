@@ -1,11 +1,12 @@
 // Decode GDN preparation, state transition and gated normalization in one launch.
-// Each threadgroup owns one value head; each SIMD group owns four value rows.
+// Each threadgroup owns one value head; each SIMD group owns eight value rows.
 // Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
 // TrackFastKernels.prepSource, leanSource and gatedRMSSource.
 
 import MLX
 
 enum TrackFastGDNDecode {
+    private static let rowsPerSimdgroup = 8
     private static let kernel = MLXFast.metalKernel(
         name: "track_gdn_decode_complete",
         inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w"],
@@ -38,9 +39,9 @@ enum TrackFastGDNDecode {
                 ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
                 ("Hk", g.hk), ("Hv", g.hv), ("KC", g.convKernel), ("CONV_DIM", g.convDim),
                 ("PW", g.projWidth), ("B_OFF", g.bOffset), ("A_OFF", g.aOffset),
-                ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)), ("RPS", 4),
+                ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)), ("RPS", rowsPerSimdgroup),
             ],
-            grid: (32, g.dv / 4, B * g.hv), threadGroup: (32, g.dv / 4, 1),
+            grid: (32, g.dv / rowsPerSimdgroup, B * g.hv), threadGroup: (32, g.dv / rowsPerSimdgroup, 1),
             outputShapes: [[B, g.hv, g.dv, g.dk], [B, 1, g.hv * g.dv], [B, g.convKernel - 1, g.convDim]],
             outputDTypes: [stateIn.dtype, proj.dtype, proj.dtype])
         return (result[1], result[0], result[2])
