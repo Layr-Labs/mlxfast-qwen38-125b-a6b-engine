@@ -1,7 +1,6 @@
 // MLXFAST-PLEFUSE2: S=1 PLE fusion. No projection or weight-layout changes.
-// Scratch: ONE reused float[32] (128 B) in prepare, ZERO in convolution.
-// This retains the RMS/reduction lane layout and the dilated convolution's
-// channel-per-threadgroup layout; token tolerance, not bit equality, applies.
+// Scratch: ONE reused float[32] (128 B) for preparation and convolution.
+// This retains the RMS/reduction lane layout and convolution tap order.
 import Foundation
 import MLX
 
@@ -23,7 +22,7 @@ enum TrackPLEFusion {
         """
 
     static let prepareSource = """
-        // MLXFAST-PLEFUSE2: all three group norms, dot, gate, and concat.
+        // MLXFAST-PLEFUSE2: all three group norms, dot, gate, convolution, and concat.
         constexpr uint H = 2560;
         constexpr uint W = 4 * H;
         const uint hc = threadgroup_position_in_grid.y;
@@ -84,7 +83,6 @@ enum TrackPLEFusion {
         acc = 0.0f;
         for (uint i = 0; i < 4; ++i) {
             g[i] = activation * value[d + i];
-            gated[base + i] = g[i];
             float v = float(g[i]);
             acc += v * v;
         }
@@ -92,7 +90,19 @@ enum TrackPLEFusion {
             ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
         for (uint i = 0; i < 4; ++i) {
             InT n = InT(float(g[i]) * iv);
-            full[9 * W + base + i] = n * convScale[base + i];
+            const InT normed = n * convScale[base + i];
+            full[9 * W + base + i] = normed;
+            {
+                #pragma clang fp contract(off)
+                const uint c = base + i;
+                float acc = float(convState[c]) * float(weight[c * 4]);
+                acc += float(convState[3 * W + c]) * float(weight[c * 4 + 1]);
+                acc += float(convState[6 * W + c]) * float(weight[c * 4 + 2]);
+                acc += float(normed) * float(weight[c * 4 + 3]);
+                InT convolved = InT(acc);
+                InT activated = mlx_silu(convolved);
+                out[c] = g[i] + activated;
+            }
         }
         // Same [old nine rows, new row] layout as concatenated. State staging
         // keeps its existing tail view, including capture/rollback behavior.
@@ -103,44 +113,11 @@ enum TrackPLEFusion {
         }
         """
 
-    static let convolutionSource = """
-        // MLXFAST-PLEFUSE2: preserve the S=1 dilated implicit-GEMM dispatch:
-        // group=(32,1,4), grid of groups=(1,1,W), channel=group.z.
-        // Its small-channel loaders assign taps 0..3 to SIMD 0 lanes 0..3;
-        // lane 0 owns the single valid output. Keep those owners, discard
-        // the padded matrix work, and require no threadgroup storage.
-        constexpr uint W = 10240;
-        const uint c = threadgroup_position_in_grid.z;
-        const uint lane = thread_index_in_simdgroup;
-        if (simdgroup_index_in_threadgroup != 0) { return; }
-        float product = 0.0f;
-        if (lane < 4) {
-            product = float(full[(lane * 3) * W + c]) * float(weight[c * 4 + lane]);
-        }
-        // FP32 products and chronological FP32 additions, taps 0,1,2,3.
-        // Shuffle broadcasts retain the weight-loading lanes. Unlike a
-        // padded simdgroup MMA, this has no matrix accumulator or spill array.
-        float acc = simd_broadcast(product, 0);
-        acc += simd_broadcast(product, 1);
-        acc += simd_broadcast(product, 2);
-        acc += simd_broadcast(product, 3);
-        if (lane == 0) {
-            InT convolved = InT(acc);
-            InT activated = mlx_silu(convolved);
-            out[c] = gated[c] + activated;
-        }
-        """
-
     static let prepareKernel = MLXFast.metalKernel(
         name: "track_ple_prepare_fuse2",
-        inputNames: ["key", "query", "value", "keyScale", "queryScale", "convScale", "convState"],
-        outputNames: ["gated", "full"], source: prepareSource,
+        inputNames: ["key", "query", "value", "keyScale", "queryScale", "convScale", "convState", "weight"],
+        outputNames: ["out", "full"], source: prepareSource,
         header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
-
-    static let convolutionKernel = MLXFast.metalKernel(
-        name: "track_ple_convolution_fuse2", inputNames: ["full", "weight", "gated"],
-        outputNames: ["out"], source: convolutionSource,
-        header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
     static func supports(_ p: TrackPLE, stream: MLXArray, hidden: Int, hcCount: Int) -> Bool {
         // Guard the exact geometry; every other path builds the original chain.
@@ -165,16 +142,12 @@ enum TrackPLEFusion {
             key.dtype == stream.dtype, value.dtype == stream.dtype
         else { return nil }
         let r = prepareKernel(
-            [key, stream, value, p.normKeyScale, p.normQueryScale, p.normConvScale, convState],
+            [key, stream, value, p.normKeyScale, p.normQueryScale, p.normConvScale, convState, p.convW],
             template: [("InT", stream.dtype), ("EPS_BITS", Int(eps.bitPattern)),
                        ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern))],
             grid: (640, 4, 1), threadGroup: (640, 1, 1),
             outputShapes: [[1, 1, 10240], [1, 10, 10240]],
             outputDTypes: [stream.dtype, stream.dtype])
-        let output = convolutionKernel(
-            [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
-            grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
-            outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
-        return (r[1], output)
+        return (r[1], r[0])
     }
 }
