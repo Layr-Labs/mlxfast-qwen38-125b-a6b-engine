@@ -211,7 +211,15 @@ enum TrackP12Prefill {
         let sortedIDs: MLXArray
         let inverse: MLXArray
         if let indirect = TrackPrefillIndirect.apply(m, x: x, indices: indices) {
-            (activated, sortedIDs, inverse) = indirect
+            activated = indirect.activated
+            sortedIDs = indirect.sortedIDs
+            if K == 10, let down = TrackPrefillIndirect.scatterDown(
+                m, activated: activated, sortedIDs: sortedIDs, order: indirect.order)
+            {
+                return TrackFastKernels.moeCombine(
+                    routed: down.reshaped(B, S, K, H), w: weights, shared: shared, gate: gate)
+            }
+            inverse = indirect.inverse
         } else {
             let expanded = MLX.expandedDimensions(x, axes: [-2, -3])
             let sorted = gatherSort(x: expanded, indices: indices)

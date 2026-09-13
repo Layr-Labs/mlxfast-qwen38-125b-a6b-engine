@@ -73,13 +73,13 @@ enum TrackPrefillSort {
     private static let scatterKernel = MLXFast.metalKernel(
         name: "track_route_counting_scatter",
         inputNames: ["ids", "counts"],
-        outputNames: ["sorted_ids", "token_rows", "inverse"],
+        outputNames: ["sorted_ids", "token_rows", "inverse", "order"],
         source: scatterSource, header: "", ensureRowContiguous: true)
 
-    /// `(sortedIDs, tokenRows, inverse)` for `flatIDs` over `E` expert ids,
+    /// `(sortedIDs, tokenRows, inverse, order)` for `flatIDs` over `E` expert ids,
     /// or nil when the shape is outside the supported window.
     static func apply(flatIDs: MLXArray, experts E: Int, topK: Int)
-        -> (sortedIDs: MLXArray, tokenRows: MLXArray, inverse: MLXArray)?
+        -> (sortedIDs: MLXArray, tokenRows: MLXArray, inverse: MLXArray, order: MLXArray)?
     {
         let R = flatIDs.size
         guard enabled, flatIDs.ndim == 1, flatIDs.dtype == .uint32, topK > 0,
@@ -96,9 +96,9 @@ enum TrackPrefillSort {
             [flatIDs, counts],
             template: [("E", E), ("BLK", blockSize), ("R", R), ("NB", nBlocks), ("TOPK", topK)],
             grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
-            outputShapes: [[R], [R], [R]],
-            outputDTypes: [.uint32, .uint32, .uint32])
-        return (outs[0], outs[1], outs[2])
+            outputShapes: [[R], [R], [R], [R]],
+            outputDTypes: [.uint32, .uint32, .uint32, .uint32])
+        return (outs[0], outs[1], outs[2], outs[3])
     }
 
     // MARK: - kernels
@@ -169,5 +169,6 @@ enum TrackPrefillSort {
         sorted_ids[dest] = v;
         token_rows[dest] = gi / (uint)TOPK;
         inverse[gi] = dest;
+        order[dest] = gi;
         """#
 }

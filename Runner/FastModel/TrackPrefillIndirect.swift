@@ -24,7 +24,7 @@ enum TrackPrefillIndirect {
         ensureRowContiguous: true)
 
     static func apply(_ m: TrackMoE, x: MLXArray, indices: MLXArray)
-        -> (activated: MLXArray, sortedIDs: MLXArray, inverse: MLXArray)?
+        -> (activated: MLXArray, sortedIDs: MLXArray, inverse: MLXArray, order: MLXArray)?
     {
         guard enabled, supportsNAX, StreamOrDevice.default.stream == Stream.gpu,
             m.expertBits == 4, m.expertGroupSize == 32,
@@ -46,14 +46,15 @@ enum TrackPrefillIndirect {
         let flatIDs = indices.flattened()
         let sortedIDs: MLXArray
         let inverse: MLXArray
+        let order: MLXArray
         let tokenRows: MLXArray
         if let c = TrackPrefillSort.apply(
             flatIDs: flatIDs, experts: g.w.dim(0), topK: indices.dim(2))
         {
-            // The identical permutation in two launches (see TrackPrefillSort).
-            (sortedIDs, tokenRows, inverse) = (c.sortedIDs, c.tokenRows, c.inverse)
+            (sortedIDs, tokenRows, inverse, order) =
+                (c.sortedIDs, c.tokenRows, c.inverse, c.order)
         } else {
-            let order = argSort(flatIDs)
+            order = argSort(flatIDs)
             inverse = argSort(order)
             sortedIDs = flatIDs[order]
             tokenRows = order.floorDivide(indices.dim(2))
@@ -69,7 +70,7 @@ enum TrackPrefillIndirect {
         }
         let up = project(u)
         let gate = project(g)
-        return (compiledSiluProduct(gate, up), sortedIDs, inverse)
+        return (compiledSiluProduct(gate, up), sortedIDs, inverse, order)
     }
 
     static let source = #"""
