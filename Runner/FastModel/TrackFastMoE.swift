@@ -1328,7 +1328,8 @@ extension TrackFastMoEKernels {
     /// Routed slots [0, BR) then the shared expert for the S tokens: act [BR + S, N].
     static func gateUpAct(
         wg: MLXArray, sg: MLXArray, bg: MLXArray, wu: MLXArray, su: MLXArray, bu: MLXArray,
-        shared: TrackQuantWeight, x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int
+        shared: TrackQuantWeight, x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int,
+        metadata: [MLXArray] = []
     ) -> MLXArray {
         let BR = idx.dim(0), S = x.dim(0), KD = x.dim(1), N = wg.dim(1)
         precondition(N % 8 == 0 && bits == 4 && idx.dtype == .uint32 && xrow.dtype == .uint32)
@@ -1337,6 +1338,10 @@ extension TrackFastMoEKernels {
         if x.dtype == .bfloat16 && S == 1 && KD == 2560 && N == 640
             && groupSize == 32 && bits == 4 && shared.mode == .affine
         {
+            if metadata.count == 6 {
+                return TrackIndexedAffine.gateUp(
+                    wg: wg, wu: wu, shared: shared, metadata: metadata, x: x, idx: idx, xrow: xrow)
+            }
             let rows = gateUpReuseRowsPerSimdgroup
             return gateUpReuseKernel(
                 [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
