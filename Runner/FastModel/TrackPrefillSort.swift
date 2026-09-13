@@ -68,18 +68,17 @@ enum TrackPrefillSort {
         inputNames: ["ids"], outputNames: ["counts"],
         source: countSource, header: "", ensureRowContiguous: true)
 
-    /// The stable destination of every assignment, plus the three arrays the
-    /// consumers actually read.
+    /// Stable assignment destinations and reusable expert boundaries.
     private static let scatterKernel = MLXFast.metalKernel(
         name: "track_route_counting_scatter",
         inputNames: ["ids", "counts"],
-        outputNames: ["sorted_ids", "token_rows", "inverse"],
+        outputNames: ["sorted_ids", "token_rows", "inverse", "expert_bounds"],
         source: scatterSource, header: "", ensureRowContiguous: true)
 
-    /// `(sortedIDs, tokenRows, inverse)` for `flatIDs` over `E` expert ids,
+    /// `(sortedIDs, tokenRows, inverse, expertBounds)` over `E` expert ids,
     /// or nil when the shape is outside the supported window.
     static func apply(flatIDs: MLXArray, experts E: Int, topK: Int)
-        -> (sortedIDs: MLXArray, tokenRows: MLXArray, inverse: MLXArray)?
+        -> (sortedIDs: MLXArray, tokenRows: MLXArray, inverse: MLXArray, expertBounds: MLXArray)?
     {
         let R = flatIDs.size
         guard enabled, flatIDs.ndim == 1, flatIDs.dtype == .uint32, topK > 0,
@@ -96,9 +95,9 @@ enum TrackPrefillSort {
             [flatIDs, counts],
             template: [("E", E), ("BLK", blockSize), ("R", R), ("NB", nBlocks), ("TOPK", topK)],
             grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
-            outputShapes: [[R], [R], [R]],
-            outputDTypes: [.uint32, .uint32, .uint32])
-        return (outs[0], outs[1], outs[2])
+            outputShapes: [[R], [R], [R], [E + 1]],
+            outputDTypes: [.uint32, .uint32, .uint32, .uint32])
+        return (outs[0], outs[1], outs[2], outs[3])
     }
 
     // MARK: - kernels
@@ -160,6 +159,10 @@ enum TrackPrefillSort {
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint b = t; b < (uint)E; b += BLK) { sA[b] = sB[b]; }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (blk == 0) {
+            for (uint b = t; b < (uint)E; b += BLK) { expert_bounds[b] = sA[b] - tot[b]; }
+            if (t == 0) { expert_bounds[E] = R; }
         }
         if (gi >= (uint)R) { return; }
         const uint v = vals[t];

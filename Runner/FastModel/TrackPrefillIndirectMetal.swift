@@ -1304,7 +1304,7 @@ template <
     int BK,
     int WM,
     int WN,
-    bool transpose>
+    bool transpose, bool HAS_EXPERT_BOUNDS = false>
 METAL_FUNC void track_prefill_indirect(
     const device T* x,
     const device uint32_t* w,
@@ -1320,7 +1320,8 @@ METAL_FUNC void track_prefill_indirect(
     threadgroup T* As,
     uint3 tid,
     uint simd_group_id,
-    uint simd_lane_id) {
+    uint simd_lane_id,
+    const device uint32_t* expert_bounds = nullptr) {
   static_assert(
       transpose && BM == 32 && BN == 64 && BK == 64 && WM == 2 && WN == 2,
       "P17 requires the original 32x64x64 NAX tile and 2x2 SIMD layout");
@@ -1382,8 +1383,17 @@ METAL_FUNC void track_prefill_indirect(
 
     int tile_begin;
     int tile_end;
-    p17_sorted_expert_tile<BM>(
-        indices, M, y_row, offset, offset_next, index, tile_begin, tile_end);
+    if constexpr (HAS_EXPERT_BOUNDS) {
+      tile_begin = int(expert_bounds[index]);
+      if (tile_begin < y_row) {
+        tile_begin += ((y_row - tile_begin + BM - 1) / BM) * BM;
+      }
+      tile_end = tile_begin >= y_row + offset_next
+          ? tile_begin : min(tile_begin + BM, int(expert_bounds[index + 1]));
+    } else {
+      p17_sorted_expert_tile<BM>(
+          indices, M, y_row, offset, offset_next, index, tile_begin, tile_end);
+    }
     if (tile_begin == tile_end) {
       continue;  // Uniform over the ENTIRE threadgroup; no barrier is skipped by a subset.
     }
