@@ -1230,15 +1230,20 @@ struct PackedNAXGroup32 {
     const float s = float(scale);
     const float b = float(bias);
     float sc[2] = {s, s / 16.0f};
+    // MLXFAST-WVEC: the same per-value arithmetic, stored four values at a
+    // time (dst is 8-byte aligned: rows of 72/40 elements, column offsets of 32).
+    threadgroup vec<bfloat16_t, 4>* d4 = (threadgroup vec<bfloat16_t, 4>*)dst;
     STEEL_PRAGMA_UNROLL
     for (int j = 0; j < 4; j++) {
       STEEL_PRAGMA_UNROLL
-      for (int i = 0; i < 4; i++) {
-        const uint8_t w = uint8_t(words[j] >> (8 * i));
-        dst[8 * j + 2 * i] =
-            static_cast<bfloat16_t>(sc[0] * (w & 0x0f) + b);
-        dst[8 * j + 2 * i + 1] =
-            static_cast<bfloat16_t>(sc[1] * (w & 0xf0) + b);
+      for (int i = 0; i < 4; i += 2) {
+        const uint8_t w0 = uint8_t(words[j] >> (8 * i));
+        const uint8_t w1 = uint8_t(words[j] >> (8 * (i + 1)));
+        d4[2 * j + i / 2] = vec<bfloat16_t, 4>(
+            static_cast<bfloat16_t>(sc[0] * (w0 & 0x0f) + b),
+            static_cast<bfloat16_t>(sc[1] * (w0 & 0xf0) + b),
+            static_cast<bfloat16_t>(sc[0] * (w1 & 0x0f) + b),
+            static_cast<bfloat16_t>(sc[1] * (w1 & 0xf0) + b));
       }
     }
   }
@@ -1350,29 +1355,27 @@ METAL_FUNC void track_prefill_indirect(
         simd_lane_id);
 
     dispatch_bool(tile_m == BM, [&](auto kAlignedM) {
-      T a_buf[A_PER_THREAD];
+      // MLXFAST-AVEC: the slice is 16-byte aligned at both ends (K = 2560/640
+      // elements, a_col a multiple of 8 elements, As rows 72/40 elements), so
+      // it moves as uint4 vectors; the same bytes in the same order.
+      constexpr short A_VECS = (A_PER_THREAD * sizeof(T)) / 16;
+      uint4 a_buf[A_VECS];
       PackedNAXGroup32 packed_w;
       if (K_it > 0) {
         packed_w.prefetch(loader_w);
         if (a_live) {
-          const device T* a0 = xb;
+          const device uint4* a0 = (const device uint4*)xb;
           STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < A_PER_THREAD; ++e) { a_buf[e] = a0[e]; }
+          for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a0[v]; }
         }
       }
       for (int k = 0; k < K_it; k++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         packed_w.store(loader_w.dst);
-        if (a_live) {
+        {
+          threadgroup uint4* d4 = (threadgroup uint4*)a_dst;
           STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < A_PER_THREAD; ++e) {
-            a_dst[e] = a_buf[e];
-          }
-        } else {
-          STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < A_PER_THREAD; ++e) {
-            a_dst[e] = T(0);
-          }
+          for (short v = 0; v < A_VECS; ++v) { d4[v] = a_live ? a_buf[v] : uint4(0); }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1380,9 +1383,9 @@ METAL_FUNC void track_prefill_indirect(
           loader_w.next();
           packed_w.prefetch(loader_w);
           if (a_live) {
-            const device T* a_next = xb + BK;
+            const device uint4* a_next = (const device uint4*)(xb + BK);
             STEEL_PRAGMA_UNROLL
-            for (short e = 0; e < A_PER_THREAD; ++e) { a_buf[e] = a_next[e]; }
+            for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a_next[v]; }
           }
         }
 
@@ -1562,32 +1565,30 @@ METAL_FUNC void track_prefill_indirect_gu(
         simd_lane_id);
 
     dispatch_bool(tile_m == BM, [&](auto kAlignedM) {
-      T a_buf[A_PER_THREAD];
+      // MLXFAST-AVEC: the slice is 16-byte aligned at both ends (K = 2560/640
+      // elements, a_col a multiple of 8 elements, As rows 72/40 elements), so
+      // it moves as uint4 vectors; the same bytes in the same order.
+      constexpr short A_VECS = (A_PER_THREAD * sizeof(T)) / 16;
+      uint4 a_buf[A_VECS];
       PackedNAXGroup32 packed_w0;
       PackedNAXGroup32 packed_w1;
       if (K_it > 0) {
         packed_w0.prefetch(loader_w0);
         packed_w1.prefetch(loader_w1);
         if (a_live) {
-          const device T* a0 = xb;
+          const device uint4* a0 = (const device uint4*)xb;
           STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < A_PER_THREAD; ++e) { a_buf[e] = a0[e]; }
+          for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a0[v]; }
         }
       }
       for (int k = 0; k < K_it; k++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         packed_w0.store(loader_w0.dst);
         packed_w1.store(loader_w1.dst);
-        if (a_live) {
+        {
+          threadgroup uint4* d4 = (threadgroup uint4*)a_dst;
           STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < A_PER_THREAD; ++e) {
-            a_dst[e] = a_buf[e];
-          }
-        } else {
-          STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < A_PER_THREAD; ++e) {
-            a_dst[e] = T(0);
-          }
+          for (short v = 0; v < A_VECS; ++v) { d4[v] = a_live ? a_buf[v] : uint4(0); }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1597,9 +1598,9 @@ METAL_FUNC void track_prefill_indirect_gu(
           packed_w0.prefetch(loader_w0);
         packed_w1.prefetch(loader_w1);
           if (a_live) {
-            const device T* a_next = xb + BK;
+            const device uint4* a_next = (const device uint4*)(xb + BK);
             STEEL_PRAGMA_UNROLL
-            for (short e = 0; e < A_PER_THREAD; ++e) { a_buf[e] = a_next[e]; }
+            for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a_next[v]; }
           }
         }
 
