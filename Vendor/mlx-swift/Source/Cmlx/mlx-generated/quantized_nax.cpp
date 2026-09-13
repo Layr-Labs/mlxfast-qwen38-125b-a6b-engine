@@ -875,15 +875,21 @@ struct PackedNAXGroup32 {
     const float s = float(scale);
     const float b = float(bias);
     float sc[2] = {s, s / 16.0f};
+    // MLXFAST-WVEC: the same per-value arithmetic, stored four values at a
+    // time (dst is 8-byte aligned: padded rows and 32-element column offsets,
+    // and the staging arrays below are declared alignas(16)).
+    threadgroup vec<bfloat16_t, 4>* d4 = (threadgroup vec<bfloat16_t, 4>*)dst;
     STEEL_PRAGMA_UNROLL
     for (int j = 0; j < 4; j++) {
       STEEL_PRAGMA_UNROLL
-      for (int i = 0; i < 4; i++) {
-        const uint8_t w = uint8_t(words[j] >> (8 * i));
-        dst[8 * j + 2 * i] =
-            static_cast<bfloat16_t>(sc[0] * (w & 0x0f) + b);
-        dst[8 * j + 2 * i + 1] =
-            static_cast<bfloat16_t>(sc[1] * (w & 0xf0) + b);
+      for (int i = 0; i < 4; i += 2) {
+        const uint8_t w0 = uint8_t(words[j] >> (8 * i));
+        const uint8_t w1 = uint8_t(words[j] >> (8 * (i + 1)));
+        d4[2 * j + i / 2] = vec<bfloat16_t, 4>(
+            static_cast<bfloat16_t>(sc[0] * (w0 & 0x0f) + b),
+            static_cast<bfloat16_t>(sc[1] * (w0 & 0xf0) + b),
+            static_cast<bfloat16_t>(sc[0] * (w1 & 0x0f) + b),
+            static_cast<bfloat16_t>(sc[1] * (w1 & 0xf0) + b));
       }
     }
   }
@@ -1100,7 +1106,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
             }
           }
 
-          STEEL_PRAGMA_NO_UNROLL
+          STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             NAXTile<T, TM, TK> Atile;
             NAXTile<T, TN, TK> Btile;
@@ -1317,7 +1323,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  alignas(16) threadgroup T Ws[BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1376,7 +1382,7 @@ template <
 
   constexpr int BN_padded = (BN + 16 / sizeof(T));
 
-  threadgroup T Ws[BK * BN_padded];
+  alignas(16) threadgroup T Ws[BK * BN_padded];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1442,7 +1448,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  alignas(16) threadgroup T Ws[BN * BK_padded];
 
   adjust_matrix_offsets<T>(
       x,
@@ -1510,7 +1516,7 @@ template <
 
   constexpr int BN_padded = (BN + 16 / sizeof(T));
 
-  threadgroup T Ws[BK * BN_padded];
+  alignas(16) threadgroup T Ws[BK * BN_padded];
 
   adjust_matrix_offsets<T>(
       x,
@@ -1855,7 +1861,7 @@ template <
       group_size,
       bits>;
 
-  threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
+  alignas(16) threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
   // MLXFAST-ASTAGE: 32 x 72 bf16 = 4,608 B, only for the P17-eligible shape. An
   // in-situ probe that added exactly this much untouched threadgroup memory to
   // this kernel cost 0.8%, so the allocation is close to free here.
