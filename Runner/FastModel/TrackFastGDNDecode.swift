@@ -137,10 +137,37 @@ enum TrackFastGDNDecode {
                 #pragma clang fp reassociate(off)
                 #pragma clang fp contract(off)
                 float kv_compensation = 0.0f;
-                for (int i = 0; i < 4; ++i) {
-                    const int s_idx = 4 * lane + i;
-                    state[i] = state[i] * gate_decay;
-                    auto product = state[i] * static_cast<float>(k_[s_idx]);
+                {
+                    const int s_idx = 4 * lane + 0;
+                    state[0] = state[0] * gate_decay;
+                    auto product = state[0] * static_cast<float>(k_[s_idx]);
+                    auto corrected = product - kv_compensation;
+                    auto next_sum = kv_mem + corrected;
+                    kv_compensation = (next_sum - kv_mem) - corrected;
+                    kv_mem = next_sum;
+                }
+                {
+                    const int s_idx = 4 * lane + 1;
+                    state[1] = state[1] * gate_decay;
+                    auto product = state[1] * static_cast<float>(k_[s_idx]);
+                    auto corrected = product - kv_compensation;
+                    auto next_sum = kv_mem + corrected;
+                    kv_compensation = (next_sum - kv_mem) - corrected;
+                    kv_mem = next_sum;
+                }
+                {
+                    const int s_idx = 4 * lane + 2;
+                    state[2] = state[2] * gate_decay;
+                    auto product = state[2] * static_cast<float>(k_[s_idx]);
+                    auto corrected = product - kv_compensation;
+                    auto next_sum = kv_mem + corrected;
+                    kv_compensation = (next_sum - kv_mem) - corrected;
+                    kv_mem = next_sum;
+                }
+                {
+                    const int s_idx = 4 * lane + 3;
+                    state[3] = state[3] * gate_decay;
+                    auto product = state[3] * static_cast<float>(k_[s_idx]);
                     auto corrected = product - kv_compensation;
                     auto next_sum = kv_mem + corrected;
                     kv_compensation = (next_sum - kv_mem) - corrected;
@@ -150,10 +177,25 @@ enum TrackFastGDNDecode {
             kv_mem = simd_sum(kv_mem);
             const float delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * gate_beta;
             float out = 0.0f;
-            for (int i = 0; i < 4; ++i) {
-                const int s_idx = 4 * lane + i;
-                state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
-                out += state[i] * static_cast<float>(q_[s_idx]);
+            {
+                const int s_idx = 4 * lane + 0;
+                state[0] = state[0] + static_cast<float>(k_[s_idx]) * delta;
+                out += state[0] * static_cast<float>(q_[s_idx]);
+            }
+            {
+                const int s_idx = 4 * lane + 1;
+                state[1] = state[1] + static_cast<float>(k_[s_idx]) * delta;
+                out += state[1] * static_cast<float>(q_[s_idx]);
+            }
+            {
+                const int s_idx = 4 * lane + 2;
+                state[2] = state[2] + static_cast<float>(k_[s_idx]) * delta;
+                out += state[2] * static_cast<float>(q_[s_idx]);
+            }
+            {
+                const int s_idx = 4 * lane + 3;
+                state[3] = state[3] + static_cast<float>(k_[s_idx]) * delta;
+                out += state[3] * static_cast<float>(q_[s_idx]);
             }
             out = simd_sum(out);
             if (lane == 0) {
