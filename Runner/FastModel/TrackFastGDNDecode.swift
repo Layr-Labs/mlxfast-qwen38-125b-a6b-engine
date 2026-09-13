@@ -46,7 +46,7 @@ enum TrackFastGDNDecode {
         return (result[1], result[0], result[2])
     }
 
-    private static let source = #"""
+    static let source = #"""
         static_assert(Dk == 128 && Dv == 128, "GDN head geometry");
         const uint n = threadgroup_position_in_grid.z;
         const uint b_idx = n / Hv;
@@ -120,7 +120,8 @@ enum TrackFastGDNDecode {
         const float gate_decay = gb_shared[0];
         const float gate_beta = gb_shared[1];
         threadgroup InT y_shared[Dv];
-        threadgroup float norm_sums[32];
+        const auto k4 = *reinterpret_cast<const threadgroup vec<InT, 4>*>(k_ + 4 * lane);
+        const auto q4 = *reinterpret_cast<const threadgroup vec<InT, 4>*>(q_ + 4 * lane);
         for (int r = 0; r < RPS; ++r) {
             const uint dv_idx = sg * RPS + r;
             const device StT* i_state = state_in + (n * Dv + dv_idx) * Dk;
@@ -132,18 +133,19 @@ enum TrackFastGDNDecode {
             } else {
                 for (int i = 0; i < 4; ++i) { state[i] = static_cast<float>(i_state[4 * lane + i]); }
             }
-            float kv_mem = 0.0f;
+            float kv_mem;
             {
                 #pragma clang fp reassociate(off)
                 #pragma clang fp contract(off)
+                state[0] = state[0] * gate_decay;
+                kv_mem = 0.0f + state[0] * static_cast<float>(k4[0]);
                 float kv_compensation = 0.0f;
-                for (int i = 0; i < 4; ++i) {
-                    const int s_idx = 4 * lane + i;
+                for (int i = 1; i < 4; ++i) {
                     state[i] = state[i] * gate_decay;
-                    auto product = state[i] * static_cast<float>(k_[s_idx]);
+                    auto product = state[i] * static_cast<float>(k4[i]);
                     auto corrected = product - kv_compensation;
                     auto next_sum = kv_mem + corrected;
-                    kv_compensation = (next_sum - kv_mem) - corrected;
+                    if (i + 1 < 4) { kv_compensation = (next_sum - kv_mem) - corrected; }
                     kv_mem = next_sum;
                 }
             }
@@ -151,9 +153,8 @@ enum TrackFastGDNDecode {
             const float delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * gate_beta;
             float out = 0.0f;
             for (int i = 0; i < 4; ++i) {
-                const int s_idx = 4 * lane + i;
-                state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
-                out += state[i] * static_cast<float>(q_[s_idx]);
+                state[i] = state[i] + static_cast<float>(k4[i]) * delta;
+                out += state[i] * static_cast<float>(q4[i]);
             }
             out = simd_sum(out);
             if (lane == 0) {
@@ -168,27 +169,24 @@ enum TrackFastGDNDecode {
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float thread_x[4];
         if (sg == 0) {
+            float thread_x[4];
             float acc = 0.0f;
             for (int i = 0; i < 4; ++i) {
                 thread_x[i] = static_cast<float>(y_shared[lane * 4 + i]);
                 acc += thread_x[i] * thread_x[i];
             }
             acc = simd_sum(acc);
-            norm_sums[lane] = lane == 0 ? acc : 0;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0) {
-            const float acc = simd_sum(norm_sums[lane]);
             const float inv_mean = metal::precise::rsqrt(acc / (float)Dv + as_type<float>((uint)EPS_BITS));
+            const auto w4 = *reinterpret_cast<const device vec<InT, 4>*>(w + lane * 4);
+            const auto z4 = *reinterpret_cast<const device vec<InT, 4>*>(proj + (b_idx * PW + Z_OFF + hv_idx * Dv + lane * 4));
+            vec<InT, 4> out4;
             for (int i = 0; i < 4; ++i) {
-                const uint d = lane * 4 + i;
-                InT normalized = w[d] * static_cast<InT>(thread_x[i] * inv_mean);
-                const float z = static_cast<float>(proj[b_idx * PW + Z_OFF + hv_idx * Dv + d]);
-                const float zg = mlx_sigmoid(z);
-                gated[n * Dv + d] = static_cast<InT>(zg * static_cast<float>(normalized));
+                InT normalized = w4[i] * static_cast<InT>(thread_x[i] * inv_mean);
+                const float zg = mlx_sigmoid(static_cast<float>(z4[i]));
+                out4[i] = static_cast<InT>(zg * static_cast<float>(normalized));
             }
+            *reinterpret_cast<device vec<InT, 4>*>(gated + (n * Dv + lane * 4)) = out4;
         }
         """#
 }
