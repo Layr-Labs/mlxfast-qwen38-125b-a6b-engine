@@ -1503,13 +1503,22 @@ METAL_FUNC void track_prefill_indirect(
           for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a0[v]; }
         }
       }
+      if (!a_live) {
+        // A dead row's slice of the activation stage is zero for every K step:
+        // `a_dst` never advances (only `xb`, the device side, does), so it is
+        // written once here instead of once per step. Half the threadgroup is
+        // dead in the ranked window's last tile.
+        threadgroup uint4* d0 = (threadgroup uint4*)a_dst;
+        STEEL_PRAGMA_UNROLL
+        for (short v = 0; v < A_VECS; ++v) { d0[v] = uint4(0); }
+      }
       for (int k = 0; k < K_it; k++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         packed_w.store(loader_w.dst);
-        {
+        if (a_live) {
           threadgroup uint4* d4 = (threadgroup uint4*)a_dst;
           STEEL_PRAGMA_UNROLL
-          for (short v = 0; v < A_VECS; ++v) { d4[v] = a_live ? a_buf[v] : uint4(0); }
+          for (short v = 0; v < A_VECS; ++v) { d4[v] = a_buf[v]; }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1775,14 +1784,23 @@ METAL_FUNC void track_prefill_indirect_gu(
           for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a0[v]; }
         }
       }
+      if (!a_live) {
+        // A dead row's slice of the activation stage is zero for every K step:
+        // `a_dst` never advances (only `xb`, the device side, does), so it is
+        // written once here instead of once per step. Half the threadgroup is
+        // dead in the ranked window's last tile.
+        threadgroup uint4* d0 = (threadgroup uint4*)a_dst;
+        STEEL_PRAGMA_UNROLL
+        for (short v = 0; v < A_VECS; ++v) { d0[v] = uint4(0); }
+      }
       for (int k = 0; k < K_it; k++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         packed_w0.store(loader_w0.dst);
         packed_w1.store(loader_w1.dst);
-        {
+        if (a_live) {
           threadgroup uint4* d4 = (threadgroup uint4*)a_dst;
           STEEL_PRAGMA_UNROLL
-          for (short v = 0; v < A_VECS; ++v) { d4[v] = a_live ? a_buf[v] : uint4(0); }
+          for (short v = 0; v < A_VECS; ++v) { d4[v] = a_buf[v]; }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
