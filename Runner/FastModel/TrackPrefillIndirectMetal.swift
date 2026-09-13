@@ -1365,7 +1365,8 @@ template <
     int WM,
     int WN,
     bool transpose,
-    int NS>
+    int NS,
+    bool IDENTITY_ROWS = false>
 METAL_FUNC void track_prefill_indirect(
     const device T* x,
     const device uint32_t* w,
@@ -1476,7 +1477,11 @@ METAL_FUNC void track_prefill_indirect(
     const bool a_live = a_row < tile_m;
     const device T* xb = x;
     if (a_live) {
-      xb += size_t(token_rows[tile_begin + a_row]) * K + a_col;
+      if constexpr (IDENTITY_ROWS) {
+        xb += size_t(tile_begin + a_row) * K + a_col;
+      } else {
+        xb += size_t(token_rows[tile_begin + a_row]) * K + a_col;
+      }
     }
 
     thread loader_w_t loader_w(
