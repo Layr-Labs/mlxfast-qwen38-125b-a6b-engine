@@ -124,19 +124,31 @@ enum TrackFastMixerKernels {
         const int d0 = 2 * tile;
         const uint sg = simdgroup_index_in_threadgroup;
         const uint lid = thread_index_in_simdgroup;
-        threadgroup float res[8][VPT];
+        threadgroup T products[8][VPT];
         if constexpr (VPT == 1) {
             int rows[4];
             for (int i = 0; i < 4; ++i) { const int s = (int)sg * 4 + i; rows[i] = d0 + (s & 1) + H * (s >> 1); }
             float r[4];
             qmv_reg_rows<T, GS, BITS, false, (LW % get_pack_factor<BITS, 32>()) == 0>(wu, su, bu, act, LW, rows, lid, r);
-            if (lid == 0) { for (int i = 0; i < 4; ++i) { res[(int)sg * 4 + i][0] = r[i]; } }
+            if (lid < 4 && (int)(sg * 2 + lid / 2) < HC) {
+                const int slot = (int)sg * 4 + (int)lid;
+                const float low = metal::select(r[0], r[1], (lid & 1u) != 0);
+                const float high = metal::select(r[2], r[3], (lid & 1u) != 0);
+                const T weight = static_cast<T>(metal::select(low, high, (lid & 2u) != 0));
+                const int row = d0 + (slot & 1) + H * (slot >> 1);
+                products[slot][0] = mlx_sigmoid(weight) * normed[row];
+            }
         } else {
             const int s = (int)sg * 4 + (int)(lid / 8);
             const int row = d0 + (s & 1) + H * (s >> 1);
             float r[VPT];
             qmv_wide_reg_full<T, GS, BITS, VPT, 8, false>(wu, su, bu, act, LW, VPT, row, lid, r);
-            if ((lid % 8) == 0) { for (int v = 0; v < VPT; ++v) { res[s][v] = r[v]; } }
+            if ((lid % 8) == 0 && (s >> 1) < HC) {
+                for (int v = 0; v < VPT; ++v) {
+                    const T weight = static_cast<T>(r[v]);
+                    products[s][v] = mlx_sigmoid(weight) * normed[(size_t)v * (size_t)(HC * H) + (size_t)row];
+                }
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const uint t = sg * 32 + lid;
@@ -145,9 +157,7 @@ enum TrackFastMixerKernels {
             for (int v = 0; v < VPT; ++v) {
                 T acc = T(0);
                 for (int s = 0; s < HC; ++s) {
-                    const T w = static_cast<T>(res[s * 2 + (int)t][v]);
-                    const T sgm = mlx_sigmoid(w);
-                    const T p = sgm * normed[(size_t)v * (size_t)(HC * H) + (size_t)(s * H + d)];
+                    const T p = products[s * 2 + (int)t][v];
                     acc = acc + p;
                 }
                 input[(size_t)v * (size_t)H + (size_t)d] = acc;
