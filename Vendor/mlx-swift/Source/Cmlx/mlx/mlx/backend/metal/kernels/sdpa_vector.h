@@ -547,14 +547,16 @@ template <typename T, int D>
   typedef float U;
 
   thread U o[elem_per_thread] = {0};
-  constexpr bool batch_components = metal::is_same_v<T, bfloat16_t> && D == 256;
-  threadgroup U outputs[BN * BD * (batch_components ? elem_per_thread : 1)];
+  constexpr bool direct_partials = metal::is_same_v<T, bfloat16_t> && D == 256;
+  threadgroup U outputs[direct_partials ? 1 : BN * BD];
 
   // Adjust positions
   const int head_idx = tid.x;
   const int q_seq_idx = tid.y;
   const int q_offset = head_idx * tpg.y + q_seq_idx;
-  partials += q_offset * blocks * D + simd_gid * D + simd_lid * elem_per_thread;
+  const uint partial_block = direct_partials ? simd_lid : simd_gid;
+  const uint component_group = direct_partials ? simd_gid : simd_lid;
+  partials += q_offset * blocks * D + partial_block * D + component_group * elem_per_thread;
   sums += q_offset * blocks;
   maxs += q_offset * blocks;
   out += q_offset * D + simd_gid * elem_per_thread;
@@ -578,7 +580,7 @@ template <typename T, int D>
 
   // Reduce the sum exp and partials
   for (int b = 0; b < blocks / BN; ++b) {
-    U factor = fast::exp(maxs[simd_gid] - max_score);
+    U factor = fast::exp(maxs[partial_block] - max_score);
 
     // Update the output accumulator
     for (int i = 0; i < elem_per_thread; i++) {
@@ -589,14 +591,10 @@ template <typename T, int D>
     partials += BN * D;
   }
 
-  // Use shared memory to transpose and reduce the final block
-  if constexpr (batch_components) {
+  // Reduce block partials in their original SIMD lane order.
+  if constexpr (direct_partials) {
     for (int i = 0; i < elem_per_thread; i++) {
-      outputs[i * BN * BD + simd_lid * BD + simd_gid] = o[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = 0; i < elem_per_thread; i++) {
-      o[i] = simd_sum(outputs[i * BN * BD + simd_gid * BD + simd_lid]);
+      o[i] = simd_sum(o[i]);
       o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
     }
   } else {
