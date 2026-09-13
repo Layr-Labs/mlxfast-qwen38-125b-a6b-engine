@@ -470,7 +470,7 @@ METAL_FUNC void qmv_fast_impl(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, bool EXACT_TAIL = false>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -546,7 +546,24 @@ METAL_FUNC void qmv_impl(
         static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
         0,
         values_per_thread);
-    if (remaining > 0) {
+    // MLXFAST-FULLTAIL. Same argument as qmv_reg: an exact K makes remaining
+    // 0 or values_per_thread, so the unchecked helpers are bit-identical.
+    if constexpr (EXACT_TAIL) {
+      if (remaining > 0) {
+        U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+        for (int row = 0;
+             row < results_per_simdgroup && out_row + row < out_vec_size;
+             row++) {
+          auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+          const device T* sl = scales + row * in_vec_size_g;
+          const device T* bl = biases + row * in_vec_size_g;
+          U s = sl[0];
+          U b = bl[0];
+          result[row] +=
+              qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+        }
+      }
+    } else if (remaining > 0) {
       U sum = load_vector_safe<T, U, values_per_thread, bits>(
           x, x_thread, remaining);
 
@@ -607,7 +624,20 @@ METAL_FUNC void qmv_impl(
         static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
         0,
         values_per_thread);
-    if (remaining > 0) {
+    if constexpr (EXACT_TAIL) {
+      if (remaining > 0) {
+        U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+        for (int row = 0; row < results_per_simdgroup; row++) {
+          auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+          const device T* sl = scales + row * in_vec_size_g;
+          const device T* bl = biases + row * in_vec_size_g;
+          U s = sl[0];
+          U b = bl[0];
+          result[row] +=
+              qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+        }
+      }
+    } else if (remaining > 0) {
       U sum = load_vector_safe<T, U, values_per_thread, bits>(
           x, x_thread, remaining);
 
@@ -665,7 +695,7 @@ METAL_FUNC void qmv_impl(
             if (blk >= nblocks) break;
             uint3 tid = uint3(0, blk, 0);
             if (FAST) { qmv_fast_impl<T, GS, BITS>(wb, sb, bb, xb, yb_, K, N, tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup); }
-            else { qmv_impl<T, GS, BITS>(wb, sb, bb, xb, yb_, K, N, tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup); }
+            else { qmv_impl<T, GS, BITS, EXACT_TAIL>(wb, sb, bb, xb, yb_, K, N, tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup); }
         }
         """
 
@@ -688,7 +718,7 @@ METAL_FUNC void qmv_impl(
             if (blk >= nblocks) break;
             uint3 tid = uint3(0, blk, 0);
             if (FAST) { qmv_fast_impl<T, GS, BITS>(wb, sb, bb, xb, yb_, K, N, tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup); }
-            else { qmv_impl<T, GS, BITS>(wb, sb, bb, xb, yb_, K, N, tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup); }
+            else { qmv_impl<T, GS, BITS, EXACT_TAIL>(wb, sb, bb, xb, yb_, K, N, tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup); }
         }
         """
 
@@ -706,6 +736,36 @@ METAL_FUNC void qmv_impl(
 
     static func isFast(k: Int, n: Int) -> Bool { n % 8 == 0 && k % 512 == 0 }
 
+    /// `TRACK_QMV_FULLTAIL`: skip per-element tail bounds checks when K is an
+    /// exact multiple of the qmv lane coverage. Default ON. `"0"` restores the
+    /// vendored `_safe` tail.
+    static var fulltailEnabled: Bool {
+        (ProcessInfo.processInfo.environment["TRACK_QMV_FULLTAIL"] ?? "1") != "0"
+    }
+
+    /// MLX `get_pack_factor<bits, 32>()`: values packed in one 32-bit word.
+    static func packFactor(bits: Int, wsize: Int = 32) -> Int {
+        if bits == 3 || bits == 5 { return 8 }
+        if bits == 6 { return 4 }
+        return wsize / bits
+    }
+
+    /// `qmv_impl` / inject: `values_per_thread = pack_factor * packs_per_thread`.
+    static func valuesPerThread(bits: Int, packsPerThread: Int = 1) -> Int {
+        packFactor(bits: bits) * packsPerThread
+    }
+
+    /// Tail coverage is exact: `remaining` is 0 or `values_per_thread`, never a
+    /// partial slice. `qmv_impl` `packs_per_thread` is 1.
+    static func isExactTail(k: Int, bits: Int, packsPerThread: Int = 1) -> Bool {
+        let vpt = valuesPerThread(bits: bits, packsPerThread: packsPerThread)
+        return vpt > 0 && k % vpt == 0
+    }
+
+    static func useExactTail(k: Int, bits: Int, packsPerThread: Int = 1) -> Bool {
+        fulltailEnabled && isExactTail(k: k, bits: bits, packsPerThread: packsPerThread)
+    }
+
     /// 8-row blocks per threadgroup: the K=640 down projection is overhead-bound
     /// at one block per threadgroup.
     static func rowBlocks(k: Int) -> Int { k % 512 == 0 ? 1 : 4 }
@@ -721,7 +781,7 @@ METAL_FUNC void qmv_impl(
         let nb = (N / 8 + rb - 1) / rb
         let outs = gateUpKernel(
             [wg, sg, bg, wu, su, bu, x, idx, xrow],
-            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb), ("K", K), ("N", N)],
+            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb), ("K", K), ("N", N), ("EXACT_TAIL", useExactTail(k: K, bits: bits))],
             grid: (32, nb * 2 * 2, B), threadGroup: (32, 2, 1),
             outputShapes: [[B, N], [B, N]], outputDTypes: [x.dtype, x.dtype])
         return (outs[0], outs[1])
@@ -737,24 +797,48 @@ METAL_FUNC void qmv_impl(
         let nb = (N / 8 + rb - 1) / rb
         return singleKernel(
             [w, scales, biases, x, idx],
-            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb), ("K", K), ("N", N)],
+            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("FAST", isFast(k: K, n: N)), ("RB", rb), ("K", K), ("N", N), ("EXACT_TAIL", useExactTail(k: K, bits: bits))],
             grid: (32, nb * 2, B), threadGroup: (32, 2, 1),
             outputShapes: [[B, N]], outputDTypes: [x.dtype])[0]
     }
 }
 
-// MARK: router tail: top-k selection + softmax in ONE launch
+// MARK: router tail: top-k + softmax + scatter in ONE launch
 //
 // Replaces `argPartition(-logits, kth: k-1)[..., ..<k]`, `takeAlong`,
-// `softmax(precise: true)` and the index cast. MLX's GPU argpartition is a
-// full stable merge sort (`sort.h`: strict `<` in both the thread sort and
-// the merge step), so the first k entries are the k largest logits in
-// descending order with ties in ascending index order; the kernel selects
-// exactly that. The softmax is `softmax_single_row` verbatim for a row of k
-// (N_READS = 4, one simdgroup, `fast::exp`, per-thread sequential partials,
-// `simd_sum`, multiply by the reciprocal).
+// `softmax(precise: true)` and the index store. MLX's GPU argpartition is a
+// full stable merge sort (`sort.h`: strict `<` in the thread sort and the
+// merge), so the first k entries are the k largest logits in descending
+// value order with ties in ascending index order.
+//
+// Top-k is K sequential ArgMax reductions. Each reduction is the same
+// order-fixed simd_shuffle_down tree as `arg_reduce.metal` (offset
+// 16,8,4,2,1; compare is ArgMax: higher value, then lower index). No
+// `simd_max`/`simd_min` and no atomics: the winner is independent of
+// unspecified reduction order. Lane-local scan uses strict `>` over
+// strided experts `e = lane + 32*j`, so a within-lane tie keeps the
+// lower index. Softmax over the K selected logits stays
+// `softmax_single_row` verbatim (N_READS = 4, one simdgroup, `fast::exp`,
+// per-thread sequential partials, `simd_sum`, reciprocal) so the weights
+// match `softmax(..., precise: true)` bit-for-bit. Scatter writes idx
+// uint32 and w float32 in that same descending/tie order.
+//
+// `TRACK_ROUTER_FUSED=0` restores the three-op chain. Shapes outside the
+// warmed set (see `fusedRouterEnabled` call sites) also fall back.
 
 extension TrackFastMoEKernels {
+    /// `TRACK_ROUTER_FUSED=0` restores `argPartition` + `takeAlong` +
+    /// `softmax(precise: true)`. Default ON.
+    static let fusedRouterEnabled =
+        (ProcessInfo.processInfo.environment["TRACK_ROUTER_FUSED"] ?? "1") != "0"
+
+    /// The eager chain the fused kernel is bit-exact against.
+    static func routeChain(logits: MLXArray, topK: Int) -> (idx: MLXArray, w: MLXArray) {
+        let idx = argPartition(-logits, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+        let w = softmax(takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
+        return (idx, w)
+    }
+
     /// logits f32 [R, E] -> idx uint32 [R, K], w f32 [R, K].
     static let routeSource = """
         constexpr int E_PER = (E + 31) / 32;
@@ -767,7 +851,7 @@ extension TrackFastMoEKernels {
         if constexpr (HAS_GATE) {
             const device T* xr = x + (size_t)row * (size_t)KD;
             if constexpr (VPT == 1) {
-                track_inject_qmv<T, GS, BITS, KD, 1, 4>(wg, sgw, bgw, xr, gate + row, sg, lane);
+                track_inject_qmv<T, GS, BITS, KD, 1, 4, EXACT_TAIL>(wg, sgw, bgw, xr, gate + row, sg, lane);
             } else {
                 threadgroup float fp[8];
                 float r[1]; bool valid = false; int orow = 0;
@@ -796,16 +880,25 @@ extension TrackFastMoEKernels {
             taken[j] = (e >= E);
         }
         for (int k = 0; k < K; ++k) {
-            // lane-local best: largest value, then lowest index
+            // lane-local best: largest value, then lowest index (strict `>`
+            // keeps the earlier, lower-index slot on a tie).
             float bv = -INFINITY; int bj = -1;
             for (int j = 0; j < E_PER; ++j) {
                 if (!taken[j] && (v[j] > bv)) { bv = v[j]; bj = j; }
             }
-            const float gmax = simd_max(bv);
-            const uint cand = (bv == gmax && bj >= 0) ? (uint)(lane + 32 * bj) : 0xffffffffu;
-            const uint gidx = simd_min(cand);
-            if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
-            if (gidx == (uint)(lane + 32 * bj) && bj >= 0) { taken[bj] = true; }
+            uint bi = (bj >= 0) ? (uint)(lane + 32 * bj) : 0xffffffffu;
+            const uint local_i = bi;
+            // arg_reduce.metal ArgMax tree: shuffle_down offsets 16..1,
+            // take neighbor if it has a strictly larger value or the same
+            // value and a smaller index. Lane 0 holds the winner.
+            for (ushort off = 16; off > 0; off >>= 1) {
+                const float nv = simd_shuffle_down(bv, off);
+                const uint ni = simd_shuffle_down(bi, off);
+                if (nv > bv || (nv == bv && ni < bi)) { bv = nv; bi = ni; }
+            }
+            const uint gidx = simd_shuffle(bi, (ushort)0);
+            if (lane == 0) { selv[k] = bv; seli[k] = bi; }
+            if (gidx == local_i && bj >= 0) { taken[bj] = true; }
         }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -863,10 +956,84 @@ extension TrackFastMoEKernels {
         let simdgroups = g == nil ? 1 : 2
         let outs = (R == 1 ? routeKernel1 : routeKernel)(
             [logits.reshaped(R, E), x.reshaped(R, KD), g?.weight ?? x, g?.scales ?? x, g?.biases ?? x],
-            template: [("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32), ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R), ("HAS_GATE", g != nil)],
+            template: [("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32), ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R), ("HAS_GATE", g != nil), ("EXACT_TAIL", useExactTail(k: KD, bits: g?.bits ?? 4))],
             grid: (32, R * simdgroups, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[R, topK], [R, topK], [R]], outputDTypes: [.uint32, .float32, x.dtype])
         return (outs[0].reshaped(lead + [topK]), outs[1].reshaped(lead + [topK]), outs[2].reshaped(lead))
+    }
+}
+
+// MARK: depth-1 next-K-block weight staging (decode expert GEMVs)
+//
+// Presence check (w67):
+//   (a) Production `qdot` 4-bit reads `uint16_t` words from device, not 32-bit
+//       packed loads (roster row 22 / c7352109). Byte-at-a-time is also absent
+//       on this path.
+//   (b) Served `qmv_fast_reg` / `qmv_fast_reg_dual` / `qmv_reg` issue those
+//       loads inside the current block's qdot. `qmv_fast_reg_pf*` below is an
+//       unused experiment, not dispatched.
+// Staging prefetches the next K-block's uint16 weight words into registers
+// and runs the same qdot expression on the staged set. Packed 32-bit loads
+// stay a separate job. No second threadgroup buffer.
+// `TRACK_WEIGHT_STAGING=0` restores the original kernel objects.
+
+enum TrackWeightStaging {
+    static func resolves(_ raw: String?) -> Bool {
+        (raw ?? "1") != "0"
+    }
+
+    static let enabled = resolves(
+        ProcessInfo.processInfo.environment["TRACK_WEIGHT_STAGING"])
+
+    /// Current decode gate/up reuse geometry: 2 rows/simdgroup, 2 simdgroups.
+    static let gateUpRowsPerSimdgroup = 2
+    /// Current decode down geometry: 4 output rows per threadgroup.
+    static let downRowsPerThreadgroup = 4
+
+    static func stagesGateUp(
+        s: Int, dtype: DType, kd: Int, n: Int, groupSize: Int, bits: Int,
+        sharedAffine: Bool, enabled: Bool
+    ) -> Bool {
+        enabled
+            && dtype == .bfloat16 && s == 1 && kd == 2560 && n == 640
+            && groupSize == 32 && bits == 4 && sharedAffine
+    }
+
+    static func stagesDown(
+        windowTokens: Int, f: Int, h: Int, bits: Int, enabled: Bool
+    ) -> Bool {
+        enabled && windowTokens == 1 && f == 640 && h == 2560 && bits == 4
+    }
+
+    enum GateUpDispatch: Equatable {
+        case reuseStaged
+        case reuse
+        case act
+    }
+
+    static func gateUpDispatch(
+        s: Int, dtype: DType, kd: Int, n: Int, groupSize: Int, bits: Int,
+        sharedAffine: Bool, enabled: Bool
+    ) -> GateUpDispatch {
+        let reuse = dtype == .bfloat16 && s == 1 && kd == 2560 && n == 640
+            && groupSize == 32 && bits == 4 && sharedAffine
+        guard reuse else { return .act }
+        return stagesGateUp(
+            s: s, dtype: dtype, kd: kd, n: n, groupSize: groupSize, bits: bits,
+            sharedAffine: sharedAffine, enabled: enabled) ? .reuseStaged : .reuse
+    }
+
+    enum DownDispatch: Equatable {
+        case combineStaged
+        case combine
+    }
+
+    static func downDispatch(
+        windowTokens: Int, f: Int, h: Int, bits: Int, enabled: Bool
+    ) -> DownDispatch {
+        stagesDown(
+            windowTokens: windowTokens, f: f, h: h, bits: bits, enabled: enabled)
+            ? .combineStaged : .combine
     }
 }
 
@@ -876,7 +1043,7 @@ extension TrackFastMoEKernels {
 //       registers instead of stored: same lanes, same accumulation, same
 //       `simd_sum`, same bf16 rounding of each expert's output before the
 //       epilogue arithmetic (`static_cast<T>`), which is what the separate
-//       launches did.
+//       launches did. `TRACK_SWIGLU_EPILOGUE=0` restores those two launches.
 
 extension TrackFastMoEKernels {
     static let regHelpers = #"""
@@ -907,6 +1074,55 @@ extension TrackFastMoEKernels {
           for (int row = 0; row < results_per_simdgroup; row++) { result[row] = 0; }
           const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
           const int in_vec_size_g = in_vec_size / group_size;
+          ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+          scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          x += simd_lid * values_per_thread;
+          for (int k = 0; k < in_vec_size; k += block_size) {
+            U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+            for (int row = 0; row < results_per_simdgroup; row++) {
+              auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+              const device T* sl = scales + row * in_vec_size_g;
+              const device T* bl = biases + row * in_vec_size_g;
+              U s = sl[0];
+              U b = bl[0];
+              result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+            }
+            ws += block_size * bytes_per_pack / pack_factor;
+            scales += block_size / group_size;
+            biases += block_size / group_size;
+            x += block_size;
+          }
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            result[row] = simd_sum(result[row]);
+          }
+        }
+
+        // Same walk as qmv_fast_reg above, with in_vec_size a template so the
+        // K loop bound is compile-time. Call sites that pass K as a function
+        // argument keep the original overload; mixer staging instantiates this
+        // one. Same lanes, same order, same qdot.
+        template <typename T, int group_size, int bits, int in_vec_size, int results_per_simdgroup>
+        METAL_FUNC void qmv_fast_reg(
+            const device uint32_t* w,
+            const device T* scales,
+            const device T* biases,
+            const device T* x,
+            const int out_row,
+            uint simd_lid,
+            thread float (&result)[results_per_simdgroup]) {
+          constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+          constexpr int pack_factor = get_pack_factor<bits, 32>();
+          constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+          constexpr int values_per_thread = pack_factor * packs_per_thread;
+          constexpr int block_size = values_per_thread * SIMD_SIZE;
+          constexpr int scale_step_per_thread = group_size / values_per_thread;
+          const device uint8_t* ws = (const device uint8_t*)w;
+          typedef float U;
+          thread U x_thread[values_per_thread];
+          for (int row = 0; row < results_per_simdgroup; row++) { result[row] = 0; }
+          constexpr int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+          constexpr int in_vec_size_g = in_vec_size / group_size;
           ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
           scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
           biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
@@ -1144,6 +1360,82 @@ extension TrackFastMoEKernels {
             result[row] = simd_sum(result[row]);
           }
         }
+
+        // Same walk as qmv_reg_rows above, with in_vec_size a template so the
+        // K loop bound is compile-time. Mixer staging instantiates this; the
+        // original overload stays for every runtime-K caller.
+        template <typename T, int group_size, int bits, int in_vec_size, bool SILU, bool EXACT_TAIL = false>
+        METAL_FUNC void qmv_reg_rows(
+            const device uint32_t* w,
+            const device T* scales,
+            const device T* biases,
+            const device T* x,
+            const thread int (&rows)[4],
+            uint simd_lid,
+            thread float (&result)[4]) {
+          constexpr int results_per_simdgroup = 4;
+          constexpr int packs_per_thread = 1;
+          constexpr int pack_factor = get_pack_factor<bits, 32>();
+          constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+          constexpr int values_per_thread = pack_factor * packs_per_thread;
+          constexpr int block_size = values_per_thread * SIMD_SIZE;
+          constexpr int scale_step_per_thread = group_size / values_per_thread;
+          const device uint8_t* ws = (const device uint8_t*)w;
+          typedef float U;
+          thread U x_thread[values_per_thread];
+          for (int row = 0; row < results_per_simdgroup; row++) { result[row] = 0; }
+          constexpr int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+          constexpr int in_vec_size_g = in_vec_size / group_size;
+          const device uint8_t* wr[4];
+          const device T* sr[4];
+          const device T* br[4];
+          for (int row = 0; row < 4; row++) {
+            wr[row] = ws + rows[row] * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+            sr[row] = scales + rows[row] * in_vec_size_g + simd_lid / scale_step_per_thread;
+            br[row] = biases + rows[row] * in_vec_size_g + simd_lid / scale_step_per_thread;
+          }
+          x += simd_lid * values_per_thread;
+          int k = 0;
+          for (; k < in_vec_size - block_size; k += block_size) {
+            U sum = SILU ? load_vector_silu<T, U, values_per_thread, bits>(x, x_thread)
+                         : load_vector<T, U, values_per_thread, bits>(x, x_thread);
+            for (int row = 0; row < results_per_simdgroup; row++) {
+              U s = sr[row][0];
+              U b = br[row][0];
+              result[row] += qdot<U, values_per_thread, bits>(wr[row], x_thread, s, b, sum);
+            }
+            for (int row = 0; row < 4; row++) {
+              wr[row] += block_size * bytes_per_pack / pack_factor;
+              sr[row] += block_size / group_size;
+              br[row] += block_size / group_size;
+            }
+            x += block_size;
+          }
+          const int remaining = clamp(
+              static_cast<int>(in_vec_size - k - simd_lid * values_per_thread), 0, values_per_thread);
+          if constexpr (EXACT_TAIL) {
+            if (remaining > 0) {
+              U sum = SILU ? load_vector_silu<T, U, values_per_thread, bits>(x, x_thread)
+                           : load_vector<T, U, values_per_thread, bits>(x, x_thread);
+              for (int row = 0; row < results_per_simdgroup; row++) {
+                U s = sr[row][0];
+                U b = br[row][0];
+                result[row] += qdot<U, values_per_thread, bits>(wr[row], x_thread, s, b, sum);
+              }
+            }
+          } else if (remaining > 0) {
+            U sum = SILU ? load_vector_safe_silu<T, U, values_per_thread, bits>(x, x_thread, remaining)
+                         : load_vector_safe<T, U, values_per_thread, bits>(x, x_thread, remaining);
+            for (int row = 0; row < results_per_simdgroup; row++) {
+              U s = sr[row][0];
+              U b = br[row][0];
+              result[row] += qdot_safe<U, values_per_thread, bits>(wr[row], x_thread, s, b, sum, remaining);
+            }
+          }
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            result[row] = simd_sum(result[row]);
+          }
+        }
         """#
 
     /// Routed experts, gate|up + SwiGLU. x [S, KD], idx/xrow uint32 [BR] ->
@@ -1186,14 +1478,16 @@ extension TrackFastMoEKernels {
         const uint kg = (uint)KD / GS;
         const int out_row = (int)threadgroup_position_in_grid.y * 8 + (int)simdgroup_index_in_threadgroup * 4;
         const device T* xb = x + (size_t)r * (size_t)KD;
-        const size_t eoff = (size_t)e * (size_t)N;
+        const size_t pitch = (size_t)N * (size_t)TILES;
+        const size_t eoff_g = (size_t)e * pitch;
+        const size_t eoff_u = TILES > 1 ? eoff_g + (size_t)N : (size_t)e * (size_t)N;
         float g[4], u[4];
         if (FAST) {
-            qmv_fast_reg<T, GS, BITS>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
-            qmv_fast_reg<T, GS, BITS>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
+            qmv_fast_reg<T, GS, BITS>(wg + eoff_g * kw, sg + eoff_g * kg, bg + eoff_g * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
+            qmv_fast_reg<T, GS, BITS>(wu + eoff_u * kw, su + eoff_u * kg, bu + eoff_u * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
         } else {
-            qmv_reg<T, GS, BITS, (KD % get_pack_factor<BITS, 32>()) == 0>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
-            qmv_reg<T, GS, BITS, (KD % get_pack_factor<BITS, 32>()) == 0>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
+            qmv_reg<T, GS, BITS, EXACT_TAIL>(wg + eoff_g * kw, sg + eoff_g * kg, bg + eoff_g * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
+            qmv_reg<T, GS, BITS, EXACT_TAIL>(wu + eoff_u * kw, su + eoff_u * kg, bu + eoff_u * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
         }
         if (thread_index_in_simdgroup == 0) {
             for (int i = 0; i < 4; ++i) {
@@ -1217,7 +1511,48 @@ extension TrackFastMoEKernels {
         source: gateUpActSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
 
-    static let gateUpReuseRowsPerSimdgroup = 2
+    /// PB-556 / mixer-RPS family: one-token gate/up row ownership.
+    /// Default ON: 1 row/simdgroup (was 2). Threadgroup stays 2 simdgroups, so
+    /// rows/threadgroup go 4 → 2 and independently schedulable threadgroups
+    /// double at N=640 (160 → 320 per expert slot). `TRACK_GATEUP_RPS=0`
+    /// restores 2. S>1 and non-served shapes keep the 8-row fallback launch.
+    static let gateUpReuseRpsEnabled =
+        (ProcessInfo.processInfo.environment["TRACK_GATEUP_RPS"] ?? "1") != "0"
+    static let gateUpReuseSimdgroupsPerThreadgroup = 2
+
+    static func gateUpReuseRowsPerSimdgroup(enabled: Bool) -> Int {
+        enabled ? 1 : 2
+    }
+
+    static var gateUpReuseRowsPerSimdgroup: Int {
+        gateUpReuseRowsPerSimdgroup(enabled: gateUpReuseRpsEnabled)
+    }
+
+    static func gateUpReuseEligible(
+        s: Int, dtype: DType, kd: Int, n: Int, groupSize: Int, bits: Int, sharedAffine: Bool
+    ) -> Bool {
+        dtype == .bfloat16 && s == 1 && kd == 2560 && n == 640
+            && groupSize == 32 && bits == 4 && sharedAffine
+    }
+
+    static func gateUpReuseLaunch(
+        n: Int, rowsPerSimdgroup: Int, slots: Int
+    ) -> (
+        grid: (Int, Int, Int), threadGroup: (Int, Int, Int), threadgroups: Int,
+        rowsPerThreadgroup: Int
+    ) {
+        let tgY = gateUpReuseSimdgroupsPerThreadgroup
+        let rowsPerThreadgroup = tgY * rowsPerSimdgroup
+        let gridY = n / rowsPerSimdgroup
+        precondition(rowsPerSimdgroup == 1 || rowsPerSimdgroup == 2)
+        precondition(n % rowsPerThreadgroup == 0 && gridY % tgY == 0)
+        return (
+            (32, gridY, slots),
+            (32, tgY, 1),
+            (gridY / tgY) * slots,
+            rowsPerThreadgroup
+        )
+    }
 
     static let gateUpReuseHelpers = #"""
         template <typename T, int group_size, int bits, int rows>
@@ -1288,20 +1623,237 @@ extension TrackFastMoEKernels {
         }
         """#
 
+    /// Next-K-block uint16 weight-word prefetch. Same 4-bit qdot body as
+    /// `qdot` in helpersCore; loads happen one block ahead into registers.
+    static let weightStagingHelpers = #"""
+        template <typename U, int nwords>
+        METAL_FUNC U qdot4_from_words(
+            const thread uint16_t* ws,
+            const thread U* x_thread,
+            U scale,
+            U bias,
+            U sum) {
+          U accum = 0;
+          for (int i = 0; i < nwords; i++) {
+            accum +=
+                (x_thread[4 * i] * (ws[i] & 0x000f) +
+                 x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+                 x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+                 x_thread[4 * i + 3] * (ws[i] & 0xf000));
+          }
+          return scale * accum + sum * bias;
+        }
+
+        template <int rows, int nwords>
+        METAL_FUNC void track_ws_fetch_rows(
+            thread uint16_t* dst,
+            const device uint8_t* ws,
+            int in_vec_size_w) {
+          for (int row = 0; row < rows; row++) {
+            const device uint16_t* wl =
+                (const device uint16_t*)(ws + row * in_vec_size_w);
+            for (int i = 0; i < nwords; i++) {
+              dst[row * nwords + i] = wl[i];
+            }
+          }
+        }
+
+        // Decode gate/up: K % 512 == 0, 2 rows/simdgroup. Prefetch the next
+        // block's uint16 words (the same loads `qdot` 4-bit issues) before this
+        // block's dequant. Activations, scales and biases stay on the original
+        // schedule — weight stream only.
+        template <typename T, int group_size, int bits, int rows>
+        METAL_FUNC void qmv_fast_reg_dual_ws(
+            const device uint32_t* w0,
+            const device T* scales0,
+            const device T* biases0,
+            const device uint32_t* w1,
+            const device T* scales1,
+            const device T* biases1,
+            const device T* x,
+            const int in_vec_size,
+            const int out_row,
+            uint simd_lid,
+            thread float (&result0)[rows],
+            thread float (&result1)[rows]) {
+          static_assert(bits == 4, "weight staging: 4-bit");
+          static_assert(rows == 2, "weight staging gated to 2 rows/simdgroup");
+          constexpr int packs_per_thread = 2;
+          constexpr int pack_factor = get_pack_factor<bits, 32>();
+          constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+          constexpr int values_per_thread = pack_factor * packs_per_thread;
+          constexpr int block_size = values_per_thread * SIMD_SIZE;
+          constexpr int scale_step_per_thread = group_size / values_per_thread;
+          constexpr int nwords = values_per_thread / 4;
+          constexpr int WSTEP = block_size * bytes_per_pack / pack_factor;
+          constexpr int GSTEP = block_size / group_size;
+          const device uint8_t* ws0 = (const device uint8_t*)w0;
+          const device uint8_t* ws1 = (const device uint8_t*)w1;
+          typedef float U;
+          thread U x_thread[values_per_thread];
+          for (int row = 0; row < rows; row++) {
+            result0[row] = 0;
+            result1[row] = 0;
+          }
+          const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+          const int in_vec_size_g = in_vec_size / group_size;
+          ws0 += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+          ws1 += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+          scales0 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          scales1 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          biases0 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          biases1 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          x += simd_lid * values_per_thread;
+          uint16_t ga[rows * nwords], ua[rows * nwords];
+          uint16_t gb[rows * nwords], ub[rows * nwords];
+          #define TRACK_WS_FETCH(GW, UW, OFFB) \
+            track_ws_fetch_rows<rows, nwords>(GW, ws0 + (OFFB) * WSTEP, in_vec_size_w); \
+            track_ws_fetch_rows<rows, nwords>(UW, ws1 + (OFFB) * WSTEP, in_vec_size_w);
+          #define TRACK_WS_COMPUTE(GW, UW, OFFB) { \
+            U sum = load_vector<T, U, values_per_thread, bits>( \
+                x + (OFFB) * block_size, x_thread); \
+            const device T* sc0 = scales0 + (OFFB) * GSTEP; \
+            const device T* sc1 = scales1 + (OFFB) * GSTEP; \
+            const device T* bi0 = biases0 + (OFFB) * GSTEP; \
+            const device T* bi1 = biases1 + (OFFB) * GSTEP; \
+            for (int row = 0; row < rows; row++) { \
+              U s0 = sc0[row * in_vec_size_g]; \
+              U b0 = bi0[row * in_vec_size_g]; \
+              result0[row] += qdot4_from_words<U, nwords>( \
+                  GW + row * nwords, x_thread, s0, b0, sum); \
+              U s1 = sc1[row * in_vec_size_g]; \
+              U b1 = bi1[row * in_vec_size_g]; \
+              result1[row] += qdot4_from_words<U, nwords>( \
+                  UW + row * nwords, x_thread, s1, b1, sum); \
+            } \
+          }
+          const int nblocks = in_vec_size / block_size;
+          TRACK_WS_FETCH(ga, ua, 0)
+          int blk = 0;
+          for (; blk + 1 < nblocks; blk += 2) {
+            TRACK_WS_FETCH(gb, ub, blk + 1)
+            TRACK_WS_COMPUTE(ga, ua, blk)
+            if (blk + 2 < nblocks) { TRACK_WS_FETCH(ga, ua, blk + 2) }
+            TRACK_WS_COMPUTE(gb, ub, blk + 1)
+          }
+          if (blk < nblocks) { TRACK_WS_COMPUTE(ga, ua, blk) }
+          #undef TRACK_WS_FETCH
+          #undef TRACK_WS_COMPUTE
+          for (int row = 0; row < rows; row++) {
+            result0[row] = simd_sum(result0[row]);
+            result1[row] = simd_sum(result1[row]);
+          }
+        }
+
+        // Decode down: qmv_reg main loop (K=640, 256-wide blocks) plus the
+        // original tail. Prefetch is registers only; the two threadgroup
+        // arrays in the caller stay the same size.
+        template <typename T, int group_size, int bits, bool EXACT_TAIL = false>
+        METAL_FUNC void qmv_reg_ws(
+            const device uint32_t* w,
+            const device T* scales,
+            const device T* biases,
+            const device T* x,
+            const int in_vec_size,
+            const int out_row,
+            uint simd_lid,
+            thread float (&result)[4]) {
+          static_assert(bits == 4, "weight staging: 4-bit");
+          constexpr int results_per_simdgroup = 4;
+          constexpr int packs_per_thread = 1;
+          constexpr int pack_factor = get_pack_factor<bits, 32>();
+          constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+          constexpr int values_per_thread = pack_factor * packs_per_thread;
+          constexpr int block_size = values_per_thread * SIMD_SIZE;
+          constexpr int scale_step_per_thread = group_size / values_per_thread;
+          constexpr int nwords = values_per_thread / 4;
+          constexpr int WSTEP = block_size * bytes_per_pack / pack_factor;
+          constexpr int GSTEP = block_size / group_size;
+          const device uint8_t* ws = (const device uint8_t*)w;
+          typedef float U;
+          thread U x_thread[values_per_thread];
+          for (int row = 0; row < results_per_simdgroup; row++) { result[row] = 0; }
+          const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+          const int in_vec_size_g = in_vec_size / group_size;
+          ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+          scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          x += simd_lid * values_per_thread;
+          uint16_t wa[results_per_simdgroup * nwords];
+          uint16_t wb[results_per_simdgroup * nwords];
+          track_ws_fetch_rows<results_per_simdgroup, nwords>(wa, ws, in_vec_size_w);
+          int k = 0;
+          int cur = 0;
+          for (; k < in_vec_size - block_size; k += block_size) {
+            thread uint16_t* held = cur == 0 ? &wa[0] : &wb[0];
+            if (k + block_size < in_vec_size - block_size) {
+              thread uint16_t* nxt = cur == 0 ? &wb[0] : &wa[0];
+              track_ws_fetch_rows<results_per_simdgroup, nwords>(
+                  nxt, ws + WSTEP, in_vec_size_w);
+            }
+            U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+            for (int row = 0; row < results_per_simdgroup; row++) {
+              const device T* sl = scales + row * in_vec_size_g;
+              const device T* bl = biases + row * in_vec_size_g;
+              U s = sl[0];
+              U b = bl[0];
+              result[row] += qdot4_from_words<U, nwords>(
+                  held + row * nwords, x_thread, s, b, sum);
+            }
+            ws += WSTEP;
+            scales += GSTEP;
+            biases += GSTEP;
+            x += block_size;
+            cur = 1 - cur;
+          }
+          const int remaining = clamp(
+              static_cast<int>(in_vec_size - k - simd_lid * values_per_thread), 0, values_per_thread);
+          if constexpr (EXACT_TAIL) {
+            if (remaining > 0) {
+              U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+              for (int row = 0; row < results_per_simdgroup; row++) {
+                auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                const device T* sl = scales + row * in_vec_size_g;
+                const device T* bl = biases + row * in_vec_size_g;
+                U s = sl[0];
+                U b = bl[0];
+                result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+              }
+            }
+          } else if (remaining > 0) {
+            U sum = load_vector_safe<T, U, values_per_thread, bits>(x, x_thread, remaining);
+            for (int row = 0; row < results_per_simdgroup; row++) {
+              auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+              const device T* sl = scales + row * in_vec_size_g;
+              const device T* bl = biases + row * in_vec_size_g;
+              U s = sl[0];
+              U b = bl[0];
+              result[row] += qdot_safe<U, values_per_thread, bits>(wl, x_thread, s, b, sum, remaining);
+            }
+          }
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            result[row] = simd_sum(result[row]);
+          }
+        }
+        """#
+
     static let gateUpReuseSource = """
+        static_assert(RPS == 1 || RPS == 2, "gate/up row ownership");
         const uint z = threadgroup_position_in_grid.z;
         const bool shared = z == (uint)BR;
         const uint e = shared ? 0u : idx[z];
         const uint r = shared ? 0u : xrow[z];
         const size_t kw = (size_t)KD / 8;
         const size_t kg = (size_t)KD / GS;
-        const size_t eoff = (size_t)e * (size_t)N;
-        const device uint32_t* gw = shared ? wsh : wg + eoff * kw;
-        const device T* gs = shared ? ssh : sg + eoff * kg;
-        const device T* gb = shared ? bsh : bg + eoff * kg;
-        const device uint32_t* uw = shared ? wsh + (size_t)N * kw : wu + eoff * kw;
-        const device T* us = shared ? ssh + (size_t)N * kg : su + eoff * kg;
-        const device T* ub = shared ? bsh + (size_t)N * kg : bu + eoff * kg;
+        const size_t pitch = (size_t)N * (size_t)TILES;
+        const size_t eoff_g = (size_t)e * pitch;
+        const size_t eoff_u = TILES > 1 ? eoff_g + (size_t)N : (size_t)e * (size_t)N;
+        const device uint32_t* gw = shared ? wsh : wg + eoff_g * kw;
+        const device T* gs = shared ? ssh : sg + eoff_g * kg;
+        const device T* gb = shared ? bsh : bg + eoff_g * kg;
+        const device uint32_t* uw = shared ? wsh + (size_t)N * kw : wu + eoff_u * kw;
+        const device T* us = shared ? ssh + (size_t)N * kg : su + eoff_u * kg;
+        const device T* ub = shared ? bsh + (size_t)N * kg : bu + eoff_u * kg;
         const int out_row = (int)threadgroup_position_in_grid.y * (2 * RPS)
             + (int)simdgroup_index_in_threadgroup * RPS;
         float g[RPS], u[RPS];
@@ -1325,33 +1877,132 @@ extension TrackFastMoEKernels {
         header: helpersCore + TrackFastKernels.exactHeader + gateUpReuseHelpers,
         ensureRowContiguous: true)
 
+    static let gateUpReuseStagedSource = """
+        static_assert(RPS == 2, "weight staging gated to 2 rows/simdgroup");
+        const uint z = threadgroup_position_in_grid.z;
+        const bool shared = z == (uint)BR;
+        const uint e = shared ? 0u : idx[z];
+        const uint r = shared ? 0u : xrow[z];
+        const size_t kw = (size_t)KD / 8;
+        const size_t kg = (size_t)KD / GS;
+        const size_t eoff = (size_t)e * (size_t)N;
+        const device uint32_t* gw = shared ? wsh : wg + eoff * kw;
+        const device T* gs = shared ? ssh : sg + eoff * kg;
+        const device T* gb = shared ? bsh : bg + eoff * kg;
+        const device uint32_t* uw = shared ? wsh + (size_t)N * kw : wu + eoff * kw;
+        const device T* us = shared ? ssh + (size_t)N * kg : su + eoff * kg;
+        const device T* ub = shared ? bsh + (size_t)N * kg : bu + eoff * kg;
+        const int out_row = (int)threadgroup_position_in_grid.y * (2 * RPS)
+            + (int)simdgroup_index_in_threadgroup * RPS;
+        float g[RPS], u[RPS];
+        qmv_fast_reg_dual_ws<T, GS, BITS, RPS>(
+            gw, gs, gb, uw, us, ub, x + (size_t)r * (size_t)KD,
+            KD, out_row, thread_index_in_simdgroup, g, u);
+        if (thread_index_in_simdgroup == 0) {
+            for (int i = 0; i < RPS; ++i) {
+                const T gv = static_cast<T>(g[i]);
+                const T uv = static_cast<T>(u[i]);
+                act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+            }
+        }
+        """
+
+    nonisolated(unsafe) static let gateUpReuseStagedKernel = MLXFast.metalKernel(
+        name: "track_moe_gate_up_reuse_2row_ws",
+        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
+        outputNames: ["act"],
+        source: gateUpReuseStagedSource,
+        header: helpersCore + TrackFastKernels.exactHeader + weightStagingHelpers,
+        ensureRowContiguous: true)
+
     /// Routed slots [0, BR) then the shared expert for the S tokens: act [BR + S, N].
+    /// Fused epilogue (`TRACK_SWIGLU_EPILOGUE`, default ON) writes `silu(gate)*up`
+    /// from registers. Toggle-off or an unexpected shape uses `gateUp` + `swiglu2`.
+    /// `rowsPerSimdgroup` overrides the TRACK_GATEUP_RPS choice (tests); nil uses the toggle.
+    /// `staging` overrides TRACK_WEIGHT_STAGING (tests). Nil uses the toggle.
     static func gateUpAct(
         wg: MLXArray, sg: MLXArray, bg: MLXArray, wu: MLXArray, su: MLXArray, bu: MLXArray,
-        shared: TrackQuantWeight, x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int
+        shared: TrackQuantWeight, x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int,
+        fusedGateUp: Bool = false,
+        fusedTiles: Int = 1,
+        rowsPerSimdgroup: Int? = nil,
+        staging: Bool? = nil
     ) -> MLXArray {
-        let BR = idx.dim(0), S = x.dim(0), KD = x.dim(1), N = wg.dim(1)
+        let tiles = max(fusedTiles > 1 ? fusedTiles : (fusedGateUp ? 2 : 1), 1)
+        let N = wg.dim(1) / tiles
+        let request = TrackSwiGLUEpilogue.Request(
+            dtype: x.dtype, tokens: x.dim(0), hidden: x.dim(1), intermediate: N,
+            bits: bits, groupSize: groupSize, sharedRows: shared.rows,
+            idxIsUInt32: idx.dtype == .uint32, xrowIsUInt32: xrow.dtype == .uint32)
+        // Interleaved gate+up tiles need the fused kernel walk. Split weights
+        // keep the SwiGLU-epilogue toggle (fused GEMV vs two launches).
+        if tiles > 1 || TrackSwiGLUEpilogue.shouldFuse(request) {
+            return gateUpActFused(
+                wg: wg, sg: sg, bg: bg, wu: wu, su: su, bu: bu, shared: shared,
+                x: x, idx: idx, xrow: xrow, groupSize: groupSize, bits: bits,
+                fusedTiles: tiles, rowsPerSimdgroup: rowsPerSimdgroup, staging: staging)
+        }
+        return gateUpActTwoKernel(
+            wg: wg, sg: sg, bg: bg, wu: wu, su: su, bu: bu, shared: shared,
+            x: x, idx: idx, xrow: xrow, groupSize: groupSize, bits: bits)
+    }
+
+    static func gateUpActFused(
+        wg: MLXArray, sg: MLXArray, bg: MLXArray, wu: MLXArray, su: MLXArray, bu: MLXArray,
+        shared: TrackQuantWeight, x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int,
+        fusedTiles: Int = 1,
+        rowsPerSimdgroup: Int? = nil,
+        staging: Bool? = nil
+    ) -> MLXArray {
+        let BR = idx.dim(0), S = x.dim(0), KD = x.dim(1)
+        let tiles = max(fusedTiles, 1)
+        let N = wg.dim(1) / tiles
         precondition(N % 8 == 0 && bits == 4 && idx.dtype == .uint32 && xrow.dtype == .uint32)
         precondition(shared.rows == 2 * N && shared.groupSize == groupSize && shared.bits == bits && S >= 1 && S <= 8)
         precondition(isFast(k: KD, n: N), "shared expert one-token path assumes qmv_fast")
-        if x.dtype == .bfloat16 && S == 1 && KD == 2560 && N == 640
-            && groupSize == 32 && bits == 4 && shared.mode == .affine
-        {
-            let rows = gateUpReuseRowsPerSimdgroup
-            return gateUpReuseKernel(
-                [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
+        let inputs: [MLXArray] = [
+            wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow,
+        ]
+        let route = TrackWeightStaging.gateUpDispatch(
+            s: S, dtype: x.dtype, kd: KD, n: N, groupSize: groupSize, bits: bits,
+            sharedAffine: shared.mode == .affine,
+            enabled: staging ?? TrackWeightStaging.enabled)
+        switch route {
+        case .reuseStaged, .reuse:
+            let rows = rowsPerSimdgroup ?? gateUpReuseRowsPerSimdgroup
+            let launch = gateUpReuseLaunch(n: N, rowsPerSimdgroup: rows, slots: BR + 1)
+            let kernel = route == .reuseStaged ? gateUpReuseStagedKernel : gateUpReuseKernel
+            return kernel(
+                inputs,
                 template: [
                     ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N),
-                    ("KD", KD), ("BR", BR), ("RPS", rows),
+                    ("KD", KD), ("BR", BR), ("RPS", rows), ("TILES", tiles),
                 ],
-                grid: (32, N / rows, BR + 1), threadGroup: (32, 2, 1),
+                grid: launch.grid, threadGroup: launch.threadGroup,
+                outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
+        case .act:
+            return (S == 1 ? gateUpActKernel1 : gateUpActKernel)(
+                inputs,
+                template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("BR", BR), ("VPT", S), ("TILES", tiles), ("EXACT_TAIL", useExactTail(k: KD, bits: bits))],
+                grid: (32, (N / 8) * 2, BR + 1), threadGroup: (32, 2, 1),
                 outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
         }
-        return (S == 1 ? gateUpActKernel1 : gateUpActKernel)(
-            [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
-            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("BR", BR), ("VPT", S)],
-            grid: (32, (N / 8) * 2, BR + 1), threadGroup: (32, 2, 1),
-            outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
+    }
+
+    /// Two launches: routed `gateUp` writes both halves, `swiglu2` applies
+    /// `mlx_silu(gate)*up`; the shared expert is the same elementwise after its GEMV.
+    static func gateUpActTwoKernel(
+        wg: MLXArray, sg: MLXArray, bg: MLXArray, wu: MLXArray, su: MLXArray, bu: MLXArray,
+        shared: TrackQuantWeight, x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int
+    ) -> MLXArray {
+        let n = wg.dim(1)
+        let (gate, up) = gateUp(
+            wg: wg, sg: sg, bg: bg, wu: wu, su: su, bu: bu,
+            x: x, idx: idx, xrow: xrow, groupSize: groupSize, bits: bits)
+        let routed = TrackFastKernels.swiglu2(gate: gate, up: up)
+        let gu = shared.apply(x)
+        let sharedAct = TrackFastKernels.swiglu2(gate: gu[0..., 0..<n], up: gu[0..., n...])
+        return concatenated([routed, sharedAct], axis: 0)
     }
 
     /// Routed experts, down GEMV + expert-weighted combine + shared expert
@@ -1381,10 +2032,12 @@ extension TrackFastMoEKernels {
             const int k = (int)sgi + kk * KSG;
             const uint z = t * K + k;
             const uint e = idx[z];
-            const size_t eoff = (size_t)e * (size_t)H;
+            const size_t eoff = TILES > 2
+                ? (size_t)e * (size_t)H * 3 + (size_t)H * 2
+                : (size_t)e * (size_t)H;
             const device T* xb = act + (size_t)z * (size_t)F;
             if (FAST) { qmv_fast_reg<T, GS, BITS, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
-            else { qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
+            else { qmv_reg<T, GS, BITS, EXACT_TAIL, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
             const float wk = w[z];
             if (lid == 0) {
                 for (int i = 0; i < RPS; ++i) { prod[k][i] = static_cast<float>(static_cast<T>(res[i])) * wk; }
@@ -1397,7 +2050,7 @@ extension TrackFastMoEKernels {
             const device T* xs = act + (size_t)(BR + t) * (size_t)F;
             if constexpr (VPT == 1) {
                 float rs[RPS];
-                qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wsd, ssd, bsd, xs, F, d0, lid, rs);
+                qmv_reg<T, GS, BITS, EXACT_TAIL, RPS>(wsd, ssd, bsd, xs, F, d0, lid, rs);
                 if (lid == 0) { for (int i = 0; i < RPS; ++i) { shvT[i] = static_cast<float>(static_cast<T>(rs[i])); } }
             } else {
                 float rw[1];
@@ -1416,22 +2069,95 @@ extension TrackFastMoEKernels {
                 for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
                 const T r = static_cast<T>(mlx_colsum_small_f32<K>(col));
                 const T sh = sg * static_cast<T>(shvT[i]);
-                out[(size_t)t * (size_t)H + (size_t)(d0 + i)] = r + sh;
+                const T g = r + sh;
+                if (HAS_RESIDUAL) {
+                    const int d = d0 + i;
+                    for (int hc = 0; hc < HC; ++hc) {
+                        const T sp = g * inj[(size_t)t * (size_t)HC + (size_t)hc];
+                        const T rv = residual[(size_t)t * (size_t)(HC * H)
+                            + (size_t)hc * (size_t)H + (size_t)d];
+                        out[(size_t)t * (size_t)(HC * H)
+                            + (size_t)hc * (size_t)H + (size_t)d] = rv + sp;
+                    }
+                } else {
+                    out[(size_t)t * (size_t)H + (size_t)(d0 + i)] = g;
+                }
             }
         }
         """
 
     nonisolated(unsafe) static let downCombineKernel = MLXFast.metalKernel(
         name: "track_moe_down_combine",
-        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate"],
+        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate", "residual", "inj"],
         outputNames: ["out"],
         source: downCombineSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideHelpers,
         ensureRowContiguous: true)
     nonisolated(unsafe) static let downCombineKernel1 = MLXFast.metalKernel(
         name: "track_moe_down_combine_1",
-        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate"],
+        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate", "residual", "inj"],
         outputNames: ["out"],
         source: downCombineSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
+        ensureRowContiguous: true)
+
+    /// Same epilogue as `downCombineSource`. Routed and shared `qmv_reg` walks
+    /// prefetch the next K-block's uint16 words. Threadgroup arrays stay
+    /// `prod[K][4]` and `shvT[4]`. FAST stays the original helper (dead at F=640).
+    static let downCombineStagedSource = """
+        const uint t = threadgroup_position_in_grid.z;
+        const int d0 = (int)threadgroup_position_in_grid.y * 4;
+        const uint kw = (uint)F / 8;
+        const uint kg = (uint)F / GS;
+        const uint sgi = simdgroup_index_in_threadgroup;
+        const uint lid = thread_index_in_simdgroup;
+        threadgroup float prod[K][4];
+        threadgroup float shvT[4];
+        float res[4];
+        for (int kk = 0; kk < K / KSG; ++kk) {
+            const int k = (int)sgi + kk * KSG;
+            const uint z = t * K + k;
+            const uint e = idx[z];
+            const size_t eoff = (size_t)e * (size_t)H;
+            const device T* xb = act + (size_t)z * (size_t)F;
+            if (FAST) { qmv_fast_reg<T, GS, BITS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
+            else { qmv_reg_ws<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
+            const float wk = w[z];
+            if (lid == 0) {
+                for (int i = 0; i < 4; ++i) { prod[k][i] = static_cast<float>(static_cast<T>(res[i])) * wk; }
+            }
+        }
+        if (sgi == (KSG > K ? (uint)K : 0u)) {
+            const device T* xs = act + (size_t)(BR + t) * (size_t)F;
+            if constexpr (VPT == 1) {
+                float rs[4];
+                qmv_reg_ws<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0>(wsd, ssd, bsd, xs, F, d0, lid, rs);
+                if (lid == 0) { for (int i = 0; i < 4; ++i) { shvT[i] = static_cast<float>(static_cast<T>(rs[i])); } }
+            } else {
+                float rw[1];
+                qmv_wide_reg_full<T, GS, BITS, 1, 8, false>(wsd, ssd, bsd, xs, F, 1, d0 + (int)(lid / 8), lid, rw);
+                float sh4[4];
+                for (int i = 0; i < 4; ++i) { sh4[i] = static_cast<float>(static_cast<T>(simd_shuffle(rw[0], (ushort)(i * 8)))); }
+                if (lid == 0) { for (int i = 0; i < 4; ++i) { shvT[i] = sh4[i]; } }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgi == 0 && lid == 0) {
+            const T sg = mlx_sigmoid(gate[t]);
+            for (int i = 0; i < 4; ++i) {
+                float col[K];
+                for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
+                const T r = static_cast<T>(mlx_colsum_small_f32<K>(col));
+                const T sh = sg * static_cast<T>(shvT[i]);
+                out[(size_t)t * (size_t)H + (size_t)(d0 + i)] = r + sh;
+            }
+        }
+        """
+
+    nonisolated(unsafe) static let downCombineStagedKernel1 = MLXFast.metalKernel(
+        name: "track_moe_down_combine_1_ws",
+        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate"],
+        outputNames: ["out"],
+        source: downCombineStagedSource,
+        header: helpersCore + TrackFastKernels.exactHeader + regHelpers + weightStagingHelpers + wideDecls,
         ensureRowContiguous: true)
 
     /// Simdgroups per down+combine threadgroup: the top-K expert walks of one
@@ -1448,21 +2174,61 @@ extension TrackFastMoEKernels {
         ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 2
 
     /// act [BR + S, F] (routed slots, then the shared expert per token), gate [S] pre-sigmoid.
+    /// When `residual` and `inject` match the decode residual-epilogue gate the
+    /// kernel writes the W-wide stream (`residual + (down) * inject`) instead
+    /// of the H-wide block output.
+    /// `staging` overrides TRACK_WEIGHT_STAGING (tests). Nil uses the toggle.
     static func downCombine(
         wd: MLXArray, sd: MLXArray, bd: MLXArray, sharedDown: TrackQuantWeight, act: MLXArray,
-        idx: MLXArray, w: MLXArray, gate: MLXArray, topK: Int, groupSize: Int, bits: Int
+        idx: MLXArray, w: MLXArray, gate: MLXArray, topK: Int, groupSize: Int, bits: Int,
+        residual: MLXArray? = nil, inject: MLXArray? = nil, hcCount: Int = 4,
+        staging: Bool? = nil,
+        fusedTiles: Int = 1, rowsPerDown: Int = 0
     ) -> MLXArray {
-        let BR = idx.dim(0), F = act.dim(1), H = wd.dim(1)
+        let BR = idx.dim(0), F = act.dim(1)
+        var wdUse = wd, sdUse = sd, bdUse = bd
+        if fusedTiles > 2, rowsPerDown > 0 {
+            let expertCount = wd.dim(0)
+            let rowsPerHalf = wd.dim(1) / 3
+            let packed = wd.dim(2)
+            let tile = rowsPerHalf * packed
+            let downInner = tile / rowsPerDown
+            wdUse = wd.reshaped(expertCount, 3 * rowsPerDown, downInner)
+            let scaleInner = sd.dim(2)
+            let downGroups = (rowsPerHalf * scaleInner) / rowsPerDown
+            sdUse = sd.reshaped(expertCount, 3 * rowsPerDown, downGroups)
+            bdUse = bd.reshaped(expertCount, 3 * rowsPerDown, downGroups)
+        }
+        let H = fusedTiles > 2 ? rowsPerDown : wdUse.dim(1)
         let S = BR / topK
         precondition(BR % topK == 0 && H % 4 == 0 && bits == 4 && w.dtype == .float32 && S >= 1 && S <= 8)
         precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
+        let fuse = residual != nil && inject != nil
+            && TrackResidualEpilogue.coversDownProj(k: F, n: H, tokens: S)
+            && residual!.dim(-1) == hcCount * H && inject!.dim(-1) == hcCount
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
         let rps = S == 1 ? downRowsPerSimdgroup : 4
-        return (S == 1 ? downCombineKernel1 : downCombineKernel)(
-            [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
-            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
+        let dummy = act
+        let tiles = max(fusedTiles, 1)
+        let staged = !fuse && fusedTiles <= 2 && TrackWeightStaging.downDispatch(
+            windowTokens: S, f: F, h: H, bits: bits,
+            enabled: staging ?? TrackWeightStaging.enabled) == .combineStaged
+        let kernel = staged ? downCombineStagedKernel1 : (S == 1 ? downCombineKernel1 : downCombineKernel)
+        let inputs: [MLXArray] =
+            staged
+            ? [wdUse, sdUse, bdUse, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate]
+            : [wdUse, sdUse, bdUse, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate,
+               residual ?? dummy, inject ?? dummy]
+        return kernel(
+            inputs,
+            template: [
+                ("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK),
+                ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps),
+                ("HAS_RESIDUAL", fuse), ("HC", hcCount),
+                ("EXACT_TAIL", useExactTail(k: F, bits: bits)), ("TILES", tiles),
+            ],
             grid: (32, (H / rps) * ksg, S), threadGroup: (32, ksg, 1),
-            outputShapes: [[S, H]], outputDTypes: [act.dtype])[0]
+            outputShapes: [fuse ? [S, hcCount * H] : [S, H]], outputDTypes: [act.dtype])[0]
     }
 }
 
@@ -1478,7 +2244,7 @@ extension TrackFastMoEKernels {
         template <typename T> METAL_FUNC vec<T, 4> track_silu4(vec<T, 4> x) {
             return vec<T, 4>(mlx_silu(x.x), mlx_silu(x.y), mlx_silu(x.z), mlx_silu(x.w));
         }
-        template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes, bool SILU>
+        template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes, bool SILU, int k_bound = 0>
         METAL_FUNC void qmv_wide_reg_full(
             const device uint32_t* w,
             const device T* scales,
@@ -1495,16 +2261,19 @@ extension TrackFastMoEKernels {
           constexpr int k_folds = 1;
           constexpr int fold = 0;
           constexpr int vec0 = 0;
+          // k_bound > 0: compile-time K from the mixer staging generator.
+          // k_bound == 0: keep the runtime in_vec_size argument.
+          const int K = k_bound > 0 ? k_bound : in_vec_size;
         
-          const int in_vec_size_w = in_vec_size * bits / 8; // bytes per weight row
-          const int in_vec_size_g = in_vec_size / group_size;
+          const int in_vec_size_w = K * bits / 8; // bytes per weight row
+          const int in_vec_size_g = K / group_size;
           const device uint8_t* wrow = (const device uint8_t*)w + row * in_vec_size_w;
           const device T* srow = scales + row * in_vec_size_g;
           const device T* brow = biases + row * in_vec_size_g;
         
           const device T* xv[vecs_per_tg];
           for (int v = 0; v < vecs_per_tg; v++) {
-            xv[v] = x + min(vec0 + v, M - 1) * in_vec_size;
+            xv[v] = x + min(vec0 + v, M - 1) * K;
           }
         
           for (int v = 0; v < vecs_per_tg; v++) { result[v] = 0; }
@@ -1744,7 +2513,7 @@ extension TrackFastMoEKernels {
         // full threadgroup (2 simdgroups) and 8 * vecs_per_tg floats of
         // threadgroup memory. On return, `valid` lanes (k_lane == 0, slot <
         // out_vec_size) hold row `slot`'s totals in `result`.
-        template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes>
+        template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes, int k_bound = 0, int n_bound = 0>
         METAL_FUNC void qmv_wide_reg_partial(
             const device uint32_t* w,
             const device T* scales,
@@ -1768,7 +2537,9 @@ extension TrackFastMoEKernels {
           const short sg_row = simd_lid / k_lanes;
           const short slot = simd_gid * results_per_simdgroup + sg_row;
           const int tile_row0 = 0;
-          const int tile_rows = min(out_vec_size - tile_row0, rows_per_tg);
+          const int K = k_bound > 0 ? k_bound : in_vec_size;
+          const int N = n_bound > 0 ? n_bound : out_vec_size;
+          const int tile_rows = min(N - tile_row0, rows_per_tg);
           const int vec0 = 0;
           int k_folds = 1;
           int fold = 0;
@@ -1780,17 +2551,17 @@ extension TrackFastMoEKernels {
             fold = slot / tile_rows;
             out_row = tile_row0 + slot % tile_rows;
           }
-          const int row = min(out_row, out_vec_size - 1);
+          const int row = min(out_row, N - 1);
         
-          const int in_vec_size_w = in_vec_size * bits / 8; // bytes per weight row
-          const int in_vec_size_g = in_vec_size / group_size;
+          const int in_vec_size_w = K * bits / 8; // bytes per weight row
+          const int in_vec_size_g = K / group_size;
           const device uint8_t* wrow = (const device uint8_t*)w + row * in_vec_size_w;
           const device T* srow = scales + row * in_vec_size_g;
           const device T* brow = biases + row * in_vec_size_g;
         
           const device T* xv[vecs_per_tg];
           for (int v = 0; v < vecs_per_tg; v++) {
-            xv[v] = x + min(vec0 + v, M - 1) * in_vec_size;
+            xv[v] = x + min(vec0 + v, M - 1) * K;
           }
         
           for (int v = 0; v < vecs_per_tg; v++) { result[v] = 0; }
@@ -2043,7 +2814,7 @@ extension TrackFastMoEKernels {
             }
             return;
           }
-          if (k_lane == 0 && fold == 0 && out_row < out_vec_size) { valid = true; }
+          if (k_lane == 0 && fold == 0 && out_row < N) { valid = true; }
         }
         """#
 
@@ -2051,11 +2822,11 @@ extension TrackFastMoEKernels {
     /// wide (2-8 token) branch, so it needs the names, not the 27 KB of bodies
     /// (the custom-kernel call cost on the host scales with the source size).
     static let wideDecls = #"""
-        template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes, bool SILU>
+        template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes, bool SILU, int k_bound = 0>
         METAL_FUNC void qmv_wide_reg_full(
             const device uint32_t* w, const device T* scales, const device T* biases, const device T* x,
             const int in_vec_size, const int M, const int row, uint simd_lid, thread float (&result)[vecs_per_tg]);
-        template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes>
+        template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes, int k_bound = 0, int n_bound = 0>
         METAL_FUNC void qmv_wide_reg_partial(
             const device uint32_t* w, const device T* scales, const device T* biases, const device T* x,
             const int in_vec_size, const int out_vec_size, const int M, threadgroup float* fold_partials,
@@ -2121,6 +2892,79 @@ extension TrackFastMoEKernels {
             [w, scales, biases, x],
             template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("VPT", M), ("K", K), ("N", N), ("M", M)],
             grid: (32, 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[M, N]], outputDTypes: [x.dtype])[0]
+    }
+}
+
+// MARK: exact-tail check kernels (qmv_impl + inject small-N vs the vendored path)
+extension TrackFastMoEKernels {
+    /// y [M, N] = x [M, K] * W^T over the Runner `qmv_impl` copy. `EXACT_TAIL`
+    /// selects the unchecked tail; false is the vendored `_safe` tail.
+    static let qmvImplCheckSource = """
+        const uint b = threadgroup_position_in_grid.z;
+        const uint blk = threadgroup_position_in_grid.y;
+        uint3 tid = uint3(0, blk, 0);
+        const device T* xb = x + (size_t)b * (size_t)K;
+        device T* yb = y + (size_t)b * (size_t)N;
+        qmv_impl<T, GS, BITS, EXACT_TAIL>(
+            w, scales, biases, xb, yb, K, N, tid,
+            simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+        """
+
+    nonisolated(unsafe) static let qmvImplCheckKernel = MLXFast.metalKernel(
+        name: "track_qmv_impl_check",
+        inputNames: ["w", "scales", "biases", "x"],
+        outputNames: ["y"],
+        source: qmvImplCheckSource, header: helpers, ensureRowContiguous: true)
+
+    static func qmvImplCheck(
+        w: MLXArray, scales: MLXArray, biases: MLXArray, x: MLXArray,
+        groupSize: Int, bits: Int, exactTail: Bool
+    ) -> MLXArray {
+        let M = x.dim(0), K = x.dim(1), N = w.dim(0)
+        precondition(N % 8 == 0 && M >= 1 && bits == 4)
+        let nb = N / 8
+        return qmvImplCheckKernel(
+            [w, scales, biases, x],
+            template: [
+                ("T", x.dtype), ("GS", groupSize), ("BITS", bits),
+                ("K", K), ("N", N), ("EXACT_TAIL", exactTail),
+            ],
+            grid: (32, nb * 2, M), threadGroup: (32, 2, 1),
+            outputShapes: [[M, N]], outputDTypes: [x.dtype])[0]
+    }
+
+    /// y [M, N] = x [M, K] * W^T over `track_inject_qmv` (small-N branch, N < 8).
+    static let injectCheckSource = """
+        const uint row = threadgroup_position_in_grid.y;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint lid = thread_index_in_simdgroup;
+        track_inject_qmv<T, GS, BITS, K, N, 4, EXACT_TAIL>(
+            w, scales, biases, x + (size_t)row * (size_t)K,
+            y + (size_t)row * (size_t)N, sg, lid);
+        """
+
+    nonisolated(unsafe) static let injectCheckKernel = MLXFast.metalKernel(
+        name: "track_inject_qmv_check",
+        inputNames: ["w", "scales", "biases", "x"],
+        outputNames: ["y"],
+        source: injectCheckSource,
+        header: TrackFastKernels.mixerHeadHeader,
+        ensureRowContiguous: true)
+
+    static func injectCheck(
+        w: MLXArray, scales: MLXArray, biases: MLXArray, x: MLXArray,
+        groupSize: Int, bits: Int, exactTail: Bool
+    ) -> MLXArray {
+        let M = x.dim(0), K = x.dim(1), N = w.dim(0)
+        precondition(N < 8 && M >= 1 && bits == 4 && K > 256 && K % 256 == 0)
+        return injectCheckKernel(
+            [w, scales, biases, x],
+            template: [
+                ("T", x.dtype), ("GS", groupSize), ("BITS", bits),
+                ("K", K), ("N", N), ("EXACT_TAIL", exactTail),
+            ],
+            grid: (64, M, 1), threadGroup: (64, 1, 1),
             outputShapes: [[M, N]], outputDTypes: [x.dtype])[0]
     }
 }

@@ -186,6 +186,10 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
             model.install(
                 ngramRowSource: try Self.resolveNGramRowSource(
                     options.resources[ngramRowSourceResource], for: model))
+            // Untimed: touch the PLE n-gram LRU resident set so the first
+            // scored window does not pay SSD/LRU faults. TRACK_PLE_WARM=0
+            // skips. A second adopt is a no-op.
+            TrackPLEWarm.warm(model: model)
         }
 
         // ADOPT THE HEAD INTO THIS REPOSITORY. The loader builds the fork's
@@ -215,6 +219,10 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         // fork's module directly, for A/B.
         let serving: any LanguageModel =
             TrackQwen4ExpFastModel.enabled ? TrackQwen4ExpFastModel(base: model) : model
+        // Untimed: pre-JIT verify widths S=1...7 so the first scored speculative
+        // round is not a first-hit Metal/compile stall.
+        (serving as? TrackQwen4ExpFastModel)?.warmVerifyCaches()
+        drafter?.warmVerifyCaches()
 
         return TrackQwen4ExpRunner(
             model: model,
@@ -226,6 +234,66 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
             headProvenance: provenance,
             kvBytesCapacity: options.kvBytesCapacity,
             maxSequenceLength: options.maxSequenceLength)
+    }
+
+    /// Load weights once, then adopt. Fused expert files (`gate_up_down_proj`
+    /// plus a version-2 `mlxfast-expert-layout.json`) swap each SwitchGLU to
+    /// the fused topology before load. A missing or old-version table uses
+    /// the factory split layout so old weight files still load.
+    public static func load(
+        _ directory: URL, options: RunnerLoadOptions
+    ) async throws -> TrackQwen4ExpRunner {
+        if TrackExpertLayout.shouldFuseLoad(at: directory) {
+            return try await loadFusedExpertLayout(directory, options: options)
+        }
+        let context = try await LLMModelFactory.shared.load(
+            from: directory, using: #huggingFaceTokenizerLoader())
+        var options = options
+        options.preloadedDrafter = try await loadDrafter(
+            options: options, directory: directory, target: context.model)
+        return try adopt(
+            model: context.model,
+            tokenizer: context.tokenizer,
+            configuration: context.configuration,
+            directory: directory,
+            options: options)
+    }
+
+    private static func loadFusedExpertLayout(
+        _ directory: URL, options: RunnerLoadOptions
+    ) async throws -> TrackQwen4ExpRunner {
+        guard let table = TrackExpertLayout.loadTable(at: directory) else {
+            throw RunnerError.invalidCheckpoint("fused expert layout table failed to parse")
+        }
+        let configData = try Data(contentsOf: directory.appendingPathComponent("config.json"))
+        let baseConfig = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
+        let model: Qwen4ExpModel
+        if baseConfig.modelType == "qwen4_exp_text" {
+            let text = try JSONDecoder.json5().decode(
+                Qwen4ExpTextConfiguration.self, from: configData)
+            model = Qwen4ExpModel(text: text)
+        } else {
+            let cfg = try JSONDecoder.json5().decode(Qwen4ExpConfiguration.self, from: configData)
+            model = Qwen4ExpModel(cfg)
+        }
+        TrackExpertLayout.fuseListedSwitchGLUs(in: model, table: table)
+        let tokenizerLoader: any TokenizerLoader = #huggingFaceTokenizerLoader()
+        async let tokenizerTask = tokenizerLoader.load(from: directory)
+        try TrackExpertLayout.loadFusedWeights(
+            modelDirectory: directory,
+            model: model,
+            table: table,
+            perLayerQuantization: baseConfig.perLayerQuantization)
+        let tokenizer = try await tokenizerTask
+        var options = options
+        options.preloadedDrafter = try await loadDrafter(
+            options: options, directory: directory, target: model)
+        return try adopt(
+            model: model,
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(directory: directory),
+            directory: directory,
+            options: options)
     }
 
     /// The family half of the `--verbose` load summary.
