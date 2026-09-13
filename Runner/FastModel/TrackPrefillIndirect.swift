@@ -44,20 +44,10 @@ enum TrackPrefillIndirect {
         else { return nil }
 
         let flatIDs = indices.flattened()
-        let sortedIDs: MLXArray
-        let inverse: MLXArray
-        let tokenRows: MLXArray
-        if let c = TrackPrefillSort.apply(
-            flatIDs: flatIDs, experts: g.w.dim(0), topK: indices.dim(2))
-        {
-            // The identical permutation in two launches (see TrackPrefillSort).
-            (sortedIDs, tokenRows, inverse) = (c.sortedIDs, c.tokenRows, c.inverse)
-        } else {
-            let order = argSort(flatIDs)
-            inverse = argSort(order)
-            sortedIDs = flatIDs[order]
-            tokenRows = order.floorDivide(indices.dim(2))
-        }
+        let order = argSort(flatIDs)
+        let inverse = argSort(order)
+        let sortedIDs = flatIDs[order]
+        let tokenRows = order.floorDivide(indices.dim(2))
         let rows = indices.size
         func project(_ bank: (w: MLXArray, s: MLXArray, b: MLXArray)) -> MLXArray {
             kernel(
