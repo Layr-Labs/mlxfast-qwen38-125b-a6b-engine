@@ -185,6 +185,7 @@ struct TrackMoE {
     let sharedGate: TrackProj
     let topK: Int
     let sharedHidden: Int
+    var pairedGateUpMetadata: [MLXArray] = []
 }
 
 struct TrackPLE {
@@ -394,7 +395,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let su = TrackProj(shared.trackChild("up_proj"))
         let sd = TrackProj(shared.trackChild("down_proj"))
         let sharedGate = TrackProj(m.trackChild("shared_expert_gate"))
-        return TrackMoE(
+        var result = TrackMoE(
             routerW32: routerW, routerW16: routerW16, switchMLP: switchMLP,
             p12SortedParts: {
                 guard let g = switchMLP.trackChild("gate_proj") as? SwitchLinear,
@@ -408,6 +409,26 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             sharedGateUp: TrackMultiProj([sg, su]),
             sharedDown: sd, sharedGate: sharedGate, topK: cfg.numExpertsPerTok,
             sharedHidden: sg.rows)
+        if StreamOrDevice.default.stream == Stream.gpu,
+            result.expertBits == 4, result.expertGroupSize == 32,
+            result.expertGate.s.shape == [512, 640, 80],
+            result.expertUp.s.shape == result.expertGate.s.shape,
+            case .quant(let sharedQ)? = result.sharedGateUp.fused,
+            sharedQ.scales.shape == [1280, 80], let sharedB = sharedQ.biases,
+            [result.expertGate.s, result.expertGate.b, result.expertUp.s, result.expertUp.b,
+             sharedQ.scales, sharedB].allSatisfy({ $0.dtype == .bfloat16 }),
+            result.expertGate.b.shape == result.expertGate.s.shape,
+            result.expertUp.b.shape == result.expertUp.s.shape,
+            sharedB.shape == sharedQ.scales.shape
+        {
+            result.pairedGateUpMetadata = [
+                TrackPairedAffine.pack(scales: result.expertGate.s, biases: result.expertGate.b),
+                TrackPairedAffine.pack(scales: result.expertUp.s, biases: result.expertUp.b),
+                TrackPairedAffine.pack(scales: sharedQ.scales, biases: sharedB),
+            ]
+            eval(result.pairedGateUpMetadata)
+        }
+        return result
     }
 
     static func bindPLE(_ ple: Qwen4ExpPLELayer, ordinal: Int, cfg: Qwen4ExpTextConfiguration)
@@ -645,14 +666,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return compile(shapeless: false) {
             [groupSize = m.expertGroupSize, bits = m.expertBits, topK = m.topK,
              guGroupSize = guq.groupSize, guBits = guq.bits, guMode = guq.mode,
-             downGroupSize = dq.groupSize, downBits = dq.bits, downMode = dq.mode] inputs in
+             downGroupSize = dq.groupSize, downBits = dq.bits, downMode = dq.mode,
+             hasPairedMetadata = !m.pairedGateUpMetadata.isEmpty] inputs in
             let sharedGU = TrackQuantWeight(
                 weight: inputs[11], scales: inputs[12], biases: inputs[13],
                 groupSize: guGroupSize, bits: guBits, mode: guMode)
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: inputs[5], sg: inputs[6], bg: inputs[7],
                 wu: inputs[8], su: inputs[9], bu: inputs[10], shared: sharedGU,
-                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits)
+                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits,
+                metadata: hasPairedMetadata ? Array(inputs[20..<23]) : [])
             let sharedDown = TrackQuantWeight(
                 weight: inputs[17], scales: inputs[18], biases: inputs[19],
                 groupSize: downGroupSize, bits: downBits, mode: downMode)
@@ -726,12 +749,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     guq.weight, guq.scales, guq.biases!,
                     m.expertDown.w, m.expertDown.s, m.expertDown.b,
                     dq.weight, dq.scales, dq.biases!,
-                ])[0].reshaped(1, S, H)
+                ] + m.pairedGateUpMetadata)[0].reshaped(1, S, H)
             }
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
                 wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b, shared: guq,
-                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits)
+                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits,
+                metadata: m.pairedGateUpMetadata)
             return TrackFastMoEKernels.downCombine(
                 wd: m.expertDown.w, sd: m.expertDown.s, bd: m.expertDown.b, sharedDown: dq,
                 act: act, idx: flatIdx, w: weights.reshaped(S * K), gate: gate, topK: K,
