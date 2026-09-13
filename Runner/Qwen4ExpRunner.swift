@@ -178,14 +178,22 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         //
         // Reads only resident tensors. See `Qwen4ExpNormConvention`.
         try Self.validateNormConvention(model)
+        TrackBootPhase.mark("norm convention validated")
 
         // The PLE layers read their rows through the injected source. A model
         // that has PLE layers and no source cannot run a forward pass at all,
         // so adoption refuses here rather than at the first token.
         if !model.pleEmbeddings.isEmpty {
+            TrackBootPhase.mark("installing PLE n-gram row source")
             model.install(
                 ngramRowSource: try Self.resolveNGramRowSource(
                     options.resources[ngramRowSourceResource], for: model))
+            // Untimed: touch the PLE n-gram LRU resident set so the first
+            // scored window does not pay SSD/LRU faults. TRACK_PLE_WARM=0
+            // skips. A second adopt is a no-op.
+            TrackBootPhase.mark("warming PLE n-gram cache")
+            TrackPLEWarm.warm(model: model)
+            TrackBootPhase.mark("PLE n-gram cache warmed")
         }
 
         // ADOPT THE HEAD INTO THIS REPOSITORY. The loader builds the fork's
@@ -194,7 +202,10 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         // loaded tensors over. A checkpoint without the `mtp.*` block has no
         // head and is serial only.
         let head = try model.mtp.map {
-            try Self.adoptMTPHead($0, configuration: model.configuration)
+            TrackBootPhase.mark("adopting MTP head")
+            let adopted = try Self.adoptMTPHead($0, configuration: model.configuration)
+            TrackBootPhase.mark("MTP head adopted")
+            return adopted
         }
         // The fork's `mtp` module stays bound to the model: a Module property
         // may only change through `update(modules:)`, and there is nothing to
@@ -215,6 +226,14 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         // fork's module directly, for A/B.
         let serving: any LanguageModel =
             TrackQwen4ExpFastModel.enabled ? TrackQwen4ExpFastModel(base: model) : model
+        // Untimed: pre-JIT verify widths S=1...7 so the first scored speculative
+        // round is not a first-hit Metal/compile stall.
+        TrackBootPhase.mark("warming verify caches")
+        if let fast = serving as? TrackQwen4ExpFastModel {
+            fast.warmVerifyCaches()
+        }
+        drafter?.warmVerifyCaches()
+        TrackBootPhase.mark("verify caches warm — load complete")
 
         return TrackQwen4ExpRunner(
             model: model,
@@ -226,6 +245,70 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
             headProvenance: provenance,
             kvBytesCapacity: options.kvBytesCapacity,
             maxSequenceLength: options.maxSequenceLength)
+    }
+
+    /// Load weights once, then adopt. Fused expert files (`gate_up_down_proj`
+    /// plus a version-2 `mlxfast-expert-layout.json`) swap each SwitchGLU to
+    /// the fused topology before load. A missing or old-version table uses
+    /// the factory split layout so old weight files still load.
+    public static func load(
+        _ directory: URL, options: RunnerLoadOptions
+    ) async throws -> TrackQwen4ExpRunner {
+        if TrackExpertLayout.shouldFuseLoad(at: directory) {
+            return try await loadFusedExpertLayout(directory, options: options)
+        }
+        let context = try await LLMModelFactory.shared.load(
+            from: directory, using: #huggingFaceTokenizerLoader())
+        var options = options
+        options.preloadedDrafter = try await loadDrafter(
+            options: options, directory: directory, target: context.model)
+        return try adopt(
+            model: context.model,
+            tokenizer: context.tokenizer,
+            configuration: context.configuration,
+            directory: directory,
+            options: options)
+    }
+
+    private static func loadFusedExpertLayout(
+        _ directory: URL, options: RunnerLoadOptions
+    ) async throws -> TrackQwen4ExpRunner {
+        TrackBootPhase.mark("fused-layout load begin")
+        guard let table = TrackExpertLayout.loadTable(at: directory) else {
+            throw RunnerError.invalidCheckpoint("fused expert layout table failed to parse")
+        }
+        let configData = try Data(contentsOf: directory.appendingPathComponent("config.json"))
+        let baseConfig = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
+        let model: Qwen4ExpModel
+        if baseConfig.modelType == "qwen4_exp_text" {
+            let text = try JSONDecoder.json5().decode(
+                Qwen4ExpTextConfiguration.self, from: configData)
+            model = Qwen4ExpModel(text: text)
+        } else {
+            let cfg = try JSONDecoder.json5().decode(Qwen4ExpConfiguration.self, from: configData)
+            model = Qwen4ExpModel(cfg)
+        }
+        TrackExpertLayout.fuseListedSwitchGLUs(in: model, table: table)
+        let tokenizerLoader: any TokenizerLoader = #huggingFaceTokenizerLoader()
+        async let tokenizerTask = tokenizerLoader.load(from: directory)
+        TrackBootPhase.mark("reading fused weight shards")
+        try TrackExpertLayout.loadFusedWeights(
+            modelDirectory: directory,
+            model: model,
+            table: table,
+            perLayerQuantization: baseConfig.perLayerQuantization)
+        TrackBootPhase.mark("fused weight shards resident")
+        let tokenizer = try await tokenizerTask
+        var options = options
+        TrackBootPhase.mark("loading drafter")
+        options.preloadedDrafter = try await loadDrafter(
+            options: options, directory: directory, target: model)
+        return try adopt(
+            model: model,
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(directory: directory),
+            directory: directory,
+            options: options)
     }
 
     /// The family half of the `--verbose` load summary.
