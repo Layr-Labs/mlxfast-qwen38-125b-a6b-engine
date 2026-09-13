@@ -2150,12 +2150,19 @@ extension TrackFastMoEKernels {
         out_row = out_row + TM <= N ? out_row : N - TM;
         const device T* mat = w + (size_t)out_row * (size_t)K;
         const int n_iter = K / blockN;
+        // MLXFAST-ROUTER1PASS: hoist the x loads out of the row loop. The
+        // same TN coefficients serve every row in this SIMD group, so the
+        // bf16->float conversions per block happen once, not TM times. Each
+        // product is the identical float pair multiplied and accumulated in
+        // the identical order, so every partial sum is unchanged.
         for (int i = 0; i < n_iter; ++i) {
-            for (int tn = 0; tn < TN; tn++) { v_coeff[tn] = x[bn + tn]; }
+            float vc[TN];
+            for (int tn = 0; tn < TN; tn++) { vc[tn] = static_cast<float>(x[bn + tn]); }
             int mat_offset = 0;
             for (int tm = 0; tm < TM; tm++) {
-                for (int tn = 0; tn < TN; tn++) { inter[tn] = static_cast<float>(mat[mat_offset + bn + tn]); }
-                for (int tn = 0; tn < TN; tn++) { result[tm] += inter[tn] * v_coeff[tn]; }
+                for (int tn = 0; tn < TN; tn++) {
+                    result[tm] += static_cast<float>(mat[mat_offset + bn + tn]) * vc[tn];
+                }
                 mat_offset += K;
             }
             bn += blockN;
