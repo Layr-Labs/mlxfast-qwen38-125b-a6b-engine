@@ -284,6 +284,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         self.layers = built
         self.finalMixer = Self.bindHC(tower.trackChild("hyper_connection_mixer"), cfg: cfg)
         super.init()
+        if finalMixer.normScaleQ.dtype == .bfloat16 && StreamOrDevice.default.stream === Stream.gpu {
+            _ = TrackBF16Functions.sigmoid
+        }
     }
 
     // MARK: binding

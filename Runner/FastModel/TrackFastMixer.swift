@@ -120,6 +120,13 @@ enum TrackFastMixerKernels {
     /// Tile t owns columns 2t, 2t+1 across the HC streams (8 rows); slot s ->
     /// row (2t + (s & 1)) + H * (s >> 1). grid threads (32, 2 * H/2, 1), tg (32, 2, 1).
     static let upMixSource = """
+        auto sigmoid = [&](T value) -> T {
+            if constexpr (metal::is_same_v<T, bfloat16_t>) {
+                return sigmoid_lut[as_type<ushort>(static_cast<bfloat16_t>(value))];
+            } else {
+                return mlx_sigmoid(value);
+            }
+        };
         const int tile = (int)threadgroup_position_in_grid.y;
         const int d0 = 2 * tile;
         const uint sg = simdgroup_index_in_threadgroup;
@@ -146,7 +153,7 @@ enum TrackFastMixerKernels {
                 T acc = T(0);
                 for (int s = 0; s < HC; ++s) {
                     const T w = static_cast<T>(res[s * 2 + (int)t][v]);
-                    const T sgm = mlx_sigmoid(w);
+                    const T sgm = sigmoid(w);
                     const T p = sgm * normed[(size_t)v * (size_t)(HC * H) + (size_t)(s * H + d)];
                     acc = acc + p;
                 }
@@ -156,18 +163,18 @@ enum TrackFastMixerKernels {
         }
         if (HAS_INJECT && tile == 0 && t < (uint)(HC * VPT)) {
             const T x = inj[t];
-            inject[t] = T(2) * mlx_sigmoid(x);
+            inject[t] = T(2) * sigmoid(x);
         }
         """
 
     nonisolated(unsafe) static let upMixKernel = MLXFast.metalKernel(
         name: "track_mixer_up_mix",
-        inputNames: ["act", "normed", "wu", "su", "bu", "inj"],
+        inputNames: ["act", "normed", "wu", "su", "bu", "inj", "sigmoid_lut"],
         outputNames: ["input", "inject", "inputF"],
         source: upMixSource, header: header, ensureRowContiguous: true)
     nonisolated(unsafe) static let upMixKernel1 = MLXFast.metalKernel(
         name: "track_mixer_up_mix_1",
-        inputNames: ["act", "normed", "wu", "su", "bu", "inj"],
+        inputNames: ["act", "normed", "wu", "su", "bu", "inj", "sigmoid_lut"],
         outputNames: ["input", "inject", "inputF"],
         source: upMixSource, header: header1, ensureRowContiguous: true)
 
@@ -178,8 +185,9 @@ enum TrackFastMixerKernels {
         let S = act.dim(0), LW = act.dim(1)
         precondition(S >= 1 && S <= 8 && hidden % 2 == 0 && up.rows == hcCount * hidden && up.bits == 4)
         precondition(LW % 32 == 0 && LW < 512 + 256)  // K = 320: one full block + a tail, the `qmv` normal branch
+        let sigmoidTable = act.dtype == .bfloat16 ? TrackBF16Functions.sigmoid : normed
         let outs = (S == 1 ? upMixKernel1 : upMixKernel)(
-            [act, normed, up.weight, up.scales, up.biases!, inj],
+            [act, normed, up.weight, up.scales, up.biases!, inj, sigmoidTable],
             template: [
                 ("T", act.dtype), ("GS", up.groupSize), ("BITS", up.bits), ("H", hidden), ("HC", hcCount),
                 ("LW", LW), ("VPT", S), ("HAS_INJECT", hasInject), ("EMIT_F32", emitF32),
