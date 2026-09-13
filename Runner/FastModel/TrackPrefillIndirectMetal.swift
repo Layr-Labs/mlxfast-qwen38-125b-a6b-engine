@@ -1465,8 +1465,7 @@ METAL_FUNC void track_prefill_indirect_gu(
     device T* y1,
     int N,
     int K,
-    threadgroup T* Ws0,
-    threadgroup T* Ws1,
+    threadgroup T* Ws,
     threadgroup T* As,
     uint3 tid,
     uint simd_group_id,
@@ -1544,12 +1543,15 @@ METAL_FUNC void track_prefill_indirect_gu(
       xb += size_t(token_rows[tile_begin + a_row]) * K + a_col;
     }
 
+    // Both loaders own the same staging buffer; `dst` is base-relative, so the
+    // two streams lay their K blocks down at identical offsets and the second
+    // store simply overwrites the first.
     thread loader_w_t loader_w0(
         wl0 + index * stride_w,
         scales0 + index * stride_s,
         biases0 + index * stride_s,
         K,
-        Ws0,
+        Ws,
         simd_group_id,
         simd_lane_id);
     thread loader_w_t loader_w1(
@@ -1557,7 +1559,7 @@ METAL_FUNC void track_prefill_indirect_gu(
         scales1 + index * stride_s,
         biases1 + index * stride_s,
         K,
-        Ws1,
+        Ws,
         simd_group_id,
         simd_lane_id);
 
@@ -1574,10 +1576,17 @@ METAL_FUNC void track_prefill_indirect_gu(
           for (short e = 0; e < A_PER_THREAD; ++e) { a_buf[e] = a0[e]; }
         }
       }
+      // ONE staging buffer serves both weight streams: the gate block is
+      // dequantised into `Ws`, consumed by the gate MMAs, and only then is the
+      // up block dequantised into the same buffer. 13 824 B of threadgroup
+      // memory per threadgroup instead of 23 040 B, i.e. two resident
+      // threadgroups per core instead of one. Every `store` reproduces exactly
+      // the same dequantisation of the same K block, and every MMA sees the
+      // same K slices in the same order, so each output element's arithmetic
+      // is unchanged.
       for (int k = 0; k < K_it; k++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         packed_w0.store(loader_w0.dst);
-        packed_w1.store(loader_w1.dst);
         if (a_live) {
           STEEL_PRAGMA_UNROLL
           for (short e = 0; e < A_PER_THREAD; ++e) {
@@ -1593,9 +1602,7 @@ METAL_FUNC void track_prefill_indirect_gu(
 
         if (k + 1 < K_it) {
           loader_w0.next();
-          loader_w1.next();
           packed_w0.prefetch(loader_w0);
-        packed_w1.prefetch(loader_w1);
           if (a_live) {
             const device T* a_next = xb + BK;
             STEEL_PRAGMA_UNROLL
@@ -1608,15 +1615,13 @@ METAL_FUNC void track_prefill_indirect_gu(
           if (sg_active) {
             NAXTile<T, TM, TK> Atile;
             NAXTile<T, BR, BC> Btile0;
-            NAXTile<T, BR, BC> Btile1;
 
             volatile int compiler_barrier;
 
             Atile.template load<T, BKA_padded, 1>(
                 As + tm * BKA_padded + kk1);
 
-            Btile0.template load<T, BK_padded, 1>(Ws0 + tn * BK_padded + kk1);
-            Btile1.template load<T, BK_padded, 1>(Ws1 + tn * BK_padded + kk1);
+            Btile0.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
 
             tile_matmad_nax(
                 Dtile0,
@@ -1624,6 +1629,34 @@ METAL_FUNC void track_prefill_indirect_gu(
                 metal::bool_constant<false>{},
                 Btile0,
                 metal::bool_constant<transpose>{});
+
+            (void)compiler_barrier;
+          }
+        }
+
+        // Every thread has finished reading the gate block before the up block
+        // overwrites it, and the up MMAs start only after that store lands.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        packed_w1.store(loader_w1.dst);
+        if (k + 1 < K_it) {
+          loader_w1.next();
+          packed_w1.prefetch(loader_w1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        STEEL_PRAGMA_UNROLL
+        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          if (sg_active) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, BR, BC> Btile1;
+
+            volatile int compiler_barrier;
+
+            Atile.template load<T, BKA_padded, 1>(
+                As + tm * BKA_padded + kk1);
+
+            Btile1.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
             tile_matmad_nax(
                 Dtile1,
                 Atile,

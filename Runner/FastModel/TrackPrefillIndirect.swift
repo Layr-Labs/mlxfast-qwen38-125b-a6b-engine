@@ -140,12 +140,11 @@ enum TrackPrefillIndirect {
     }
 
     static let sourceGU = #"""
-        threadgroup T Ws0[64 * 72];
-        threadgroup T Ws1[64 * 72];
+        threadgroup T Ws[64 * 72];
         threadgroup T As[32 * 72];
         track_prefill_indirect_gu<T, 32, 4, 32, 64, 64, 2, 2, true, SILU>(
             x, w0, scales0, biases0, w1, scales1, biases1, indices, token_rows, tiles,
-            y0, y1, N, K, Ws0, Ws1, As, threadgroup_position_in_grid,
+            y0, y1, N, K, Ws, As, threadgroup_position_in_grid,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
         """#
 
