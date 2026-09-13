@@ -786,6 +786,51 @@ extension TrackFastMoEKernels {
         constexpr uint SEL_SG = (VPT == 1) ? 1u : 0u;
         if (sg == SEL_SG) {
         const device float* lr = logits + (size_t)row * (size_t)E;
+        if constexpr (E == 512) {
+            float tree[31];
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 16; ++j) {
+                const float value = lr[lane + 32 * j];
+                tree[15 + j] = value > -INFINITY ? value : -INFINITY;
+            }
+            #pragma clang loop unroll(full)
+            for (int node = 14; node >= 0; --node) {
+                const float left = tree[2 * node + 1];
+                const float right = tree[2 * node + 2];
+                tree[node] = right > left ? right : left;
+            }
+            uint winner = 0;
+            #pragma clang loop unroll(full)
+            for (int level = 0; level < 4; ++level) {
+                const uint left = 2 * winner + 1;
+                winner = tree[left + 1] > tree[left] ? left + 1 : left;
+            }
+            for (int k = 0; k < K; ++k) {
+                const float bv = tree[0];
+                const int bj = bv > -INFINITY ? int(winner) - 15 : -1;
+                const float gmax = simd_max(bv);
+                const uint cand = (bv == gmax && bj >= 0) ? (uint)(lane + 32 * bj) : 0xffffffffu;
+                const uint gidx = simd_min(cand);
+                if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
+                if (k + 1 < K && bj >= 0 && gidx == (uint)(lane + 32 * bj)) {
+                    tree[winner] = -INFINITY;
+                    uint node = winner;
+                    #pragma clang loop unroll(full)
+                    for (int level = 0; level < 4; ++level) {
+                        node = (node - 1u) >> 1;
+                        const float left = tree[2 * node + 1];
+                        const float right = tree[2 * node + 2];
+                        tree[node] = right > left ? right : left;
+                    }
+                    winner = 0;
+                    #pragma clang loop unroll(full)
+                    for (int level = 0; level < 4; ++level) {
+                        const uint left = 2 * winner + 1;
+                        winner = tree[left + 1] > tree[left] ? left + 1 : left;
+                    }
+                }
+            }
+        } else {
         // each lane owns E_PER experts: e = lane + 32 * j (strided so a tie at
         // the same value resolves to the lowest index across lanes too)
         float v[E_PER];
@@ -806,6 +851,7 @@ extension TrackFastMoEKernels {
             const uint gidx = simd_min(cand);
             if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
             if (gidx == (uint)(lane + 32 * bj) && bj >= 0) { taken[bj] = true; }
+        }
         }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
