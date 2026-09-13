@@ -1070,17 +1070,18 @@ extension TrackFastMoEKernels {
         // independent of its neighbours), optional silu on the activations.
         // EXACT_TAIL as in qmv_reg above: the caller's in_vec_size is a multiple
         // of values_per_thread, so the runtime-indexed tail can be compiled away.
-        template <typename T, int group_size, int bits, bool SILU, bool EXACT_TAIL = false>
+        // MLXFAST-UPDPT: NR rows per simdgroup; each row's walk is unchanged for any NR.
+        template <typename T, int group_size, int bits, bool SILU, bool EXACT_TAIL = false, int NR = 4>
         METAL_FUNC void qmv_reg_rows(
             const device uint32_t* w,
             const device T* scales,
             const device T* biases,
             const device T* x,
             const int in_vec_size,
-            const thread int (&rows)[4],
+            const thread int (&rows)[NR],
             uint simd_lid,
-            thread float (&result)[4]) {
-          constexpr int results_per_simdgroup = 4;
+            thread float (&result)[NR]) {
+          constexpr int results_per_simdgroup = NR;
           constexpr int packs_per_thread = 1;
           constexpr int pack_factor = get_pack_factor<bits, 32>();
           constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
@@ -1093,10 +1094,10 @@ extension TrackFastMoEKernels {
           for (int row = 0; row < results_per_simdgroup; row++) { result[row] = 0; }
           const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
           const int in_vec_size_g = in_vec_size / group_size;
-          const device uint8_t* wr[4];
-          const device T* sr[4];
-          const device T* br[4];
-          for (int row = 0; row < 4; row++) {
+          const device uint8_t* wr[NR];
+          const device T* sr[NR];
+          const device T* br[NR];
+          for (int row = 0; row < NR; row++) {
             wr[row] = ws + rows[row] * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
             sr[row] = scales + rows[row] * in_vec_size_g + simd_lid / scale_step_per_thread;
             br[row] = biases + rows[row] * in_vec_size_g + simd_lid / scale_step_per_thread;

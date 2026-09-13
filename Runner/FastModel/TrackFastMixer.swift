@@ -121,16 +121,21 @@ enum TrackFastMixerKernels {
     /// row (2t + (s & 1)) + H * (s >> 1). grid threads (32, 2 * H/2, 1), tg (32, 2, 1).
     static let upMixSource = """
         const int tile = (int)threadgroup_position_in_grid.y;
-        const int d0 = 2 * tile;
+        // MLXFAST-UPDPT: DPT output columns per tile (2 for wide windows); a tile is
+        // DPT x HC rows over two simdgroups, so each simdgroup walks DPT*HC/2 rows.
+        static_assert(VPT == 1 || DPT == 2, "wide windows keep two columns per tile");
+        static_assert((DPT * HC) % 2 == 0, "rows split over two simdgroups");
+        constexpr int RPSU = DPT * HC / 2;
+        const int d0 = DPT * tile;
         const uint sg = simdgroup_index_in_threadgroup;
         const uint lid = thread_index_in_simdgroup;
-        threadgroup float res[8][VPT];
+        threadgroup float res[DPT * HC][VPT];
         if constexpr (VPT == 1) {
-            int rows[4];
-            for (int i = 0; i < 4; ++i) { const int s = (int)sg * 4 + i; rows[i] = d0 + (s & 1) + H * (s >> 1); }
-            float r[4];
-            qmv_reg_rows<T, GS, BITS, false, (LW % get_pack_factor<BITS, 32>()) == 0>(wu, su, bu, act, LW, rows, lid, r);
-            if (lid == 0) { for (int i = 0; i < 4; ++i) { res[(int)sg * 4 + i][0] = r[i]; } }
+            int rows[RPSU];
+            for (int i = 0; i < RPSU; ++i) { const int s = (int)sg * RPSU + i; rows[i] = d0 + (s % DPT) + H * (s / DPT); }
+            float r[RPSU];
+            qmv_reg_rows<T, GS, BITS, false, (LW % get_pack_factor<BITS, 32>()) == 0, RPSU>(wu, su, bu, act, LW, rows, lid, r);
+            if (lid == 0) { for (int i = 0; i < RPSU; ++i) { res[(int)sg * RPSU + i][0] = r[i]; } }
         } else {
             const int s = (int)sg * 4 + (int)(lid / 8);
             const int row = d0 + (s & 1) + H * (s >> 1);
@@ -140,12 +145,12 @@ enum TrackFastMixerKernels {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const uint t = sg * 32 + lid;
-        if (t < 2) {
+        if (t < (uint)DPT) {
             const int d = d0 + (int)t;
             for (int v = 0; v < VPT; ++v) {
                 T acc = T(0);
                 for (int s = 0; s < HC; ++s) {
-                    const T w = static_cast<T>(res[s * 2 + (int)t][v]);
+                    const T w = static_cast<T>(res[s * DPT + (int)t][v]);
                     const T sgm = mlx_sigmoid(w);
                     const T p = sgm * normed[(size_t)v * (size_t)(HC * H) + (size_t)(s * H + d)];
                     acc = acc + p;
@@ -171,6 +176,11 @@ enum TrackFastMixerKernels {
         outputNames: ["input", "inject", "inputF"],
         source: upMixSource, header: header1, ensureRowContiguous: true)
 
+    /// MLXFAST-UPDPT: output columns per up-projection tile in a one-token window
+    /// (2 = the shipped layout: 8 rows over two simdgroups; 1 = 4 rows, twice the
+    /// threadgroups). Each row's walk and the per-column fold are unchanged.
+    static let upColumnsPerTile = 1
+
     static func upMix(
         act: MLXArray, normed: MLXArray, up: TrackQuantWeight, inj: MLXArray, hcCount: Int, hidden: Int,
         hasInject: Bool, emitF32: Bool = false
@@ -178,13 +188,14 @@ enum TrackFastMixerKernels {
         let S = act.dim(0), LW = act.dim(1)
         precondition(S >= 1 && S <= 8 && hidden % 2 == 0 && up.rows == hcCount * hidden && up.bits == 4)
         precondition(LW % 32 == 0 && LW < 512 + 256)  // K = 320: one full block + a tail, the `qmv` normal branch
+        let dpt = S == 1 ? upColumnsPerTile : 2
         let outs = (S == 1 ? upMixKernel1 : upMixKernel)(
             [act, normed, up.weight, up.scales, up.biases!, inj],
             template: [
                 ("T", act.dtype), ("GS", up.groupSize), ("BITS", up.bits), ("H", hidden), ("HC", hcCount),
-                ("LW", LW), ("VPT", S), ("HAS_INJECT", hasInject), ("EMIT_F32", emitF32),
+                ("LW", LW), ("VPT", S), ("HAS_INJECT", hasInject), ("EMIT_F32", emitF32), ("DPT", dpt),
             ],
-            grid: (32, (hidden / 2) * 2, 1), threadGroup: (32, 2, 1),
+            grid: (32, (hidden / dpt) * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [[S, hidden], [S, hcCount], [emitF32 ? S : 1, emitF32 ? hidden : 1]],
             outputDTypes: [act.dtype, act.dtype, .float32])
         return (outs[0], outs[1], outs[2])
