@@ -1245,56 +1245,6 @@ struct PackedNAXGroup32 {
 };
 
 
-template <int BM>
-METAL_FUNC void p17_sorted_expert_tile(
-    const device uint32_t* indices,
-    int M,
-    int y_row,
-    int offset,
-    int offset_next,
-    uint32_t index,
-    thread int& begin,
-    thread int& end) {
-  int run_begin = y_row + offset;
-  if (offset == 0 && y_row > 0 && indices[y_row - 1] == index) {
-    int lo = 0;
-    int hi = y_row;
-    while (lo < hi) {
-      const int mid = lo + (hi - lo) / 2;
-      if (indices[mid] < index) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    run_begin = lo;
-  }
-
-  begin = run_begin;
-  if (begin < y_row) {
-    begin += ((y_row - begin + BM - 1) / BM) * BM;
-  }
-  end = begin;
-  if (begin >= y_row + offset_next) {
-    return;
-  }
-
-  // Only the next BM rows matter. Use <= rather than index+1 so uint32 max
-  // remains legal. Searches never dereference the half-open upper bound.
-  int lo = begin;
-  int hi = min(M, begin + BM);
-  while (lo < hi) {
-    const int mid = lo + (hi - lo) / 2;
-    if (indices[mid] <= index) {
-      lo = mid + 1;
-    } else {
-      hi = mid;
-    }
-  }
-  end = lo;
-}
-
-
 template <
     typename T,
     int group_size,
@@ -1312,8 +1262,8 @@ METAL_FUNC void track_prefill_indirect(
     const device T* biases,
     const device uint32_t* indices,
     const device uint32_t* token_rows,
+    const device uint32_t* tiles,
     device T* y,
-    int M,
     int N,
     int K,
     threadgroup T* Ws,
@@ -1340,9 +1290,7 @@ METAL_FUNC void track_prefill_indirect(
   const int K_it = K / BK;
   const size_t stride_w = size_t(N) * K_w;
   const size_t stride_s = size_t(N) * K_g;
-  const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
-  const short tgp_bm = short(min(BM, M - y_row));
 
   auto wl = (const device uint8_t*)w;
   wl += size_t(y_col) * K_w;
@@ -1361,32 +1309,17 @@ METAL_FUNC void track_prefill_indirect(
   const short tn = SN * (simd_group_id % WN);
   using AccumType = float;
 
-  uint32_t index;
-  short offset;
-  uint32_t index_next = indices[y_row];
-  short offset_next = 0;
-  int n = 0;
-  while (n < tgp_bm) {
-    n++;
-    offset = offset_next;
-    index = index_next;
-    offset_next = tgp_bm;
-    for (; n < tgp_bm; n++) {
-      if (indices[y_row + n] != index) {
-        offset_next = n;
-        index_next = indices[y_row + n];
-        break;
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_none);
-
-    int tile_begin;
-    int tile_end;
-    p17_sorted_expert_tile<BM>(
-        indices, M, y_row, offset, offset_next, index, tile_begin, tile_end);
+  // One tile per threadgroup row. The table (built by track_prefill_tile_table
+  // from the sorted ids) holds [begin, end) per tile, aligned to the expert
+  // run's start exactly as the former in-kernel scan aligned them; padding
+  // slots are [0, 0) and exit at once. Uniform over the whole threadgroup.
+  {
+    const int tile_begin = int(tiles[2 * tid.y]);
+    const int tile_end = int(tiles[2 * tid.y + 1]);
     if (tile_begin == tile_end) {
-      continue;  // Uniform over the ENTIRE threadgroup; no barrier is skipped by a subset.
+      return;
     }
+    const uint32_t index = indices[tile_begin];
     const short tile_m = short(tile_end - tile_begin);
     const short sgp_sm = short(min(int(SM), max(0, int(tile_m) - int(tm))));
     const bool sg_active = sgp_sm > 0;
