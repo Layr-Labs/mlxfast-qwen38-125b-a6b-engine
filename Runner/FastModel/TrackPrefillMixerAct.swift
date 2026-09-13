@@ -36,13 +36,20 @@ enum TrackPrefillMixerAct {
         let rows = x.dim(1)
         return kernel(
             [x, q.weight, q.scales, biases], template: [("T", x.dtype), ("M", rows)],
-            grid: (5 * 32, ((rows + 63) / 64) * 2, 2), threadGroup: (32, 2, 2),
+            grid: (5 * 32, ((rows + 31) / 32) * 2, 2), threadGroup: (32, 2, 2),
             outputShapes: [[1, rows, 320]], outputDTypes: [.bfloat16])[0]
     }
 
+    /// MLXFAST-MIXACTBM: the down projection is 1024x320x10240, so the stock
+    /// 64-row M tile leaves only 16 M tiles x 5 N tiles = 80 threadgroups for a
+    /// 40-core GPU. A 32-row M tile doubles that to 160. The K traversal is
+    /// untouched: `for (k = 0; k < K; k += BK)` with the same BK = 64 and the
+    /// same `kk1` MMAs inside, so every output element still accumulates its K
+    /// blocks in the same order -- only which rows share a threadgroup changes.
+    /// `TM = SM / 16` becomes 1 instead of 2 and the register tile halves.
     static let source = #"""
         threadgroup T Ws[64 * 72];
-        track_mixer_act_dense<T, 32, 4, true, 64, 64, 64, 2, 2>(
+        track_mixer_act_dense<T, 32, 4, true, 32, 64, 64, 2, 2>(
             w, scales, biases, x, y, Ws, 10240, 320, M,
             threadgroup_position_in_grid, thread_index_in_threadgroup,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
