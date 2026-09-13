@@ -1350,29 +1350,47 @@ METAL_FUNC void track_prefill_indirect(
         simd_lane_id);
 
     dispatch_bool(tile_m == BM, [&](auto kAlignedM) {
-      T a_buf[A_PER_THREAD];
+      // The activation slice is A_PER_THREAD * sizeof(T) = 32 or 16 contiguous
+      // bytes, and both ends of the copy are 16-byte aligned: `a_col` is a
+      // multiple of A_PER_THREAD elements and `BK_padded` is a multiple of 8
+      // elements. Move it as whole 16-byte vectors: same bytes, same order, two
+      // instructions per thread per K step instead of sixteen.
+      constexpr short A_VECS = A_PER_THREAD / (16 / sizeof(T));
+      uint4 a_buf[A_VECS];
       PackedNAXGroup32 packed_w;
       if (K_it > 0) {
         packed_w.prefetch(loader_w);
         if (a_live) {
-          const device T* a0 = xb;
+          const device uint4* a0 = (const device uint4*)xb;
           STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < A_PER_THREAD; ++e) { a_buf[e] = a0[e]; }
+          for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a0[v]; }
         }
+      }
+      if (!a_live) {
+        // A dead row's slice of the activation stage is zero for every K step:
+        // `a_dst` never advances (only the device side does), so the fill is
+        // written once here instead of once per step, for half the threadgroup
+        // at the ranked window's row counts.
+        threadgroup uint4* d0 = (threadgroup uint4*)a_dst;
+        STEEL_PRAGMA_UNROLL
+        for (short v = 0; v < A_VECS; ++v) { d0[v] = uint4(0); }
+      }
+      if (!a_live) {
+        // A dead row's slice of the activation stage is zero for every K step:
+        // `a_dst` never advances (only the device side does), so the fill is
+        // written once here instead of once per step, for half the threadgroup
+        // at the ranked window's row counts.
+        threadgroup uint4* d0 = (threadgroup uint4*)a_dst;
+        STEEL_PRAGMA_UNROLL
+        for (short v = 0; v < A_VECS; ++v) { d0[v] = uint4(0); }
       }
       for (int k = 0; k < K_it; k++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         packed_w.store(loader_w.dst);
         if (a_live) {
+          threadgroup uint4* d4 = (threadgroup uint4*)a_dst;
           STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < A_PER_THREAD; ++e) {
-            a_dst[e] = a_buf[e];
-          }
-        } else {
-          STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < A_PER_THREAD; ++e) {
-            a_dst[e] = T(0);
-          }
+          for (short v = 0; v < A_VECS; ++v) { d4[v] = a_buf[v]; }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1380,9 +1398,9 @@ METAL_FUNC void track_prefill_indirect(
           loader_w.next();
           packed_w.prefetch(loader_w);
           if (a_live) {
-            const device T* a_next = xb + BK;
+            const device uint4* a_next = (const device uint4*)(xb + BK);
             STEEL_PRAGMA_UNROLL
-            for (short e = 0; e < A_PER_THREAD; ++e) { a_buf[e] = a_next[e]; }
+            for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a_next[v]; }
           }
         }
 
@@ -1562,16 +1580,22 @@ METAL_FUNC void track_prefill_indirect_gu(
         simd_lane_id);
 
     dispatch_bool(tile_m == BM, [&](auto kAlignedM) {
-      T a_buf[A_PER_THREAD];
+      // The activation slice is A_PER_THREAD * sizeof(T) = 32 or 16 contiguous
+      // bytes, and both ends of the copy are 16-byte aligned: `a_col` is a
+      // multiple of A_PER_THREAD elements and `BK_padded` is a multiple of 8
+      // elements. Move it as whole 16-byte vectors: same bytes, same order, two
+      // instructions per thread per K step instead of sixteen.
+      constexpr short A_VECS = A_PER_THREAD / (16 / sizeof(T));
+      uint4 a_buf[A_VECS];
       PackedNAXGroup32 packed_w0;
       PackedNAXGroup32 packed_w1;
       if (K_it > 0) {
         packed_w0.prefetch(loader_w0);
         packed_w1.prefetch(loader_w1);
         if (a_live) {
-          const device T* a0 = xb;
+          const device uint4* a0 = (const device uint4*)xb;
           STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < A_PER_THREAD; ++e) { a_buf[e] = a0[e]; }
+          for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a0[v]; }
         }
       }
       for (int k = 0; k < K_it; k++) {
@@ -1579,15 +1603,9 @@ METAL_FUNC void track_prefill_indirect_gu(
         packed_w0.store(loader_w0.dst);
         packed_w1.store(loader_w1.dst);
         if (a_live) {
+          threadgroup uint4* d4 = (threadgroup uint4*)a_dst;
           STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < A_PER_THREAD; ++e) {
-            a_dst[e] = a_buf[e];
-          }
-        } else {
-          STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < A_PER_THREAD; ++e) {
-            a_dst[e] = T(0);
-          }
+          for (short v = 0; v < A_VECS; ++v) { d4[v] = a_buf[v]; }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1597,9 +1615,9 @@ METAL_FUNC void track_prefill_indirect_gu(
           packed_w0.prefetch(loader_w0);
         packed_w1.prefetch(loader_w1);
           if (a_live) {
-            const device T* a_next = xb + BK;
+            const device uint4* a_next = (const device uint4*)(xb + BK);
             STEEL_PRAGMA_UNROLL
-            for (short e = 0; e < A_PER_THREAD; ++e) { a_buf[e] = a_next[e]; }
+            for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a_next[v]; }
           }
         }
 
