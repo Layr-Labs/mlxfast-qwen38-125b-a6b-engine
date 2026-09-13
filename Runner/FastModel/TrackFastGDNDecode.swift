@@ -141,10 +141,16 @@ enum TrackFastGDNDecode {
                     const int s_idx = 4 * lane + i;
                     state[i] = state[i] * gate_decay;
                     auto product = state[i] * static_cast<float>(k_[s_idx]);
-                    auto corrected = product - kv_compensation;
-                    auto next_sum = kv_mem + corrected;
-                    kv_compensation = (next_sum - kv_mem) - corrected;
-                    kv_mem = next_sum;
+                    // Peeled Kahan ends: i == 0 runs with kv_mem == 0 and
+                    // compensation == 0, and the last step's compensation is
+                    // never read. Guard inside; the bound stays unrolled.
+                    if (i == 0) { kv_mem = product; }
+                    else {
+                        auto corrected = product - kv_compensation;
+                        auto next_sum = kv_mem + corrected;
+                        if (i + 1 < 4) { kv_compensation = (next_sum - kv_mem) - corrected; }
+                        kv_mem = next_sum;
+                    }
                 }
             }
             kv_mem = simd_sum(kv_mem);
