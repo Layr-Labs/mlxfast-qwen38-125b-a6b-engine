@@ -1216,6 +1216,7 @@ extension TrackFastMoEKernels {
         ensureRowContiguous: true)
 
     static let gateUpReuseRowsPerSimdgroup = 2
+    static let gateUpReuseSimdgroups = 8
 
     static let gateUpReuseHelpers = #"""
         template <typename T, int group_size, int bits, int rows>
@@ -1300,7 +1301,7 @@ extension TrackFastMoEKernels {
         const device uint32_t* uw = shared ? wsh + (size_t)N * kw : wu + eoff * kw;
         const device T* us = shared ? ssh + (size_t)N * kg : su + eoff * kg;
         const device T* ub = shared ? bsh + (size_t)N * kg : bu + eoff * kg;
-        const int out_row = (int)threadgroup_position_in_grid.y * (2 * RPS)
+        const int out_row = (int)threadgroup_position_in_grid.y * (SGS * RPS)
             + (int)simdgroup_index_in_threadgroup * RPS;
         float g[RPS], u[RPS];
         qmv_fast_reg_dual<T, GS, BITS, RPS>(
@@ -1340,9 +1341,9 @@ extension TrackFastMoEKernels {
                 [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
                 template: [
                     ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N),
-                    ("KD", KD), ("BR", BR), ("RPS", rows),
+                    ("KD", KD), ("BR", BR), ("RPS", rows), ("SGS", gateUpReuseSimdgroups),
                 ],
-                grid: (32, N / rows, BR + 1), threadGroup: (32, 2, 1),
+                grid: (32, N / rows, BR + 1), threadGroup: (32, gateUpReuseSimdgroups, 1),
                 outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
         }
         return (S == 1 ? gateUpActKernel1 : gateUpActKernel)(
