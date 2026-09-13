@@ -290,6 +290,40 @@ struct BaseNAXFrag {
     }
   }
 
+  /// Vector form of `load` for a contiguous, vector-aligned threadgroup stage.
+  ///
+  /// `load` reads each fragment as `kElemRows` groups of `kElemCols` *scalar*
+  /// elements: for the P17 tile that is eight 2-byte loads per fragment, forty
+  /// per (A, B0, B1) triple per `kk1` step. The four elements inside one group
+  /// are contiguous, and every term of their address is a multiple of four
+  /// elements -- `str_x` and `off_y` are compile-time multiples of `kElemCols`,
+  /// and `get_coord().x` is `((qid & 2) | (lane & 1)) * 4` -- so the group is
+  /// 8-byte aligned and moves as one `vec<T,4>` load. The compiler cannot do
+  /// this itself: it cannot prove the alignment of a lane-dependent offset.
+  ///
+  /// Same elements, same registers, same order: this is `load` with the inner
+  /// loop replaced by one vector access.
+  template <int str_x, int off_x, int off_y, typename T>
+  METAL_FUNC static constexpr void load_vec4(
+      thread dtype_frag_t<T>& dst, const threadgroup T* src) {
+    static_assert(
+        str_x % kElemCols == 0, "P17 row stride is not vector aligned");
+    static_assert(
+        off_y % kElemCols == 0, "P17 column offset is not vector aligned");
+    const short2 sc = get_coord();
+    const threadgroup T* base = src + (sc.y + off_x) * str_x + sc.x + off_y;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      const metal::vec<T, kElemCols> v =
+          *reinterpret_cast<const threadgroup metal::vec<T, kElemCols>*>(
+              base + i * kElemRowsJump * str_x);
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < kElemCols; j++) {
+        dst[i * kElemCols + j] = v[j];
+      }
+    }
+  }
+
   template <
       typename T,
       typename SrcPtrType,
@@ -879,6 +913,22 @@ struct NAXTile {
     });
   }
 
+  /// `load` restricted to the case its own inner loop is scalar for: the P17
+  /// gather's threadgroup stages, whose column offsets and row strides are
+  /// vector aligned. See `BaseNAXFrag::load_vec4`.
+  template <int str_x>
+  METAL_FUNC void loadV(const threadgroup T* src) thread {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::template load_vec4<
+            str_x,
+            idx_row.value * kFragRows,
+            idx_col.value * kFragCols>(
+            frag_at<idx_row.value, idx_col.value>(), src);
+      });
+    });
+  }
+
   template <typename U, int str_x, int str_y>
   METAL_FUNC void store(threadgroup U* dst) const thread {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
@@ -1230,21 +1280,29 @@ struct PackedNAXGroup32 {
     const float s = float(scale);
     const float b = float(bias);
     float sc[2] = {s, s / 16.0f};
-    // MLXFAST-WVEC: the same per-value arithmetic, stored four values at a
-    // time (dst is 8-byte aligned: rows of 72/40 elements, column offsets of 32).
-    threadgroup vec<bfloat16_t, 4>* d4 = (threadgroup vec<bfloat16_t, 4>*)dst;
+    // MLXFAST-WVEC8: the same per-value arithmetic, stored eight values at a
+    // time. One `words[j]` holds the four bytes that dequantise into values
+    // `8j` through `8j + 7`, so the group is four 16-byte stores instead of
+    // eight 8-byte ones. `dst` is 16-byte aligned for every shape this kernel
+    // is launched with: the threadgroup stages are declared `alignas(16)`,
+    // their rows are 72 or 40 `bfloat16_t` (144 / 80 bytes), and `kk1` is a
+    // multiple of 16 elements.
+    threadgroup vec<bfloat16_t, 8>* d8 = (threadgroup vec<bfloat16_t, 8>*)dst;
     STEEL_PRAGMA_UNROLL
     for (int j = 0; j < 4; j++) {
-      STEEL_PRAGMA_UNROLL
-      for (int i = 0; i < 4; i += 2) {
-        const uint8_t w0 = uint8_t(words[j] >> (8 * i));
-        const uint8_t w1 = uint8_t(words[j] >> (8 * (i + 1)));
-        d4[2 * j + i / 2] = vec<bfloat16_t, 4>(
-            static_cast<bfloat16_t>(sc[0] * (w0 & 0x0f) + b),
-            static_cast<bfloat16_t>(sc[1] * (w0 & 0xf0) + b),
-            static_cast<bfloat16_t>(sc[0] * (w1 & 0x0f) + b),
-            static_cast<bfloat16_t>(sc[1] * (w1 & 0xf0) + b));
-      }
+      const uint8_t w0 = uint8_t(words[j]);
+      const uint8_t w1 = uint8_t(words[j] >> 8);
+      const uint8_t w2 = uint8_t(words[j] >> 16);
+      const uint8_t w3 = uint8_t(words[j] >> 24);
+      d8[j] = vec<bfloat16_t, 8>(
+          static_cast<bfloat16_t>(sc[0] * (w0 & 0x0f) + b),
+          static_cast<bfloat16_t>(sc[1] * (w0 & 0xf0) + b),
+          static_cast<bfloat16_t>(sc[0] * (w1 & 0x0f) + b),
+          static_cast<bfloat16_t>(sc[1] * (w1 & 0xf0) + b),
+          static_cast<bfloat16_t>(sc[0] * (w2 & 0x0f) + b),
+          static_cast<bfloat16_t>(sc[1] * (w2 & 0xf0) + b),
+          static_cast<bfloat16_t>(sc[0] * (w3 & 0x0f) + b),
+          static_cast<bfloat16_t>(sc[1] * (w3 & 0xf0) + b));
     }
   }
 };
@@ -1333,6 +1391,34 @@ METAL_FUNC void track_prefill_indirect(
     NAXTile<AccumType, TM, TN> Dtile;
     Dtile.clear();
 
+    // MLXFAST-ACC: see `track_prefill_indirect_gu`. The destination cooperative
+    // tensor lives across the whole K walk instead of being a per-call
+    // temporary.
+    constexpr auto acc_desc = mpp::tensor_ops::matmul2d_descriptor(
+        16,
+        32,
+        16,
+        false,
+        true,
+        true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<acc_desc, metal::execution_simdgroup> acc_op;
+    auto acc_a =
+        acc_op.template get_left_input_cooperative_tensor<T, T, AccumType>();
+    auto acc_b =
+        acc_op.template get_right_input_cooperative_tensor<T, T, AccumType>();
+    using AccAT = metal::remove_addrspace_t<decltype(acc_a)>;
+    using AccBT = metal::remove_addrspace_t<decltype(acc_b)>;
+    auto acc_c0 =
+        acc_op.template get_destination_cooperative_tensor<AccAT, AccBT, AccumType>();
+    auto acc_c1 =
+        acc_op.template get_destination_cooperative_tensor<AccAT, AccBT, AccumType>();
+    STEEL_PRAGMA_UNROLL
+    for (short e = 0; e < 2 * NAXTile<AccumType, TM, TN>::kElemsPerFrag; ++e) {
+      acc_c0[e] = AccumType(0);
+      acc_c1[e] = AccumType(0);
+    }
+
     constexpr short A_PER_THREAD = (BM * BK) / (WM * WN * SIMD_SIZE);  // 16 or 8
     constexpr short A_SPLIT = BK / A_PER_THREAD;                        // threads per row
     const short tgp_thread = short(simd_group_id * SIMD_SIZE + simd_lane_id);
@@ -1397,17 +1483,35 @@ METAL_FUNC void track_prefill_indirect(
 
             volatile int compiler_barrier;
 
-            Atile.template load<T, BKA_padded, 1>(
+            Atile.template loadV<BKA_padded>(
                 As + tm * BKA_padded + kk1);
 
-            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+            Btile.template loadV<BK_padded>(Ws + tn * BK_padded + kk1);
 
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile,
-                metal::bool_constant<transpose>{});
+            // The same walk `tile_matmad_nax` performs for TN % 2 == 0: `TN / 2`
+            // destination pairs, each accumulated by its own cooperative tensor.
+            STEEL_PRAGMA_UNROLL
+            for (short nn = 0; nn < TN; nn += 2) {
+              STEEL_PRAGMA_UNROLL
+              for (short kk = 0; kk < TK; ++kk) {
+                const thread auto& a_frag = Atile.frag_at(0, kk);
+                STEEL_PRAGMA_UNROLL
+                for (short e = 0; e < NAXTile<T, TM, TK>::kElemsPerFrag; ++e) {
+                  acc_a[e] = a_frag[e];
+                }
+                STEEL_PRAGMA_UNROLL
+                for (short e = 0; e < NAXTile<T, BR, BC>::kElemsPerFrag; ++e) {
+                  acc_b[e] = Btile.frag_at(nn, kk)[e];
+                  acc_b[NAXTile<T, BR, BC>::kElemsPerFrag + e] =
+                      Btile.frag_at(nn + 1, kk)[e];
+                }
+                if (nn == 0) {
+                  acc_op.run(acc_a, acc_b, acc_c0);
+                } else {
+                  acc_op.run(acc_a, acc_b, acc_c1);
+                }
+              }
+            }
 
             (void)compiler_barrier;
           }
@@ -1418,6 +1522,15 @@ METAL_FUNC void track_prefill_indirect(
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
       if (sg_active) {
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < NAXTile<AccumType, TM, TN>::kElemsPerFrag; ++e) {
+          Dtile.val_frags[0][e] = acc_c0[e];
+          Dtile.val_frags[1][e] =
+              acc_c0[NAXTile<AccumType, TM, TN>::kElemsPerFrag + e];
+          Dtile.val_frags[2][e] = acc_c1[e];
+          Dtile.val_frags[3][e] =
+              acc_c1[NAXTile<AccumType, TM, TN>::kElemsPerFrag + e];
+        }
         device T* yn = y + size_t(tile_begin + tm) * N + y_col + tn;
         if constexpr (kAlignedM.value) {
           Dtile.store(yn, N);
@@ -1535,6 +1648,38 @@ METAL_FUNC void track_prefill_indirect_gu(
     Dtile0.clear();
     Dtile1.clear();
 
+    // MLXFAST-ACC. The MMA's destination cooperative tensor is the accumulator
+    // and stays alive across the whole K walk. The per-call form copies the
+    // fragment pair into a fresh `ct_c` and back around every MMA -- eight
+    // times per thread per K step, sixteen fragment copies each way; keeping
+    // one `ct_c` per stream moves the value out of the accumulator exactly
+    // once, at the end. The MMA sequence, its operands and its order are
+    // unchanged, so every output element accumulates in the same order.
+    constexpr auto acc_desc = mpp::tensor_ops::matmul2d_descriptor(
+        16,
+        32,
+        16,
+        false,
+        true,
+        true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<acc_desc, metal::execution_simdgroup> acc_op;
+    auto acc_a =
+        acc_op.template get_left_input_cooperative_tensor<T, T, AccumType>();
+    auto acc_b =
+        acc_op.template get_right_input_cooperative_tensor<T, T, AccumType>();
+    using AccAT = metal::remove_addrspace_t<decltype(acc_a)>;
+    using AccBT = metal::remove_addrspace_t<decltype(acc_b)>;
+    auto acc_c0 =
+        acc_op.template get_destination_cooperative_tensor<AccAT, AccBT, AccumType>();
+    auto acc_c1 =
+        acc_op.template get_destination_cooperative_tensor<AccAT, AccBT, AccumType>();
+    STEEL_PRAGMA_UNROLL
+    for (short e = 0; e < 2 * NAXTile<AccumType, TM, TN>::kElemsPerFrag; ++e) {
+      acc_c0[e] = AccumType(0);
+      acc_c1[e] = AccumType(0);
+    }
+
     constexpr short A_PER_THREAD = (BM * BK) / (WM * WN * SIMD_SIZE);  // 16 or 8
     constexpr short A_SPLIT = BK / A_PER_THREAD;                        // threads per row
     const short tgp_thread = short(simd_group_id * SIMD_SIZE + simd_lane_id);
@@ -1613,24 +1758,38 @@ METAL_FUNC void track_prefill_indirect_gu(
 
             volatile int compiler_barrier;
 
-            Atile.template load<T, BKA_padded, 1>(
+            Atile.template loadV<BKA_padded>(
                 As + tm * BKA_padded + kk1);
 
-            Btile0.template load<T, BK_padded, 1>(Ws0 + tn * BK_padded + kk1);
-            Btile1.template load<T, BK_padded, 1>(Ws1 + tn * BK_padded + kk1);
+            Btile0.template loadV<BK_padded>(Ws0 + tn * BK_padded + kk1);
+            Btile1.template loadV<BK_padded>(Ws1 + tn * BK_padded + kk1);
 
-            tile_matmad_nax(
-                Dtile0,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile0,
-                metal::bool_constant<transpose>{});
-            tile_matmad_nax(
-                Dtile1,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile1,
-                metal::bool_constant<transpose>{});
+            // The same walk `tile_matmad_nax` performs for TN = 2: for each
+            // `kk` the A fragment goes to the left operand, the two B
+            // fragments to the right one, and the MMA accumulates into the
+            // stream's own destination tensor.
+            STEEL_PRAGMA_UNROLL
+            for (short kk = 0; kk < TK; ++kk) {
+              const thread auto& a_frag = Atile.frag_at(0, kk);
+              STEEL_PRAGMA_UNROLL
+              for (short e = 0; e < NAXTile<T, TM, TK>::kElemsPerFrag; ++e) {
+                acc_a[e] = a_frag[e];
+              }
+              STEEL_PRAGMA_UNROLL
+              for (short e = 0; e < NAXTile<T, BR, BC>::kElemsPerFrag; ++e) {
+                acc_b[e] = Btile0.frag_at(0, kk)[e];
+                acc_b[NAXTile<T, BR, BC>::kElemsPerFrag + e] =
+                    Btile0.frag_at(1, kk)[e];
+              }
+              acc_op.run(acc_a, acc_b, acc_c0);
+              STEEL_PRAGMA_UNROLL
+              for (short e = 0; e < NAXTile<T, BR, BC>::kElemsPerFrag; ++e) {
+                acc_b[e] = Btile1.frag_at(0, kk)[e];
+                acc_b[NAXTile<T, BR, BC>::kElemsPerFrag + e] =
+                    Btile1.frag_at(1, kk)[e];
+              }
+              acc_op.run(acc_a, acc_b, acc_c1);
+            }
 
             (void)compiler_barrier;
           }
@@ -1641,6 +1800,15 @@ METAL_FUNC void track_prefill_indirect_gu(
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
       if (sg_active) {
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < NAXTile<AccumType, TM, TN>::kElemsPerFrag; ++e) {
+          Dtile0.val_frags[0][e] = acc_c0[e];
+          Dtile0.val_frags[1][e] =
+              acc_c0[NAXTile<AccumType, TM, TN>::kElemsPerFrag + e];
+          Dtile1.val_frags[0][e] = acc_c1[e];
+          Dtile1.val_frags[1][e] =
+              acc_c1[NAXTile<AccumType, TM, TN>::kElemsPerFrag + e];
+        }
         const size_t yoff = size_t(tile_begin + tm) * N + y_col + tn;
         if constexpr (SILU) {
           // silu(gate) * up, op for op as MLX's compiled `silu(gate) * up`: the
