@@ -44,7 +44,9 @@ enum TrackFastMixerKernels {
                 if (lid == 0) {
                     for (int i = 0; i < RPS; ++i) {
                         const T l = static_cast<T>(r[i]);
+        #ifndef TRACK_MIXER_OMIT_LO
                         lo[tile * (2 * RPS) + (int)sg * RPS + i] = l;
+        #endif
                         act[tile * (2 * RPS) + (int)sg * RPS + i] = mlx_silu(l);
                     }
                 }
@@ -55,7 +57,9 @@ enum TrackFastMixerKernels {
                 if ((lid % 8) == 0) {
                     for (int v = 0; v < VPT; ++v) {
                         const T l = static_cast<T>(r[v]);
+        #ifndef TRACK_MIXER_OMIT_LO
                         lo[v * ND + row] = l;
+        #endif
                         act[v * ND + row] = mlx_silu(l);
                     }
                 }
@@ -93,10 +97,15 @@ enum TrackFastMixerKernels {
         inputNames: ["normed", "wd", "sd", "bd", "wi", "si", "bi"],
         outputNames: ["lo", "act", "inj"],
         source: downInjectSource, header: header1, ensureRowContiguous: true)
+    private static let downInjectLiveKernel1 = MLXFast.metalKernel(
+        name: "track_mixer_down_inject_live_1",
+        inputNames: ["normed", "wd", "sd", "bd", "wi", "si", "bi"],
+        outputNames: ["act", "inj"], source: downInjectSource,
+        header: header1 + "\n#define TRACK_MIXER_OMIT_LO\n", ensureRowContiguous: true)
 
     static func downInject(
-        normed: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?
-    ) -> (lo: MLXArray, act: MLXArray, inj: MLXArray) {
+        normed: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?, includeLo: Bool = false
+    ) -> (lo: MLXArray?, act: MLXArray, inj: MLXArray) {
         let S = normed.dim(0), KD = normed.dim(1), ND = down.rows
         let HC = inject?.rows ?? 4
         precondition(S >= 1 && S <= 8 && ND % 8 == 0 && KD % 512 == 0 && down.bits == 4)
@@ -105,15 +114,18 @@ enum TrackFastMixerKernels {
         let rowsPerSimdgroup = S == 1 ? downRowsPerSimdgroup : 4
         // MLXFAST-INJSPLIT: add two inject tiles only to the one-token path.
         let tiles = ND / (2 * rowsPerSimdgroup) + (inject != nil ? (S == 1 ? 2 : 1) : 0)
-        let outs = (S == 1 ? downInjectKernel1 : downInjectKernel)(
+        let liveOnly = S == 1 && !includeLo
+        let kernel = liveOnly ? downInjectLiveKernel1 : (S == 1 ? downInjectKernel1 : downInjectKernel)
+        let outs = kernel(
             [normed, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
             template: [
                 ("T", normed.dtype), ("GS", down.groupSize), ("BITS", down.bits), ("KD", KD), ("ND", ND),
                 ("HC", HC), ("VPT", S), ("HAS_INJECT", inject != nil),
             ],
             grid: (32, tiles * 2, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[S, ND], [S, ND], [S, HC]], outputDTypes: [normed.dtype, normed.dtype, normed.dtype])
-        return (outs[0], outs[1], outs[2])
+            outputShapes: (liveOnly ? [] : [[S, ND]]) + [[S, ND], [S, HC]],
+            outputDTypes: Array(repeating: normed.dtype, count: liveOnly ? 2 : 3))
+        return liveOnly ? (nil, outs[0], outs[1]) : (outs[0], outs[1], outs[2])
     }
 
     /// lo [S, LW] (pre-silu), normed [S, HC*H], inj [S, HC] -> input [S, H], inject [S, HC].
@@ -151,7 +163,9 @@ enum TrackFastMixerKernels {
                     acc = acc + p;
                 }
                 input[(size_t)v * (size_t)H + (size_t)d] = acc;
+        #ifndef TRACK_MIXER_OMIT_INPUTF
                 if (EMIT_F32) { inputF[(size_t)v * (size_t)H + (size_t)d] = static_cast<float>(acc); }
+        #endif
             }
         }
         if (HAS_INJECT && tile == 0 && t < (uint)(HC * VPT)) {
@@ -170,23 +184,30 @@ enum TrackFastMixerKernels {
         inputNames: ["act", "normed", "wu", "su", "bu", "inj"],
         outputNames: ["input", "inject", "inputF"],
         source: upMixSource, header: header1, ensureRowContiguous: true)
+    private static let upMixLiveKernel1 = MLXFast.metalKernel(
+        name: "track_mixer_up_mix_live_1",
+        inputNames: ["act", "normed", "wu", "su", "bu", "inj"],
+        outputNames: ["input", "inject"], source: upMixSource,
+        header: header1 + "\n#define TRACK_MIXER_OMIT_INPUTF\n", ensureRowContiguous: true)
 
     static func upMix(
         act: MLXArray, normed: MLXArray, up: TrackQuantWeight, inj: MLXArray, hcCount: Int, hidden: Int,
         hasInject: Bool, emitF32: Bool = false
-    ) -> (input: MLXArray, inject: MLXArray, inputF32: MLXArray) {
+    ) -> (input: MLXArray, inject: MLXArray, inputF32: MLXArray?) {
         let S = act.dim(0), LW = act.dim(1)
         precondition(S >= 1 && S <= 8 && hidden % 2 == 0 && up.rows == hcCount * hidden && up.bits == 4)
         precondition(LW % 32 == 0 && LW < 512 + 256)  // K = 320: one full block + a tail, the `qmv` normal branch
-        let outs = (S == 1 ? upMixKernel1 : upMixKernel)(
+        let liveOnly = S == 1 && !emitF32
+        let kernel = liveOnly ? upMixLiveKernel1 : (S == 1 ? upMixKernel1 : upMixKernel)
+        let outs = kernel(
             [act, normed, up.weight, up.scales, up.biases!, inj],
             template: [
                 ("T", act.dtype), ("GS", up.groupSize), ("BITS", up.bits), ("H", hidden), ("HC", hcCount),
                 ("LW", LW), ("VPT", S), ("HAS_INJECT", hasInject), ("EMIT_F32", emitF32),
             ],
             grid: (32, (hidden / 2) * 2, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[S, hidden], [S, hcCount], [emitF32 ? S : 1, emitF32 ? hidden : 1]],
-            outputDTypes: [act.dtype, act.dtype, .float32])
-        return (outs[0], outs[1], outs[2])
+            outputShapes: [[S, hidden], [S, hcCount]] + (liveOnly ? [] : [[emitF32 ? S : 1, emitF32 ? hidden : 1]]),
+            outputDTypes: [act.dtype, act.dtype] + (liveOnly ? [] : [.float32]))
+        return (outs[0], outs[1], liveOnly ? nil : outs[2])
     }
 }

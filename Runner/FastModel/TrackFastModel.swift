@@ -473,14 +473,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             if hc.hasInject, case .quant(let q)? = hc.inject, q.biases != nil { injQ = q }
             if !hc.hasInject || injQ != nil {
                 let n2 = normed.reshaped(S, hcCount * hidden)
-                let d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
+                let d = TrackFastMixerKernels.downInject(
+                    normed: n2, down: dq, inject: injQ, includeLo: Self.debugTaps != nil && !tag.isEmpty)
                 let u = TrackFastMixerKernels.upMix(
                     act: d.act, normed: n2, up: uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
                     hasInject: hc.hasInject, emitF32: emitF32)
-                let f32 = emitF32 ? u.inputF32.reshaped(1, S, hidden) : nil
+                let f32 = emitF32 ? u.inputF32?.reshaped(1, S, hidden) : nil
                 if Self.debugTaps != nil, !tag.isEmpty {
                     Self.debugTaps?.append((tag + ".normedQ", normed))
-                    Self.debugTaps?.append((tag + ".lo", d.lo.reshaped(1, S, -1)))
+                    if let lo = d.lo { Self.debugTaps?.append((tag + ".lo", lo.reshaped(1, S, -1))) }
                     Self.debugTaps?.append((tag + ".inj", d.inj.reshaped(1, S, -1)))
                 }
                 return (u.input.reshaped(1, S, hidden), u.inject.reshaped(1, S, hcCount), f32)
