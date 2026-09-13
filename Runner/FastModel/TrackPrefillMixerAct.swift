@@ -40,6 +40,33 @@ enum TrackPrefillMixerAct {
             outputShapes: [[1, rows, 320]], outputDTypes: [.bfloat16])[0]
     }
 
+    static func upMix(
+        _ projection: TrackProj, act: MLXArray, normed: MLXArray, inj: MLXArray,
+        hasInject: Bool, hcCount: Int, hidden: Int
+    ) -> (input: MLXArray, inject: MLXArray)? {
+        guard supportsNAX, StreamOrDevice.default.stream == Stream.gpu,
+            hcCount == 4, hidden == 2560, act.ndim == 3,
+            act.dim(0) == 1, act.dim(1) >= 1024, act.dim(2) == 320,
+            act.dtype == .bfloat16,
+            normed.shape == [1, act.dim(1), 10240], normed.dtype == .bfloat16,
+            inj.ndim == 3, inj.dim(0) == 1, inj.dim(1) == act.dim(1),
+            inj.dtype == .bfloat16, !hasInject || inj.dim(2) == 4,
+            case .quant(let q) = projection, q.groupSize == 32, q.bits == 4,
+            q.mode == .affine, q.weight.shape == [10240, 40], q.weight.dtype == .uint32,
+            q.scales.shape == [10240, 10], q.scales.dtype == .bfloat16,
+            let biases = q.biases, biases.shape == q.scales.shape, biases.dtype == .bfloat16
+        else { return nil }
+        let rows = act.dim(1)
+        let result = upMixKernel(
+            [q.weight, q.scales, biases, act, normed, inj],
+            template: [("T", act.dtype), ("M", rows), ("N", 10240), ("K", 320),
+                ("HAS_INJECT", hasInject)],
+            grid: (40 * 32, ((rows + 63) / 64) * 2, 2), threadGroup: (32, 2, 2),
+            outputShapes: [[1, rows, 2560], [1, rows, 4]],
+            outputDTypes: [.bfloat16, .bfloat16])
+        return (result[0], result[1])
+    }
+
     static let source = #"""
         threadgroup T Ws[64 * 72];
         track_mixer_act_dense<T, 32, 4, true, 64, 64, 64, 2, 2>(

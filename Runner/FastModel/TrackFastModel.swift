@@ -507,6 +507,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 act = TrackFastKernels.siluHead(lo: lo, width: hc.lowrank)
             }
         }
+        if Self.debugTaps == nil,
+            let fused = TrackPrefillMixerAct.upMix(
+                hc.up, act: act, normed: normed, inj: inj, hasInject: hc.hasInject,
+                hcCount: hcCount, hidden: hidden)
+        {
+            return (fused.input, fused.inject, nil)
+        }
         let w = hc.up.apply(act)  // [B,S,W], pre-sigmoid
         if Self.debugTaps != nil, !tag.isEmpty {
             Self.debugTaps?.append((tag + ".normedQ", normed))
