@@ -1697,17 +1697,11 @@ METAL_FUNC void track_prefill_indirect_gu(
     Dtile0.clear();
     Dtile1.clear();
 
-    // MLXFAST-ACC. The MMA's destination cooperative tensor is the accumulator
-    // and stays alive across the whole K walk. The per-call form copies the
-    // fragment pair into a fresh `ct_c` and back around every MMA -- eight
-    // times per thread per K step, sixteen fragment copies each way; keeping
-    // one `ct_c` per stream moves the value out of the accumulator exactly
-    // once, at the end. The MMA sequence, its operands and its order are
-    // unchanged, so every output element accumulates in the same order.
+    constexpr short acc_k = BN == 64 && BK == 64 ? 32 : 16;
     constexpr auto acc_desc = mpp::tensor_ops::matmul2d_descriptor(
         16,
         32,
-        16,
+        acc_k,
         false,
         true,
         true,
@@ -1801,43 +1795,55 @@ METAL_FUNC void track_prefill_indirect_gu(
         STEEL_PRAGMA_UNROLL
         for (int kk1 = 0; kk1 < BK; kk1 += SK) {
           if (sg_active) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<T, BR, BC> Btile0;
-            NAXTile<T, BR, BC> Btile1;
-
             volatile int compiler_barrier;
-
-            Atile.template loadV<BKA_padded>(
-                As + tm * BKA_padded + kk1);
-
-            Btile0.template loadV<BK_padded>(Ws0 + tn * BK_padded + kk1);
-            Btile1.template loadV<BK_padded>(Ws1 + tn * BK_padded + kk1);
-
-            // The same walk `tile_matmad_nax` performs for TN = 2: for each
-            // `kk` the A fragment goes to the left operand, the two B
-            // fragments to the right one, and the MMA accumulates into the
-            // stream's own destination tensor.
-            STEEL_PRAGMA_UNROLL
-            for (short kk = 0; kk < TK; ++kk) {
-              const thread auto& a_frag = Atile.frag_at(0, kk);
-              STEEL_PRAGMA_UNROLL
-              for (short e = 0; e < NAXTile<T, TM, TK>::kElemsPerFrag; ++e) {
-                acc_a[e] = a_frag[e];
+            if constexpr (acc_k == 32) {
+              for (ushort e = 0; e < 16; ++e) {
+                auto c = acc_a.get_multidimensional_index(e);
+                acc_a[e] = As[(tm + c[1]) * BKA_padded + kk1 + c[0]];
               }
-              STEEL_PRAGMA_UNROLL
-              for (short e = 0; e < NAXTile<T, BR, BC>::kElemsPerFrag; ++e) {
-                acc_b[e] = Btile0.frag_at(0, kk)[e];
-                acc_b[NAXTile<T, BR, BC>::kElemsPerFrag + e] =
-                    Btile0.frag_at(1, kk)[e];
+              for (ushort e = 0; e < 32; ++e) {
+                auto c = acc_b.get_multidimensional_index(e);
+                acc_b[e] = Ws0[(tn + c[1]) * BK_padded + kk1 + c[0]];
               }
               acc_op.run(acc_a, acc_b, acc_c0);
-              STEEL_PRAGMA_UNROLL
-              for (short e = 0; e < NAXTile<T, BR, BC>::kElemsPerFrag; ++e) {
-                acc_b[e] = Btile1.frag_at(0, kk)[e];
-                acc_b[NAXTile<T, BR, BC>::kElemsPerFrag + e] =
-                    Btile1.frag_at(1, kk)[e];
+              for (ushort e = 0; e < 32; ++e) {
+                auto c = acc_b.get_multidimensional_index(e);
+                acc_b[e] = Ws1[(tn + c[1]) * BK_padded + kk1 + c[0]];
               }
               acc_op.run(acc_a, acc_b, acc_c1);
+            } else {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<T, BR, BC> Btile0;
+              NAXTile<T, BR, BC> Btile1;
+
+              Atile.template loadV<BKA_padded>(
+                  As + tm * BKA_padded + kk1);
+
+              Btile0.template loadV<BK_padded>(Ws0 + tn * BK_padded + kk1);
+              Btile1.template loadV<BK_padded>(Ws1 + tn * BK_padded + kk1);
+
+              STEEL_PRAGMA_UNROLL
+              for (short kk = 0; kk < TK; ++kk) {
+                const thread auto& a_frag = Atile.frag_at(0, kk);
+                STEEL_PRAGMA_UNROLL
+                for (short e = 0; e < NAXTile<T, TM, TK>::kElemsPerFrag; ++e) {
+                  acc_a[e] = a_frag[e];
+                }
+                STEEL_PRAGMA_UNROLL
+                for (short e = 0; e < NAXTile<T, BR, BC>::kElemsPerFrag; ++e) {
+                  acc_b[e] = Btile0.frag_at(0, kk)[e];
+                  acc_b[NAXTile<T, BR, BC>::kElemsPerFrag + e] =
+                      Btile0.frag_at(1, kk)[e];
+                }
+                acc_op.run(acc_a, acc_b, acc_c0);
+                STEEL_PRAGMA_UNROLL
+                for (short e = 0; e < NAXTile<T, BR, BC>::kElemsPerFrag; ++e) {
+                  acc_b[e] = Btile1.frag_at(0, kk)[e];
+                  acc_b[NAXTile<T, BR, BC>::kElemsPerFrag + e] =
+                      Btile1.frag_at(1, kk)[e];
+                }
+                acc_op.run(acc_a, acc_b, acc_c1);
+              }
             }
 
             (void)compiler_barrier;
