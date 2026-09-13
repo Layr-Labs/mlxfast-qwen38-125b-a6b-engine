@@ -46,7 +46,98 @@ enum TrackFastGDNDecode {
         return (result[1], result[0], result[2])
     }
 
-    private static let source = #"""
+    private static let projectionKernel = MLXFast.metalKernel(
+        name: "track_gdn_projection_convolution",
+        inputNames: ["weight", "scales", "biases", "x", "conv_state", "conv_w"],
+        outputNames: ["prepared", "conv_out"], source: projectionSource,
+        header: TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader
+            + TrackFastMoEKernels.regHelpers,
+        ensureRowContiguous: true)
+
+    private static let preparedKernel = MLXFast.metalKernel(
+        name: "track_gdn_decode_prepared",
+        inputNames: ["proj", "neg_exp_alog", "dt_bias", "state_in", "w"],
+        outputNames: ["state_out", "gated"], source: preparedSource,
+        header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
+
+    static func projectAndApply(
+        _ projection: TrackProj?, x: MLXArray, convState: MLXArray, convW: MLXArray,
+        negExpALog: MLXArray, dtBias: MLXArray, stateIn: MLXArray, normW: MLXArray,
+        zOffset: Int, eps: Float, capture: Bool, geometry g: TrackFastKernels.GDNGeometry
+    ) -> (gated: MLXArray, stateOut: MLXArray, convOut: MLXArray)? {
+        guard !capture, StreamOrDevice.default.stream == Stream.gpu,
+            x.shape == [1, 1, 2560], x.dtype == .bfloat16,
+            let projection, case .quant(let q) = projection,
+            q.mode == .affine, q.bits == 4, q.groupSize == 32,
+            q.weight.shape == [16480, 320], q.weight.dtype == .uint32,
+            q.scales.shape == [16480, 80], q.scales.dtype == .bfloat16,
+            let biases = q.biases, biases.shape == q.scales.shape, biases.dtype == .bfloat16,
+            g.dk == 128, g.dv == 128, g.hk == 16, g.hv == 48,
+            g.convKernel == 4, g.convDim == 10240, g.projWidth == 16480,
+            zOffset == 10240, g.bOffset == 16384, g.aOffset == 16432,
+            convState.shape == [1, 3, 10240], convState.dtype == .bfloat16,
+            convW.shape == [10240, 4], convW.dtype == .bfloat16,
+            stateIn.shape == [1, 48, 128, 128], stateIn.dtype == .float32,
+            negExpALog.shape == [48], negExpALog.dtype == .float32,
+            dtBias.shape == [48], dtBias.dtype == .bfloat16,
+            normW.shape == [128], normW.dtype == .bfloat16
+        else { return nil }
+        let prepared = projectionKernel(
+            [q.weight, q.scales, biases, x, convState, convW],
+            template: [("T", x.dtype), ("K", 2560), ("PW", 16480),
+                ("CONV_DIM", 10240), ("KC", 4)],
+            grid: (32, 16480 / 4, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, 1, 16480], [1, 3, 10240]],
+            outputDTypes: [.bfloat16, .bfloat16])
+        let result = preparedKernel(
+            [prepared[0], negExpALog, dtBias, stateIn, normW],
+            template: [
+                ("InT", x.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
+                ("Hk", g.hk), ("Hv", g.hv), ("KC", g.convKernel), ("CONV_DIM", g.convDim),
+                ("PW", g.projWidth), ("B_OFF", g.bOffset), ("A_OFF", g.aOffset),
+                ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)), ("RPS", 4),
+            ],
+            grid: (32, g.dv / 4, g.hv),
+            threadGroup: (32, g.dv / 4, 1),
+            outputShapes: [[1, g.hv, g.dv, g.dk], [1, 1, g.hv * g.dv]],
+            outputDTypes: [.float32, .bfloat16])
+        return (result[1], result[0], prepared[1])
+    }
+
+    private static let projectionSource = #"""
+        const uint b = threadgroup_position_in_grid.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint row0 = threadgroup_position_in_grid.y * 8 + simdgroup_index_in_threadgroup * 4;
+        float result[4];
+        qmv_fast_reg<T, 32, 4>(weight, scales, biases, x + (size_t)b * K, K, row0, lane, result);
+        if (lane == 0) {
+            for (int i = 0; i < 4; ++i) {
+                const uint ch = row0 + i;
+                const T raw = static_cast<T>(result[i]);
+                if (ch < CONV_DIM) {
+                    float cacc = 0.0f;
+                    for (int j = 0; j < KC; ++j) {
+                        const float value = j < KC - 1
+                            ? static_cast<float>(conv_state[((size_t)b * (KC - 1) + j) * CONV_DIM + ch])
+                            : static_cast<float>(raw);
+                        cacc += value * conv_w[ch * KC + j];
+                    }
+                    prepared[(size_t)b * PW + ch] = mlx_silu(static_cast<T>(cacc));
+                    for (int j = 0; j < KC - 1; ++j) {
+                        conv_out[((size_t)b * (KC - 1) + j) * CONV_DIM + ch] = j + 1 < KC - 1
+                            ? conv_state[((size_t)b * (KC - 1) + j + 1) * CONV_DIM + ch] : raw;
+                    }
+                } else {
+                    prepared[(size_t)b * PW + ch] = raw;
+                }
+            }
+        }
+        """#
+
+    private static let source = preparationSource + stateUpdateSource
+    private static let preparedSource = preparedPreparationSource + stateUpdateSource
+
+    private static let preparationSource = #"""
         static_assert(Dk == 128 && Dv == 128, "GDN head geometry");
         const uint n = threadgroup_position_in_grid.z;
         const uint b_idx = n / Hv;
@@ -105,6 +196,51 @@ enum TrackFastGDNDecode {
                 }
             }
         }
+        """# + "\n"
+
+    private static let preparedPreparationSource = #"""
+        static_assert(Dk == 128 && Dv == 128, "GDN head geometry");
+        const uint n = threadgroup_position_in_grid.z;
+        const uint b_idx = n / Hv;
+        const uint hv_idx = n % Hv;
+        const uint hk_idx = hv_idx / (Hv / Hk);
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        constexpr int KM1 = KC - 1;
+        threadgroup InT q_shared[Dk];
+        threadgroup InT k_shared[Dk];
+        threadgroup InT v_shared[Dv];
+        threadgroup float gb_shared[2];
+        if (sg < 3) {
+            const uint vec = sg == 0 ? hk_idx : (sg == 1 ? Hk + hk_idx : 2 * Hk + hv_idx);
+            const device InT* proj_b = proj + b_idx * PW;
+            float thread_x[4];
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                const uint ch = vec * 128 + lane * 4 + i;
+                thread_x[i] = static_cast<float>(proj_b[ch]);
+                acc += thread_x[i] * thread_x[i];
+            }
+            if (sg < 2) {
+                acc = simd_sum(acc);
+                const float inv_mean = metal::precise::rsqrt(acc / 128.0f + 1e-6f);
+                const float inv_scale = metal::rsqrt(static_cast<float>(Dk));
+                const InT q_mul = static_cast<InT>(inv_scale * inv_scale);
+                const InT k_mul = static_cast<InT>(inv_scale);
+                for (int i = 0; i < 4; ++i) {
+                    const InT normalized = static_cast<InT>(thread_x[i] * inv_mean);
+                    const uint d = lane * 4 + i;
+                    if (sg == 0) { q_shared[d] = q_mul * normalized; }
+                    else { k_shared[d] = k_mul * normalized; }
+                }
+            } else {
+                for (int i = 0; i < 4; ++i) { v_shared[lane * 4 + i] = static_cast<InT>(thread_x[i]); }
+            }
+
+        }
+        """# + "\n"
+
+    private static let stateUpdateSource = #"""
         if (sg == 0 && lane == 0) {
             const device InT* row = proj + b_idx * PW;
             const InT b_raw = row[B_OFF + hv_idx];

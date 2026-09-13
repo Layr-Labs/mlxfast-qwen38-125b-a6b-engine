@@ -537,33 +537,41 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let geo = separate ? TrackP12Prefill.splitGeometry(g.geometry) : g.geometry
         let prof = TrackFastProfile.prefill != nil && S >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
-        let split = separate ? g.proj.parts.map { $0.apply(x) } : nil
-        let proj = split?[0] ?? g.proj.apply(x)  // [B,S,PROJ_W]
-        if prof { TrackFastProfile.tick("gdn.proj", &pt, split ?? [proj]) }
         let state = evaluation.inputState(modelLayerIndex: layerIndex)
         let convState =
             state?.conv ?? MLXArray.zeros([B, geo.convKernel - 1, geo.convDim], dtype: x.dtype)
         let ssm =
             state?.ssm ?? MLXArray.zeros([B, geo.hv, geo.dv, geo.dk], dtype: .float32)
         let gated: MLXArray, convOut: MLXArray, stateOut: MLXArray
-        if let fused = TrackFastGDNDecode.apply(
-            proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
-            dtBias: g.dtBias, stateIn: ssm, normW: g.normW, zOffset: g.zOffset,
-            eps: 1e-6, capture: capture, geometry: geo)
+        if let prepared = TrackFastGDNDecode.projectAndApply(
+            g.proj.fused, x: x, convState: convState, convW: g.convW,
+            negExpALog: g.negExpALog, dtBias: g.dtBias, stateIn: ssm, normW: g.normW,
+            zOffset: g.zOffset, eps: 1e-6, capture: capture, geometry: geo)
         {
-            (gated, convOut, stateOut) = (fused.gated, fused.convOut, fused.stateOut)
-            if prof { TrackFastProfile.tick("gdn.decodeFused", &pt, [gated, stateOut, convOut]) }
+            (gated, convOut, stateOut) = (prepared.gated, prepared.convOut, prepared.stateOut)
         } else {
-            let r = TrackFastKernels.gdn(
+            let split = separate ? g.proj.parts.map { $0.apply(x) } : nil
+            let proj = split?[0] ?? g.proj.apply(x)  // [B,S,PROJ_W]
+            if prof { TrackFastProfile.tick("gdn.proj", &pt, split ?? [proj]) }
+            if let fused = TrackFastGDNDecode.apply(
                 proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
-                dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo,
-                separateBA: split.map { (b: $0[2], a: $0[3]) })
-            if prof { TrackFastProfile.tick("gdn.prep+lean", &pt, [r.y, r.stateOut, r.convOut]) }
-            gated = TrackFastKernels.gatedRMS(
-                y: r.y, proj: split?[1] ?? proj, w: g.normW,
-                zOffset: separate ? 0 : g.zOffset, eps: 1e-6)
-            (convOut, stateOut) = (r.convOut, r.stateOut)
-            if prof { TrackFastProfile.tick("gdn.gatedRMS", &pt, [gated]) }
+                dtBias: g.dtBias, stateIn: ssm, normW: g.normW, zOffset: g.zOffset,
+                eps: 1e-6, capture: capture, geometry: geo)
+            {
+                (gated, convOut, stateOut) = (fused.gated, fused.convOut, fused.stateOut)
+                if prof { TrackFastProfile.tick("gdn.decodeFused", &pt, [gated, stateOut, convOut]) }
+            } else {
+                let r = TrackFastKernels.gdn(
+                    proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
+                    dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo,
+                    separateBA: split.map { (b: $0[2], a: $0[3]) })
+                if prof { TrackFastProfile.tick("gdn.prep+lean", &pt, [r.y, r.stateOut, r.convOut]) }
+                gated = TrackFastKernels.gatedRMS(
+                    y: r.y, proj: split?[1] ?? proj, w: g.normW,
+                    zOffset: separate ? 0 : g.zOffset, eps: 1e-6)
+                (convOut, stateOut) = (r.convOut, r.stateOut)
+                if prof { TrackFastProfile.tick("gdn.gatedRMS", &pt, [gated]) }
+            }
         }
         do {
             if capture {
