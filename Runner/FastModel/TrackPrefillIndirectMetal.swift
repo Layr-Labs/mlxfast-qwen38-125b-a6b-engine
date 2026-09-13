@@ -290,6 +290,40 @@ struct BaseNAXFrag {
     }
   }
 
+  /// Vector form of `load` for a contiguous, vector-aligned threadgroup stage.
+  ///
+  /// `load` reads each fragment as `kElemRows` groups of `kElemCols` *scalar*
+  /// elements: for the P17 tile that is eight 2-byte loads per fragment, forty
+  /// per (A, B0, B1) triple per `kk1` step. The four elements inside one group
+  /// are contiguous, and every term of their address is a multiple of four
+  /// elements -- `str_x` and `off_y` are compile-time multiples of `kElemCols`,
+  /// and `get_coord().x` is `((qid & 2) | (lane & 1)) * 4` -- so the group is
+  /// 8-byte aligned and moves as one `vec<T,4>` load. The compiler cannot do
+  /// this itself: it cannot prove the alignment of a lane-dependent offset.
+  ///
+  /// Same elements, same registers, same order: this is `load` with the inner
+  /// loop replaced by one vector access.
+  template <int str_x, int off_x, int off_y, typename T>
+  METAL_FUNC static constexpr void load_vec4(
+      thread dtype_frag_t<T>& dst, const threadgroup T* src) {
+    static_assert(
+        str_x % kElemCols == 0, "P17 row stride is not vector aligned");
+    static_assert(
+        off_y % kElemCols == 0, "P17 column offset is not vector aligned");
+    const short2 sc = get_coord();
+    const threadgroup T* base = src + (sc.y + off_x) * str_x + sc.x + off_y;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      const metal::vec<T, kElemCols> v =
+          *reinterpret_cast<const threadgroup metal::vec<T, kElemCols>*>(
+              base + i * kElemRowsJump * str_x);
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < kElemCols; j++) {
+        dst[i * kElemCols + j] = v[j];
+      }
+    }
+  }
+
   template <
       typename T,
       typename SrcPtrType,
@@ -879,6 +913,22 @@ struct NAXTile {
     });
   }
 
+  /// `load` restricted to the case its own inner loop is scalar for: the P17
+  /// gather's threadgroup stages, whose column offsets and row strides are
+  /// vector aligned. See `BaseNAXFrag::load_vec4`.
+  template <int str_x>
+  METAL_FUNC void loadV(const threadgroup T* src) thread {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::template load_vec4<
+            str_x,
+            idx_row.value * kFragRows,
+            idx_col.value * kFragCols>(
+            frag_at<idx_row.value, idx_col.value>(), src);
+      });
+    });
+  }
+
   template <typename U, int str_x, int str_y>
   METAL_FUNC void store(threadgroup U* dst) const thread {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
@@ -1397,10 +1447,10 @@ METAL_FUNC void track_prefill_indirect(
 
             volatile int compiler_barrier;
 
-            Atile.template load<T, BKA_padded, 1>(
+            Atile.template loadV<BKA_padded>(
                 As + tm * BKA_padded + kk1);
 
-            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+            Btile.template loadV<BK_padded>(Ws + tn * BK_padded + kk1);
 
             tile_matmad_nax(
                 Dtile,
@@ -1613,11 +1663,11 @@ METAL_FUNC void track_prefill_indirect_gu(
 
             volatile int compiler_barrier;
 
-            Atile.template load<T, BKA_padded, 1>(
+            Atile.template loadV<BKA_padded>(
                 As + tm * BKA_padded + kk1);
 
-            Btile0.template load<T, BK_padded, 1>(Ws0 + tn * BK_padded + kk1);
-            Btile1.template load<T, BK_padded, 1>(Ws1 + tn * BK_padded + kk1);
+            Btile0.template loadV<BK_padded>(Ws0 + tn * BK_padded + kk1);
+            Btile1.template loadV<BK_padded>(Ws1 + tn * BK_padded + kk1);
 
             tile_matmad_nax(
                 Dtile0,
