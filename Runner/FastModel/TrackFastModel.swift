@@ -794,9 +794,36 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return TrackFastKernels.moeCombine(routed: routed, w: weights, shared: shared, gate: gate)
     }
 
+    private func preparePLELookup(
+        ids: MLXArray, evaluation: CBv2RecurrentStateEvaluation, capture: Bool
+    ) -> TrackPLELookup? {
+        let firstDispatch = Self.asyncFirst > 0 ? Self.asyncFirst : Self.asyncChunk
+        guard Self.asyncChunk <= 0 || firstDispatch > 1,
+            !capture, ids.shape == [1, 1], ids.dtype == .int32,
+            Self.debugTaps == nil, TrackFastProfile.prefill == nil,
+            StreamOrDevice.default.stream === Stream.gpu,
+            layers.count > 1, layers[0].ple == nil, let ple = layers[1].ple,
+            let source = ple.embedding.rowSourceHolder.source as? Qwen4ExpNGramTable,
+            TrackPLELookup.isAvailable(ids)
+        else { return nil }
+        let previous = evaluation.inputState(modelLayerIndex: ple.stateLayerIndex)?.ssm
+        let context: [Int64]
+        if let previous {
+            guard previous.dtype == .int32, TrackPLELookup.isAvailable(previous) else { return nil }
+            context = previous.asArray(Int32.self).map(Int64.init)
+        } else {
+            context = Array(repeating: Int64(cfg.eosTokenId), count: max(1, ple.dilation - 1))
+        }
+        let history = context + ids.asArray(Int32.self).map(Int64.init)
+        let rowIds = ple.embedding.hostRowIds(history: [history], newCount: 1)
+        return TrackPLELookup(
+            source: source, ids: rowIds,
+            shape: [1, 1, (cfg.ngramSize - 1) * cfg.headsPerNGram], history: history)
+    }
+
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
-        evaluation: CBv2RecurrentStateEvaluation, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, capture: Bool, lookup: TrackPLELookup? = nil
     ) -> MLXArray {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
@@ -819,7 +846,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // host-backed int32 array, so the only device sync of the step is the
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
-        if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
+        if let lookup {
+            embedded = lookup.wait().reshaped(B, S, -1).asType(stream.dtype)
+            hostHistory = lookup.history
+        } else if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
             let rawPrev = state?.ssm
             let ctx: [Int64] = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
@@ -924,6 +954,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     ) -> (mixed: MLXArray, multi: MLXArray) {
         precondition(recurrentState.count == 1)
         let evaluation = recurrentState[0]
+        let pleLookup = preparePLELookup(ids: ids, evaluation: evaluation, capture: capture)
         var residual = inputEmbeddings ?? embedTokens(ids)  // [B,S,H] until tiled
         var tile = true
         var pendingOut: MLXArray? = nil
@@ -946,7 +977,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 stream =
                     stream
                     + pleForward(
-                        ple, stream: stream, ids: ids, evaluation: evaluation, capture: capture)
+                        ple, stream: stream, ids: ids, evaluation: evaluation, capture: capture,
+                        lookup: layer.index == 1 ? pleLookup : nil)
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
