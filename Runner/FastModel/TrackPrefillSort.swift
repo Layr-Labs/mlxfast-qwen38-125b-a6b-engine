@@ -65,14 +65,14 @@ enum TrackPrefillSort {
     /// Per-block occupancy counts, `[nBlocks, E]`.
     private static let countKernel = MLXFast.metalKernel(
         name: "track_route_block_counts",
-        inputNames: ["ids"], outputNames: ["counts"],
+        inputNames: ["ids"], outputNames: ["counts", "ranks"],
         source: countSource, header: "", ensureRowContiguous: true)
 
     /// The stable destination of every assignment, plus the three arrays the
     /// consumers actually read.
     private static let scatterKernel = MLXFast.metalKernel(
         name: "track_route_counting_scatter",
-        inputNames: ["ids", "counts"],
+        inputNames: ["ids", "counts", "ranks"],
         outputNames: ["sorted_ids", "token_rows", "inverse"],
         source: scatterSource, header: "", ensureRowContiguous: true)
 
@@ -87,13 +87,13 @@ enum TrackPrefillSort {
             R >= blockSize, R % blockSize == 0
         else { return nil }
         let nBlocks = R / blockSize
-        let counts = countKernel(
+        let counted = countKernel(
             [flatIDs],
             template: [("E", E), ("BLK", blockSize), ("R", R)],
             grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
-            outputShapes: [[nBlocks * E]], outputDTypes: [.uint32])[0]
+            outputShapes: [[nBlocks * E], [R]], outputDTypes: [.uint32, .uint32])
         let outs = scatterKernel(
-            [flatIDs, counts],
+            [flatIDs, counted[0], counted[1]],
             template: [("E", E), ("BLK", blockSize), ("R", R), ("NB", nBlocks), ("TOPK", topK)],
             grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
             outputShapes: [[R], [R], [R]],
@@ -109,6 +109,7 @@ enum TrackPrefillSort {
     /// scheduling.
     static let countSource = #"""
         threadgroup uint vals[BLK];
+        threadgroup uint local_ranks[BLK];
         const uint blk = threadgroup_position_in_grid.x;
         const uint t = thread_position_in_threadgroup.x;
         const uint gi = blk * BLK + t;
@@ -116,9 +117,13 @@ enum TrackPrefillSort {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint b = t; b < (uint)E; b += BLK) {
             uint c = 0;
-            for (uint j = 0; j < BLK; ++j) { c += (vals[j] == b) ? 1u : 0u; }
+            for (uint j = 0; j < BLK; ++j) {
+                if (vals[j] == b) { local_ranks[j] = c; ++c; }
+            }
             counts[blk * (uint)E + b] = c;
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (gi < (uint)R) { ranks[gi] = local_ranks[t]; }
         """#
 
     /// One threadgroup per block again. Each threadgroup re-derives the whole
@@ -163,8 +168,7 @@ enum TrackPrefillSort {
         }
         if (gi >= (uint)R) { return; }
         const uint v = vals[t];
-        uint rank = 0;
-        for (uint j = 0; j < t; ++j) { rank += (vals[j] == v) ? 1u : 0u; }
+        const uint rank = ranks[gi];
         const uint dest = (sA[v] - tot[v]) + pre[v] + rank;
         sorted_ids[dest] = v;
         token_rows[dest] = gi / (uint)TOPK;
