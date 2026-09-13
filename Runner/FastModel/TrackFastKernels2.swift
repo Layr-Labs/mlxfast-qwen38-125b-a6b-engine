@@ -126,7 +126,7 @@ extension TrackFastKernels {
         const uint row = thread_position_in_grid.z;
         const uint hc = thread_position_in_grid.y;
         const uint lane = thread_index_in_simdgroup;
-        threadgroup float local_sums[32];
+        float norm_partial = 0.0f;
         const uint base = row * W + hc * H;
         InT inj_t = InT(0);
         if (HAS_INJECT) { inj_t = inject[row * HC + hc]; }
@@ -148,11 +148,10 @@ extension TrackFastKernels {
                 }
             }
             acc = simd_sum(acc);
-            if (lane == 0) { local_sums[g] = acc; }
+            const float partial_zero = simd_shuffle(acc, 0);
+            if (lane == g) { norm_partial = partial_zero; }
         }
-        if (lane >= simd_groups) { local_sums[lane] = 0; }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        const float total = simd_sum(local_sums[lane]);
+        const float total = simd_sum(norm_partial);
         const float inv_mean = metal::precise::rsqrt(total / (float)H + as_type<float>((uint)EPS_BITS));
         for (uint g = 0; g < simd_groups; ++g) {
             const uint lid = g * 32 + lane;
