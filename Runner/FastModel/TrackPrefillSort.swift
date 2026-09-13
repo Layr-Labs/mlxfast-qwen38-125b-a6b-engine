@@ -64,7 +64,7 @@ enum TrackPrefillSort {
 
     /// Per-block occupancy counts, `[nBlocks, E]`.
     private static let countKernel = MLXFast.metalKernel(
-        name: "track_route_block_counts",
+        name: "track_route_atomic_block_counts",
         inputNames: ["ids"], outputNames: ["counts"],
         source: countSource, header: "", ensureRowContiguous: true)
 
@@ -76,9 +76,14 @@ enum TrackPrefillSort {
         outputNames: ["sorted_ids", "token_rows", "inverse"],
         source: scatterSource, header: "", ensureRowContiguous: true)
 
+    private static let localScatterKernel = MLXFast.metalKernel(
+        name: "track_route_atomic_local_scatter", inputNames: ["ids", "counts"],
+        outputNames: ["sorted_ids", "token_rows", "inverse"],
+        source: localScatterSource, ensureRowContiguous: true)
+
     /// `(sortedIDs, tokenRows, inverse)` for `flatIDs` over `E` expert ids,
     /// or nil when the shape is outside the supported window.
-    static func apply(flatIDs: MLXArray, experts E: Int, topK: Int)
+    static func apply(flatIDs: MLXArray, experts E: Int, topK: Int, localScan: Bool = true)
         -> (sortedIDs: MLXArray, tokenRows: MLXArray, inverse: MLXArray)?
     {
         let R = flatIDs.size
@@ -92,7 +97,7 @@ enum TrackPrefillSort {
             template: [("E", E), ("BLK", blockSize), ("R", R)],
             grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
             outputShapes: [[nBlocks * E]], outputDTypes: [.uint32])[0]
-        let outs = scatterKernel(
+        let outs = (localScan ? localScatterKernel : scatterKernel)(
             [flatIDs, counts],
             template: [("E", E), ("BLK", blockSize), ("R", R), ("NB", nBlocks), ("TOPK", topK)],
             grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
@@ -103,22 +108,21 @@ enum TrackPrefillSort {
 
     // MARK: - kernels
 
-    /// One threadgroup per block of `BLK` assignments. Bucket `b` is counted by
-    /// the thread that owns it, by scanning the block's own value tile, so
-    /// there is no atomic anywhere and the result is independent of thread
-    /// scheduling.
+    /// Integer atomic increments commute; stable ordering comes from the
+    /// unchanged scatter, never from atomic arrival order.
     static let countSource = #"""
-        threadgroup uint vals[BLK];
-        const uint blk = threadgroup_position_in_grid.x;
+        threadgroup atomic_uint histogram[E];
         const uint t = thread_position_in_threadgroup.x;
+        const uint blk = threadgroup_position_in_grid.x;
         const uint gi = blk * BLK + t;
-        vals[t] = (gi < (uint)R) ? ids[gi] : (uint)E;
+        for (uint expert = t; expert < (uint)E; expert += BLK)
+            atomic_store_explicit(histogram + expert, 0u, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint b = t; b < (uint)E; b += BLK) {
-            uint c = 0;
-            for (uint j = 0; j < BLK; ++j) { c += (vals[j] == b) ? 1u : 0u; }
-            counts[blk * (uint)E + b] = c;
-        }
+        if (gi < (uint)R)
+            atomic_fetch_add_explicit(histogram + ids[gi], 1u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint expert = t; expert < (uint)E; expert += BLK)
+            counts[blk * (uint)E + expert] = atomic_load_explicit(histogram + expert, memory_order_relaxed);
         """#
 
     /// One threadgroup per block again. Each threadgroup re-derives the whole
@@ -166,6 +170,41 @@ enum TrackPrefillSort {
         uint rank = 0;
         for (uint j = 0; j < t; ++j) { rank += (vals[j] == v) ? 1u : 0u; }
         const uint dest = (sA[v] - tot[v]) + pre[v] + rank;
+        sorted_ids[dest] = v;
+        token_rows[dest] = gi / (uint)TOPK;
+        inverse[gi] = dest;
+        """#
+
+    static let localScatterSource = #"""
+        threadgroup uint vals[BLK];
+        threadgroup uint local_offsets[E];
+        threadgroup uint chunk_totals[E / 32];
+        const uint blk = threadgroup_position_in_grid.x;
+        const uint t = thread_position_in_threadgroup.x;
+        const uint gi = blk * BLK + t;
+        vals[t] = (gi < (uint)R) ? ids[gi] : (uint)E;
+        for (uint b = t; b < (uint)E; b += BLK) {
+            uint sum = 0, before = 0;
+            for (uint n = 0; n < (uint)NB; ++n) {
+                const uint count = counts[n * (uint)E + b];
+                if (n < blk) before += count;
+                sum += count;
+            }
+            const uint local_prefix = simd_prefix_exclusive_sum(sum);
+            const uint chunk_sum = simd_sum(sum);
+            local_offsets[b] = local_prefix + before;
+            if ((t & 31u) == 0) chunk_totals[b / 32] = chunk_sum;
+        }
+        // Every lane participates in all full SIMD chunks: E is a positive
+        // multiple of BLK=256. Publish values, offsets and all chunk totals.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (gi >= (uint)R) return;
+        const uint v = vals[t];
+        uint base = local_offsets[v];
+        for (uint chunk = 0; chunk < v / 32; ++chunk) base += chunk_totals[chunk];
+        uint rank = 0;
+        for (uint j = 0; j < t; ++j) rank += (vals[j] == v) ? 1u : 0u;
+        const uint dest = base + rank;
         sorted_ids[dest] = v;
         token_rows[dest] = gi / (uint)TOPK;
         inverse[gi] = dest;

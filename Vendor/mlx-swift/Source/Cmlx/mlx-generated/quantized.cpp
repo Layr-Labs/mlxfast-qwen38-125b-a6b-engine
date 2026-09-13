@@ -2375,6 +2375,19 @@ template <
   biases += k_start / group_size;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
+  // N <= 16 has exactly one N tile under BOTH the host's stock BN=32
+  // and this narrow BN=16. Keep the host's K partitions and output strides.
+  // Select here because this kernel header ships while host dispatch does not.
+  if constexpr (metal::is_same_v<T, bfloat16_t> && group_size == 32 &&
+                bits == 4 && BM == 32 && BK == 32 && BN == 32) {
+    if (N > 0 && N <= 16 && k_partition_size >= 512) {
+      qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, 16>(
+          (const device uint32_t*)wl, scales, biases, x, y, Xs, Ws,
+          K, N, M, k_partition_size, tid, lid, simd_gid, simd_lid);
+      return;
+    }
+  }
+
   qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
       (const device uint32_t*)wl,
       scales,
