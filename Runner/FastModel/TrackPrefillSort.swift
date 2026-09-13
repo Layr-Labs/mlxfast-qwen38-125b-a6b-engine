@@ -153,11 +153,27 @@ enum TrackPrefillSort {
             sA[b] = s;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint off = 1; off < (uint)E; off <<= 1) {
-            for (uint b = t; b < (uint)E; b += BLK) {
-                sB[b] = sA[b] + ((b >= off) ? sA[b - off] : 0u);
+        // The exclusive scan ping-pongs between sA and sB: each round reads the
+        // array the previous round wrote and writes the other, so the copy and
+        // its barrier disappear and one barrier per round remains. The adds are
+        // the same adds in the same order; only which array is read and which
+        // is written alternates, and both branches are uniform across the
+        // threadgroup. The final buffer depends on the parity of log2(E), so an
+        // odd round count is copied once into sA.
+        uint r = 0;
+        for (uint off = 1; off < (uint)E; off <<= 1, ++r) {
+            if (r & 1u) {
+                for (uint b = t; b < (uint)E; b += BLK) {
+                    sA[b] = sB[b] + ((b >= off) ? sB[b - off] : 0u);
+                }
+            } else {
+                for (uint b = t; b < (uint)E; b += BLK) {
+                    sB[b] = sA[b] + ((b >= off) ? sA[b - off] : 0u);
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (r & 1u) {
             for (uint b = t; b < (uint)E; b += BLK) { sA[b] = sB[b]; }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
