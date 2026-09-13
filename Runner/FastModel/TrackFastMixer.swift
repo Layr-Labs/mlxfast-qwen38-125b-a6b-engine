@@ -126,10 +126,14 @@ enum TrackFastMixerKernels {
         const uint lid = thread_index_in_simdgroup;
         threadgroup float res[8][VPT];
         if constexpr (VPT == 1) {
-            int rows[4];
-            for (int i = 0; i < 4; ++i) { const int s = (int)sg * 4 + i; rows[i] = d0 + (s & 1) + H * (s >> 1); }
             float r[4];
-            qmv_reg_rows<T, GS, BITS, false, (LW % get_pack_factor<BITS, 32>()) == 0>(wu, su, bu, act, LW, rows, lid, r);
+            if constexpr (PACKED_ROWS) {
+                qmv_reg<T, GS, BITS, (LW % get_pack_factor<BITS, 32>()) == 0>(wu, su, bu, act, LW, tile * 8 + (int)sg * 4, lid, r);
+            } else {
+                int rows[4];
+                for (int i = 0; i < 4; ++i) { const int s = (int)sg * 4 + i; rows[i] = d0 + (s & 1) + H * (s >> 1); }
+                qmv_reg_rows<T, GS, BITS, false, (LW % get_pack_factor<BITS, 32>()) == 0>(wu, su, bu, act, LW, rows, lid, r);
+            }
             if (lid == 0) { for (int i = 0; i < 4; ++i) { res[(int)sg * 4 + i][0] = r[i]; } }
         } else {
             const int s = (int)sg * 4 + (int)(lid / 8);
@@ -173,16 +177,18 @@ enum TrackFastMixerKernels {
 
     static func upMix(
         act: MLXArray, normed: MLXArray, up: TrackQuantWeight, inj: MLXArray, hcCount: Int, hidden: Int,
-        hasInject: Bool, emitF32: Bool = false
+        hasInject: Bool, emitF32: Bool = false, packedRows: Bool = false
     ) -> (input: MLXArray, inject: MLXArray, inputF32: MLXArray) {
         let S = act.dim(0), LW = act.dim(1)
         precondition(S >= 1 && S <= 8 && hidden % 2 == 0 && up.rows == hcCount * hidden && up.bits == 4)
         precondition(LW % 32 == 0 && LW < 512 + 256)  // K = 320: one full block + a tail, the `qmv` normal branch
+        precondition(!packedRows || (S == 1 && hcCount == 4))
         let outs = (S == 1 ? upMixKernel1 : upMixKernel)(
             [act, normed, up.weight, up.scales, up.biases!, inj],
             template: [
                 ("T", act.dtype), ("GS", up.groupSize), ("BITS", up.bits), ("H", hidden), ("HC", hcCount),
                 ("LW", LW), ("VPT", S), ("HAS_INJECT", hasInject), ("EMIT_F32", emitF32),
+                ("PACKED_ROWS", packedRows),
             ],
             grid: (32, (hidden / 2) * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [[S, hidden], [S, hcCount], [emitF32 ? S : 1, emitF32 ? hidden : 1]],
