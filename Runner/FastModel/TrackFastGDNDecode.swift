@@ -119,6 +119,12 @@ enum TrackFastGDNDecode {
         const threadgroup InT* v_ = v_shared;
         const float gate_decay = gb_shared[0];
         const float gate_beta = gb_shared[1];
+        const float4 local_q = float4(
+            static_cast<float>(q_[4 * lane]), static_cast<float>(q_[4 * lane + 1]),
+            static_cast<float>(q_[4 * lane + 2]), static_cast<float>(q_[4 * lane + 3]));
+        const float4 local_k = float4(
+            static_cast<float>(k_[4 * lane]), static_cast<float>(k_[4 * lane + 1]),
+            static_cast<float>(k_[4 * lane + 2]), static_cast<float>(k_[4 * lane + 3]));
         threadgroup InT y_shared[Dv];
         threadgroup float norm_sums[32];
         for (int r = 0; r < RPS; ++r) {
@@ -138,9 +144,8 @@ enum TrackFastGDNDecode {
                 #pragma clang fp contract(off)
                 float kv_compensation = 0.0f;
                 for (int i = 0; i < 4; ++i) {
-                    const int s_idx = 4 * lane + i;
                     state[i] = state[i] * gate_decay;
-                    auto product = state[i] * static_cast<float>(k_[s_idx]);
+                    auto product = state[i] * local_k[i];
                     auto corrected = product - kv_compensation;
                     auto next_sum = kv_mem + corrected;
                     kv_compensation = (next_sum - kv_mem) - corrected;
@@ -151,9 +156,8 @@ enum TrackFastGDNDecode {
             const float delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * gate_beta;
             float out = 0.0f;
             for (int i = 0; i < 4; ++i) {
-                const int s_idx = 4 * lane + i;
-                state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
-                out += state[i] * static_cast<float>(q_[s_idx]);
+                state[i] = state[i] + local_k[i] * delta;
+                out += state[i] * local_q[i];
             }
             out = simd_sum(out);
             if (lane == 0) {

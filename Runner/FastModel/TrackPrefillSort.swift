@@ -58,9 +58,15 @@ enum TrackPrefillSort {
     static let enabled =
         ProcessInfo.processInfo.environment["TRACK_PREFILL_COUNTING_SORT"] != "0"
 
-    /// Threads per block of assignments. 256 keeps the per-block value tile in
-    /// threadgroup memory and the predecessor scan at 256 comparisons.
-    static let blockSize = 256
+    /// Threads per block of assignments. The counting work is `R * E`
+    /// comparisons whatever this is, so the block size buys nothing but
+    /// parallelism: at the prefill shape 256 leaves 40 threadgroups on a
+    /// 40-core GPU, one per core, while 64 leaves 160. It changes only how the
+    /// stable ranks are partitioned -- `dest = bucketBase[v] + (# id v in
+    /// earlier blocks) + (# id v earlier in this block)` is the same rank
+    /// whatever the blocking, and every quantity in it is an exact integer --
+    /// so the permutation is identical.
+    static let blockSize = 64
 
     /// Per-block occupancy counts, `[nBlocks, E]`.
     private static let countKernel = MLXFast.metalKernel(
