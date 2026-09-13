@@ -1233,12 +1233,15 @@ struct PackedNAXGroup32 {
     STEEL_PRAGMA_UNROLL
     for (int j = 0; j < 4; j++) {
       STEEL_PRAGMA_UNROLL
-      for (int i = 0; i < 4; i++) {
-        const uint8_t w = uint8_t(words[j] >> (8 * i));
-        dst[8 * j + 2 * i] =
-            static_cast<bfloat16_t>(sc[0] * (w & 0x0f) + b);
-        dst[8 * j + 2 * i + 1] =
-            static_cast<bfloat16_t>(sc[1] * (w & 0xf0) + b);
+      for (int i = 0; i < 2; i++) {
+        const uint8_t w0 = uint8_t(words[j] >> (16 * i));
+        const uint8_t w1 = uint8_t(words[j] >> (16 * i + 8));
+        metal::vec<T,4> v;
+        v[0] = static_cast<T>(sc[0] * (w0 & 0x0f) + b);
+        v[1] = static_cast<T>(sc[1] * (w0 & 0xf0) + b);
+        v[2] = static_cast<T>(sc[0] * (w1 & 0x0f) + b);
+        v[3] = static_cast<T>(sc[1] * (w1 & 0xf0) + b);
+        *reinterpret_cast<threadgroup metal::vec<T,4>*>(dst + 8*j + 4*i) = v;
       }
     }
   }
