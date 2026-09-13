@@ -38,6 +38,22 @@ public enum MLXFastConstants {
     public static let referenceModelName = "Qwen3.8-Flash-Next-MLX-4bit-MTP"
     public static let defaultReferencePath = "reference_weights/Qwen3.8-Flash-Next-MLX-4bit-MTP"
     public static let defaultReferenceCachePath = ".cache/huggingface/hub/models--Vontra--Qwen3.8-Flash-Next-MLX-4bit-MTP/snapshots/327c8a604de613b42f84ba5e6b796c0931e8aa3b"
+
+    // THE SERVED MTP HEAD (David ruling 2026-09-12: "replace the 4-bit mtp
+    // with the 8-bit one; leave everything else the same"). The target pin
+    // above does not move, and neither does any golden's provenance: the
+    // transform replaces the 76 `language_model.mtp.*` tensors the 4-bit
+    // target embeds with the SAME 76 tensors from the publisher's 8-bit
+    // conversion, read out of the two shards that carry them and pinned per
+    // file in fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256. The tower
+    // stays the 4-bit bytes above; only the head's bytes change, at transform
+    // time, into the tree the engine loads.
+    public static let mtpHeadSourceRepository = "Vontra/Qwen3.8-Flash-Next-MLX-8bit-MTP"
+    public static let mtpHeadSourceRevision = "9c306179562765396e197a8a7a5de1b6b761c41a"
+    public static let mtpHeadSourceName = "Qwen3.8-Flash-Next-MLX-8bit-MTP"
+    public static let mtpHeadSourceManifestPath = "fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256"
+    public static let defaultMTPHeadSourcePath = "reference_weights/Qwen3.8-Flash-Next-MLX-8bit-MTP"
+    public static let defaultMTPHeadSourceCachePath = ".cache/huggingface/hub/models--Vontra--Qwen3.8-Flash-Next-MLX-8bit-MTP/snapshots/9c306179562765396e197a8a7a5de1b6b761c41a"
     public static let defaultWeightsPath = "weights"
     public static let defaultGoldenPath = "correctness_golden.json"
     public static let defaultPublicCorrectnessPromptPath = "correctness_prompts/public_longcopy_gate_english_1024.txt"

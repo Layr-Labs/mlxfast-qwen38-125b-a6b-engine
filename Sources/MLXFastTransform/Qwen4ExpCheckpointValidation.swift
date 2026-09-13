@@ -127,6 +127,11 @@ enum Qwen4ExpCheckpointValidation {
         static let quantizationGroupSize = 32
         static let quantizationBits = 4
         static let quantizationMode = "affine"
+        /// The width of the head the transform SERVES (David ruling
+        /// 2026-09-12): the publisher's 8-bit conversion of the same 76
+        /// `language_model.mtp.*` tensors, spliced into the 4-bit tower's
+        /// tree. Same group size, same mode; only the packed columns differ.
+        static let mtpHeadServedQuantizationBits = 8
 
         /// The hyper-connection stream width: the residual carries `hcCount`
         /// streams side by side the whole way down the tower.
@@ -198,6 +203,10 @@ enum Qwen4ExpCheckpointValidation {
     /// UNIFORM. This target promotes nothing, so the override table is empty
     /// and a config that carries one is refused rather than half-read.
     static let expectedQuantizationOverrideCount = 0
+    /// The head's quantized projections: every `language_model.mtp.*` stem
+    /// that ships `.scales`. The EMITTED runtime config carries exactly one
+    /// per-module entry for each of them, at the served width.
+    static let expectedMTPQuantizedModuleCount = 22
 
     static let textTowerPrefix = "language_model."
 
@@ -225,6 +234,31 @@ enum Qwen4ExpCheckpointValidation {
     static func quantizationSpec(
         fromConfigRoot root: [String: Any]
     ) throws -> Qwen4ExpTransformQuantizationSpec {
+        try uniformQuantizationSpec(
+            fromConfigRoot: root,
+            expectedBits: PinnedGeometry.quantizationBits,
+            label: "Qwen 3.8 125B A6B"
+        )
+    }
+
+    /// Parses the SERVED HEAD source's quantization block(s): the publisher's
+    /// 8-bit conversion of the same checkpoint. Same two-block shape, same
+    /// agreement rule, uniform, pinned to the served width.
+    static func headSourceQuantizationSpec(
+        fromConfigRoot root: [String: Any]
+    ) throws -> Qwen4ExpTransformQuantizationSpec {
+        try uniformQuantizationSpec(
+            fromConfigRoot: root,
+            expectedBits: PinnedGeometry.mtpHeadServedQuantizationBits,
+            label: "Qwen 3.8 125B A6B MTP head source"
+        )
+    }
+
+    private static func uniformQuantizationSpec(
+        fromConfigRoot root: [String: Any],
+        expectedBits: Int,
+        label: String
+    ) throws -> Qwen4ExpTransformQuantizationSpec {
         func parseBlock(
             _ key: String
         ) throws -> Qwen4ExpTransformQuantizationSpec? {
@@ -233,7 +267,7 @@ enum Qwen4ExpCheckpointValidation {
             }
             guard let block = value as? [String: Any] else {
                 throw MLXFastError.invalidInput(
-                    "Qwen 3.8 125B A6B config \(key) must be an object"
+                    "\(label) config \(key) must be an object"
                 )
             }
             let scalarKeys: Set<String> = ["group_size", "bits", "mode"]
@@ -241,7 +275,7 @@ enum Qwen4ExpCheckpointValidation {
                   block["mode"] != nil
             else {
                 throw MLXFastError.invalidInput(
-                    "Qwen 3.8 125B A6B config \(key) must explicitly define "
+                    "\(label) config \(key) must explicitly define "
                         + "group_size, bits, and mode"
                 )
             }
@@ -250,24 +284,26 @@ enum Qwen4ExpCheckpointValidation {
             let mode = try stringField("mode", in: block)
             guard mode == PinnedGeometry.quantizationMode,
                   groupSize == PinnedGeometry.quantizationGroupSize,
-                  bits == PinnedGeometry.quantizationBits
+                  bits == expectedBits
             else {
                 throw MLXFastError.invalidInput(
-                    "Qwen 3.8 125B A6B quantization must be affine 4-bit "
-                        + "group_size 32"
+                    "\(label) quantization must be affine \(expectedBits)-bit "
+                        + "group_size \(PinnedGeometry.quantizationGroupSize)"
                 )
             }
 
-            // UNIFORM. This target promotes nothing, so every non-scalar key
-            // is a per-tensor override this transform would carry into a
+            // UNIFORM. Neither source promotes anything, so every non-scalar
+            // key is a per-tensor override this transform would carry into a
             // config the runtime loader then ignores -- the runtime resolves
-            // one width for every quantized path. Refuse rather than emit a
-            // block whose extra half nothing reads.
+            // one width for every quantized path of a source. Refuse rather
+            // than emit a block whose extra half nothing reads. (The served
+            // head's own per-module entries are EMITTED, from the pinned
+            // geometry, never read from a source.)
             let overrides: [String: Qwen4ExpTransformTensorQuantization] = [:]
             let extra = Set(block.keys).subtracting(scalarKeys).sorted()
             guard extra.isEmpty else {
                 throw MLXFastError.invalidInput(
-                    "Qwen 3.8 125B A6B config \(key) carries "
+                    "\(label) config \(key) carries "
                         + "\(extra.count) per-tensor entr(ies) and this target "
                         + "is uniform, first: \(extra[0])"
                 )
@@ -286,7 +322,7 @@ enum Qwen4ExpCheckpointValidation {
         if let quantization, let quantizationConfig {
             guard quantization == quantizationConfig else {
                 throw MLXFastError.invalidInput(
-                    "Qwen 3.8 125B A6B config quantization and "
+                    "\(label) config quantization and "
                         + "quantization_config must match exactly"
                 )
             }
@@ -294,7 +330,7 @@ enum Qwen4ExpCheckpointValidation {
         }
         guard let spec = quantization ?? quantizationConfig else {
             throw MLXFastError.invalidInput(
-                "Qwen 3.8 125B A6B config is missing both quantization and "
+                "\(label) config is missing both quantization and "
                     + "quantization_config"
             )
         }
@@ -309,18 +345,146 @@ enum Qwen4ExpCheckpointValidation {
     /// `bfloat16`). Shapes and names ARE read off the pinned artifact. If the
     /// box session finds a different dtype on one of the small unquantized
     /// tensors, that is a repin of this table, not a relaxation of the check.
+    ///
+    /// This is the SOURCE contract: the 4-bit target as published, its own
+    /// 4-bit copy of the embedded head included. The head the transform
+    /// SERVES is `expectedHeadInventory(bits:)` at the served width.
     static func expectedTensorInventory() -> [String: ExpectedTensorMetadata] {
-        let hidden = PinnedGeometry.hiddenSize
-        let wide = PinnedGeometry.hyperConnectionWidth
-        let moeIntermediate = PinnedGeometry.moeIntermediateSize
-        let sharedIntermediate = PinnedGeometry.sharedExpertIntermediateSize
-        let experts = PinnedGeometry.expertCount
-        let vocab = PinnedGeometry.vocabSize
-        let groupSize = PinnedGeometry.quantizationGroupSize
-        let bits = PinnedGeometry.quantizationBits
+        var builder = InventoryBuilder()
+        builder.addTower(bits: PinnedGeometry.quantizationBits)
+        builder.addHead(bits: PinnedGeometry.quantizationBits)
+        precondition(
+            builder.inventory.count == expectedTensorCount,
+            "Qwen 3.8 125B A6B inventory must contain \(expectedTensorCount) "
+                + "tensors, built \(builder.inventory.count)"
+        )
+        return builder.inventory
+    }
 
+    /// The 76 tensors of the embedded head at one affine width. At
+    /// `PinnedGeometry.quantizationBits` this is the copy the 4-bit target
+    /// carries; at `PinnedGeometry.mtpHeadServedQuantizationBits` it is the
+    /// head the transform splices in from the 8-bit source. Same names, same
+    /// scale and bias shapes; only the packed columns scale with the width.
+    static func expectedHeadInventory(bits: Int) -> [String: ExpectedTensorMetadata] {
+        var builder = InventoryBuilder()
+        builder.addHead(bits: bits)
+        precondition(
+            builder.inventory.count == expectedMTPTensorCount,
+            "Qwen 3.8 125B A6B head inventory must contain "
+                + "\(expectedMTPTensorCount) tensors, built \(builder.inventory.count)"
+        )
+        return builder.inventory
+    }
+
+    /// The head's quantized projections as checkpoint stems: every
+    /// `language_model.mtp.*` tensor that ships `.scales`.
+    static func headQuantizedModuleStems() -> [String] {
+        expectedHeadInventory(bits: PinnedGeometry.mtpHeadServedQuantizationBits).keys
+            .filter { $0.hasSuffix(".scales") }
+            .map { String($0.dropLast(".scales".count)) }
+            .sorted()
+    }
+
+    /// The per-module entries the emitted runtime `config.json` carries for
+    /// the served head, keyed the way the runtime walks its module tree. The
+    /// runtime drops the checkpoint's `language_model.` prefix at sanitize, so
+    /// the key for `language_model.mtp.fc_hidden` is `mtp.fc_hidden`. Every
+    /// entry is the pinned served geometry; nothing here is read from a file.
+    static func runtimeHeadQuantizationOverrides() -> [String: [String: Any]] {
+        var overrides: [String: [String: Any]] = [:]
+        for stem in headQuantizedModuleStems() {
+            precondition(
+                stem.hasPrefix(textTowerPrefix),
+                "Qwen 3.8 125B A6B head stem \(stem) is outside the text tower")
+            let module = String(stem.dropFirst(textTowerPrefix.count))
+            overrides[module] = [
+                "group_size": PinnedGeometry.quantizationGroupSize,
+                "bits": PinnedGeometry.mtpHeadServedQuantizationBits,
+                "mode": PinnedGeometry.quantizationMode,
+            ]
+        }
+        precondition(
+            overrides.count == expectedMTPQuantizedModuleCount,
+            "Qwen 3.8 125B A6B head must carry \(expectedMTPQuantizedModuleCount) "
+                + "quantized modules, built \(overrides.count)")
+        return overrides
+    }
+
+    /// Validate the served head's SOURCE: the shards `--head-source` names
+    /// must carry every one of the 76 `language_model.mtp.*` tensors at the
+    /// served width, each packed projection with its affine companions. The
+    /// other tensors in those shards (the 8-bit tower tensors that share
+    /// them, `lm_head` included) are ignored: the transform copies the head
+    /// out of them and nothing else.
+    static func validateHeadSource(
+        index: CheckpointIndex,
+        headers: [String: SafetensorsHeader],
+        quantization: Qwen4ExpTransformQuantizationSpec
+    ) throws {
+        guard quantization.bits == PinnedGeometry.mtpHeadServedQuantizationBits,
+              quantization.groupSize == PinnedGeometry.quantizationGroupSize,
+              quantization.mode == PinnedGeometry.quantizationMode,
+              quantization.overrides.isEmpty
+        else {
+            throw MLXFastError.invalidInput(
+                "Qwen 3.8 125B A6B MTP head source must be uniform affine "
+                    + "\(PinnedGeometry.mtpHeadServedQuantizationBits)-bit group_size "
+                    + "\(PinnedGeometry.quantizationGroupSize)"
+            )
+        }
+        let expected = expectedHeadInventory(bits: quantization.bits)
+        let expectedNames = Set(expected.keys)
+        let mtpPrefix = "\(textTowerPrefix)mtp."
+        let present = Set(index.weightMap.keys.filter { $0.hasPrefix(mtpPrefix) })
+        let headerNameList = headers.values.flatMap { $0.tensors.keys }
+        guard present == expectedNames,
+              expectedNames.isSubset(of: Set(headerNameList)),
+              headerNameList.count == Set(headerNameList).count
+        else {
+            let missing = expectedNames.subtracting(present).sorted()
+            let extra = present.subtracting(expectedNames).sorted()
+            throw MLXFastError.invalidInput(
+                "Qwen 3.8 125B A6B MTP head source must carry exactly the "
+                    + "\(expectedMTPTensorCount) embedded head tensors "
+                    + "(missing: \(missing.prefix(8).joined(separator: ", ")); "
+                    + "extra: \(extra.prefix(8).joined(separator: ", ")))"
+            )
+        }
+        for name in expectedNames.sorted() {
+            guard let expectedMetadata = expected[name] else {
+                preconditionFailure(
+                    "missing expected Qwen 3.8 125B A6B head metadata for \(name)")
+            }
+            let actual = try tensorInfo(named: name, index: index, headers: headers)
+            guard actual.dtype == expectedMetadata.dtype,
+                  actual.shape == expectedMetadata.shape
+            else {
+                throw MLXFastError.invalidInput(
+                    "Qwen 3.8 125B A6B MTP head source tensor \(name) dtype/shape "
+                        + "\(actual.dtype) \(actual.shape) does not match the served "
+                        + "\(quantization.bits)-bit head \(expectedMetadata.dtype) "
+                        + "\(expectedMetadata.shape)"
+                )
+            }
+        }
+        for stem in headQuantizedModuleStems() {
+            try validateAffinePacking(
+                stem: stem, index: index, headers: headers, spec: quantization.fallback)
+        }
+    }
+
+    /// Builds the exact expected inventory. The tower and the head are built
+    /// by the same code at a caller-chosen affine width, so the SOURCE table
+    /// (tower and head at 4 bits) and the SERVED head table (8 bits) can never
+    /// disagree on a name or a leading dimension.
+    private struct InventoryBuilder {
         var inventory: [String: ExpectedTensorMetadata] = [:]
-        func add(_ name: String, _ dtype: TensorDType, _ shape: [Int]) {
+        private let hidden = PinnedGeometry.hiddenSize
+        private let wide = PinnedGeometry.hyperConnectionWidth
+        private let groupSize = PinnedGeometry.quantizationGroupSize
+
+        mutating func add(_ name: String, _ dtype: TensorDType, _ shape: [Int]) {
             precondition(
                 inventory[name] == nil,
                 "duplicate expected Qwen 3.8 125B A6B tensor \(name)"
@@ -328,11 +492,14 @@ enum Qwen4ExpCheckpointValidation {
             inventory[name] = ExpectedTensorMetadata(
                 dtype: dtype.rawValue, shape: shape)
         }
+
         /// One affine-quantized projection: packed U32 codes plus the BF16
         /// scale and bias companions the affine scheme requires. `leading` is
         /// everything before the contracted axis, so the stacked expert
         /// tensors pass their experts axis through it.
-        func addAffine(_ stem: String, leading: [Int], inFeatures: Int) {
+        mutating func addAffine(
+            _ stem: String, leading: [Int], inFeatures: Int, bits: Int
+        ) {
             precondition(
                 inFeatures.isMultiple(of: groupSize)
                     && (inFeatures * bits).isMultiple(of: 32),
@@ -342,27 +509,33 @@ enum Qwen4ExpCheckpointValidation {
             add("\(stem).scales", .bf16, leading + [inFeatures / groupSize])
             add("\(stem).biases", .bf16, leading + [inFeatures / groupSize])
         }
+
         /// One hyper-connection mixer. The final mixer of a tower or of the
         /// embedded head has NO inject head.
-        func addHyperConnection(_ stem: String, inject: Bool) {
+        mutating func addHyperConnection(_ stem: String, inject: Bool, bits: Int) {
             add("\(stem).hc_norm.weight", .bf16, [wide])
             addAffine(
                 "\(stem).input_mix_weight_down",
-                leading: [PinnedGeometry.hcLowrank], inFeatures: wide)
+                leading: [PinnedGeometry.hcLowrank], inFeatures: wide, bits: bits)
             addAffine(
                 "\(stem).input_mix_weight_up",
-                leading: [wide], inFeatures: PinnedGeometry.hcLowrank)
+                leading: [wide], inFeatures: PinnedGeometry.hcLowrank, bits: bits)
             if inject {
                 addAffine(
                     "\(stem).block_inject_weight",
-                    leading: [PinnedGeometry.hcCount], inFeatures: wide)
+                    leading: [PinnedGeometry.hcCount], inFeatures: wide, bits: bits)
             }
         }
+
         /// One decoder layer, of either kind. Both kinds carry the same two
         /// hyper-connection mixers and the same mixture-of-experts block.
-        func addDecoderLayer(_ prefix: String, isFullAttention: Bool) {
-            addHyperConnection("\(prefix).attn_hyper_connection", inject: true)
-            addHyperConnection("\(prefix).mlp_hyper_connection", inject: true)
+        mutating func addDecoderLayer(_ prefix: String, isFullAttention: Bool, bits: Int) {
+            let moeIntermediate = PinnedGeometry.moeIntermediateSize
+            let sharedIntermediate = PinnedGeometry.sharedExpertIntermediateSize
+            let experts = PinnedGeometry.expertCount
+
+            addHyperConnection("\(prefix).attn_hyper_connection", inject: true, bits: bits)
+            addHyperConnection("\(prefix).mlp_hyper_connection", inject: true, bits: bits)
 
             // The router stays in full precision: the checkpoint ships no
             // scales beside it.
@@ -370,20 +543,20 @@ enum Qwen4ExpCheckpointValidation {
             for projection in ["gate_proj", "up_proj"] {
                 addAffine(
                     "\(prefix).mlp.shared_expert.\(projection)",
-                    leading: [sharedIntermediate], inFeatures: hidden)
+                    leading: [sharedIntermediate], inFeatures: hidden, bits: bits)
                 addAffine(
                     "\(prefix).mlp.switch_mlp.\(projection)",
-                    leading: [experts, moeIntermediate], inFeatures: hidden)
+                    leading: [experts, moeIntermediate], inFeatures: hidden, bits: bits)
             }
             addAffine(
                 "\(prefix).mlp.shared_expert.down_proj",
-                leading: [hidden], inFeatures: sharedIntermediate)
+                leading: [hidden], inFeatures: sharedIntermediate, bits: bits)
             addAffine(
                 "\(prefix).mlp.switch_mlp.down_proj",
-                leading: [experts, hidden], inFeatures: moeIntermediate)
+                leading: [experts, hidden], inFeatures: moeIntermediate, bits: bits)
             addAffine(
                 "\(prefix).mlp.shared_expert_gate",
-                leading: [1], inFeatures: hidden)
+                leading: [1], inFeatures: hidden, bits: bits)
 
             if isFullAttention {
                 let attentionDim =
@@ -403,18 +576,18 @@ enum Qwen4ExpCheckpointValidation {
                 // width.
                 addAffine(
                     "\(prefix).self_attn.q_proj",
-                    leading: [attentionDim * 2], inFeatures: hidden)
+                    leading: [attentionDim * 2], inFeatures: hidden, bits: bits)
                 for projection in ["k_proj", "v_proj"] {
                     addAffine(
                         "\(prefix).self_attn.\(projection)",
-                        leading: [kvDim], inFeatures: hidden)
+                        leading: [kvDim], inFeatures: hidden, bits: bits)
                 }
                 addAffine(
                     "\(prefix).self_attn.o_proj",
-                    leading: [hidden], inFeatures: attentionDim)
+                    leading: [hidden], inFeatures: attentionDim, bits: bits)
                 addAffine(
                     "\(prefix).self_attn.indexer.index_qk_proj",
-                    leading: [indexerDim], inFeatures: hidden)
+                    leading: [indexerDim], inFeatures: hidden, bits: bits)
                 for norm in ["q_layernorm", "k_layernorm"] {
                     add(
                         "\(prefix).self_attn.indexer.\(norm).weight", .bf16,
@@ -442,90 +615,92 @@ enum Qwen4ExpCheckpointValidation {
                     [PinnedGeometry.linearValueHeadDim])
                 addAffine(
                     "\(prefix).linear_attn.in_proj_qkv",
-                    leading: [PinnedGeometry.linearConvDim], inFeatures: hidden)
+                    leading: [PinnedGeometry.linearConvDim], inFeatures: hidden, bits: bits)
                 addAffine(
                     "\(prefix).linear_attn.in_proj_z",
-                    leading: [valueDim], inFeatures: hidden)
+                    leading: [valueDim], inFeatures: hidden, bits: bits)
                 for projection in ["in_proj_a", "in_proj_b"] {
                     addAffine(
                         "\(prefix).linear_attn.\(projection)",
                         leading: [PinnedGeometry.linearValueHeads],
-                        inFeatures: hidden)
+                        inFeatures: hidden, bits: bits)
                 }
                 addAffine(
                     "\(prefix).linear_attn.out_proj",
-                    leading: [hidden], inFeatures: valueDim)
+                    leading: [hidden], inFeatures: valueDim, bits: bits)
             }
         }
 
-        addAffine(
-            "\(modelPrefix).embed_tokens", leading: [vocab], inFeatures: hidden)
-        addAffine(
-            "\(textTowerPrefix)lm_head", leading: [vocab], inFeatures: hidden)
-        // THERE IS NO `model.norm`: this mixer stands in for it.
-        addHyperConnection(
-            "\(modelPrefix).hyper_connection_mixer", inject: false)
-
-        for layerIndex in 0 ..< PinnedGeometry.layerCount {
-            addDecoderLayer(
-                "\(layerPrefix)\(layerIndex)",
-                isFullAttention: PinnedGeometry.isFullAttention(layer: layerIndex))
-        }
-
-        // The per-layer embedding block and its sharded table.
-        let ngramHeads =
-            (PinnedGeometry.ngramSize - 1) * PinnedGeometry.headsPerNGram
-        let rowDimensions = PinnedGeometry.pleEmbedDim / ngramHeads
-        let rowsPerShard = PinnedGeometry.ngramRowsPerShard
-        for layerIndex in PinnedGeometry.pleLayerIndices {
-            let prefix = "\(layerPrefix)\(layerIndex).ple"
-            add(
-                "\(prefix).conv1d.weight", .bf16,
-                [wide, PinnedGeometry.pleConvKernelSize, 1])
-            for norm in ["norm_conv", "norm_key", "norm_query"] {
-                add("\(prefix).\(norm).weight", .bf16, [wide])
-            }
+        /// The tower: the embedding, the untied output head, the final
+        /// mixer, the 48 layers, and the per-layer embedding block with its
+        /// sharded table.
+        mutating func addTower(bits: Int) {
+            let vocab = PinnedGeometry.vocabSize
             addAffine(
-                "\(prefix).key_proj", leading: [wide],
-                inFeatures: PinnedGeometry.pleEmbedDim)
+                "\(Qwen4ExpCheckpointValidation.modelPrefix).embed_tokens", leading: [vocab], inFeatures: hidden, bits: bits)
             addAffine(
-                "\(prefix).value_proj", leading: [hidden],
-                inFeatures: PinnedGeometry.pleEmbedDim)
-            add(
-                "\(prefix).ple_embedding.layer_multipliers", .i64,
-                [PinnedGeometry.ngramSize])
-            for buffer in ["ngram_heads_offsets", "ngram_heads_vocab_sizes"] {
-                add("\(prefix).ple_embedding.\(buffer)", .i64, [ngramHeads])
+                "\(Qwen4ExpCheckpointValidation.textTowerPrefix)lm_head", leading: [vocab], inFeatures: hidden, bits: bits)
+            // THERE IS NO `model.norm`: this mixer stands in for it.
+            addHyperConnection(
+                "\(Qwen4ExpCheckpointValidation.modelPrefix).hyper_connection_mixer", inject: false, bits: bits)
+
+            for layerIndex in 0 ..< PinnedGeometry.layerCount {
+                addDecoderLayer(
+                    "\(Qwen4ExpCheckpointValidation.layerPrefix)\(layerIndex)",
+                    isFullAttention: PinnedGeometry.isFullAttention(layer: layerIndex),
+                    bits: bits)
             }
-            for shard in 0 ..< PinnedGeometry.ngramShardCount {
+
+            // The per-layer embedding block and its sharded table.
+            let ngramHeads =
+                (PinnedGeometry.ngramSize - 1) * PinnedGeometry.headsPerNGram
+            let rowDimensions = PinnedGeometry.pleEmbedDim / ngramHeads
+            let rowsPerShard = PinnedGeometry.ngramRowsPerShard
+            for layerIndex in PinnedGeometry.pleLayerIndices {
+                let prefix = "\(Qwen4ExpCheckpointValidation.layerPrefix)\(layerIndex).ple"
+                add(
+                    "\(prefix).conv1d.weight", .bf16,
+                    [wide, PinnedGeometry.pleConvKernelSize, 1])
+                for norm in ["norm_conv", "norm_key", "norm_query"] {
+                    add("\(prefix).\(norm).weight", .bf16, [wide])
+                }
                 addAffine(
-                    "\(prefix).ple_embedding.ngram_embedding.shard_\(shard)",
-                    leading: [rowsPerShard], inFeatures: rowDimensions)
+                    "\(prefix).key_proj", leading: [wide],
+                    inFeatures: PinnedGeometry.pleEmbedDim, bits: bits)
+                addAffine(
+                    "\(prefix).value_proj", leading: [hidden],
+                    inFeatures: PinnedGeometry.pleEmbedDim, bits: bits)
+                add(
+                    "\(prefix).ple_embedding.layer_multipliers", .i64,
+                    [PinnedGeometry.ngramSize])
+                for buffer in ["ngram_heads_offsets", "ngram_heads_vocab_sizes"] {
+                    add("\(prefix).ple_embedding.\(buffer)", .i64, [ngramHeads])
+                }
+                for shard in 0 ..< PinnedGeometry.ngramShardCount {
+                    addAffine(
+                        "\(prefix).ple_embedding.ngram_embedding.shard_\(shard)",
+                        leading: [rowsPerShard], inFeatures: rowDimensions, bits: bits)
+                }
             }
         }
 
-        // The head EMBEDDED in this checkpoint. It has no embedding table and
-        // no head of its own; it rides the target's.
-        let mtpPrefix = "\(textTowerPrefix)mtp"
-        add("\(mtpPrefix).pre_fc_norm_embedding.weight", .bf16, [hidden])
-        add("\(mtpPrefix).pre_fc_norm_hidden.weight", .bf16, [wide])
-        for projection in ["fc_embedding", "fc_hidden"] {
-            addAffine(
-                "\(mtpPrefix).\(projection)", leading: [hidden],
-                inFeatures: hidden)
+        /// The head EMBEDDED in this checkpoint. It has no embedding table and
+        /// no head of its own; it rides the target's.
+        mutating func addHead(bits: Int) {
+            let mtpPrefix = "\(Qwen4ExpCheckpointValidation.textTowerPrefix)mtp"
+            add("\(mtpPrefix).pre_fc_norm_embedding.weight", .bf16, [hidden])
+            add("\(mtpPrefix).pre_fc_norm_hidden.weight", .bf16, [wide])
+            for projection in ["fc_embedding", "fc_hidden"] {
+                addAffine(
+                    "\(mtpPrefix).\(projection)", leading: [hidden],
+                    inFeatures: hidden, bits: bits)
+            }
+            addHyperConnection("\(mtpPrefix).hyper_connection_mixer", inject: false, bits: bits)
+            for layerIndex in 0 ..< PinnedGeometry.mtpLayerCount {
+                addDecoderLayer(
+                    "\(mtpPrefix).layers.\(layerIndex)", isFullAttention: true, bits: bits)
+            }
         }
-        addHyperConnection("\(mtpPrefix).hyper_connection_mixer", inject: false)
-        for layerIndex in 0 ..< PinnedGeometry.mtpLayerCount {
-            addDecoderLayer(
-                "\(mtpPrefix).layers.\(layerIndex)", isFullAttention: true)
-        }
-
-        precondition(
-            inventory.count == expectedTensorCount,
-            "Qwen 3.8 125B A6B inventory must contain \(expectedTensorCount) "
-                + "tensors, built \(inventory.count)"
-        )
-        return inventory
     }
 
     static func validateSelectedTensors(
@@ -597,64 +772,13 @@ enum Qwen4ExpCheckpointValidation {
                         + ".scales and .biases"
                 )
             }
-            let weightInfo = try tensorInfo(
-                named: name, index: index, headers: headers)
-            let scalesInfo = try tensorInfo(
-                named: scalesName, index: index, headers: headers)
-            let biasesInfo = try tensorInfo(
-                named: biasesName, index: index, headers: headers)
-            // Rank is >= 2 rather than == 2: the stacked SwitchGLU expert
-            // tensors are rank 3 (experts x out x packed-in).
-            guard weightInfo.dtype == TensorDType.u32.rawValue,
-                  scalesInfo.dtype == TensorDType.bf16.rawValue,
-                  biasesInfo.dtype == TensorDType.bf16.rawValue,
-                  weightInfo.shape.count >= 2,
-                  scalesInfo.shape == biasesInfo.shape,
-                  scalesInfo.shape.count == weightInfo.shape.count,
-                  weightInfo.shape.dropLast() == scalesInfo.shape.dropLast(),
-                  weightInfo.shape.allSatisfy({ $0 > 0 }),
-                  scalesInfo.shape.allSatisfy({ $0 > 0 })
-            else {
-                throw MLXFastError.invalidInput(
-                    "Qwen 3.8 125B A6B affine projection \(stem) has "
-                        + "incompatible weight, scale, or bias metadata"
-                )
-            }
-
             // THE PER-PATH LOOKUP, and it is the point of this whole file. A
             // single global width would accept a 4-bit-packed tensor the
             // config declares at 8 bits and vice versa -- right names, right
             // leading dimensions, wrong numerics.
-            let pathSpec = quantization.spec(forPath: stem)
-            guard let packedWidth = weightInfo.shape.last,
-                  let groupCount = scalesInfo.shape.last
-            else {
-                throw MLXFastError.invalidInput(
-                    "Qwen 3.8 125B A6B affine projection \(stem) has no packed "
-                        + "axis"
-                )
-            }
-            let (inputFeatures, inputOverflow) =
-                groupCount.multipliedReportingOverflow(by: pathSpec.groupSize)
-            let (packedBits, packedOverflow) =
-                packedWidth.multipliedReportingOverflow(by: 32)
-            guard !inputOverflow, !packedOverflow else {
-                throw MLXFastError.invalidInput(
-                    "Qwen 3.8 125B A6B projection \(stem) packed width overflows "
-                        + "Int"
-                )
-            }
-            let (expectedPackedBits, expectedOverflow) =
-                inputFeatures.multipliedReportingOverflow(by: pathSpec.bits)
-            guard !expectedOverflow, packedBits == expectedPackedBits else {
-                throw MLXFastError.invalidInput(
-                    "quantized Qwen 3.8 125B A6B projection \(stem) stored width "
-                        + "\(packedWidth) does not match config quantization "
-                        + "group_size \(pathSpec.groupSize) bits "
-                        + "\(pathSpec.bits) for input dimension "
-                        + "\(inputFeatures)"
-                )
-            }
+            try validateAffinePacking(
+                stem: stem, index: index, headers: headers,
+                spec: quantization.spec(forPath: stem))
         }
 
         try validateExactPublicInventory(
@@ -662,6 +786,71 @@ enum Qwen4ExpCheckpointValidation {
             index: index,
             headers: headers
         )
+    }
+
+    /// One affine projection's packed geometry against the width its path
+    /// resolves to: U32 codes, BF16 scale and bias companions of one shape,
+    /// and a packed column count that is exactly `in_features * bits / 32`
+    /// for the group count the scales carry.
+    static func validateAffinePacking(
+        stem: String,
+        index: CheckpointIndex,
+        headers: [String: SafetensorsHeader],
+        spec pathSpec: Qwen4ExpTransformTensorQuantization
+    ) throws {
+        let weightInfo = try tensorInfo(
+            named: "\(stem).weight", index: index, headers: headers)
+        let scalesInfo = try tensorInfo(
+            named: "\(stem).scales", index: index, headers: headers)
+        let biasesInfo = try tensorInfo(
+            named: "\(stem).biases", index: index, headers: headers)
+        // Rank is >= 2 rather than == 2: the stacked SwitchGLU expert
+        // tensors are rank 3 (experts x out x packed-in).
+        guard weightInfo.dtype == TensorDType.u32.rawValue,
+              scalesInfo.dtype == TensorDType.bf16.rawValue,
+              biasesInfo.dtype == TensorDType.bf16.rawValue,
+              weightInfo.shape.count >= 2,
+              scalesInfo.shape == biasesInfo.shape,
+              scalesInfo.shape.count == weightInfo.shape.count,
+              weightInfo.shape.dropLast() == scalesInfo.shape.dropLast(),
+              weightInfo.shape.allSatisfy({ $0 > 0 }),
+              scalesInfo.shape.allSatisfy({ $0 > 0 })
+        else {
+            throw MLXFastError.invalidInput(
+                "Qwen 3.8 125B A6B affine projection \(stem) has "
+                    + "incompatible weight, scale, or bias metadata"
+            )
+        }
+
+        guard let packedWidth = weightInfo.shape.last,
+              let groupCount = scalesInfo.shape.last
+        else {
+            throw MLXFastError.invalidInput(
+                "Qwen 3.8 125B A6B affine projection \(stem) has no packed "
+                    + "axis"
+            )
+        }
+        let (inputFeatures, inputOverflow) =
+            groupCount.multipliedReportingOverflow(by: pathSpec.groupSize)
+        let (packedBits, packedOverflow) =
+            packedWidth.multipliedReportingOverflow(by: 32)
+        guard !inputOverflow, !packedOverflow else {
+            throw MLXFastError.invalidInput(
+                "Qwen 3.8 125B A6B projection \(stem) packed width overflows "
+                    + "Int"
+            )
+        }
+        let (expectedPackedBits, expectedOverflow) =
+            inputFeatures.multipliedReportingOverflow(by: pathSpec.bits)
+        guard !expectedOverflow, packedBits == expectedPackedBits else {
+            throw MLXFastError.invalidInput(
+                "quantized Qwen 3.8 125B A6B projection \(stem) stored width "
+                    + "\(packedWidth) does not match config quantization "
+                    + "group_size \(pathSpec.groupSize) bits "
+                    + "\(pathSpec.bits) for input dimension "
+                    + "\(inputFeatures)"
+            )
+        }
     }
 
     static func validateExactPublicInventory(

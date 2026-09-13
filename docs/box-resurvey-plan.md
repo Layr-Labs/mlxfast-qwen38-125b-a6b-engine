@@ -27,6 +27,7 @@ engine build.
 |---|---|
 | Engine | the MERGED main branch, after the indexer fix and the norm-convention fix |
 | Weights | the pinned tree, `Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP` at revision `327c8a604de613b42f84ba5e6b796c0931e8aa3b` |
+| MTP head source | the two 8-bit shards beside the weights, `Vontra/Qwen3.8-Flash-Next-MLX-8bit-MTP` at revision `9c306179562765396e197a8a7a5de1b6b761c41a`, verified against `fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256` |
 | Reference | mlx-lm at `c961f8399a23e962837495ec403ea7c5e0e4e848` |
 | Prompt | the 1024-token public correctness prompt, wrapped as section 4 says |
 

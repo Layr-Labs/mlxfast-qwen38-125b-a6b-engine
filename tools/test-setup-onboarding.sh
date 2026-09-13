@@ -14,7 +14,7 @@ reject() { if grep -Fq -- "$2" "$1"; then fail "unexpected '$2' in $1"; fi; }
 # remote host. No global git config or developer credentials are used.
 export GIT_ALLOW_PROTOCOL=file
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
-mkdir -p "${WORK}/engine" "${WORK}/seed/tools" "${WORK}/bin" "${WORK}/upstream"
+mkdir -p "${WORK}/engine" "${WORK}/seed/tools" "${WORK}/bin" "${WORK}/upstream" "${WORK}/upstream-head"
 git -C "${WORK}/engine" init -q
 printf '// fixture engine\n' > "${WORK}/engine/Package.swift"
 git -C "${WORK}/engine" add Package.swift
@@ -52,15 +52,18 @@ case "$1" in
     printf 'model-01.safetensors\nmodel-02.safetensors\n'
     ;;
   transform)
-    [[ "$2" == --reference && "$4" == --output && "$#" == 5 ]] || exit 1
+    # The served MTP head's source rides along as --head-source, verified
+    # like the target before the transform runs.
+    [[ "$2" == --reference && "$4" == --head-source && "$6" == --output && "$#" == 7 ]] || exit 1
     [[ -x .build/release/bench-worker ]] || { echo 'worker not staged before transform' >&2; exit 1; }
     [[ -f "$3/.mlxfast-reference-cache.lock" ]] || { echo 'reference not verified before transform' >&2; exit 1; }
+    [[ -f "$5/.mlxfast-reference-cache.lock" ]] || { echo 'head source not verified before transform' >&2; exit 1; }
     printf 'transform %s\n' "$*" >> "${TEST_EVENTS}"
     [[ "${TEST_TRANSFORM_FAIL:-0}" != 1 ]] || { echo 'fixture transform failure' >&2; exit 1; }
     [[ "${TEST_TRANSFORM_EMPTY:-0}" != 1 ]] || exit 0
-    mkdir -p "$5"
-    printf '{}\n' > "$5/config.json"
-    printf '{"weight_map":{}}\n' > "$5/model.safetensors.index.json"
+    mkdir -p "$7"
+    printf '{}\n' > "$7/config.json"
+    printf '{"weight_map":{}}\n' > "$7/model.safetensors.index.json"
     ;;
   *) echo "unexpected CLI command: $1" >&2; exit 1;;
 esac
@@ -91,6 +94,15 @@ for path in "${WORK}/upstream/"*; do
   printf '%s %s %s\n' "$(shasum -a 256 "${path}" | awk '{print $1}')" \
     "$(wc -c < "${path}" | tr -d ' ')" "$(basename "${path}")"
 done > "${WORK}/reference.sha256"
+# The served MTP head's source: a config and the two pinned shards of a
+# checkpoint whose (unpinned) index names more. No index is published for it.
+printf '{}\n' > "${WORK}/upstream-head/config.json"
+printf 'head shard one\n' > "${WORK}/upstream-head/model-00041-of-00042.safetensors"
+printf 'head shard two\n' > "${WORK}/upstream-head/model-00042-of-00042.safetensors"
+for path in "${WORK}/upstream-head/"*; do
+  printf '%s %s %s\n' "$(shasum -a 256 "${path}" | awk '{print $1}')" \
+    "$(wc -c < "${path}" | tr -d ' ')" "$(basename "${path}")"
+done > "${WORK}/head.sha256"
 printf 'fixture metallib\n' > "${WORK}/mlx.metallib"
 printf 'fixture fingerprint\n' > "${WORK}/mlx.metallib.fingerprint"
 
@@ -103,6 +115,10 @@ export MLXFAST_REFERENCE_FALLBACK_BASE_URL=""
 export MLXFAST_REFERENCE_MANIFEST_PATH="${WORK}/reference.sha256"
 export MLXFAST_REFERENCE_MIN_FREE_GIB=0 MLXFAST_REFERENCE_DOWNLOAD_JOBS=2
 export MLXFAST_REFERENCE_HASH_VERIFY=1 MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY=1
+export MLXFAST_MTP_HEAD_SOURCE_BASE_URL="file://${WORK}/upstream-head"
+export MLXFAST_MTP_HEAD_SOURCE_FALLBACK_BASE_URL=""
+export MLXFAST_MTP_HEAD_SOURCE_MANIFEST_PATH="${WORK}/head.sha256"
+export MLXFAST_MTP_HEAD_SOURCE_MIN_FREE_GIB=0
 # In particular, do not accidentally inherit the workaround that masked the
 # original parallel-download bug in a user's shell.
 unset SETUP_LOG_LABEL MLXFAST_SETUP_LOG_LABEL MLXFAST_SKIP_SWIFT_BUILD
@@ -113,6 +129,7 @@ new_clone() {
   git clone -q "${WORK}/seed" "${CASE_ROOT}"
   export TEST_EVENTS="${CASE_ROOT}/events"
   export MLXFAST_REFERENCE_DIR="${CASE_ROOT}/reference checkpoint"
+  export MLXFAST_MTP_HEAD_SOURCE_DIR="${CASE_ROOT}/head source"
   export MLXFAST_WEIGHTS_PATH="${CASE_ROOT}/runtime weights"
 }
 run_setup() { (cd "${CASE_ROOT}" && bash ./setup.sh) > "${CASE_ROOT}/setup.log" 2>&1; }
@@ -127,9 +144,17 @@ expect "${CASE_ROOT}/setup.log" 'setup.sh: downloaded shard 2/2:'
 expect "${CASE_ROOT}/setup.log" 'setup complete'
 expect "${CASE_ROOT}/setup.log" 'MLXFAST_ENGINE_BIN=.build/release/bench-worker'
 expect "${CASE_ROOT}/setup.log" "transformed weights: ${MLXFAST_WEIGHTS_PATH}"
+# The served MTP head's source is provisioned from ITS manifest (no index
+# upstream), verified, and handed to the transform.
+expect "${CASE_ROOT}/setup.log" 'served MTP head source:'
+expect "${CASE_ROOT}/setup.log" '(2 shard(s) per manifest)'
+expect "${CASE_ROOT}/setup.log" "mtp head source (8-bit): ${MLXFAST_MTP_HEAD_SOURCE_DIR}"
+[[ -f "${MLXFAST_MTP_HEAD_SOURCE_DIR}/model-00042-of-00042.safetensors" ]] || fail 'head source shard missing'
+[[ -f "${MLXFAST_MTP_HEAD_SOURCE_DIR}/.mlxfast-reference-cache.lock" ]] || fail 'head source not stamped verified'
 [[ -f "${MLXFAST_WEIGHTS_PATH}/config.json" ]] || fail 'runtime weights missing'
 [[ "$(tail -1 "${TEST_EVENTS}")" == transform* ]] || fail 'transform did not follow builds'
-echo 'test-setup-onboarding: PASS -- plain clone initializes, downloads in parallel, stages, and transforms'
+[[ "$(tail -1 "${TEST_EVENTS}")" == *"--head-source ${MLXFAST_MTP_HEAD_SOURCE_DIR} "* ]] || fail 'transform did not receive the head source'
+echo 'test-setup-onboarding: PASS -- plain clone initializes, downloads in parallel, stages, transforms, and provisions the served MTP head'
 
 # A cached setup still runs the current transform, and leaves initialized
 # dependency edits untouched. A wrapper label must reach shard child shells.
@@ -188,6 +213,7 @@ expect "${CASE_ROOT}/setup.log" 'initializing the pinned engine submodule'
 reject "${CASE_ROOT}/setup.log" 'setup complete'
 [[ ! -e "${TEST_EVENTS}" ]] || fail 'submodule failure reached the build'
 [[ ! -e "${MLXFAST_REFERENCE_DIR}" ]] || fail 'submodule failure started a reference download'
+[[ ! -e "${MLXFAST_MTP_HEAD_SOURCE_DIR}" ]] || fail 'submodule failure started a head source download'
 echo 'test-setup-onboarding: PASS -- submodule failure stops before build or download'
 
 new_clone no-weights
@@ -195,6 +221,7 @@ MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1 run_setup || { cat "${CASE_ROOT}/setup.log" >&2;
 reject "${TEST_EVENTS}" 'transform '
 expect "${CASE_ROOT}/setup.log" 'transformed weights: not prepared'
 [[ ! -e "${MLXFAST_REFERENCE_DIR}" ]] || fail 'build-only setup downloaded weights'
+[[ ! -e "${MLXFAST_MTP_HEAD_SOURCE_DIR}" ]] || fail 'build-only setup downloaded the head source'
 echo 'test-setup-onboarding: PASS -- explicit build-only setup reports weights as unprepared'
 
 # Prebuilt deployments may intentionally carry no dependency checkout. Reusing

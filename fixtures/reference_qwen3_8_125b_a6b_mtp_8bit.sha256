@@ -1,0 +1,28 @@
+# SHA256 manifest for the SERVED MTP head: Vontra/Qwen3.8-Flash-Next-MLX-8bit-MTP.
+# Revision: 9c306179562765396e197a8a7a5de1b6b761c41a
+#
+# David ruling 2026-09-12: the head the engine serves is the 8-bit head, the
+# rest of the target stays the 4-bit checkpoint that
+# fixtures/reference_qwen3_8_125b_a6b_4bit.sha256 pins. This manifest pins the
+# SUBSET of the publisher's 8-bit conversion the transform reads: its config
+# and the two shards that carry the 76 `language_model.mtp.*` tensors
+# (2,934,230,336 bytes of head, affine 8-bit group-32). The 40 other shards of
+# that 42-shard checkpoint are never fetched. The transform splices the head
+# out of these two shards into the tower's shard 22 and emits the tree the
+# engine loads; the source bytes are only read.
+#
+# No model.safetensors.index.json is pinned ON PURPOSE: the publisher's index
+# names all 42 shards, and setup.sh derives this artifact's shard list from
+# THIS manifest instead (REFERENCE_SHARD_LIST_SOURCE=manifest).
+#
+# Verified against the pinned revision's published tree via the Hugging Face
+# tree API. The two shards use the LFS object's own sha256 (`lfs.oid`);
+# config.json was fetched and hashed directly.
+#
+#   MLXFAST_REFERENCE_MANIFEST_RECORDS: 3
+#   MLXFAST_REFERENCE_MANIFEST_BYTES:   5564655839
+#
+# Format: <sha256> <byte_count> <relative_path>
+b5118fedcd77d8654655b1e56327bc22afff2e8c59565ac283f5d992d38cbcc3 5361 config.json
+8f771800510bdae0c0e2ddee1a542e61ec782636fdf0ba17f142edb0f339dc39 4593121634 model-00041-of-00042.safetensors
+b6ecb7c53cd0377042ebe7e0d8c86eebec44aef69fdd4190f11d86b1118698c3 971528844 model-00042-of-00042.safetensors
