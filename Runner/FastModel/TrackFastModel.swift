@@ -473,10 +473,22 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             if hc.hasInject, case .quant(let q)? = hc.inject, q.biases != nil { injQ = q }
             if !hc.hasInject || injQ != nil {
                 let n2 = normed.reshaped(S, hcCount * hidden)
-                let d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
-                let u = TrackFastMixerKernels.upMix(
-                    act: d.act, normed: n2, up: uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
-                    hasInject: hc.hasInject, emitF32: emitF32)
+                // MLXFAST-V2TWOROW (valve): two logical S = 1 rows, one weight walk.
+                let d = (S == 2 && TrackVerify2TwoRow.hcDownTwoRowEnabled)
+                    ? TrackVerify2TwoRow.downInject2Row(normed: n2, down: dq, inject: injQ)
+                    : TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
+                // MLXFAST-V4UPMIX (valve): S = 1 launches per row, the serial arithmetic.
+                let u = (S == 2 && TrackVerify4Exact.upMix2RowEnabled)
+                    ? TrackVerify4Exact.upMix2Row(
+                        act: d.act, normed: n2, up: uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
+                        hasInject: hc.hasInject, emitF32: emitF32)
+                    : (S >= 2 && TrackVerify4Exact.upMixRowsEnabled)
+                    ? TrackVerify4Exact.upMixRows(
+                        act: d.act, normed: n2, up: uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
+                        hasInject: hc.hasInject, emitF32: emitF32)
+                    : TrackFastMixerKernels.upMix(
+                        act: d.act, normed: n2, up: uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
+                        hasInject: hc.hasInject, emitF32: emitF32)
                 let f32 = emitF32 ? u.inputF32.reshaped(1, S, hidden) : nil
                 if Self.debugTaps != nil, !tag.isEmpty {
                     Self.debugTaps?.append((tag + ".normedQ", normed))
@@ -546,12 +558,37 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let ssm =
             state?.ssm ?? MLXArray.zeros([B, geo.hv, geo.dv, geo.dk], dtype: .float32)
         let gated: MLXArray, convOut: MLXArray, stateOut: MLXArray
-        if let fused = TrackFastGDNDecode.apply(
+        // MLXFAST-V3GDN (valve): the same megafusion for a two-row window.
+        let fusedTwoRow = TrackVerify3GDN.apply(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
             dtBias: g.dtBias, stateIn: ssm, normW: g.normW, zOffset: g.zOffset,
             eps: 1e-6, capture: capture, geometry: geo)
+        if let fused = fusedTwoRow
+            ?? TrackFastGDNDecode.apply(
+                proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
+                dtBias: g.dtBias, stateIn: ssm, normW: g.normW, zOffset: g.zOffset,
+                eps: 1e-6, capture: capture, geometry: geo)
         {
             (gated, convOut, stateOut) = (fused.gated, fused.convOut, fused.stateOut)
+            if S == 2, TrackVerify4Exact.diagEnabled, fusedTwoRow != nil {
+                // DIAGNOSTIC: the S = 1 megafusion twice in sequence.
+                var conv = convState, st = ssm
+                for s in 0 ..< 2 {
+                    guard let one = TrackFastGDNDecode.apply(
+                        proj: proj[0..., s ..< (s + 1), 0...], convState: conv, convW: g.convW,
+                        negExpALog: g.negExpALog, dtBias: g.dtBias, stateIn: st, normW: g.normW,
+                        zOffset: g.zOffset, eps: 1e-6, capture: false, geometry: geo)
+                    else { break }
+                    TrackVerify4Exact.diagReport("L\(layerIndex).gdn.gated r\(s)", one.gated, gated[0..., s ..< (s + 1), 0...])
+                    if stateOut.dim(0) == 2 && convOut.dim(0) == 2 {
+                        TrackVerify4Exact.diagReport("L\(layerIndex).gdn.stateOut slot\(s)", one.stateOut[0], stateOut[s])
+                        TrackVerify4Exact.diagReport("L\(layerIndex).gdn.convOut slot\(s)", one.convOut[0], convOut[s])
+                    } else if s == 0 {
+                        FileHandle.standardError.write(Data("[diag2] L\(layerIndex).gdn capture shapes state \(stateOut.shape) conv \(convOut.shape)\n".utf8))
+                    }
+                    conv = one.convOut; st = one.stateOut
+                }
+            }
             if prof { TrackFastProfile.tick("gdn.decodeFused", &pt, [gated, stateOut, convOut]) }
         } else {
             let r = TrackFastKernels.gdn(
@@ -617,7 +654,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } else {
             idxKeys = a.indexerFull.apply(x)[.ellipsis, a.indexerQWidth...]
         }
-        _ = cache.updateIndexerTape(keys: idxKeys)
+        let attnRows = S >= 2 && S <= 8 && TrackVerify4Exact.attnRowsEnabled
+        if !attnRows { _ = cache.updateIndexerTape(keys: idxKeys) }
 
         let prep: (q: MLXArray, k: MLXArray, v: MLXArray)
         if let parts = splitInputs {
@@ -630,9 +668,26 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 qkv: qkv, qNorm: a.qNormW, kNorm: a.kNormW, cos: rope.cos, sin: rope.sin,
                 heads: heads, kvHeads: kvHeads, headDim: d, rotaryDims: rotaryDims, eps: eps)
         }
-        let att = cache.updateAndAttend(
-            queries: prep.q, keys: prep.k, values: prep.v,
-            scale: attentionScale, sinks: nil, keepMask: nil)  // [B,HQ,S,D]
+        let att: MLXArray
+        if attnRows {
+            // MLXFAST-V4ATTN (valve): the decode path's own L = 1 sequence per
+            // position -- tape append, K/V append, attend over the keys so far.
+            var atts: [MLXArray] = []
+            for s in 0 ..< S {
+                _ = cache.updateIndexerTape(keys: idxKeys[0..., s ..< (s + 1), 0...])
+                atts.append(
+                    cache.updateAndAttend(
+                        queries: prep.q[0..., 0..., s ..< (s + 1), 0...],
+                        keys: prep.k[0..., 0..., s ..< (s + 1), 0...],
+                        values: prep.v[0..., 0..., s ..< (s + 1), 0...],
+                        scale: attentionScale, sinks: nil, keepMask: nil))
+            }
+            att = concatenated(atts, axis: 2)  // [B,HQ,S,D]
+        } else {
+            att = cache.updateAndAttend(
+                queries: prep.q, keys: prep.k, values: prep.v,
+                scale: attentionScale, sinks: nil, keepMask: nil)  // [B,HQ,S,D]
+        }
         let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: a.qWidth)
         return a.out.apply(out)
     }
@@ -690,6 +745,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // reference upcasts it to float32 and reads twice the bytes).
             let xf = (inputF32 ?? x.asType(.float32)).reshaped(x.dim(2))
             logits = TrackFastMoEKernels.routerGemv(x: xf, w: m.routerW16).reshaped(1, 1, -1)
+        } else if x.dim(0) == 1, x.dim(1) == 2, TrackVerify2TwoRow.routerTwoRowEnabled,
+            m.routerW16.dtype == .bfloat16, x.dim(2) % 128 == 0, m.routerW16.dim(0) % 16 == 0
+        {
+            // MLXFAST-V2TWOROW (valve): two logical S = 1 rows, one weight walk.
+            // Each row's logits are bit-identical to the serial `track_router_gemv`.
+            let xf = (inputF32 ?? x.asType(.float32)).reshaped(2, x.dim(2))
+            logits = TrackVerify2TwoRow.router2Row(x: xf, w: m.routerW16).reshaped(1, 2, -1)
         } else if inputF32 == nil, let wide = TrackPrefillRouter.apply(x: x, w: m.routerW16) {
             logits = wide
         } else {
@@ -932,6 +994,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         var stream = residual
         let ropeTab = ropeTables(offset: offset, count: ids.dim(1), dtype: residual.dtype)
 
+        let diag = ids.dim(1) == 2 && TrackVerify4Exact.diagEnabled
+        if diag { TrackVerify4Exact.diagForwards += 1 }
         let profiling = TrackFastProfile.prefill != nil && ids.dim(1) >= TrackFastProfile.minWindow
         var profT = profiling ? CFAbsoluteTimeGetCurrent() : 0
         if profiling { TrackFastProfile.windows += 1 }
@@ -960,10 +1024,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             tile = false
             if profiling { TrackFastProfile.tick(layer.ple != nil ? "norm+ple" : "norm", &profT, [stream, normed]) }
             let am = hcMix(layer.attnHC, normed: normed, tag: "L\(layer.index).attn.hc")
+            if diag { diagHC("L\(layer.index).attn.hc", layer.attnHC, normed: normed, r: am, emitF32: false) }
             var input = am.input, injectW = am.inject
             if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
             Self.debugTaps?.append(("L\(layer.index).attn.stream_in", stream))
             Self.debugTaps?.append(("L\(layer.index).attn.input", input))
+            let residualBefore: MLXArray? = diag ? stream : nil
             let attended: MLXArray
             if let gdn = layer.gdn {
                 attended = gdnForward(
@@ -979,14 +1045,32 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 residual: stream, out: attended, inject: injectW,
                 scale: layer.mlpHC.normScaleQ,
                 tile: false)
+            if diag {
+                for s in 0 ..< 2 {
+                    let one = injectNorm(
+                        residual: residualBefore![0..., s ..< (s + 1), 0...], out: attended[0..., s ..< (s + 1), 0...],
+                        inject: injectW[0..., s ..< (s + 1), 0...], scale: layer.mlpHC.normScaleQ, tile: false)
+                    TrackVerify4Exact.diagReport("L\(layer.index).mlp.norm.stream r\(s)", one.stream, stream[0..., s ..< (s + 1), 0...])
+                    TrackVerify4Exact.diagReport("L\(layer.index).mlp.norm.normed r\(s)", one.normed, normed[0..., s ..< (s + 1), 0...])
+                }
+            }
             if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
             let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
+            if diag { diagHC("L\(layer.index).mlp.hc", layer.mlpHC, normed: normed, r: mm, emitF32: true) }
             input = mm.input; injectW = mm.inject
             if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
             pendingOut = Self.moeForwardShared(
                 layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay)
+            if diag {
+                for s in 0 ..< 2 {
+                    let one = Self.moeForwardShared(
+                        layer.moe, input[0..., s ..< (s + 1), 0...],
+                        inputF32: mm.inputF32.map { $0[0..., s ..< (s + 1), 0...] }, replay: layer.moePairReplay)
+                    TrackVerify4Exact.diagReport("L\(layer.index).moe r\(s)", one, pendingOut![0..., s ..< (s + 1), 0...])
+                }
+            }
             if profiling { TrackFastProfile.tick("moe", &profT, [pendingOut!]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
             pendingInject = injectW
@@ -1004,8 +1088,31 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             residual: residual, out: pendingOut, inject: pendingInject,
             scale: finalMixer.normScaleQ,
             tile: false)
-        let mixed = hcMix(finalMixer, normed: finalNormed).input
+        let fm = hcMix(finalMixer, normed: finalNormed)
+        if diag { diagHC("final.hc", finalMixer, normed: finalNormed, r: fm, emitF32: false) }
+        let mixed = fm.input
+        if diag {
+            let h2 = base.head(mixed)
+            for s in 0 ..< 2 {
+                TrackVerify4Exact.diagReport("head r\(s)", base.head(mixed[0..., s ..< (s + 1), 0...]), h2[0..., s ..< (s + 1), 0...])
+            }
+        }
         return (mixed, multi)
+    }
+
+    /// DIAGNOSTIC: the two-row mixer against the S = 1 mixer on each row.
+    private func diagHC(
+        _ tag: String, _ hc: TrackHC, normed: MLXArray,
+        r: (input: MLXArray, inject: MLXArray, inputF32: MLXArray?), emitF32: Bool
+    ) {
+        for s in 0 ..< 2 {
+            let one = hcMix(hc, normed: normed[0..., s ..< (s + 1), 0...], emitF32: emitF32)
+            TrackVerify4Exact.diagReport(tag + ".input r\(s)", one.input, r.input[0..., s ..< (s + 1), 0...])
+            TrackVerify4Exact.diagReport(tag + ".inject r\(s)", one.inject, r.inject[0..., s ..< (s + 1), 0...])
+            if emitF32, let a = one.inputF32, let b = r.inputF32 {
+                TrackVerify4Exact.diagReport(tag + ".inputF32 r\(s)", a, b[0..., s ..< (s + 1), 0...])
+            }
+        }
     }
 
     // MARK: routing
@@ -1188,7 +1295,21 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentMTPForwardable {
 
 extension TrackQwen4ExpFastModel: CBv2MTPPolicyTopTwoProviding {
     public func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray) {
-        base.cbv2MTPTopTwo(logits)
+        let r = base.cbv2MTPTopTwo(logits)
+        guard TrackVerify4Exact.argmaxRowsEnabled, logits.ndim == 3, logits.dim(2) >= 2 else { return r }
+        // MLXFAST-V4ARGMAX (valve): the committed id is the serial sampler's
+        // `argMax` over a `[1, V]` float32 copy of the row -- the same launch
+        // the serial free-run takes -- so a tie resolves as it does there.
+        let B = logits.dim(0), L = logits.dim(1), V = logits.dim(2)
+        var tops: [MLXArray] = []
+        for b in 0 ..< B {
+            for l in 0 ..< L {
+                let row = logits[b ..< (b + 1), l ..< (l + 1), 0...].reshaped(1, V).asType(.float32)
+                tops.append(argMax(row, axis: -1))
+            }
+        }
+        let top = concatenated(tops, axis: 0).reshaped(B, L, 1).asType(r.ids.dtype)
+        return (concatenated([top, r.ids[0..., 0..., 1 ..< 2]], axis: -1), r.values)
     }
 }
 

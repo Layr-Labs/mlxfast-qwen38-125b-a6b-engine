@@ -834,6 +834,89 @@ METAL_FUNC void qmv_fast_impl(
   }
 }
 
+// MLXFAST-V4DENSE2: `qmv_fast_impl` with TWO activation vectors over ONE weight
+// walk. Row r's accumulator sees exactly the sequence of `qdot` results the
+// one-vector kernel produces for that row: same block order, same scale/bias
+// reads, same device-pointer operands, same closing `simd_sum`, so each output
+// row is bit-identical to the M = 1 launch on that row alone. Used by the
+// M == 2 `affine_qmv_wide` entry so a two-token verify window keeps the
+// serial (M = 1) arithmetic on every dense projection, the LM head included.
+template <typename T, int group_size, int bits>
+METAL_FUNC void qmv_fast2_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+
+  typedef float U;
+
+  thread U x0_thread[values_per_thread];
+  thread U x1_thread[values_per_thread];
+  thread U result0[results_per_simdgroup] = {0};
+  thread U result1[results_per_simdgroup] = {0};
+
+  // Adjust positions
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* x0 = x + simd_lid * values_per_thread;
+  const device T* x1 = x + in_vec_size + simd_lid * values_per_thread;
+  device T* y0 = y + out_row;
+  device T* y1 = y + out_vec_size + out_row;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    U sum0 = load_vector<T, U, values_per_thread, bits>(x0, x0_thread);
+    U sum1 = load_vector<T, U, values_per_thread, bits>(x1, x1_thread);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+
+      U s = sl[0];
+      U b = bl[0];
+      result0[row] += qdot<U, values_per_thread, bits>(wl, x0_thread, s, b, sum0);
+      result1[row] += qdot<U, values_per_thread, bits>(wl, x1_thread, s, b, sum1);
+    }
+
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    x0 += block_size;
+    x1 += block_size;
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+      y1[row] = static_cast<T>(result1[row]);
+    }
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
@@ -2126,6 +2209,16 @@ template <
         s_strides,
         b_strides,
         tid);
+  }
+  // MLXFAST-V4DENSE2: a two-vector tile over a `qmv_fast`-eligible shape runs
+  // the serial (M = 1) arithmetic for each row instead of the 8-lane partial
+  // fold. Same grid (one 8-row threadgroup per output tile, two simdgroups),
+  // so the dispatch above is untouched; every other tile keeps the wide walk.
+  if (vecs_per_tg == 2 && k_lanes == 8 && M == 2 && (out_vec_size % 8) == 0 &&
+      (in_vec_size % (SIMD_SIZE * get_pack_factor<bits, 32>() * (bits == 2 ? 1 : 2))) == 0) {
+    qmv_fast2_impl<T, group_size, bits>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    return;
   }
   threadgroup float fold_partials[(SIMD_SIZE / k_lanes) * 2 * vecs_per_tg];
   qmv_wide_impl<T, group_size, bits, vecs_per_tg, k_lanes>(

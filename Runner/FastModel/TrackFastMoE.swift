@@ -768,6 +768,27 @@ extension TrackFastMoEKernels {
             const device T* xr = x + (size_t)row * (size_t)KD;
             if constexpr (VPT == 1) {
                 track_inject_qmv<T, GS, BITS, KD, 1, 4>(wg, sgw, bgw, xr, gate + row, sg, lane);
+            } else if constexpr (GATE2ROW) {
+                // MLXFAST-V3COMPACT: the tip's VPT >= 2 branch below is
+                // `qmv_wide_reg_partial`, which is NOT the serial S = 1
+                // arithmetic; `qmv_reg2` at NR = 1 is `track_inject_qmv`'s own
+                // walk (packs_per_thread 1, block 256, the FULLTAIL branch) with
+                // a second activation vector over the one weight walk, so each
+                // row's gate logit is the serial row's. Row 0's threadgroup
+                // writes both; row 1's writes none (`gate` is read by a later
+                // launch, so no threadgroup ever reads what another wrote).
+                // MLXFAST-ROUTESG1's trick, for two rows: the top-K walk below
+                // runs on simdgroup 0 at VPT >= 2, so put the gate GEMV on
+                // simdgroup 1 and let the two latency chains overlap.
+                if (row == 0 && sg == 1) {
+                    float g0[1], g1[1];
+                    qmv_reg2<T, GS, BITS, (KD % get_pack_factor<BITS, 32>()) == 0, 1>(
+                        wg, sgw, bgw, x, x + (size_t)KD, KD, 0, lane, g0, g1);
+                    if (lane == 0) {
+                        gate[0] = static_cast<T>(g0[0]);
+                        gate[1] = static_cast<T>(g1[0]);
+                    }
+                }
             } else {
                 threadgroup float fp[8];
                 float r[1]; bool valid = false; int orow = 0;
@@ -841,13 +862,17 @@ extension TrackFastMoEKernels {
         name: "track_moe_route",
         inputNames: ["logits", "x", "wg", "sgw", "bgw"],
         outputNames: ["idx", "w", "gate"],
-        source: routeSource, header: TrackFastKernels.mixerHeadHeader + wideHelpers, ensureRowContiguous: true)
+        source: routeSource,
+        header: TrackFastKernels.mixerHeadHeader + wideHelpers + TrackVerify3Compact.qmvReg2Helpers,
+        ensureRowContiguous: true)
     /// One-token instantiation: same source, wide bodies replaced by their declarations.
     nonisolated(unsafe) static let routeKernel1 = MLXFast.metalKernel(
         name: "track_moe_route_1",
         inputNames: ["logits", "x", "wg", "sgw", "bgw"],
         outputNames: ["idx", "w", "gate"],
-        source: routeSource, header: TrackFastKernels.mixerHeadHeader + wideDecls, ensureRowContiguous: true)
+        source: routeSource,
+        header: TrackFastKernels.mixerHeadHeader + wideDecls + TrackVerify3Compact.qmvReg2Helpers,
+        ensureRowContiguous: true)
 
     /// logits f32 [..., E] -> (idx uint32 [..., K], w f32 [..., K])
     /// Also the shared-expert gate logit per row: x [..., KD] x sharedGate [1, KD] -> gate [...] (pre-sigmoid).
@@ -863,7 +888,12 @@ extension TrackFastMoEKernels {
         let simdgroups = g == nil ? 1 : 2
         let outs = (R == 1 ? routeKernel1 : routeKernel)(
             [logits.reshaped(R, E), x.reshaped(R, KD), g?.weight ?? x, g?.scales ?? x, g?.biases ?? x],
-            template: [("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32), ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R), ("HAS_GATE", g != nil)],
+            template: [
+                ("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32),
+                ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R), ("HAS_GATE", g != nil),
+                // MLXFAST-V3COMPACT (valve): serial-semantic two-row shared gate.
+                ("GATE2ROW", R == 2 && TrackVerify3Compact.enabled),
+            ],
             grid: (32, R * simdgroups, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[R, topK], [R, topK], [R]], outputDTypes: [.uint32, .float32, x.dtype])
         return (outs[0].reshaped(lead + [topK]), outs[1].reshaped(lead + [topK]), outs[2].reshaped(lead))
@@ -1334,6 +1364,14 @@ extension TrackFastMoEKernels {
         precondition(N % 8 == 0 && bits == 4 && idx.dtype == .uint32 && xrow.dtype == .uint32)
         precondition(shared.rows == 2 * N && shared.groupSize == groupSize && shared.bits == bits && S >= 1 && S <= 8)
         precondition(isFast(k: KD, n: N), "shared expert one-token path assumes qmv_fast")
+        // MLXFAST-V3COMPACT (valve): two-row window, each distinct expert walked once.
+        if TrackVerify3Compact.enabled, S == 2, BR % 2 == 0, bits == 4, KD % 512 == 0,
+            N % 8 == 0, shared.mode == .affine, shared.groupSize == groupSize
+        {
+            return TrackVerify3Compact.gateUpAct2(
+                wg: wg, sg: sg, bg: bg, wu: wu, su: su, bu: bu, shared: shared,
+                x: x, idx: idx, xrow: xrow, groupSize: groupSize, bits: bits, topK: BR / 2)
+        }
         if x.dtype == .bfloat16 && S == 1 && KD == 2560 && N == 640
             && groupSize == 32 && bits == 4 && shared.mode == .affine
         {
@@ -1456,6 +1494,14 @@ extension TrackFastMoEKernels {
         let S = BR / topK
         precondition(BR % topK == 0 && H % 4 == 0 && bits == 4 && w.dtype == .float32 && S >= 1 && S <= 8)
         precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
+        // MLXFAST-V3COMPACT (valve): two-row window, each distinct expert walked once.
+        if TrackVerify3Compact.enabled, S == 2, bits == 4,
+            H % TrackVerify3Compact.downRowsPerThreadgroup == 0
+        {
+            return TrackVerify3Compact.downCombine2(
+                wd: wd, sd: sd, bd: bd, sharedDown: sharedDown, act: act, idx: idx, w: w,
+                gate: gate, topK: topK, groupSize: groupSize, bits: bits)
+        }
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
         let rps = S == 1 ? downRowsPerSimdgroup : 4
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
