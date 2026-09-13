@@ -652,7 +652,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: inputs[5], sg: inputs[6], bg: inputs[7],
                 wu: inputs[8], su: inputs[9], bu: inputs[10], shared: sharedGU,
-                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits)
+                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits,
+                implicitRows: true)
             let sharedDown = TrackQuantWeight(
                 weight: inputs[17], scales: inputs[18], biases: inputs[19],
                 groupSize: downGroupSize, bits: downBits, mode: downMode)
@@ -717,7 +718,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let gate = gateQ != nil ? r.gate : m.sharedGate.apply(x).reshaped(S)
             if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights, gate]) }
             let flatIdx = idx.reshaped(S * K)
-            let xrow = Self.xrowTable(S: S, K: K)
+            let xrow = flatIdx
             if let replay, StreamOrDevice.default.stream === Stream.gpu {
                 return replay([
                     x2, flatIdx, weights.reshaped(S * K), gate, xrow,
@@ -731,7 +732,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
                 wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b, shared: guq,
-                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits)
+                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits,
+                implicitRows: true)
             return TrackFastMoEKernels.downCombine(
                 wd: m.expertDown.w, sd: m.expertDown.s, bd: m.expertDown.b, sharedDown: dq,
                 act: act, idx: flatIdx, w: weights.reshaped(S * K), gate: gate, topK: K,

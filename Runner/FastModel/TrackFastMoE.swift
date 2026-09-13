@@ -1181,7 +1181,7 @@ extension TrackFastMoEKernels {
             return;
         }
         const uint e = idx[z];
-        const uint r = xrow[z];
+        const uint r = IMPLICIT_ROWS ? (VPT == 1 ? 0u : z / uint(BR / VPT)) : xrow[z];
         const uint kw = (uint)KD / 8;
         const uint kg = (uint)KD / GS;
         const int out_row = (int)threadgroup_position_in_grid.y * 8 + (int)simdgroup_index_in_threadgroup * 4;
@@ -1292,7 +1292,7 @@ extension TrackFastMoEKernels {
         const uint z = threadgroup_position_in_grid.z;
         const bool shared = z == (uint)BR;
         const uint e = shared ? 0u : idx[z];
-        const uint r = shared ? 0u : xrow[z];
+        const uint r = (IMPLICIT_ROWS || shared) ? 0u : xrow[z];
         const size_t kw = (size_t)KD / 8;
         const size_t kg = (size_t)KD / GS;
         const size_t eoff = (size_t)e * (size_t)N;
@@ -1328,10 +1328,12 @@ extension TrackFastMoEKernels {
     /// Routed slots [0, BR) then the shared expert for the S tokens: act [BR + S, N].
     static func gateUpAct(
         wg: MLXArray, sg: MLXArray, bg: MLXArray, wu: MLXArray, su: MLXArray, bu: MLXArray,
-        shared: TrackQuantWeight, x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int
+        shared: TrackQuantWeight, x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int,
+        implicitRows: Bool = false
     ) -> MLXArray {
         let BR = idx.dim(0), S = x.dim(0), KD = x.dim(1), N = wg.dim(1)
         precondition(N % 8 == 0 && bits == 4 && idx.dtype == .uint32 && xrow.dtype == .uint32)
+        precondition(!implicitRows || (S >= 1 && BR >= S && BR % S == 0))
         precondition(shared.rows == 2 * N && shared.groupSize == groupSize && shared.bits == bits && S >= 1 && S <= 8)
         precondition(isFast(k: KD, n: N), "shared expert one-token path assumes qmv_fast")
         if x.dtype == .bfloat16 && S == 1 && KD == 2560 && N == 640
@@ -1342,14 +1344,14 @@ extension TrackFastMoEKernels {
                 [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
                 template: [
                     ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N),
-                    ("KD", KD), ("BR", BR), ("RPS", rows),
+                    ("KD", KD), ("BR", BR), ("RPS", rows), ("IMPLICIT_ROWS", implicitRows),
                 ],
                 grid: (32, N / rows, BR + 1), threadGroup: (32, 2, 1),
                 outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
         }
         return (S == 1 ? gateUpActKernel1 : gateUpActKernel)(
             [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
-            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("BR", BR), ("VPT", S)],
+            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("BR", BR), ("VPT", S), ("IMPLICIT_ROWS", implicitRows)],
             grid: (32, (N / 8) * 2, BR + 1), threadGroup: (32, 2, 1),
             outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
     }
