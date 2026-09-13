@@ -753,7 +753,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights]) }
         let sharedAct: MLXArray
-        if TrackP12Prefill.splitShared, TrackP12Prefill.eligible(x),
+        if x.dim(1) > 8, let fusedGU = m.sharedGateUp.fused {
+            // MLXFAST-SHAREDFUSE: wide windows run gate|up as ONE N = 1280 GEMM.
+            // Both N = 640 and N = 1280 take the plain NAX qmm (no split-K:
+            // 32 x 10 = 320 column x row tiles already exceed the split-K
+            // threshold), whose column tiles are independent, so every output
+            // element is the one the two separate GEMMs produce; the SwiGLU
+            // reads the gate and up halves of the concatenation as before.
+            sharedAct = TrackFastKernels.swiglu(gu: fusedGU.apply(x))
+        } else if TrackP12Prefill.splitShared, TrackP12Prefill.eligible(x),
             m.sharedGateUp.parts.count == 2
         {
             // The same two GEMMs and the same `mlx_silu(gate) * up`, over the
