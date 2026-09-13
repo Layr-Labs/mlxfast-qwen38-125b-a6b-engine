@@ -1245,56 +1245,6 @@ struct PackedNAXGroup32 {
 };
 
 
-template <int BM>
-METAL_FUNC void p17_sorted_expert_tile(
-    const device uint32_t* indices,
-    int M,
-    int y_row,
-    int offset,
-    int offset_next,
-    uint32_t index,
-    thread int& begin,
-    thread int& end) {
-  int run_begin = y_row + offset;
-  if (offset == 0 && y_row > 0 && indices[y_row - 1] == index) {
-    int lo = 0;
-    int hi = y_row;
-    while (lo < hi) {
-      const int mid = lo + (hi - lo) / 2;
-      if (indices[mid] < index) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    run_begin = lo;
-  }
-
-  begin = run_begin;
-  if (begin < y_row) {
-    begin += ((y_row - begin + BM - 1) / BM) * BM;
-  }
-  end = begin;
-  if (begin >= y_row + offset_next) {
-    return;
-  }
-
-  // Only the next BM rows matter. Use <= rather than index+1 so uint32 max
-  // remains legal. Searches never dereference the half-open upper bound.
-  int lo = begin;
-  int hi = min(M, begin + BM);
-  while (lo < hi) {
-    const int mid = lo + (hi - lo) / 2;
-    if (indices[mid] <= index) {
-      lo = mid + 1;
-    } else {
-      hi = mid;
-    }
-  }
-  end = lo;
-}
-
-
 template <
     typename T,
     int group_size,
@@ -1312,8 +1262,8 @@ METAL_FUNC void track_prefill_indirect(
     const device T* biases,
     const device uint32_t* indices,
     const device uint32_t* token_rows,
+    const device uint32_t* tiles,
     device T* y,
-    int M,
     int N,
     int K,
     threadgroup T* Ws,
@@ -1340,9 +1290,7 @@ METAL_FUNC void track_prefill_indirect(
   const int K_it = K / BK;
   const size_t stride_w = size_t(N) * K_w;
   const size_t stride_s = size_t(N) * K_g;
-  const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
-  const short tgp_bm = short(min(BM, M - y_row));
 
   auto wl = (const device uint8_t*)w;
   wl += size_t(y_col) * K_w;
@@ -1361,32 +1309,17 @@ METAL_FUNC void track_prefill_indirect(
   const short tn = SN * (simd_group_id % WN);
   using AccumType = float;
 
-  uint32_t index;
-  short offset;
-  uint32_t index_next = indices[y_row];
-  short offset_next = 0;
-  int n = 0;
-  while (n < tgp_bm) {
-    n++;
-    offset = offset_next;
-    index = index_next;
-    offset_next = tgp_bm;
-    for (; n < tgp_bm; n++) {
-      if (indices[y_row + n] != index) {
-        offset_next = n;
-        index_next = indices[y_row + n];
-        break;
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_none);
-
-    int tile_begin;
-    int tile_end;
-    p17_sorted_expert_tile<BM>(
-        indices, M, y_row, offset, offset_next, index, tile_begin, tile_end);
+  // One tile per threadgroup row. The table (built by track_prefill_tile_table
+  // from the sorted ids) holds [begin, end) per tile, aligned to the expert
+  // run's start exactly as the former in-kernel scan aligned them; padding
+  // slots are [0, 0) and exit at once. Uniform over the whole threadgroup.
+  {
+    const int tile_begin = int(tiles[2 * tid.y]);
+    const int tile_end = int(tiles[2 * tid.y + 1]);
     if (tile_begin == tile_end) {
-      continue;  // Uniform over the ENTIRE threadgroup; no barrier is skipped by a subset.
+      return;
     }
+    const uint32_t index = indices[tile_begin];
     const short tile_m = short(tile_end - tile_begin);
     const short sgp_sm = short(min(int(SM), max(0, int(tile_m) - int(tm))));
     const bool sg_active = sgp_sm > 0;
@@ -1484,6 +1417,250 @@ METAL_FUNC void track_prefill_indirect(
           Dtile.store(yn, N);
         } else {
           Dtile.store_slice(yn, N, short2(0, 0), short2(SN, sgp_sm));
+        }
+      }
+    });
+  }
+}
+
+
+// Gate and up in one launch: one A staging and one pair of barriers per K step
+// serve two weight streams; each output is the same MMA sequence as the single-bank kernel.
+// MLX's Sigmoid (kernels/unary_ops.h), verbatim, instantiated at bfloat16_t so the
+// bf16 math overloads round after every op exactly as the compiled kernel does.
+struct P17Sigmoid {
+  template <typename T>
+  T operator()(T x) thread {
+    auto y = 1 / (1 + metal::exp(metal::abs(x)));
+    return (x < 0) ? y : 1 - y;
+  }
+};
+
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool transpose,
+    bool SILU>
+METAL_FUNC void track_prefill_indirect_gu(
+    const device T* x,
+    const device uint32_t* w0,
+    const device T* scales0,
+    const device T* biases0,
+    const device uint32_t* w1,
+    const device T* scales1,
+    const device T* biases1,
+    const device uint32_t* indices,
+    const device uint32_t* token_rows,
+    const device uint32_t* tiles,
+    device T* y0,
+    device T* y1,
+    int N,
+    int K,
+    threadgroup T* Ws0,
+    threadgroup T* Ws1,
+    threadgroup T* As,
+    uint3 tid,
+    uint simd_group_id,
+    uint simd_lane_id) {
+  static_assert(
+      transpose && BM == 32 && BN == 64 && BK == 64 && WM == 2 && WN == 2,
+      "P17 requires the original 32x64x64 NAX tile and 2x2 SIMD layout");
+  static_assert(
+      metal::is_same_v<T, bfloat16_t> && group_size == 32 && bits == 4,
+      "P17 requires unchanged bf16 / affine group-32 / 4-bit operands");
+
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int BKA_padded = BK_padded;
+  using loader_w_t = QuantizedBlockLoader<
+      T, BN, BK, BK_padded, transpose, WM * WN * SIMD_SIZE, group_size, bits>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int K_it = K / BK;
+  const size_t stride_w = size_t(N) * K_w;
+  const size_t stride_s = size_t(N) * K_g;
+  const int y_col = tid.x * BN;
+
+  auto wl0 = (const device uint8_t*)w0 + size_t(y_col) * K_w;
+  auto wl1 = (const device uint8_t*)w1 + size_t(y_col) * K_w;
+  scales0 += size_t(y_col) * K_g;
+  biases0 += size_t(y_col) * K_g;
+  scales1 += size_t(y_col) * K_g;
+  biases1 += size_t(y_col) * K_g;
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+  constexpr short BR = TN;
+  constexpr short BC = TK;
+  const short tm = SM * (simd_group_id / WN);
+  const short tn = SN * (simd_group_id % WN);
+  using AccumType = float;
+
+  // One tile per threadgroup row. The table (built by track_prefill_tile_table
+  // from the sorted ids) holds [begin, end) per tile, aligned to the expert
+  // run's start exactly as the former in-kernel scan aligned them; padding
+  // slots are [0, 0) and exit at once. Uniform over the whole threadgroup.
+  {
+    const int tile_begin = int(tiles[2 * tid.y]);
+    const int tile_end = int(tiles[2 * tid.y + 1]);
+    if (tile_begin == tile_end) {
+      return;
+    }
+    const uint32_t index = indices[tile_begin];
+    const short tile_m = short(tile_end - tile_begin);
+    const short sgp_sm = short(min(int(SM), max(0, int(tile_m) - int(tm))));
+    const bool sg_active = sgp_sm > 0;
+
+    NAXTile<AccumType, TM, TN> Dtile0;
+    NAXTile<AccumType, TM, TN> Dtile1;
+    Dtile0.clear();
+    Dtile1.clear();
+
+    const short tgp_thread = short(simd_group_id * SIMD_SIZE + simd_lane_id);
+    const short a_row = tgp_thread / 4;            // 0..BM-1
+    const short a_col = (tgp_thread % 4) * 16;     // 0,16,32,48
+    threadgroup T* a_dst = As + a_row * BKA_padded + a_col;
+    const bool a_live = a_row < tile_m;
+    const device T* xb = x;
+    if (a_live) {
+      xb += size_t(token_rows[tile_begin + a_row]) * K + a_col;
+    }
+
+    thread loader_w_t loader_w0(
+        wl0 + index * stride_w,
+        scales0 + index * stride_s,
+        biases0 + index * stride_s,
+        K,
+        Ws0,
+        simd_group_id,
+        simd_lane_id);
+    thread loader_w_t loader_w1(
+        wl1 + index * stride_w,
+        scales1 + index * stride_s,
+        biases1 + index * stride_s,
+        K,
+        Ws1,
+        simd_group_id,
+        simd_lane_id);
+
+    dispatch_bool(tile_m == BM, [&](auto kAlignedM) {
+      T a_buf[16];
+      PackedNAXGroup32 packed_w0;
+      PackedNAXGroup32 packed_w1;
+      if (K_it > 0) {
+        packed_w0.prefetch(loader_w0);
+        packed_w1.prefetch(loader_w1);
+        if (a_live) {
+          const device T* a0 = xb;
+          STEEL_PRAGMA_UNROLL
+          for (short e = 0; e < 16; ++e) { a_buf[e] = a0[e]; }
+        }
+      }
+      for (int k = 0; k < K_it; k++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        packed_w0.store(loader_w0.dst);
+        packed_w1.store(loader_w1.dst);
+        if (a_live) {
+          STEEL_PRAGMA_UNROLL
+          for (short e = 0; e < 16; ++e) {
+            a_dst[e] = a_buf[e];
+          }
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short e = 0; e < 16; ++e) {
+            a_dst[e] = T(0);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (k + 1 < K_it) {
+          loader_w0.next();
+          loader_w1.next();
+          packed_w0.prefetch(loader_w0);
+        packed_w1.prefetch(loader_w1);
+          if (a_live) {
+            const device T* a_next = xb + BK;
+            STEEL_PRAGMA_UNROLL
+            for (short e = 0; e < 16; ++e) { a_buf[e] = a_next[e]; }
+          }
+        }
+
+        STEEL_PRAGMA_UNROLL
+        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          if (sg_active) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, BR, BC> Btile0;
+            NAXTile<T, BR, BC> Btile1;
+
+            volatile int compiler_barrier;
+
+            Atile.template load<T, BKA_padded, 1>(
+                As + tm * BKA_padded + kk1);
+
+            Btile0.template load<T, BK_padded, 1>(Ws0 + tn * BK_padded + kk1);
+            Btile1.template load<T, BK_padded, 1>(Ws1 + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile0,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile0,
+                metal::bool_constant<transpose>{});
+            tile_matmad_nax(
+                Dtile1,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile1,
+                metal::bool_constant<transpose>{});
+
+            (void)compiler_barrier;
+          }
+        }
+
+        xb += BK;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      if (sg_active) {
+        const size_t yoff = size_t(tile_begin + tm) * N + y_col + tn;
+        if constexpr (SILU) {
+          // silu(gate) * up, op for op as MLX's compiled `silu(gate) * up`: the
+          // fp32 accumulators round to bf16 exactly as the two stores would, then
+          // Sigmoid, Multiply, Multiply each round to bf16.
+          STEEL_PRAGMA_UNROLL
+          for (short fi = 0; fi < Dtile0.kNumFrags; fi++) {
+            STEEL_PRAGMA_UNROLL
+            for (short e = 0; e < Dtile0.kElemsPerFrag; e++) {
+              const T g = static_cast<T>(Dtile0.val_frags[fi][e]);
+              const T u = static_cast<T>(Dtile1.val_frags[fi][e]);
+              const T sg = P17Sigmoid{}(g);
+              const T act = (g * sg) * u;
+              Dtile0.val_frags[fi][e] = static_cast<float>(act);
+            }
+          }
+          if constexpr (kAlignedM.value) {
+            Dtile0.store(y0 + yoff, N);
+          } else {
+            Dtile0.store_slice(y0 + yoff, N, short2(0, 0), short2(SN, sgp_sm));
+          }
+        } else if constexpr (kAlignedM.value) {
+          Dtile0.store(y0 + yoff, N);
+          Dtile1.store(y1 + yoff, N);
+        } else {
+          Dtile0.store_slice(y0 + yoff, N, short2(0, 0), short2(SN, sgp_sm));
+          Dtile1.store_slice(y1 + yoff, N, short2(0, 0), short2(SN, sgp_sm));
         }
       }
     });
