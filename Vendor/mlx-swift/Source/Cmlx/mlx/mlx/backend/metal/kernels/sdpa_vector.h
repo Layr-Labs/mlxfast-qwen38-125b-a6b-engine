@@ -11,6 +11,8 @@ constant bool bool_mask [[function_constant(23)]];
 constant bool float_mask [[function_constant(24)]];
 constant bool has_sinks [[function_constant(25)]];
 constant int blocks [[function_constant(26)]];
+// TRACK_SDPA_VW8: width-8 V loads. Default ON; 0 restores vec4/scalar V loads.
+constant bool sdpa_vw8 [[function_constant(27)]];
 
 template <typename T, int D, int V = D>
 [[kernel]] void sdpa_vector(
@@ -219,6 +221,11 @@ template <typename T, int D, int V = D>
       const uint head0 = (batch * tpg.x + kv) * gqa + pair * 2;
       const device T* kp = keys + kv_batch * k_head_stride + block * k_seq_stride + simd_lid * 8;
       const device T* vp = values + kv_batch * v_head_stride + block * v_seq_stride + simd_lid * 8;
+      // Width-8 V loads need 32-byte-contiguous rows for every thread in the
+      // walk. K stays two vec4 loads with sequential component adds.
+      const bool v_width8 = sdpa_vw8 &&
+          ((v_head_stride * sizeof(T)) % 32) == 0 &&
+          ((v_seq_stride * sizeof(T)) % 32) == 0;
       float4 q_lo[2], q_hi[2];
       float4 o_lo[2] = {float4(0), float4(0)};
       float4 o_hi[2] = {float4(0), float4(0)};
@@ -232,11 +239,19 @@ template <typename T, int D, int V = D>
       }
       for (int token = block; token < N; token += blocks) {
         const device metal::vec<T, 4>* kv4 = (const device metal::vec<T, 4>*)kp;
-        const device metal::vec<T, 4>* vv4 = (const device metal::vec<T, 4>*)vp;
         const float4 k_lo = float4(kv4[0]);
         const float4 k_hi = float4(kv4[1]);
-        const float4 v_lo = float4(vv4[0]);
-        const float4 v_hi = float4(vv4[1]);
+        float4 v_lo, v_hi;
+        if (v_width8) {
+          const device metal::vec<T, 8>* vv8 = (const device metal::vec<T, 8>*)vp;
+          const metal::vec<float, 8> v8 = metal::vec<float, 8>(vv8[0]);
+          v_lo = float4(v8[0], v8[1], v8[2], v8[3]);
+          v_hi = float4(v8[4], v8[5], v8[6], v8[7]);
+        } else {
+          const device metal::vec<T, 4>* vv4 = (const device metal::vec<T, 4>*)vp;
+          v_lo = float4(vv4[0]);
+          v_hi = float4(vv4[1]);
+        }
         for (int h = 0; h < 2; ++h) {
           float score = q_lo[h].x * k_lo.x;
           score += q_lo[h].y * k_lo.y;
@@ -358,9 +373,28 @@ template <typename T, int D, int V = D>
       max_score = new_max;
       sum_exp_score = sum_exp_score * factor + exp_score;
 
-      // Update the output accumulator
-      for (int i = 0; i < v_per_thread; i++) {
-        o[i] = o[i] * factor + exp_score * values[i];
+      // Update the output accumulator. Width-8 vector load of V when the
+      // head-dim walk is 32-byte contiguous; add order stays 0..v_per_thread.
+      if constexpr (v_per_thread == 8) {
+        const bool v_width8 = sdpa_vw8 &&
+            ((v_head_stride * sizeof(T)) % 32) == 0 &&
+            ((v_seq_stride * sizeof(T)) % 32) == 0;
+        if (v_width8) {
+          const device metal::vec<T, 8>* v8 =
+              (const device metal::vec<T, 8>*)values;
+          const metal::vec<T, 8> loaded = v8[0];
+          for (int i = 0; i < 8; i++) {
+            o[i] = o[i] * factor + exp_score * static_cast<U>(loaded[i]);
+          }
+        } else {
+          for (int i = 0; i < v_per_thread; i++) {
+            o[i] = o[i] * factor + exp_score * values[i];
+          }
+        }
+      } else {
+        for (int i = 0; i < v_per_thread; i++) {
+          o[i] = o[i] * factor + exp_score * values[i];
+        }
       }
     }
 
