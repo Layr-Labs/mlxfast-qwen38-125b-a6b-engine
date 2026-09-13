@@ -103,21 +103,23 @@ enum TrackPrefillSort {
 
     // MARK: - kernels
 
-    /// One threadgroup per block of `BLK` assignments. Bucket `b` is counted by
-    /// the thread that owns it, by scanning the block's own value tile, so
-    /// there is no atomic anywhere and the result is independent of thread
-    /// scheduling.
+    /// One integer increment per assignment; the scatter still supplies stable ranks.
     static let countSource = #"""
-        threadgroup uint vals[BLK];
+        threadgroup atomic_uint histogram[E];
         const uint blk = threadgroup_position_in_grid.x;
         const uint t = thread_position_in_threadgroup.x;
         const uint gi = blk * BLK + t;
-        vals[t] = (gi < (uint)R) ? ids[gi] : (uint)E;
+        for (uint b = t; b < (uint)E; b += BLK) {
+            atomic_store_explicit(&histogram[b], 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (gi < (uint)R) {
+            atomic_fetch_add_explicit(&histogram[ids[gi]], 1u, memory_order_relaxed);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint b = t; b < (uint)E; b += BLK) {
-            uint c = 0;
-            for (uint j = 0; j < BLK; ++j) { c += (vals[j] == b) ? 1u : 0u; }
-            counts[blk * (uint)E + b] = c;
+            counts[blk * (uint)E + b] =
+                atomic_load_explicit(&histogram[b], memory_order_relaxed);
         }
         """#
 
