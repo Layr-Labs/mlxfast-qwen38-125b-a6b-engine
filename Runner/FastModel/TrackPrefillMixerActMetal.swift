@@ -305,14 +305,52 @@ METAL_FUNC void track_mixer_act_dense(
 
   using AccumType = float;
 
+  constexpr bool persistent_acc = metal::is_same_v<T, bfloat16_t> &&
+      group_size == 32 && bits == 4 && aligned_N && BM == 32 && BN == 64 &&
+      BK == 64 && WM == 2 && WN == 2;
   NAXTile<AccumType, TM, TN> Dtile;
-  Dtile.clear();
+  if constexpr (!persistent_acc) {
+    Dtile.clear();
+  }
 
   x += tm * K;
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
       auto run = [&](auto kPrefetch) {
+        constexpr auto acc_desc = mpp::tensor_ops::matmul2d_descriptor(
+            16, 32, 16, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<acc_desc, metal::execution_simdgroup> acc_op;
+        auto acc_a = [&]() {
+          if constexpr (persistent_acc) {
+            return acc_op.template get_left_input_cooperative_tensor<T, T, AccumType>();
+          } else {
+            return false;
+          }
+        }();
+        auto acc_b = [&]() {
+          if constexpr (persistent_acc) {
+            return acc_op.template get_right_input_cooperative_tensor<T, T, AccumType>();
+          } else {
+            return false;
+          }
+        }();
+        using AccAT = metal::remove_addrspace_t<decltype(acc_a)>;
+        using AccBT = metal::remove_addrspace_t<decltype(acc_b)>;
+        auto acc_c = [&]() {
+          if constexpr (persistent_acc) {
+            return acc_op.template get_destination_cooperative_tensor<AccAT, AccBT, AccumType>();
+          } else {
+            return false;
+          }
+        }();
+        if constexpr (persistent_acc) {
+          STEEL_PRAGMA_UNROLL
+          for (short e = 0; e < 2 * Dtile.kElemsPerFrag; ++e) {
+            acc_c[e] = AccumType(0);
+          }
+        }
         PackedNAXGroup32 packed_w;
         if constexpr (kPrefetch.value) {
           if (K > 0) {
@@ -353,12 +391,25 @@ METAL_FUNC void track_mixer_act_dense(
 
             Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
 
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<transpose_a>{},
-                Btile,
-                metal::bool_constant<transpose_b>{});
+            if constexpr (persistent_acc) {
+              STEEL_PRAGMA_UNROLL
+              for (short kk = 0; kk < TK; ++kk) {
+                STEEL_PRAGMA_UNROLL
+                for (short e = 0; e < Dtile.kElemsPerFrag; ++e) {
+                  acc_a[e] = Atile.frag_at(0, kk)[e];
+                  acc_b[e] = Btile.frag_at(0, kk)[e];
+                  acc_b[Dtile.kElemsPerFrag + e] = Btile.frag_at(1, kk)[e];
+                }
+                acc_op.run(acc_a, acc_b, acc_c);
+              }
+            } else {
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<transpose_a>{},
+                  Btile,
+                  metal::bool_constant<transpose_b>{});
+            }
 
             (void)compiler_barrier;
           }
@@ -370,6 +421,14 @@ METAL_FUNC void track_mixer_act_dense(
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if constexpr (persistent_acc) {
+          STEEL_PRAGMA_UNROLL
+          for (short e = 0; e < Dtile.kElemsPerFrag; ++e) {
+            Dtile.val_frags[0][e] = acc_c[e];
+            Dtile.val_frags[1][e] = acc_c[Dtile.kElemsPerFrag + e];
+          }
+        }
 
         for (short e = 0; e < Dtile.kElemsPerTile; ++e) {
           const T rounded = static_cast<T>(Dtile.elems()[e]);
