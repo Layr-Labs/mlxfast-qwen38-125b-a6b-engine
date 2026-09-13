@@ -788,6 +788,40 @@ extension TrackFastMoEKernels {
         const device float* lr = logits + (size_t)row * (size_t)E;
         // each lane owns E_PER experts: e = lane + 32 * j (strided so a tie at
         // the same value resolves to the lowest index across lanes too)
+        if constexpr (VPT == 1 && E_PER <= 32) {
+            float v[E_PER];
+            uint taken = 0;
+            for (int j = 0; j < E_PER; ++j) {
+                const int e = (int)lane + 32 * j;
+                v[j] = e < E ? lr[e] : -INFINITY;
+                if (e >= E) { taken |= 1u << j; }
+            }
+            float bv = -INFINITY, sv = -INFINITY;
+            int bj = -1, sj = -1;
+            auto refill = [&]() {
+                bv = -INFINITY; sv = -INFINITY;
+                bj = -1; sj = -1;
+                for (int j = 0; j < E_PER; ++j) {
+                    if ((taken & (1u << j)) == 0) {
+                        if (v[j] > bv) { sv = bv; sj = bj; bv = v[j]; bj = j; }
+                        else if (v[j] > sv) { sv = v[j]; sj = j; }
+                    }
+                }
+            };
+            refill();
+            bool cached = true;
+            for (int k = 0; k < K; ++k) {
+                const float gmax = simd_max(bv);
+                const uint cand = (bv == gmax && bj >= 0) ? (uint)(lane + 32 * bj) : 0xffffffffu;
+                const uint gidx = simd_min(cand);
+                if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
+                if (k + 1 < K && bj >= 0 && gidx == (uint)(lane + 32 * bj)) {
+                    taken |= 1u << bj;
+                    if (cached) { bv = sv; bj = sj; cached = false; }
+                    else { refill(); cached = true; }
+                }
+            }
+        } else {
         float v[E_PER];
         bool taken[E_PER];
         for (int j = 0; j < E_PER; ++j) {
@@ -806,6 +840,7 @@ extension TrackFastMoEKernels {
             const uint gidx = simd_min(cand);
             if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
             if (gidx == (uint)(lane + 32 * bj) && bj >= 0) { taken[bj] = true; }
+        }
         }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
