@@ -2357,3 +2357,6 @@ extension TrackFastMoEKernels {
         """#
 
 }
+
+// r2: re-fire of d5 (best prefill + six decode mechanisms + crown MoE geometry, 2026-09-13).
+// Identical kernel behavior; the comment exists so this artifact is a distinct tree for the dedup.
