@@ -1360,6 +1360,10 @@ METAL_FUNC void track_prefill_indirect(
           for (short e = 0; e < A_PER_THREAD; ++e) { a_buf[e] = a0[e]; }
         }
       }
+      if (!a_live) {
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < A_PER_THREAD; ++e) { a_dst[e] = T(0); }
+      }
       for (int k = 0; k < K_it; k++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         packed_w.store(loader_w.dst);
@@ -1367,11 +1371,6 @@ METAL_FUNC void track_prefill_indirect(
           STEEL_PRAGMA_UNROLL
           for (short e = 0; e < A_PER_THREAD; ++e) {
             a_dst[e] = a_buf[e];
-          }
-        } else {
-          STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < A_PER_THREAD; ++e) {
-            a_dst[e] = T(0);
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1574,6 +1573,10 @@ METAL_FUNC void track_prefill_indirect_gu(
           for (short e = 0; e < A_PER_THREAD; ++e) { a_buf[e] = a0[e]; }
         }
       }
+      if (!a_live) {
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < A_PER_THREAD; ++e) { a_dst[e] = T(0); }
+      }
       for (int k = 0; k < K_it; k++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         packed_w0.store(loader_w0.dst);
@@ -1582,11 +1585,6 @@ METAL_FUNC void track_prefill_indirect_gu(
           STEEL_PRAGMA_UNROLL
           for (short e = 0; e < A_PER_THREAD; ++e) {
             a_dst[e] = a_buf[e];
-          }
-        } else {
-          STEEL_PRAGMA_UNROLL
-          for (short e = 0; e < A_PER_THREAD; ++e) {
-            a_dst[e] = T(0);
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
