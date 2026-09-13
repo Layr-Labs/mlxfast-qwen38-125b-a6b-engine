@@ -132,40 +132,45 @@ enum TrackPrefillSort {
     /// is the stable rank of the assignment among its equals, i.e. exactly the
     /// position `argSort` gives it.
     static let scatterSource = #"""
+        constexpr uint ITEMS = E / BLK;
         threadgroup uint vals[BLK];
-        threadgroup uint tot[E];
-        threadgroup uint pre[E];
-        threadgroup uint sA[E];
-        threadgroup uint sB[E];
+        threadgroup uint offsets[E];
+        threadgroup uint group_totals[BLK / 32];
         const uint blk = threadgroup_position_in_grid.x;
         const uint t = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
         const uint gi = blk * BLK + t;
         vals[t] = (gi < (uint)R) ? ids[gi] : (uint)E;
-        for (uint b = t; b < (uint)E; b += BLK) {
-            uint s = 0, before = 0;
+        uint within[ITEMS];
+        uint prior[ITEMS];
+        uint thread_total = 0;
+        for (uint i = 0; i < ITEMS; ++i) {
+            const uint b = t * ITEMS + i;
+            uint total = 0, before = 0;
             for (uint n = 0; n < (uint)NB; ++n) {
                 const uint c = counts[n * (uint)E + b];
                 if (n < blk) { before += c; }
-                s += c;
+                total += c;
             }
-            tot[b] = s;
-            pre[b] = before;
-            sA[b] = s;
+            within[i] = thread_total;
+            prior[i] = before;
+            thread_total += total;
+        }
+        const uint lane_base = simd_prefix_exclusive_sum(thread_total);
+        if (lane == 31) { group_totals[sg] = lane_base + thread_total; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint group_base = 0;
+        for (uint g = 0; g < sg; ++g) { group_base += group_totals[g]; }
+        for (uint i = 0; i < ITEMS; ++i) {
+            offsets[t * ITEMS + i] = group_base + lane_base + within[i] + prior[i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint off = 1; off < (uint)E; off <<= 1) {
-            for (uint b = t; b < (uint)E; b += BLK) {
-                sB[b] = sA[b] + ((b >= off) ? sA[b - off] : 0u);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint b = t; b < (uint)E; b += BLK) { sA[b] = sB[b]; }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
         if (gi >= (uint)R) { return; }
         const uint v = vals[t];
         uint rank = 0;
         for (uint j = 0; j < t; ++j) { rank += (vals[j] == v) ? 1u : 0u; }
-        const uint dest = (sA[v] - tot[v]) + pre[v] + rank;
+        const uint dest = offsets[v] + rank;
         sorted_ids[dest] = v;
         token_rows[dest] = gi / (uint)TOPK;
         inverse[gi] = dest;
