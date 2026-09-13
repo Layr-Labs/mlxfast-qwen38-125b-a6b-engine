@@ -1409,14 +1409,26 @@ extension TrackFastMoEKernels {
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sgi == 0 && lid == 0) {
-            const T sg = mlx_sigmoid(gate[t]);
-            for (int i = 0; i < RPS; ++i) {
+        if constexpr (VPT == 1 && RPS <= 32) {
+            if (sgi == 0 && lid < RPS) {
+                const int i = (int)lid;
+                const T sg = mlx_sigmoid(gate[t]);
                 float col[K];
                 for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
                 const T r = static_cast<T>(mlx_colsum_small_f32<K>(col));
                 const T sh = sg * static_cast<T>(shvT[i]);
                 out[(size_t)t * (size_t)H + (size_t)(d0 + i)] = r + sh;
+            }
+        } else {
+            if (sgi == 0 && lid == 0) {
+                const T sg = mlx_sigmoid(gate[t]);
+                for (int i = 0; i < RPS; ++i) {
+                    float col[K];
+                    for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
+                    const T r = static_cast<T>(mlx_colsum_small_f32<K>(col));
+                    const T sh = sg * static_cast<T>(shvT[i]);
+                    out[(size_t)t * (size_t)H + (size_t)(d0 + i)] = r + sh;
+                }
             }
         }
         """
