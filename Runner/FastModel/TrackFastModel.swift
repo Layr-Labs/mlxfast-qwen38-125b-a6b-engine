@@ -473,7 +473,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             if hc.hasInject, case .quant(let q)? = hc.inject, q.biases != nil { injQ = q }
             if !hc.hasInject || injQ != nil {
                 let n2 = normed.reshaped(S, hcCount * hidden)
-                let d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
+                // MLXFAST-V2TWOROW (valve): two logical S = 1 rows, one weight walk.
+                let d = (S == 2 && TrackVerify2TwoRow.hcDownTwoRowEnabled)
+                    ? TrackVerify2TwoRow.downInject2Row(normed: n2, down: dq, inject: injQ)
+                    : TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
                 let u = TrackFastMixerKernels.upMix(
                     act: d.act, normed: n2, up: uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
                     hasInject: hc.hasInject, emitF32: emitF32)
@@ -546,10 +549,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let ssm =
             state?.ssm ?? MLXArray.zeros([B, geo.hv, geo.dv, geo.dk], dtype: .float32)
         let gated: MLXArray, convOut: MLXArray, stateOut: MLXArray
-        if let fused = TrackFastGDNDecode.apply(
+        // MLXFAST-V3GDN (valve): the same megafusion for a two-row window.
+        let fusedTwoRow = TrackVerify3GDN.apply(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
             dtBias: g.dtBias, stateIn: ssm, normW: g.normW, zOffset: g.zOffset,
             eps: 1e-6, capture: capture, geometry: geo)
+        if let fused = fusedTwoRow
+            ?? TrackFastGDNDecode.apply(
+                proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
+                dtBias: g.dtBias, stateIn: ssm, normW: g.normW, zOffset: g.zOffset,
+                eps: 1e-6, capture: capture, geometry: geo)
         {
             (gated, convOut, stateOut) = (fused.gated, fused.convOut, fused.stateOut)
             if prof { TrackFastProfile.tick("gdn.decodeFused", &pt, [gated, stateOut, convOut]) }
@@ -690,6 +699,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // reference upcasts it to float32 and reads twice the bytes).
             let xf = (inputF32 ?? x.asType(.float32)).reshaped(x.dim(2))
             logits = TrackFastMoEKernels.routerGemv(x: xf, w: m.routerW16).reshaped(1, 1, -1)
+        } else if x.dim(0) == 1, x.dim(1) == 2, TrackVerify2TwoRow.routerTwoRowEnabled,
+            m.routerW16.dtype == .bfloat16, x.dim(2) % 128 == 0, m.routerW16.dim(0) % 16 == 0
+        {
+            // MLXFAST-V2TWOROW (valve): two logical S = 1 rows, one weight walk.
+            // Each row's logits are bit-identical to the serial `track_router_gemv`.
+            let xf = (inputF32 ?? x.asType(.float32)).reshaped(2, x.dim(2))
+            logits = TrackVerify2TwoRow.router2Row(x: xf, w: m.routerW16).reshaped(1, 2, -1)
         } else if inputF32 == nil, let wide = TrackPrefillRouter.apply(x: x, w: m.routerW16) {
             logits = wide
         } else {
