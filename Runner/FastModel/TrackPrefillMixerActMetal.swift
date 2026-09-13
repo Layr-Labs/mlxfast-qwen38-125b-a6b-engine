@@ -387,7 +387,8 @@ METAL_FUNC void track_mixer_act_dense(
       };
       if constexpr (
           metal::is_same_v<T, bfloat16_t> && group_size == 32 && bits == 4 &&
-          aligned_N && BM == 64 && BN == 64 && BK == 64 && WM == 2 && WN == 2) {
+          aligned_N && (BM == 64 || BM == 32) && BN == 64 && BK == 64 && WM == 2 &&
+          WN == 2) {
         dispatch_bool(M > 32 && K % BK == 0, run);
       } else {
         run(metal::false_type{});
