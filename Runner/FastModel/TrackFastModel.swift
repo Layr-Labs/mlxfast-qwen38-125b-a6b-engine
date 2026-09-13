@@ -633,7 +633,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let att = cache.updateAndAttend(
             queries: prep.q, keys: prep.k, values: prep.v,
             scale: attentionScale, sinks: nil, keepMask: nil)  // [B,HQ,S,D]
-        let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: a.qWidth)
+        let out = TrackGatedAttention.apply(
+            queries: prep.q, cache: cache, gates: qkv, gateOffset: a.qWidth, scale: attentionScale)
+            ?? TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: a.qWidth)
         return a.out.apply(out)
     }
 
