@@ -606,7 +606,7 @@ enum TrackFastKernels {
         s += each("        ") { r in "y_[vy_off + \(r)] = static_cast<InT>(out\(r));" }
         s += """
                 }
-                if (CAPTURE || t == T_ - 1) {
+                if (CAPTURE) {
                     const uint slot = CAPTURE ? (b_idx * T_ + t) : b_idx;
                     device StT* o_state =
                         state_out + ((slot * Hv + hv_idx) * Dv + dv_idx) * Dk + 4 * dk_idx;
@@ -620,7 +620,16 @@ enum TrackFastKernels {
                 }
                 kq_off += Hk * Dk; vy_off += Hv * Dv; gb_off += Hv;
             }
+            if (!CAPTURE && T_ > 0) {
+                device StT* o_state =
+                    state_out + ((b_idx * Hv + hv_idx) * Dv + dv_idx) * Dk + 4 * dk_idx;
+
             """
+        s += each("    ") { r in
+            "*reinterpret_cast<device float4*>((device float*)o_state + \(r) * Dk) ="
+                + " float4(state\(r)[0], state\(r)[1], state\(r)[2], state\(r)[3]);"
+        }
+        s += "}\n"
         return s
     }
 
