@@ -143,7 +143,7 @@ enum TrackPrefillIndirect {
         alignas(16) threadgroup T Ws0[64 * 72];
         alignas(16) threadgroup T Ws1[64 * 72];
         alignas(16) threadgroup T As[32 * 72];
-        track_prefill_indirect_gu<T, 32, 4, 32, 64, 64, 2, 2, true, SILU>(
+        track_prefill_indirect_gu<T, 32, 4, 32, 64, 64, 2, 2, true, SILU, N>(
             x, w0, scales0, biases0, w1, scales1, biases1, indices, token_rows, tiles,
             y0, y1, N, K, Ws0, Ws1, As, threadgroup_position_in_grid,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
@@ -154,7 +154,7 @@ enum TrackPrefillIndirect {
     static let sourceDown = #"""
         alignas(16) threadgroup T Ws[128 * 40];
         alignas(16) threadgroup T As[32 * 40];
-        track_prefill_indirect<T, 32, 4, 32, 128, 32, 2, 2, true>(
+        track_prefill_indirect<T, 32, 4, 32, 128, 32, 2, 2, true, N>(
             x, w, scales, biases, indices, token_rows, tiles, y,
             N, K, Ws, As, threadgroup_position_in_grid,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
@@ -163,7 +163,7 @@ enum TrackPrefillIndirect {
     static let source = #"""
         alignas(16) threadgroup T Ws[64 * 72];
         alignas(16) threadgroup T As[32 * 72];
-        track_prefill_indirect<T, 32, 4, 32, 64, 64, 2, 2, true>(
+        track_prefill_indirect<T, 32, 4, 32, 64, 64, 2, 2, true, N>(
             x, w, scales, biases, indices, token_rows, tiles, y,
             N, K, Ws, As, threadgroup_position_in_grid,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
