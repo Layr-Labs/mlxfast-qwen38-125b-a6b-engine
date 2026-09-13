@@ -1567,8 +1567,6 @@ METAL_FUNC void track_prefill_indirect(
 
         xb += BK;
       }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-
       if (sg_active) {
         STEEL_PRAGMA_UNROLL
         for (short e = 0; e < NAXTile<AccumType, TM, TN>::kElemsPerFrag; ++e) {
@@ -1846,8 +1844,6 @@ METAL_FUNC void track_prefill_indirect_gu(
 
         xb += BK;
       }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-
       if (sg_active) {
         STEEL_PRAGMA_UNROLL
         for (short e = 0; e < NAXTile<AccumType, TM, TN>::kElemsPerFrag; ++e) {
