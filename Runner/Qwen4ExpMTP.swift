@@ -114,7 +114,7 @@ public final class TrackQwen4ExpMTPModule: Module {
         stream = embedded[.ellipsis, .newAxis, 0...] + stream
         var hyper = stream.reshaped(B, S, hcCount * hiddenSize)
 
-        let index = layerCount == 1 ? 0 : stepIndex % layerCount
+        let index = TrackBitmaskRings.wrap(stepIndex, layerCount)
         let layerCache: KVCache? = index < cache.count ? cache[index] : nil
         let mask = makeAttentionMask(n: S, cache: layerCache)
         hyper = layers[index](

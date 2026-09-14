@@ -2,6 +2,9 @@
 // Scratch: ONE reused float[32] (128 B) in prepare, ZERO in convolution.
 // This retains the RMS/reduction lane layout and the dilated convolution's
 // channel-per-threadgroup layout; token tolerance, not bit equality, applies.
+//
+// §5.4-priced and default OFF. The bit-exact 4-launch path is
+// `TrackPLEChain` behind TRACK_PLE_CHAIN_FUSE.
 import Foundation
 import MLX
 
@@ -137,6 +140,15 @@ enum TrackPLEFusion {
         outputNames: ["gated", "full"], source: prepareSource,
         header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
 
+    static let prepareGenericKernel = MLXFast.metalKernel(
+        name: "track_ple_prepare_fuse2_eps",
+        inputNames: [
+            "key", "query", "value", "keyScale", "queryScale", "convScale", "convState", "eps",
+        ],
+        outputNames: ["gated", "full"],
+        source: TrackFastKernels.runtimeEpsSource(prepareSource),
+        header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
+
     static let convolutionKernel = MLXFast.metalKernel(
         name: "track_ple_convolution_fuse2", inputNames: ["full", "weight", "gated"],
         outputNames: ["out"], source: convolutionSource,
@@ -164,10 +176,19 @@ enum TrackPLEFusion {
         guard key.shape == [1, 1, 10240], value.shape == [1, 1, 2560],
             key.dtype == stream.dtype, value.dtype == stream.dtype
         else { return nil }
-        let r = prepareKernel(
-            [key, stream, value, p.normKeyScale, p.normQueryScale, p.normConvScale, convState],
-            template: [("InT", stream.dtype), ("EPS_BITS", Int(eps.bitPattern)),
-                       ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern))],
+        let useEps = TrackScalarTemplates.useTemplateEps(eps)
+        var inputs: [MLXArray] = [
+            key, stream, value, p.normKeyScale, p.normQueryScale, p.normConvScale, convState,
+        ]
+        if !useEps { inputs.append(TrackFastKernels.scalar(eps, dtype: .float32)) }
+        var template: [(String, any KernelTemplateArg)] = [
+            ("InT", stream.dtype),
+            ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern)),
+        ]
+        if useEps { template.append(("EPS_BITS", Int(eps.bitPattern))) }
+        let kernel = useEps ? prepareKernel : prepareGenericKernel
+        let r = kernel(
+            inputs, template: template,
             grid: (640, 4, 1), threadGroup: (640, 1, 1),
             outputShapes: [[1, 1, 10240], [1, 10, 10240]],
             outputDTypes: [stream.dtype, stream.dtype])
