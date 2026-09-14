@@ -115,15 +115,29 @@ enum TrackFastPLEKernels {
         outputNames: ["prod"],
         source: prodSource, header: header, ensureRowContiguous: true)
 
+    nonisolated(unsafe) static let prodTemplateKernel = MLXFast.metalKernel(
+        name: "track_ple_prod_eps",
+        inputNames: ["keyFlat", "stream", "kscale", "qscale"],
+        outputNames: ["prod"],
+        source: TrackFastKernels.templateEpsSource(prodSource), header: header,
+        ensureRowContiguous: true)
+
     static func prod(
         keyFlat: MLXArray, stream: MLXArray, kScale: MLXArray, qScale: MLXArray,
         hcCount: Int, hidden: Int, eps: Float
     ) -> MLXArray {
         let B = keyFlat.dim(0), S = keyFlat.dim(1), W = hcCount * hidden
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && keyFlat.dim(2) == W)
-        return prodKernel(
-            [keyFlat, stream, kScale, qScale, MLXArray(eps)],
-            template: [("InT", keyFlat.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+        let useEps = TrackScalarTemplates.useTemplateEps(eps)
+        var inputs: [MLXArray] = [keyFlat, stream, kScale, qScale]
+        if !useEps { inputs.append(TrackFastKernels.scalar(eps, dtype: .float32)) }
+        var template: [(String, any KernelTemplateArg)] = [
+            ("InT", keyFlat.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+        ]
+        if useEps { template.append(("EPS_BITS", Int(eps.bitPattern))) }
+        let kernel = useEps ? prodTemplateKernel : prodKernel
+        return kernel(
+            inputs, template: template,
             grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
             outputShapes: [[B, S, W]], outputDTypes: [keyFlat.dtype])[0]
     }
@@ -170,15 +184,22 @@ enum TrackFastPLEKernels {
         }
         """
 
+    private static let gatedHeader = header + """
+            template <typename T> METAL_FUNC T mlx_abs_t(T x) { return metal::abs(x); }
+            template <typename T> METAL_FUNC T mlx_sqrt_t(T x) { return metal::precise::sqrt(x); }
+            """
+
     nonisolated(unsafe) static let gatedKernel = MLXFast.metalKernel(
         name: "track_ple_gated",
         inputNames: ["g0", "value", "cscale", "divisor", "floorv", "eps"],
         outputNames: ["gated", "normed"],
-        source: gatedSource,
-        header: header + """
-            template <typename T> METAL_FUNC T mlx_abs_t(T x) { return metal::abs(x); }
-            template <typename T> METAL_FUNC T mlx_sqrt_t(T x) { return metal::precise::sqrt(x); }
-            """,
+        source: gatedSource, header: gatedHeader, ensureRowContiguous: true)
+
+    nonisolated(unsafe) static let gatedTemplateKernel = MLXFast.metalKernel(
+        name: "track_ple_gated_eps",
+        inputNames: ["g0", "value", "cscale", "divisor", "floorv"],
+        outputNames: ["gated", "normed"],
+        source: TrackFastKernels.templateEpsSource(gatedSource), header: gatedHeader,
         ensureRowContiguous: true)
 
     static func gated(
@@ -187,9 +208,16 @@ enum TrackFastPLEKernels {
     ) -> (gated: MLXArray, normed: MLXArray) {
         let B = value.dim(0), S = value.dim(1), W = hcCount * hidden
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && value.dim(2) == hidden)
-        let outs = gatedKernel(
-            [g0, value, cScale, divisor, floor, MLXArray(eps)],
-            template: [("InT", value.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+        let useEps = TrackScalarTemplates.useTemplateEps(eps)
+        var inputs: [MLXArray] = [g0, value, cScale, divisor, floor]
+        if !useEps { inputs.append(TrackFastKernels.scalar(eps, dtype: .float32)) }
+        var template: [(String, any KernelTemplateArg)] = [
+            ("InT", value.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+        ]
+        if useEps { template.append(("EPS_BITS", Int(eps.bitPattern))) }
+        let kernel = useEps ? gatedTemplateKernel : gatedKernel
+        let outs = kernel(
+            inputs, template: template,
             grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
             outputShapes: [[B, S, W], [B, S, W]],
             outputDTypes: [value.dtype, value.dtype])
