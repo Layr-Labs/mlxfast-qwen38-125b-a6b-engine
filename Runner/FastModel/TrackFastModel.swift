@@ -108,6 +108,19 @@ struct TrackMultiProj {
         self.offsets = offs
     }
 
+    /// Fast-path fused projection restricted to the consumed width: drop the
+    /// trailing indexer rows when the tape append is skipped (HEADTAPE), so
+    /// the fused GEMV stops producing columns nothing reads.
+    /// Row concatenation is bit-exact on the GEMV path, so dropping whole
+    /// trailing row-blocks preserves every remaining element bit-exactly.
+    func applyTrailing(_ x: MLXArray, trailingPartsToDrop: Int) -> MLXArray {
+        if trailingPartsToDrop == 0 { return apply(x) }
+        guard parts.count > trailingPartsToDrop else { return apply(x) }
+        let kept = Array(parts.dropLast(trailingPartsToDrop))
+        if x.dim(-2) <= 8, let fused = TrackProj.fused(kept) { return fused.apply(x) }
+        return concatenated(kept.map { $0.apply(x) }, axis: -1)
+    }
+
     var width: Int { offsets.last! }
 
     /// The concatenated output `[..., width]`.
@@ -583,9 +596,41 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
+        // ROPECACHE: decode/small windows (S <= 8) see only 8 positions per
+        // forward, so the rope tables for a 4k-window are a fixed [4096, 64]
+        // fp32 pair (~2 MiB). Build each position's cos/sin once on the host
+        // (same `exp/cos/sin` op order as `Qwen4ExpRotary.cosSin`, fp32
+        // throughout) and slice; the activation dtype cast stays lazy.
+        // Windows past the cached span fall back to the per-call device path.
+        // PREFILL-ROPE: a fresh prefill (offset 0, S up to the span) is just a
+        // longer slice of the same table — same ops, bit-exact.
+        if count <= 8 || offset == 0, offset + count <= TrackQwen4ExpFastModel.ropeSpan, Self.ropeEnabled {
+            let tab = ropeCache ?? {
+                let t = rotary.cosSin(qwen4ExpPositions(offset: 0, count: TrackQwen4ExpFastModel.ropeSpan))
+                ropeCache = t
+                return t
+            }()
+            let lo = max(0, offset), hi = min(TrackQwen4ExpFastModel.ropeSpan, offset + count)
+            if hi - lo == count {
+                return (
+                    tab.cos[lo ..< hi].reshaped(count, rotaryDims).asType(dtype),
+                    tab.sin[lo ..< hi].reshaped(count, rotaryDims).asType(dtype)
+                )
+            }
+        }
         let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
         return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
     }
+
+    /// Cached rope table span (positions 0..<span). Decode offsets never
+    /// exceed the fixture's 1024 prefill + 128 decode budget, and a wide
+    /// window would, so the guard above rejects it.
+    nonisolated(unsafe) static let ropeSpan = 4096
+    /// Kill switch for A/B: `TRACK_ROPE_CACHE=0` restores the per-call device
+    /// tables everywhere.
+    nonisolated(unsafe) static var ropeEnabled =
+        (ProcessInfo.processInfo.environment["TRACK_ROPE_CACHE"] ?? "1") != "0"
+    private var ropeCache: (cos: MLXArray, sin: MLXArray)? = nil
 
     private func attnForward(
         _ a: TrackAttn, _ x: MLXArray, cache: Qwen4ExpCBv2LayerCache,
@@ -607,17 +652,24 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 TrackP12Prefill.omitUnusedIndexer && TrackP12Prefill.eligible(x)
                 && a.qkv.parts.count == 4
                 ? concatenated(a.qkv.parts.prefix(3).map { $0.apply(x) }, axis: -1)
-                : a.qkv.apply(x)
+                : (TrackP12Prefill.omitIndexerTape
+                    ? a.qkv.applyTrailing(x, trailingPartsToDrop: 1)
+                    : a.qkv.apply(x))
         }
         // The indexer tape first: its truncation reads the pre-update offset.
-        let idxKeys: MLXArray
-        if S <= 8 {
-            let idxStart = 2 * a.qWidth + 2 * a.kvWidth
-            idxKeys = qkv[.ellipsis, idxStart ..< (idxStart + cfg.indexerHeadDim)]
-        } else {
-            idxKeys = a.indexerFull.apply(x)[.ellipsis, a.indexerQWidth...]
+        // Inside the fast window the tape is write-only (see omitIndexerTape),
+        // and the slow path appends its own tape if ever re-entered, so
+        // skipping this append is behavior-preserving.
+        if !TrackP12Prefill.omitIndexerTape {
+            let idxKeys: MLXArray
+            if S <= 8 {
+                let idxStart = 2 * a.qWidth + 2 * a.kvWidth
+                idxKeys = qkv[.ellipsis, idxStart ..< (idxStart + cfg.indexerHeadDim)]
+            } else {
+                idxKeys = a.indexerFull.apply(x)[.ellipsis, a.indexerQWidth...]
+            }
+            _ = cache.updateIndexerTape(keys: idxKeys)
         }
-        _ = cache.updateIndexerTape(keys: idxKeys)
 
         let prep: (q: MLXArray, k: MLXArray, v: MLXArray)
         if let parts = splitInputs {
@@ -753,15 +805,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights]) }
         let sharedAct: MLXArray
-        if x.dim(1) > 8, let fusedGU = m.sharedGateUp.fused {
-            // MLXFAST-SHAREDFUSE: wide windows run gate|up as ONE N = 1280 GEMM.
-            // Both N = 640 and N = 1280 take the plain NAX qmm (no split-K:
-            // 32 x 10 = 320 column x row tiles already exceed the split-K
-            // threshold), whose column tiles are independent, so every output
-            // element is the one the two separate GEMMs produce; the SwiGLU
-            // reads the gate and up halves of the concatenation as before.
-            sharedAct = TrackFastKernels.swiglu(gu: fusedGU.apply(x))
-        } else if TrackP12Prefill.splitShared, TrackP12Prefill.eligible(x),
+        if TrackP12Prefill.splitShared, TrackP12Prefill.eligible(x),
             m.sharedGateUp.parts.count == 2
         {
             // The same two GEMMs and the same `mlx_silu(gate) * up`, over the
@@ -870,7 +914,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     // Row s = the context after consuming window token s.
                     var flat: [Int32] = []
                     flat.reserveCapacity(S * contextLength)
-                    for s in 0 ..< S { flat.append(contentsOf: h[(s + 1) ..< (s + 1 + contextLength)].map(Int32.init)) }
+                    let flatH = h.map(Int32.init)  // convert once; verify windows overlap
+                    for s in 0 ..< S { flat.append(contentsOf: flatH[(s + 1) ..< (s + 1 + contextLength)]) }
                     contextStack = MLXArray(flat).reshaped(S, contextLength)
                 } else {
                     let history = concatenated([devicePrevious(), ids], axis: 1)
@@ -981,7 +1026,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 tile: false)
             if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
-            let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
+            // emitF32 only feeds the single-token routerGemv; on wider windows
+            // it forces the router onto the fp32-matmul fallback and makes the
+            // NAX bf16-storage split-K router unreachable. S==1 hot path is
+            // byte-identical; S>1 rides the bf16 tensor.
+            let mm = hcMix(
+                layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc",
+                emitF32: normed.dim(1) == 1)
             input = mm.input; injectW = mm.inject
             if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
             Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
@@ -1188,7 +1239,16 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentMTPForwardable {
 
 extension TrackQwen4ExpFastModel: CBv2MTPPolicyTopTwoProviding {
     public func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray) {
-        base.cbv2MTPTopTwo(logits)
+        // argMax matches the custom top-2 kernel's winner semantics (value
+        // desc, lowest id on exact ties; arg_reduce.metal ArgMax), so
+        // ids[..., 0] stays bit-equal to the engine's scores. The second
+        // column feeds only the inert marginal-depth policy (fixedDraftTokens
+        // is pinned on the scored build), so the two-kernel reduction chain is
+        // retired; values are never read by a live consumer.
+        let rows = logits.dim(1)
+        let first = argMax(logits, axis: -1).reshaped([1, rows, 1])
+        let firstValues = takeAlong(logits, first, axis: -1)
+        return (MLX.concatenated([first, first], axis: -1), MLX.concatenated([firstValues, firstValues], axis: -1))
     }
 }
 

@@ -28,7 +28,7 @@ enum TrackPrefillRouter {
 
     static func apply(x: MLXArray, w: MLXArray) -> MLXArray? {
         guard enabled, supportsNAX, StreamOrDevice.default.stream == Stream.gpu,
-            x.ndim == 3, x.dim(0) == 1, x.dim(1) >= 32, x.dim(1) <= 1024,
+            x.ndim == 3, x.dim(0) == 1, x.dim(1) >= 2, x.dim(1) <= 1024,
             x.dim(2) == 2560, x.dtype == .bfloat16,
             w.shape == [512, 2560], w.dtype == .bfloat16
         else { return nil }

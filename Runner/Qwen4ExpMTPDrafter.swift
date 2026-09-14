@@ -71,8 +71,16 @@ public final class TrackQwen4ExpInlineMTPAssistant {
         let groupSize: Int, bits: Int
     }
     private let shortlist: Shortlist?
-    static let shortlistLowIds = 98304
+    static let shortlistLowIds = 87364
     static let shortlistSpecialFrom = 248044
+
+    /// Shortlist width dial (MLXFAST-SHORTLISTW): the low-id cutoff, default
+    /// 98304. Lower shrinks the per-draft-step quantized GEMV (rows are packed
+    /// back to N % 8 == 0 for the fast GEMV path); a wider cutoff trades the
+    /// same bytes for fewer argmax misses. Zero keeps the default.
+    static var shortlistLowIdsOverride: Int {
+        Int(ProcessInfo.processInfo.environment["MLXFAST_SHORTLIST_LOW_IDS"] ?? "0") ?? 0
+    }
 
     /// - Parameters:
     ///   - target: an already-loaded model. The head reads its embedding
@@ -89,12 +97,13 @@ public final class TrackQwen4ExpInlineMTPAssistant {
         self.mtp = mtp
         self.embedTokens = embedTokens
         var shortlist: Shortlist? = nil
+        let cutoff = Self.shortlistLowIdsOverride > 0 ? Self.shortlistLowIdsOverride : Self.shortlistLowIds
         if let q = target.children()[unwrapping: "lm_head"] as? QuantizedLinear, let biases = q.biases,
             q.mode == .affine, q.bits == 4
         {
             let n = q.weight.dim(0)
-            let specials = (Self.shortlistSpecialFrom > Self.shortlistLowIds && Self.shortlistSpecialFrom < n) ? (n - Self.shortlistSpecialFrom) : 0
-            var low = min(Self.shortlistLowIds, n)
+            let specials = (Self.shortlistSpecialFrom > cutoff && Self.shortlistSpecialFrom < n) ? (n - Self.shortlistSpecialFrom) : 0
+            var low = min(cutoff, n)
             low += (8 - (low + specials) % 8) % 8  // keep the fast GEMV path (N % 8 == 0)
             var ids: [Int32] = (0 ..< min(low, n)).map { Int32($0) }
             if specials > 0 { ids.append(contentsOf: (Self.shortlistSpecialFrom ..< n).map { Int32($0) }) }
@@ -267,8 +276,15 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     public var requestStateBytesPerToken: Int {
         let configuration = target.configuration
         let elementBytes = embedTokens.weight.dtype.size
+        // The target-side and head-side indexer-tape appends are skipped on
+        // the fast decode paths (TRACK_P12_OMIT_INDEXER_TAPE /
+        // TRACK_HEAD_OMIT_INDEXER_TAPE), so the head's request state carries
+        // no indexer tape bytes to admit; billing indexerHeadDim here would
+        // over-reserve admission memory for a tape that never exists.
+        let tapeBilled = !TrackP12Prefill.omitIndexerTape || !TrackFastHead.omitIndexerTape
         let perLayer =
-            2 * configuration.kvHeads * configuration.headDim + configuration.indexerHeadDim
+            2 * configuration.kvHeads * configuration.headDim
+            + (tapeBilled ? configuration.indexerHeadDim : 0)
         let head = perLayer * mtp.layerCount * elementBytes
         let stream = configuration.hcCount * configuration.hiddenSize * elementBytes
         return head + stream + MemoryLayout<Int32>.stride
@@ -302,15 +318,27 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         guard count > 0 else { return }
 
         // Cross-chunk transition: the preceding chunk's final multi stream
-        // pairs with this chunk's first target input.
-        if let frontier = state.multiFrontier {
-            state.backlogMulti.append(frontier)
-            state.backlogTokens.append(observation.tokens[0..., 0 ..< 1])
-        }
-        // Intra-chunk transitions: multi[t] conditions token[t+1].
-        if count > 1 {
-            state.backlogMulti.append(observation.hidden[0..., 0 ..< count - 1, 0...])
-            state.backlogTokens.append(observation.tokens[0..., 1 ..< count])
+        // pairs with this chunk's first target input. Deferred: it is
+        // contiguous along axis 1 with this chunk's intra-chunk block, so it
+        // splices into ONE row instead of appending a second — a wide single
+        // headStep consumes both in one GEMV walk (bit-exact by row concat).
+        if let frontier = state.multiFrontier, count > 1 {
+            state.backlogMulti.append(
+                concatenated([frontier, observation.hidden[0..., 0 ..< count - 1, 0...]], axis: 1))
+            state.backlogTokens.append(
+                concatenated(
+                    [observation.tokens[0..., 0 ..< 1], observation.tokens[0..., 1 ..< count]],
+                    axis: 1))
+        } else {
+            if let frontier = state.multiFrontier {
+                state.backlogMulti.append(frontier)
+                state.backlogTokens.append(observation.tokens[0..., 0 ..< 1])
+            }
+            // Intra-chunk transitions: multi[t] conditions token[t+1].
+            if count > 1 {
+                state.backlogMulti.append(observation.hidden[0..., 0 ..< count - 1, 0...])
+                state.backlogTokens.append(observation.tokens[0..., 1 ..< count])
+            }
         }
         state.multiFrontier = observation.hidden[0..., (count - 1) ..< count, 0...]
     }
@@ -354,7 +382,9 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         let step = headStep(
             tokens: feed.tokens, multiStream: feed.multi, cache: state.caches,
             stepIndex: state.roundDraftSteps)
-        state.roundRoots.append(contentsOf: [step.multi, step.draft])
+        let lastRow = step.multi.dim(1) - 1
+        state.roundRoots.append(step.multi[0..., lastRow..., 0...])
+        state.roundRoots.append(step.draft)
         state.roundDraftSteps += 1
 
         if isFirstStep {

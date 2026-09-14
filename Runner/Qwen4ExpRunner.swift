@@ -338,6 +338,44 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         // Verified in full: a head that took only part of the checkpoint's
         // tensors would still draft, and would draft something else.
         try head.update(parameters: loaded.parameters(), verify: .all)
+
+        // --- HEAD RE-QUANTIZATION (REQUANT8) --------------------------------
+        // The head is a DRAFT model: it proposes tokens, and the pinned target
+        // decides every emitted one, so a change here can only move the
+        // acceptance rate, never correctness (contract section 4.4; bits 2..8,
+        // in memory, nothing on disk). Re-encode every head projection that
+        // runs through the generic quantized matmul at 8 bits. Two families
+        // stay at the checkpoint geometry: the routed-expert stack
+        // (switch_mlp) and the hyper-connection inject weights
+        // (block_inject_weight) are consumed by custom kernels with a hard
+        // `bits == 4` precondition and would trip an assertion.
+        let requantGroupSize = 32
+        let requantBits = 8
+        quantize(
+            model: head,
+            filter: { path, _ in
+                // Third family: the hyper-connection up/down projections feed
+                // TrackFastMixerKernels.downInject/upMix, whose kernels carry
+                // their own hard `bits == 4` precondition
+                // (TrackFastMixer.swift:102,179) — re-quantizing them would
+                // trip the assertion on the head's first draft step.
+                if path.contains("switch_mlp") || path.contains("block_inject_weight")
+                    || path.contains("input_mix_weight_") {
+                    return nil
+                }
+                return geometry[path].map {
+                    (groupSize: requantGroupSize, bits: requantBits, mode: $0.mode)
+                }
+            }
+        ) { module, groupSize, bits, mode in
+            guard let quantized = module as? QuantizedLinear else { return nil }
+            let floatWeight = dequantized(
+                quantized.weight, scales: quantized.scales, biases: quantized.biases,
+                groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode)
+            return QuantizedLinear(
+                weight: floatWeight, bias: quantized.bias,
+                groupSize: groupSize, bits: bits, mode: mode)
+        }
         return head
     }
 
