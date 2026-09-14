@@ -185,7 +185,7 @@ extension TrackFastKernels {
         outputNames: ["stream", "normed"],
         source: injectNormWideSource, ensureRowContiguous: true)
 
-    nonisolated(unsafe) static var wideNormMinS = 9
+    nonisolated(unsafe) static var wideNormMinS = 1
 
     /// Simdgroups per (row, stream) in the wide inject+norm launch.
     static let wideNormSimdgroups = 4
