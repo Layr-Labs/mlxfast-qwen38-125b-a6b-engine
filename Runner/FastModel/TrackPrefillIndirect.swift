@@ -121,22 +121,11 @@ enum TrackPrefillIndirect {
         else { return nil }
         let maxT = maxTiles(rows: rows, experts: d.w.dim(0))
         return kernel(
-            [activated, d.w, d.s, d.b, sortedIDs, identityRows(rows), tiles],
+            [activated, d.w, d.s, d.b, sortedIDs, sortedIDs, tiles],
             template: [("T", activated.dtype), ("N", 2560), ("K", 640)],
             grid: ((2560 / downBlockN) * 32, maxT * 2, 2),
             threadGroup: (32, 2, 2),
             outputShapes: [[rows, 1, 2560]], outputDTypes: [.bfloat16])[0]
-    }
-
-    nonisolated(unsafe) private static var identityCache: [Int: MLXArray] = [:]
-
-    /// `0 ..< rows` as uint32, built once per row count.
-    private static func identityRows(_ rows: Int) -> MLXArray {
-        if let cached = identityCache[rows] { return cached }
-        let a = MLXArray((0..<rows).map { UInt32($0) })
-        eval(a)
-        identityCache[rows] = a
-        return a
     }
 
     static let sourceGU = #"""
@@ -154,7 +143,7 @@ enum TrackPrefillIndirect {
     static let sourceDown = #"""
         alignas(16) threadgroup T Ws[128 * 40];
         alignas(16) threadgroup T As[32 * 40];
-        track_prefill_indirect<T, 32, 4, 32, 128, 32, 2, 2, true, N>(
+        track_prefill_indirect<T, 32, 4, 32, 128, 32, 2, 2, true, N, true>(
             x, w, scales, biases, indices, token_rows, tiles, y,
             N, K, Ws, As, threadgroup_position_in_grid,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
