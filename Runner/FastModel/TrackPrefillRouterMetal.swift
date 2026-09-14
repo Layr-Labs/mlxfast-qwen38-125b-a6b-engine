@@ -44,7 +44,6 @@ auto track_router_loop(
 
   STEEL_PRAGMA_NO_UNROLL
   for (int kk0 = 0; kk0 < gemm_k_iterations_; kk0++) {
-    threadgroup_barrier(mem_flags::mem_none);
     if constexpr (!kAlignedM || !kAlignedN) {
       if (!has_output)
         continue;
