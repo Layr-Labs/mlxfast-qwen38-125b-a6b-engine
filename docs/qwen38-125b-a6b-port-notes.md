@@ -1691,3 +1691,150 @@ the STAGED metallib on a ranked run, so a metallib staged without its sidecar
 fails that check with "no fingerprint record" and an official run treats that
 as fatal. A metallib that arrives with no sidecar is a refusal in the stager,
 not a skip.
+
+## 14. The served MTP head is the 8-bit head (2026-09-12)
+
+**THE RULING.** David, 2026-09-12: "the vontra mtp is 4bit ... we just want to
+replace the 4bit mtp to 8bit from
+https://huggingface.co/Vontra/Qwen3.8-Flash-Next-MLX-8bit-MTP. Leave everything
+else the same." The context is the depth history of this track: the frontier
+declares no speculation because the 4-bit head commits about 1.3 tokens per
+round on the hidden live prompt, below the break-even against the serial
+step.
+
+**THE FACTS.** The 8-bit repository at revision `9c306179` is the whole model
+at 8 bits: 42 shards, 203 GB. Its 76 `language_model.mtp.*` tensors have the
+same names and shapes as the 4-bit head, except that every packed `U32` weight
+has twice the columns; the `scales` and `biases` shapes are identical (group
+size 32 in both). They sit in shards 41 (4,593,121,634 bytes, shared with
+`lm_head` and 45 tower tensors) and 42 (971,528,844 bytes). The head is
+2,934,230,336 bytes at 8 bits against 1,631,332,416 at 4 bits. Shard 22 of
+the 4-bit target holds the 4-bit head plus 104 tower tensors (`lm_head`,
+layers 46 and 47, the final mixer).
+
+**THE DESIGN: A SECOND PINNED SOURCE, SPLICED AT TRANSFORM TIME.** Two designs
+were weighed. A composite checkpoint hosted by the organizer would have moved
+the target pin, and the golden loader compares every golden's
+`model_provenance` against that pin, so every tape would have needed a
+re-stamp. Keeping the target pin and pinning the 8-bit head shards as a second
+small source moves nothing else. That is the design that landed:
+
+1. `fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256` pins `config.json`
+   and the two shards (3 records, 5,564,655,839 bytes). No index is pinned:
+   the publisher's index names all 42 shards.
+2. `./setup.sh` provisions those files with the SAME downloader, verifier,
+   cache stamp and mutation lock as the target, under
+   `MLXFAST_MTP_HEAD_SOURCE_*` names, into a directory beside the target.
+   The one behavioural switch is `REFERENCE_SHARD_LIST_SOURCE=manifest`: this
+   artifact's shard list is its manifest, not an index.
+3. `mlxfast-swift transform --head-source <dir>` (required for this family,
+   refused for every other) validates the source's config (uniform affine
+   8-bit group-32), builds its index from the shards on disk, checks the 76
+   head tensors against `expectedHeadInventory(bits: 8)` with per-path packing
+   checks, and writes shard 22 as a COMPOSITE: the 104 tower tensors copied
+   from the target's shard 22 and the 76 head tensors copied from the source
+   shards (`Safetensors.copyComposite`). Names sorted, data contiguous, header
+   padded to eight bytes, bytes copied and never decoded. The index keeps its
+   `weight_map` and gains 1,302,897,920 bytes of `total_size`.
+4. The emitted `config.json` carries the tower's uniform 4-bit scalars plus
+   one entry per quantized head module (22 of them, keyed `mtp.*` because the
+   runtime drops `language_model.` at sanitize) at 8 bits. The fork's
+   `BaseConfiguration` decodes per-layer entries and `loadWeights` quantizes
+   each module at the resolved width; `TrackQwen4ExpRunner.adoptMTPHead`
+   reads the loaded geometry, so the served head is 8-bit with no runner
+   change.
+5. `verify-transform` regenerates with the same head source. The head
+   declaration cap `Gemma4MTPHeadDeclaration.defaultMaxBytes` moved from 2 GiB
+   to 4 GiB, and so did the checked-in `mtp-head.manifest.json`.
+6. `benchmark.json` is untouched on purpose. It is the Yukon track manifest,
+   and every field Yukon imports (editable paths, byte budget, commands,
+   scoring constants) is the same, so the live benchmark row needs no
+   re-import: submissions build on the branch tip, and the tip carries this
+   cut. Nothing in benchd changes either: its contract structs accept the new
+   `mtp_head` keys, and it never reads the head declaration's cap.
+
+**WHAT DID NOT CHANGE.** The target pin, its manifest and its inventory. Every
+golden and its provenance. `baseline_reference_commit` and the reference tree:
+the control leg runs serially and never touches the head, and the reference
+tree carries its own transformed weights and never re-transforms. The per-box
+calibration. The ranked workflow: it runs `./setup.sh` per candidate against
+the box's reference directory, so a box needs only the two shards and the
+config staged beside the target.
+
+**THE RECEIPT.** The composite shard 22 was first built on the laptop with a
+byte-copying Python script, before the Swift splice existed, and verified
+there: 104 tower tensors byte-identical to the 4-bit shard 22, 76 head tensors
+byte-identical to the 8-bit shards, header 25,264 bytes, contiguous. The Swift
+transform then produced the shard on ai-server (2026-09-13): the same
+5,018,468,984 bytes, the same parsed header, and the same data region
+(sha256 of the bytes after the header `5229d567d459a6a0afcf080375fc917302185fff4803a485df1b0cda124d93a4`).
+The two files differ only in the ORDER of keys inside the header's JSON text
+(Foundation's sorted-keys order is not Python's), so their whole-file digests
+differ. The pin is the TRANSFORM's output, `e255039300f0aff10efe95069c24e9c1b642f9824467bcdf80dd6dbb70e56f0d`,
+alongside the order-independent data digest, in
+`fixtures/qwen3_8_125b_a6b_mtp_8bit_inventory.json` and the track fixture's
+`mtp_head.transformed_shard`; a box's `weights/model-00022-of-00022.safetensors`
+can be checked against either.
+
+**WHAT A BOX OPERATOR DOES.** Stage the two shards and `config.json` at
+`<dirname of MLXFAST_REFERENCE_DIR>/Qwen3.8-Flash-Next-MLX-8bit-MTP`, verified
+against the head manifest, and run the candidate's `./setup.sh` once so the
+transform writes the spliced tree. No runner environment change is needed.
+
+**WHAT PARTICIPANTS MUST KNOW.** Fast kernels in `Runner/FastModel` that
+precondition `bits == 4` are correct for the tower and wrong for the head. A
+tree that runs `TrackFastHead` at depth 1 or more must route the head's
+modules through 8-bit-capable kernels or fall back. A tree that declares no
+speculation is unaffected. Measured on 2026-09-14 (ai-server, M5 Max 128 GiB,
+`./benchmark.sh --local-iterate`, public long-copy golden, the frontier
+Runner at `5818374`): with the fast head ON, every 8-bit leg at depth 1 to 3
+died on signal 5 (a Swift trap, no stderr) while the serial leg on the same
+tree passed; with the head routed through the fork's module path
+(`TRACK_FAST_HEAD=0` compiled in, because benchd's engine environment
+allowlist has no `TRACK_` prefix and the runtime switch cannot reach the
+worker), every leg passed.
+
+**WHAT THE HEAD SWAP MEASURED (same box, same mode, same prompt, one engine
+build, correctness passed on every leg).**
+
+| head | path | depth | acceptance | tokens per round | decode ms per token |
+|---|---|---|---|---|---|
+| none | serial | 0 | - | 1.00 | 16.34 (4-bit tree), 16.55 (8-bit tree) |
+| 4-bit | fast head | 1 | 0.924 | 1.91 | 32.49 |
+| 4-bit | fast head | 2 | 0.880 | 2.72 | 19.82 |
+| 4-bit | fast head | 3 | 0.843 | 3.46 | 19.28 |
+| 4-bit | module | 1 | 0.924 | 1.91 | 22.07 |
+| 4-bit | module | 2 | 0.880 | 2.72 | 15.79 |
+| 4-bit | module | 3 | 0.843 | 3.46 | 15.45 |
+| 8-bit | module | 1 | 0.954 | 1.94 | 21.22 |
+| 8-bit | module | 2 | 0.943 | 2.84 | 17.59 |
+| 8-bit | module | 3 | 0.876 | 3.56 | 16.50 |
+
+Three readings. First, the 8-bit head accepts 3 to 6 points more of its
+drafts at every depth, on a prompt where the 4-bit head was already near
+saturation. Second, a round costs a near-constant 41 to 59 ms against a 16 ms
+serial step, so the fixed per-round overhead is what the draft length must
+amortize; the 8-bit head's draft step reads twice the bytes, and on this
+prompt that cost outweighs its acceptance gain (17.6 against 15.8 ms per token
+at depth 2). Third, the frontier's fast head is SLOWER than the module path on
+this box at every depth (32.5 against 22.1, 19.8 against 15.8, 19.3 against
+15.4 ms per token). The hidden live prompt, where the 4-bit head is
+reported to commit far fewer tokens per round, is still unmeasured: no tapes
+were on the box.
+
+**THE GOLDENS DO NOT MOVE.** Every serial tape (the 8 pool tapes, the hidden
+the live prompt oracle, the 2 public goldens) records the target alone, and the target
+is unchanged; their `model_provenance` names the target pin, which is unchanged.
+The per-depth oracles record the target's greedy chain under
+the multi-row verify kernels. The head only proposes rows; the target decides
+every committed token. All six depths pin ONE file today, which shows the
+target's multi-row arithmetic does not depend on the window width (2 to 7
+rows) or on where the round boundaries fall, and those are the only two things
+a different head changes. So the same tape is expected at every depth with the
+8-bit head, and the ranked gate is a 10% token-tolerance budget besides. Confirm
+it with one box run at depths 1 to 3 against the per-depth oracle; regenerate and
+re-pin (R2 and the fixture) ONLY if that run diverges past the gate, and note
+that the reference tree at `baseline_reference_commit` cannot record such a
+tape, because its transform serves the 4-bit head. The acceptance the 8-bit
+head realizes on the hidden prompts is unmeasured until that run.
+

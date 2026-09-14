@@ -1,7 +1,7 @@
 {
   "version": 1,
   "source": "pinned",
-  "max_bytes": 2147483648,
+  "max_bytes": 4294967296,
   "spec": {
     "enabled": false,
     "num_speculative_tokens": 0

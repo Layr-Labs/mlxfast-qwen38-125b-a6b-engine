@@ -172,11 +172,15 @@ This is the 2026-08-26 ruling. It replaces the earlier bring-your-own-head
 design, under which a participant could declare and ship a head of their own
 choosing. That design is retired.
 
-The head is the organizer's pinned weights, because it is part of the pinned
-target checkpoint. `fixtures/qwen3_8_125b_a6b_track.json` names the repository
-and revision, and `fixtures/reference_qwen3_8_125b_a6b_4bit.sha256` carries the
-per-file digests that `./setup.sh` verifies every downloaded byte against. Both
-files live in `fixtures/`, which is outside the editable surface.
+The head is the organizer's pinned weights. Since 2026-09-12 the served head
+is the 8-bit head: the same 76 `language_model.mtp.*` tensors as the 4-bit
+target embeds, taken from the publisher's 8-bit conversion of the same
+checkpoint. `fixtures/qwen3_8_125b_a6b_track.json` names both repositories and
+revisions (`target` and `mtp_head.source_checkpoint`), and
+`fixtures/reference_qwen3_8_125b_a6b_4bit.sha256` together with
+`fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256` carry the per-file
+digests that `./setup.sh` verifies every downloaded byte against. All of them
+live in `fixtures/`, which is outside the editable surface.
 
 Three things enforce this, and section 4 states each one:
 
@@ -204,28 +208,41 @@ only proposes tokens. The pinned target model decides every emitted token.
 
 ## 4. The embedded MTP head
 
-The track carries one speculative head. It is the organizer's weights, because
-it is part of the pinned target checkpoint.
+The track carries one speculative head. It is the organizer's weights.
 
 | Item | Value |
 |---|---|
 | Declaration | `mtp-head.manifest.json` |
-| Where the weights are | Inside the pinned target checkpoint, under `language_model.mtp.*` |
-| Organizer pin | `Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP@327c8a60` |
+| Where the weights are | Inside the transformed tree, under `language_model.mtp.*` in shard 22 |
+| Served width | Affine 8-bit, group size 32 (David ruling 2026-09-12) |
+| Organizer pin, head source | `Vontra/Qwen3.8-Flash-Next-MLX-8bit-MTP@9c306179`, shards 41 and 42, `fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256` |
+| Organizer pin, tower | `Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP@327c8a60` |
 
-The declaration file is editable. The checkpoint is not.
+The declaration file is editable. Neither checkpoint is.
 
-Nothing stages a head weight file. There is no head stager and no head weights
-directory. `./setup.sh` provisions the target checkpoint, and the head arrives
-with it.
+**THE SERVED HEAD IS THE 8-BIT HEAD.** David ruling 2026-09-12: "replace the
+4-bit mtp with the 8-bit one; leave everything else the same." The 4-bit target
+embeds a 4-bit copy of the head. The transform does not serve that copy. It
+copies the 76 head tensors out of the two pinned 8-bit shards into shard 22 of
+`weights/`, byte for byte, and writes a `quantization` block that declares each
+head module at 8 bits (`mtp.*` entries) and the tower at 4 bits. The loader
+quantizes the head modules at 8 bits from that block. The tower's bytes, the
+target pin, the serial-control leg, the calibration and every serial golden do
+not change.
+
+Nothing stages a head weight file in a submission. There is no head stager and
+no head weights directory in the editable surface. `./setup.sh` provisions the
+two source shards beside the target and hands them to the transform as
+`--head-source`. The transform refuses to run without them.
 
 ### 4.1 What you may declare
 
 `"source": "pinned"` is the only accepted source. On this track it means the
-head embedded in the pinned target checkpoint. A declaration may also state
-`max_bytes` (it may lower the 2 GiB track cap and may not raise it), a `bytes`
-count, and an optional `sha256`. It carries no `arm` key; there is one arm, so
-there is nothing to select.
+head the organizer pins: the 8-bit head the transform embeds in the tree. A
+declaration may also state `max_bytes` (it may lower the 4 GiB track cap and
+may not raise it; the cap was 2 GiB before 2026-09-12 and a declaration that
+still states 2 GiB stays valid), a `bytes` count, and an optional `sha256`. It
+carries no `arm` key; there is one arm, so there is nothing to select.
 
 `"source": "remote"` is refused by name. `"source": "in_branch"` is refused by
 name. Both were accepted before the 2026-08-26 ruling and both meant "load
@@ -243,13 +260,13 @@ Yukon archives and overlays only `editablePaths`, so the file never reaches
 the measured tree, and the benchmarker's own write-divergence gate refuses any
 content that differs from the trusted baseline outside the editable surface.
 
-You may not edit the checkpoint's head tensors. The checkpoint is not an
-editable path, so any change to it is outside the surface.
+You may not edit the checkpoint's head tensors. Neither checkpoint is an
+editable path, so any change to either is outside the surface.
 
 ### 4.3 What the size cap does and does not do
 
-The 2 GiB declaration cap (`max_bytes` = 2147483648) bounds what the runner
-loads.
+The 4 GiB declaration cap (`max_bytes` = 4294967296) bounds what the runner
+loads. The served 8-bit head is 2,934,230,336 bytes.
 
 The size cap is the only gate on the declaration. A declared `sha256` is
 optional, and the runner does not verify it against the head bytes. It treats a
@@ -263,10 +280,14 @@ the candidate workspace against the trusted baseline workspace and refuses any
 divergence outside the editable surface. A correctly provisioned baseline is
 therefore load-bearing for the whole property.
 
-The head bytes themselves are bound one level up. They are part of the pinned
-target checkpoint, and `./setup.sh` verifies every downloaded byte against the
-per-file digests in `fixtures/reference_qwen3_8_125b_a6b_4bit.sha256`. Both
-legs load the head out of that one verified checkpoint.
+The head bytes themselves are bound one level up. They are the two pinned
+shards of the 8-bit source, and `./setup.sh` verifies every downloaded byte
+against the per-file digests in
+`fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256`, the same way it verifies
+the target against `fixtures/reference_qwen3_8_125b_a6b_4bit.sha256`. The
+transform copies the head out of those verified shards. The shard it writes is
+pinned too: `fixtures/qwen3_8_125b_a6b_mtp_8bit_inventory.json` records the
+byte count and sha256 of the spliced shard 22.
 
 ### 4.4 How a re-quantization reaches the box
 
@@ -304,11 +325,13 @@ The policy stays as written. A re-quantization of the pinned head is permitted.
 A replacement of the head is not, and head weights of your own are not. The
 declaration accepts `"source": "pinned"` only.
 
-The loader reads the checkpoint's own quantization block by default.
-Section 3.4 states the bounds the loader accepts: `group_size` positive and at
-most 65536, `bits` between 2 and 8, and at most 8192 per-layer overrides. A
-value outside those bounds is refused by name. The loader does not check a
-declare-versus-carry mismatch; section 3.4 states that limit.
+The loader reads the transformed tree's quantization block by default. That
+block is the target's uniform 4-bit scalars plus one per-module entry for each
+of the 22 quantized head modules at 8 bits, which the transform writes from the
+pinned geometry. Section 3.4 states the bounds the loader accepts: `group_size`
+positive and at most 65536, `bits` between 2 and 8, and at most 8192 per-layer
+overrides. A value outside those bounds is refused by name. The loader does not
+check a declare-versus-carry mismatch; section 3.4 states that limit.
 
 #### Why nothing is written
 
@@ -823,8 +846,9 @@ kept for LOCAL, UNSCORED use. The ranked path has no caller for it.
 
 `setupCommand` is `./tools/fetch-benchd.sh && ./setup.sh`. It chains no head
 stager, because there is none. The checked-in `mtp-head.manifest.json` declares
-`"source": "pinned"`, and the head arrives inside the target checkpoint that
-`./setup.sh` downloads and verifies.
+`"source": "pinned"`. `./setup.sh` downloads and verifies the target checkpoint
+and, beside it, the two 8-bit shards that carry the served head; the transform
+it runs splices that head into `weights/`.
 
 ## 7. The pinned artifacts
 
@@ -832,7 +856,10 @@ stager, because there is none. The checked-in `mtp-head.manifest.json` declares
 |---|---|
 | Target model | `Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP` @ `327c8a604de613b42f84ba5e6b796c0931e8aa3b` |
 | Target manifest | `fixtures/reference_qwen3_8_125b_a6b_4bit.sha256` |
-| MTP head | Embedded in the target checkpoint under `language_model.mtp.*` |
+| MTP head | Embedded in the transformed tree under `language_model.mtp.*`, served at 8 bits |
+| MTP head source | `Vontra/Qwen3.8-Flash-Next-MLX-8bit-MTP` @ `9c306179562765396e197a8a7a5de1b6b761c41a`, shards 41 and 42 |
+| MTP head manifest | `fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256` (3 records, 5,564,655,839 bytes) |
+| Spliced shard 22 | 5,018,468,984 bytes, sha256 `e255039300f0aff10efe95069c24e9c1b642f9824467bcdf80dd6dbb70e56f0d` |
 | Engine fork revision | `449f2d01b39f9088739c98d80a4f8a1b3cfa105e` |
 
 `fixtures/reference_qwen3_8_125b_a6b_4bit.sha256` pins 32 files totalling
@@ -844,7 +871,9 @@ repository and revision pin.
 
 The model repository is public and downloads without a token. There is no
 organizer-hosted mirror for this checkpoint, so
-`MLXFAST_REFERENCE_FALLBACK_BASE_URL` is empty by default.
+`MLXFAST_REFERENCE_FALLBACK_BASE_URL` is empty by default. The head source
+repository is public too. `./setup.sh` fetches only the two shards the head
+manifest pins, not the whole 42-shard 8-bit checkpoint.
 
 Participants never supply the target weights. Substituting or re-deriving the
 target is a failure.

@@ -142,7 +142,7 @@ kept as the record of what the exemption was for.
 RATIFIED size-only (engine-alteration-blocks audit, 2026-08-21; DECIDE-2 Q-B).**
 Here the digest half of that sentence is deliberately not a gate. That remains
 true after the requant-only ruling, and it is now the sharpest open limit on the
-track: `max_bytes` (2 GiB) is enforced fail-closed, and a declared `sha256` is
+track: `max_bytes` (4 GiB since 2026-09-12, 2 GiB before) is enforced fail-closed, and a declared `sha256` is
 parsed and carried when present but neither required nor verified against the
 head bytes
 (`Sources/MLXFastTrustedHarness/Gemma4MTPHeadDeclaration.swift`, the

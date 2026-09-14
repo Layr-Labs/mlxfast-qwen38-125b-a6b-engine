@@ -1339,3 +1339,119 @@ private func temporaryDirectory() throws -> URL {
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
 }
+
+// MARK: - The served MTP head source (David ruling 2026-09-12)
+
+private func qwen4ExpReferenceConfigJSON(bits: Int) -> String {
+    """
+    {"model_type":"qwen4_exp","text_config":{"model_type":"qwen4_exp_text","num_experts":512,"num_hidden_layers":48,"layer_types":["linear_attention","full_attention"]},"quantization":{"group_size":32,"bits":\(bits),"mode":"affine"},"quantization_config":{"group_size":32,"bits":\(bits),"mode":"affine"}}
+    """
+}
+
+/// The Qwen 3.8 125B A6B family serves the 8-bit head, so its transform
+/// REFUSES to run without a head source -- before it opens a shard, so the
+/// refusal names the flag and the pinned source rather than an inventory
+/// mismatch. Every other family refuses a head source it is given.
+@Test
+func transformRequiresAHeadSourceForTheQwen4ExpFamilyAndRefusesItElsewhere() throws {
+    let root = try temporaryDirectory()
+    let reference = root.appendingPathComponent("reference", isDirectory: true)
+    let output = root.appendingPathComponent("weights", isDirectory: true)
+    try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
+    try qwen4ExpReferenceConfigJSON(bits: 4).write(
+        to: reference.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+
+    var message = ""
+    #expect(throws: MLXFastError.self) {
+        do {
+            _ = try SwiftTransform.run(
+                TransformOptions(referencePath: reference.path, outputPath: output.path))
+        } catch let error as MLXFastError {
+            message = error.description
+            throw error
+        }
+    }
+    #expect(message.contains("--head-source"), "\(message)")
+    #expect(message.contains(MLXFastConstants.mtpHeadSourceRepository), "\(message)")
+    #expect(!FileManager.default.fileExists(atPath: output.path))
+
+    // A family with no embedded head refuses a head source by name.
+    let fixture = try writeTransformFixture()
+    var foreign = ""
+    #expect(throws: MLXFastError.self) {
+        do {
+            _ = try SwiftTransform.run(
+                TransformOptions(
+                    referencePath: fixture.reference.path,
+                    outputPath: fixture.output.path,
+                    mtpHeadSourcePath: fixture.root.path))
+        } catch let error as MLXFastError {
+            foreign = error.description
+            throw error
+        }
+    }
+    #expect(foreign.contains("--head-source"), "\(foreign)")
+    #expect(!FileManager.default.fileExists(atPath: fixture.output.path))
+}
+
+/// A head source that is not the pinned 8-bit conversion is refused before
+/// any bytes move: here the 4-bit target itself, offered as the head.
+@Test
+func transformRefusesAHeadSourceOfTheWrongWidth() throws {
+    let root = try temporaryDirectory()
+    let reference = root.appendingPathComponent("reference", isDirectory: true)
+    let head = root.appendingPathComponent("head", isDirectory: true)
+    let output = root.appendingPathComponent("weights", isDirectory: true)
+    for directory in [reference, head] {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try qwen4ExpReferenceConfigJSON(bits: 4).write(
+            to: directory.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+    }
+
+    var message = ""
+    #expect(throws: MLXFastError.self) {
+        do {
+            _ = try SwiftTransform.run(
+                TransformOptions(
+                    referencePath: reference.path,
+                    outputPath: output.path,
+                    mtpHeadSourcePath: head.path))
+        } catch let error as MLXFastError {
+            message = error.description
+            throw error
+        }
+    }
+    #expect(message.contains("8-bit"), "\(message)")
+    #expect(!FileManager.default.fileExists(atPath: output.path))
+
+    // The head source may not be the reference directory itself.
+    var same = ""
+    #expect(throws: MLXFastError.self) {
+        do {
+            _ = try SwiftTransform.run(
+                TransformOptions(
+                    referencePath: reference.path,
+                    outputPath: output.path,
+                    mtpHeadSourcePath: reference.path))
+        } catch let error as MLXFastError {
+            same = error.description
+            throw error
+        }
+    }
+    #expect(same.contains("separate"), "\(same)")
+}
+
+/// The verifier hands the head source through to the regeneration unchanged,
+/// so a tree served from the 8-bit head is judged against a regeneration
+/// from the same head.
+@Test
+func transformVerifierPassesTheHeadSourceThrough() throws {
+    let options = TransformVerificationOptions(
+        referencePath: "/reference", weightsPath: "/weights", mtpHeadSourcePath: "/head")
+    #expect(options.mtpHeadSourcePath == "/head")
+    let report = TransformReport(
+        referencePath: "/reference", outputPath: "/weights", denseTensorCount: 1,
+        denseShardCount: 1, configPath: "/weights/config.json",
+        indexPath: "/weights/model.safetensors.index.json", mtpHeadSourcePath: "/head")
+    #expect(report.mtpHeadSourcePath == "/head")
+}
