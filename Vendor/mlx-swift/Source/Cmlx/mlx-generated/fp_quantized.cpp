@@ -1634,7 +1634,7 @@ template <
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
   threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
+  alignas(16) threadgroup T Ws[BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets(
@@ -1690,7 +1690,7 @@ template <
   constexpr int BN_padded = (BN + 16 / sizeof(T));
 
   threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BK * BN_padded];
+  alignas(16) threadgroup T Ws[BK * BN_padded];
 
   if (batched) {
     adjust_matrix_offsets(
@@ -1929,7 +1929,7 @@ template <
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
   threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
+  alignas(16) threadgroup T Ws[BN * BK_padded];
 
   adjust_matrix_offsets(
       x,
@@ -1983,7 +1983,7 @@ template <
   constexpr int pack_factor = get_pack_factor<8, bits>();
   constexpr int bytes_per_pack = get_bytes_per_pack();
   threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
+  alignas(16) threadgroup T Ws[BN * BK_padded];
   const int k_start = tid.z * k_partition_size;
   x += k_start;
 
@@ -2048,7 +2048,7 @@ template <
   constexpr int BN_padded = (BN + 16 / sizeof(T));
 
   threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BK * BN_padded];
+  alignas(16) threadgroup T Ws[BK * BN_padded];
 
   adjust_matrix_offsets(
       x,
@@ -2126,7 +2126,7 @@ template <
       bits>;
 
   threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
+  alignas(16) threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
 
   // Compute the block
   const int K_w = K * bytes_per_pack / pack_factor;

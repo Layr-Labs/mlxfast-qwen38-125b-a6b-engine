@@ -26,8 +26,8 @@
 //     concatenation;
 //   * the attention QKV concatenation drops its fourth part, the narrow
 //     indexer-K projection, which wide windows do not read (they take the
-//     indexer tape from the full `index_qk_proj` instead, because the GEMM
-//     rounding there depends on N).
+//     indexer tape from `indexerK`, or from the full `index_qk_proj` when
+//     this round's keep-mask will read the q half / `TRACK_QPROJ_GUARD=0`).
 //
 // EXACTNESS. The two re-addressed Metal kernels are generated from the
 // original kernel sources by textual substitution of the address expression
@@ -96,6 +96,7 @@ enum TrackP12Prefill {
         name: "track_p12_gdn_prep_split_inputs",
         inputNames: [
             "proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "b_gate", "a_gate",
+            "adopted_slot",
         ],
         outputNames: ["qn", "kn", "vv", "g", "beta", "conv_out"],
         source: addressVariant(
@@ -109,7 +110,8 @@ enum TrackP12Prefill {
     static func gdnPrepSplit(
         proj: MLXArray, b: MLXArray, a: MLXArray,
         convState: MLXArray, convW: MLXArray, negExpALog: MLXArray,
-        dtBias: MLXArray, T: Int, capture: Bool, geometry g: TrackFastKernels.GDNGeometry
+        dtBias: MLXArray, T: Int, capture: Bool, geometry g: TrackFastKernels.GDNGeometry,
+        adoptedSlot: MLXArray? = nil
     ) -> [MLXArray] {
         let B = proj.dim(0)
         let slots = capture ? B * T : B
@@ -117,13 +119,14 @@ enum TrackP12Prefill {
         precondition(b.dim(2) == g.hv && a.dim(2) == g.hv)
         precondition(b.dtype == proj.dtype && a.dtype == proj.dtype)
         precondition(g.dk == 128 && g.dv == 128 && g.convDim % 128 == 0)
+        let adopt = TrackFastKernels.adoptFlag(adoptedSlot)
         return splitPrepKernel(
-            [proj, convState, convW, negExpALog, dtBias, b, a],
+            [proj, convState, convW, negExpALog, dtBias, b, a, adopt.flag],
             template: [
                 ("InT", proj.dtype), ("T", T), ("Dk", g.dk), ("Dv", g.dv), ("Hk", g.hk),
                 ("Hv", g.hv), ("KC", g.convKernel), ("PROJ_W", g.projWidth),
                 ("CONV_DIM", g.convDim), ("B_OFF", g.bOffset), ("A_OFF", g.aOffset),
-                ("CAPTURE", capture),
+                ("CAPTURE", capture), ("ADOPT", adopt.on),
             ],
             grid: (32, g.convDim / 128, B * T), threadGroup: (32, 4, 1),
             outputShapes: [
@@ -142,18 +145,27 @@ enum TrackP12Prefill {
             hk: g.hk, hv: g.hv, dk: g.dk, dv: g.dv, bOffset: g.bOffset, aOffset: g.aOffset)
     }
 
+    private static let splitAttnReplacements: [(String, String)] = [
+        ("src = row * QW + 2 * HQ * D + hh * D;", "src = row * HK * D + hh * D;"),
+        ("src = row * QW + 2 * HQ * D + HK * D + hh * D;", "src = row * HK * D + hh * D;"),
+        ("qkv[src + d]", "vproj[src + d]"),
+        ("qkv[src + lid * N_READS + i]", "(isQ ? qkv : kproj)[src + lid * N_READS + i]"),
+    ]
+
     nonisolated(unsafe) private static let splitAttnPrepKernel = MLXFast.metalKernel(
         name: "track_p12_attn_prep_split_inputs",
         inputNames: ["qkv", "kproj", "vproj", "qnorm", "knorm", "cosb", "sinb"],
         outputNames: ["qout", "kout", "vout"],
+        source: addressVariant(TrackFastKernels.attnPrepSource, splitAttnReplacements),
+        header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
+
+    nonisolated(unsafe) private static let splitAttnPrepGenericKernel = MLXFast.metalKernel(
+        name: "track_p12_attn_prep_split_inputs_eps",
+        inputNames: ["qkv", "kproj", "vproj", "qnorm", "knorm", "cosb", "sinb", "eps"],
+        outputNames: ["qout", "kout", "vout"],
         source: addressVariant(
-            TrackFastKernels.attnPrepSource,
-            [
-                ("src = row * QW + 2 * HQ * D + hh * D;", "src = row * HK * D + hh * D;"),
-                ("src = row * QW + 2 * HQ * D + HK * D + hh * D;", "src = row * HK * D + hh * D;"),
-                ("qkv[src + d]", "vproj[src + d]"),
-                ("qkv[src + lid * N_READS + i]", "(isQ ? qkv : kproj)[src + lid * N_READS + i]"),
-            ]),
+            TrackFastKernels.runtimeEpsSource(TrackFastKernels.attnPrepSource),
+            splitAttnReplacements),
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
     static func attnPrepSplit(
@@ -166,11 +178,65 @@ enum TrackP12Prefill {
         precondition(qGate.dim(2) == 2 * heads * headDim)
         precondition(k.shape == [B, S, kvHeads * headDim] && v.shape == k.shape)
         precondition(k.dtype == qGate.dtype && v.dtype == qGate.dtype)
-        let outs = splitAttnPrepKernel(
-            [qGate, k, v, qNorm, kNorm, cos, sin],
+        let useEps = TrackScalarTemplates.useTemplateEps(eps)
+        var inputs: [MLXArray] = [qGate, k, v, qNorm, kNorm, cos, sin]
+        if !useEps { inputs.append(TrackFastKernels.scalar(eps, dtype: .float32)) }
+        var template: [(String, any KernelTemplateArg)] = [
+            ("InT", qGate.dtype), ("D", headDim), ("HQ", heads), ("HK", kvHeads), ("S", S),
+            ("QW", qGate.dim(2)), ("ROT", rotaryDims),
+        ]
+        if useEps { template.append(("EPS_BITS", Int(eps.bitPattern))) }
+        let kernel = useEps ? splitAttnPrepKernel : splitAttnPrepGenericKernel
+        let outs = kernel(
+            inputs, template: template,
+            grid: (headDim / 4, heads + 2 * kvHeads, B * S), threadGroup: (headDim / 4, 1, 1),
+            outputShapes: [[B, heads, S, headDim], [B, kvHeads, S, headDim], [B, kvHeads, S, headDim]],
+            outputDTypes: [qGate.dtype, qGate.dtype, qGate.dtype])
+        return (outs[0], outs[1], outs[2])
+    }
+
+    /// Touches the fused-split kernel so a missing attnPrepFuseSource anchor
+    /// fails at load, not at first wide prefill.
+    static var splitFuseKernelReady: Bool {
+        splitAttnPrepFuseKernel.outputNames == ["qout", "kout", "vout"]
+    }
+
+    nonisolated(unsafe) private static let splitAttnPrepFuseKernel = MLXFast.metalKernel(
+        name: "track_p12_attn_prep_split_kv_fuse",
+        inputNames: ["qkv", "kproj", "vproj", "qnorm", "knorm", "cosb", "sinb", "kcache", "vcache", "kvmeta"],
+        outputNames: ["qout", "kout", "vout"],
+        source: addressVariant(
+            TrackFastKernels.attnPrepFuseSource,
+            [
+                ("src = row * QW + 2 * HQ * D + hh * D;", "src = row * HK * D + hh * D;"),
+                ("src = row * QW + 2 * HQ * D + HK * D + hh * D;", "src = row * HK * D + hh * D;"),
+                ("qkv[src + d]", "vproj[src + d]"),
+                ("qkv[src + lid * N_READS + i]", "(isQ ? qkv : kproj)[src + lid * N_READS + i]"),
+            ]),
+        header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
+
+    static func attnPrepSplitFused(
+        qGate: MLXArray, k: MLXArray, v: MLXArray,
+        qNorm: MLXArray, kNorm: MLXArray, cos: MLXArray, sin: MLXArray,
+        kCache: MLXArray, vCache: MLXArray, writeOffset: Int,
+        heads: Int, kvHeads: Int, headDim: Int, rotaryDims: Int, eps: Float,
+        wrap: Bool = false
+    ) -> (q: MLXArray, k: MLXArray, v: MLXArray) {
+        let B = qGate.dim(0), S = qGate.dim(1), cap = kCache.dim(2)
+        precondition(headDim % 4 == 0 && rotaryDims % 8 == 0 && cos.dim(1) == rotaryDims)
+        precondition(qGate.dim(2) == 2 * heads * headDim)
+        precondition(k.shape == [B, S, kvHeads * headDim] && v.shape == k.shape)
+        precondition(k.dtype == qGate.dtype && v.dtype == qGate.dtype)
+        precondition(kCache.shape == [B, kvHeads, cap, headDim])
+        precondition(vCache.shape == kCache.shape && vCache.dtype == qGate.dtype)
+        precondition(TrackKVFuse.canAppend(offset: writeOffset, count: S, cap: cap, wrap: wrap))
+        let meta = MLXArray([Int32(writeOffset), Int32(cap)])
+        let outs = splitAttnPrepFuseKernel(
+            [qGate, k, v, qNorm, kNorm, cos, sin, kCache, vCache, meta],
             template: [
                 ("InT", qGate.dtype), ("D", headDim), ("HQ", heads), ("HK", kvHeads), ("S", S),
                 ("QW", qGate.dim(2)), ("ROT", rotaryDims), ("EPS_BITS", Int(eps.bitPattern)),
+                ("WRAP", wrap),
             ],
             grid: (headDim / 4, heads + 2 * kvHeads, B * S), threadGroup: (headDim / 4, 1, 1),
             outputShapes: [[B, heads, S, headDim], [B, kvHeads, S, headDim], [B, kvHeads, S, headDim]],
@@ -201,7 +267,7 @@ enum TrackP12Prefill {
     /// Keep sorted expert rows through the projections and weighted combine.
     static func sortedMoE(
         _ m: TrackMoE, _ x: MLXArray, indices: MLXArray, weights: MLXArray,
-        shared: MLXArray, gate: MLXArray
+        shared: MLXArray, gate: MLXArray, dispatch: TrackMoEDispatch.Pack? = nil
     ) -> MLXArray? {
         guard sortedCombine, eligible(x), indices.size >= 64, weights.dtype == .float32,
             let parts = m.p12SortedParts, !m.switchMLP.hasFusedGateUp
@@ -211,10 +277,20 @@ enum TrackP12Prefill {
         let sortedIDs: MLXArray
         let inverse: MLXArray
         let down: MLXArray
-        if let indirect = TrackPrefillIndirect.apply(m, x: x, indices: indices) {
+        if let indirect = TrackPrefillIndirect.apply(
+            m, x: x, indices: indices, dispatch: dispatch)
+        {
             (activated, sortedIDs, inverse) = (indirect.activated, indirect.sortedIDs, indirect.inverse)
             down = TrackPrefillIndirect.down(m, activated: activated, sortedIDs: sortedIDs, tiles: indirect.tiles)
                 ?? parts.down(activated, sortedIDs, sortedIndices: true)
+        } else if let dispatch {
+            let gathered = x.reshaped(B * S, 1, H)[dispatch.tokenRows]
+            sortedIDs = dispatch.sortedIDs
+            inverse = dispatch.inverse
+            let up = parts.up(gathered, sortedIDs, sortedIndices: true)
+            let gateAct = parts.gate(gathered, sortedIDs, sortedIndices: true)
+            activated = compiledSiluProduct(gateAct, up)
+            down = parts.down(activated, sortedIDs, sortedIndices: true)
         } else {
             let expanded = MLX.expandedDimensions(x, axes: [-2, -3])
             let sorted = gatherSort(x: expanded, indices: indices)
@@ -225,6 +301,16 @@ enum TrackP12Prefill {
             activated = compiledSiluProduct(gateAct, up)
             down = parts.down(activated, sortedIDs, sortedIndices: true)
         }
+        return combineSorted(
+            down: down, weights: weights, shared: shared, gate: gate,
+            inverse: inverse, B: B, S: S, H: H, K: K)
+    }
+
+    /// Weighted combine of expert-sorted down rows through `inverse`.
+    static func combineSorted(
+        down: MLXArray, weights: MLXArray, shared: MLXArray, gate: MLXArray,
+        inverse: MLXArray, B: Int, S: Int, H: Int, K: Int
+    ) -> MLXArray? {
         guard down.ndim == 3, down.dim(0) == B * S * K, down.dim(1) == 1, down.dim(2) == H,
             inverse.size == B * S * K
         else { return nil }
