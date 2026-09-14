@@ -1365,8 +1365,7 @@ template <
     int WM,
     int WN,
     bool transpose,
-    int NS,
-    bool IDENTITY_ROWS = false>
+    int NS>
 METAL_FUNC void track_prefill_indirect(
     const device T* x,
     const device uint32_t* w,
@@ -1383,10 +1382,17 @@ METAL_FUNC void track_prefill_indirect(
     uint3 tid,
     uint simd_group_id,
     uint simd_lane_id) {
+  // Sweep set: {64×64, 128×32}. PackedNAXGroup32 requires n_reads==16
+  // (BN×BK==4096) and BK a multiple of group_size=32. 256×16 fails
+  // group_size=32 / SK=32 / PackedNAX store of 32 K. 256×32 is 23040 B
+  // (occupancy 2 vs 4) and n_reads=32. 128×64 is 23040 B (over the 13824 B
+  // existing budget) and n_reads=32 (PackedNAXGroup32 needs 16). K-walk
+  // is identical across accepted tiles: SK=32, BK % SK == 0, so each
+  // output adds K as 32-wide blocks 0, 32, …, 608 — same order as 64×64.
   static_assert(
       transpose && BM == 32 && WM == 2 && WN == 2 &&
           ((BN == 64 && BK == 64) || (BN == 128 && BK == 32)),
-      "P17 tile: 32 rows, 2x2 SIMD layout, 64x64 or 128x32 weight block");
+      "P17 down tile: 32 rows, 2x2 SIMD, BN×BK in {64×64, 128×32}");
   static_assert(
       metal::is_same_v<T, bfloat16_t> && group_size == 32 && bits == 4,
       "P17 requires unchanged bf16 / affine group-32 / 4-bit operands");
@@ -1477,11 +1483,7 @@ METAL_FUNC void track_prefill_indirect(
     const bool a_live = a_row < tile_m;
     const device T* xb = x;
     if (a_live) {
-      if constexpr (IDENTITY_ROWS) {
-        xb += size_t(tile_begin + a_row) * K + a_col;
-      } else {
-        xb += size_t(token_rows[tile_begin + a_row]) * K + a_col;
-      }
+      xb += size_t(token_rows[tile_begin + a_row]) * K + a_col;
     }
 
     thread loader_w_t loader_w(
@@ -1508,22 +1510,13 @@ METAL_FUNC void track_prefill_indirect(
           for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a0[v]; }
         }
       }
-      if (!a_live) {
-        // A dead row's slice of the activation stage is zero for every K step:
-        // `a_dst` never advances (only `xb`, the device side, does), so it is
-        // written once here instead of once per step. Half the threadgroup is
-        // dead in the ranked window's last tile.
-        threadgroup uint4* d0 = (threadgroup uint4*)a_dst;
-        STEEL_PRAGMA_UNROLL
-        for (short v = 0; v < A_VECS; ++v) { d0[v] = uint4(0); }
-      }
       for (int k = 0; k < K_it; k++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         packed_w.store(loader_w.dst);
-        if (a_live) {
+        {
           threadgroup uint4* d4 = (threadgroup uint4*)a_dst;
           STEEL_PRAGMA_UNROLL
-          for (short v = 0; v < A_VECS; ++v) { d4[v] = a_buf[v]; }
+          for (short v = 0; v < A_VECS; ++v) { d4[v] = a_live ? a_buf[v] : uint4(0); }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1650,10 +1643,16 @@ METAL_FUNC void track_prefill_indirect_gu(
     uint3 tid,
     uint simd_group_id,
     uint simd_lane_id) {
+  // 64×64 only. PackedNAXGroup32 requires n_reads==16 (BN×BK==4096) and BK
+  // a multiple of group_size=32. 64×32 is n_reads=8 and fails the loader
+  // (BCOLS_PACKED/n_reads)==n_groups rule. 128×64 is 41472 B (over the 32 KB
+  // API cap and the 23040 B two-bank budget) and occupancy 1 vs 2. 128×32 is
+  // budget-legal but TN=4, and the MLXFAST-ACC walk below implements TN=2
+  // only (frag_at(0)/(1) reads, val_frags[0]/[1] writes) — half the output
+  // columns would stay clear() zeros — so the host knob rejects it too.
   static_assert(
-      transpose && BM == 32 && WM == 2 && WN == 2 &&
-          ((BN == 64 && BK == 64) || (BN == 128 && BK == 32)),
-      "P17 tile: 32 rows, 2x2 SIMD layout, 64x64 or 128x32 weight block");
+      transpose && BM == 32 && WM == 2 && WN == 2 && BN == 64 && BK == 64,
+      "P17 gate|up tile: 32 rows, 2x2 SIMD layout, 64x64 weight block");
   static_assert(
       metal::is_same_v<T, bfloat16_t> && group_size == 32 && bits == 4,
       "P17 requires unchanged bf16 / affine group-32 / 4-bit operands");
@@ -1789,23 +1788,14 @@ METAL_FUNC void track_prefill_indirect_gu(
           for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a0[v]; }
         }
       }
-      if (!a_live) {
-        // A dead row's slice of the activation stage is zero for every K step:
-        // `a_dst` never advances (only `xb`, the device side, does), so it is
-        // written once here instead of once per step. Half the threadgroup is
-        // dead in the ranked window's last tile.
-        threadgroup uint4* d0 = (threadgroup uint4*)a_dst;
-        STEEL_PRAGMA_UNROLL
-        for (short v = 0; v < A_VECS; ++v) { d0[v] = uint4(0); }
-      }
       for (int k = 0; k < K_it; k++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         packed_w0.store(loader_w0.dst);
         packed_w1.store(loader_w1.dst);
-        if (a_live) {
+        {
           threadgroup uint4* d4 = (threadgroup uint4*)a_dst;
           STEEL_PRAGMA_UNROLL
-          for (short v = 0; v < A_VECS; ++v) { d4[v] = a_buf[v]; }
+          for (short v = 0; v < A_VECS; ++v) { d4[v] = a_live ? a_buf[v] : uint4(0); }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

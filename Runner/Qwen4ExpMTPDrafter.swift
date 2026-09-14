@@ -26,6 +26,23 @@
 //  The target verifier uses the same rule, so a draft can never be rejected
 //  over a tie the two sides broke differently.
 //
+//  WARM STATE. The engine hands every committed target chunk to
+//  `observeCommittedTarget` while it builds the step graph that computed the
+//  chunk. The fork's copy lets those transitions pile up: the first draft
+//  round after the prompt then replays the whole backlog through the head in
+//  one `[1, S]` forward, inside the decode window. With
+//  `TRACK_DRAFTER_WARMSTATE` on (the default), this copy feeds each
+//  observation's completed transitions through the head at once, inside the
+//  observing step's graph build, and submits the head's new cache rows with
+//  `asyncEval` -- the same non-blocking primitive the engine submits its own
+//  step graphs with, so no host sync is added. The rows, and their order,
+//  are the arrays the cold replay would concatenate: only the batching of
+//  the head calls differs. The first round then finds an empty backlog and
+//  feeds only the carry. Because only the cache rows are evaluated, the warm
+//  feed also skips the attention output, the MoE block and the output head
+//  for every history row -- work the cold replay performs for all `S` rows
+//  and then discards.
+//
 
 import Foundation
 import MLX
@@ -46,6 +63,19 @@ public final class TrackQwen4ExpInlineMTPAssistant {
     /// 6 on both mlx and cuda"); the CUDA track serves the same head at
     /// depth <= 6 with per-depth oracles.
     public static let maximumDepth = 6
+
+    /// Warm-state handover toggle (`TRACK_DRAFTER_WARMSTATE`). On (the
+    /// default), committed target observations run through the head as they
+    /// arrive, during the observing step's graph build. Off, transitions
+    /// accumulate in the backlog and the first round of every request pays
+    /// the whole replay -- the fork's behavior. Same off-spelling as the
+    /// engine's `DARKBLOOM_CBV2_MTP` kill switch.
+    static func resolvesWarmState(_ raw: String?) -> Bool {
+        guard let raw else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }
+    static let warmStateEnabled = resolvesWarmState(
+        ProcessInfo.processInfo.environment["TRACK_DRAFTER_WARMSTATE"])
 
     private let target: Qwen4ExpModel
     private let mtp: TrackQwen4ExpMTPModule
@@ -110,6 +140,11 @@ public final class TrackQwen4ExpInlineMTPAssistant {
             ? TrackFastHead(mtp, configuration: target.configuration) : nil
     }
 
+    /// Pre-JIT the head's S=1...7 kernels. Idempotent; no persistent buffers.
+    func warmVerifyCaches() {
+        fastHead?.warmVerifyCaches(embedTokens: embedTokens)
+    }
+
     /// Head caches, one per head layer.
     func makeCache() -> [KVCache] { mtp.makeCache() }
 
@@ -142,10 +177,22 @@ public final class TrackQwen4ExpInlineMTPAssistant {
         let lastMulti = step.multi[0..., last..., 0...]
         let draft: MLXArray
         if let sl = shortlist {
-            let logits = quantizedMM(
-                lastSample[0..., -1, 0...], sl.weight, scales: sl.scales, biases: sl.biases,
-                transpose: true, groupSize: sl.groupSize, bits: sl.bits)  // [1, NS]
-            draft = take(sl.ids, argMax(logits, axis: -1), axis: 0).asType(.int32)
+            let x = lastSample[0..., -1, 0...]
+            // TRACK_HEAD_TOP1 (default ON): GEMV epilogue writes a 16-byte
+            // {id, logit, index, 16} record. TRACK_HEAD_TOP1=0 is the original
+            // quantizedMM + host argMax, byte for byte.
+            if TrackHeadTop1.enabled,
+                let packed = TrackHeadTop1.apply(
+                    x: x, weight: sl.weight, scales: sl.scales, biases: sl.biases,
+                    ids: sl.ids, groupSize: sl.groupSize, bits: sl.bits)
+            {
+                draft = TrackHeadTop1.tokenId(packed)
+            } else {
+                let logits = quantizedMM(
+                    x, sl.weight, scales: sl.scales, biases: sl.biases,
+                    transpose: true, groupSize: sl.groupSize, bits: sl.bits)  // [1, NS]
+                draft = take(sl.ids, argMax(logits, axis: -1), axis: 0).asType(.int32)
+            }
         } else {
             draft = argMax(target.head(lastSample)[0..., -1, 0...], axis: -1).asType(.int32)
         }
@@ -159,7 +206,10 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
     /// Per-request head state: the head's own key-value caches plus the
     /// trusted target transitions not yet folded into them.
-    private final class RequestState: CBv2MTPRequestState {
+    ///
+    /// Internal, not private, so the warm-state tests can read the backlog
+    /// and the cache offset directly.
+    final class RequestState: CBv2MTPRequestState {
         var caches: [any KVCache]
 
         /// Trusted target transitions waiting to enter head history. The multi
@@ -289,6 +339,19 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         _ observation: CBv2MTPCommittedTargetObservation,
         requestState: any CBv2MTPRequestState
     ) {
+        observeCommittedTarget(
+            observation, requestState: requestState, warm: Self.warmStateEnabled)
+    }
+
+    /// One committed target chunk. `warm` selects where the completed
+    /// transitions run: through the head now (`true`), or into the backlog
+    /// for the next round's replay (`false`, the fork's behavior). The pairs
+    /// themselves -- which arrays, in which order -- are the same either way.
+    func observeCommittedTarget(
+        _ observation: CBv2MTPCommittedTargetObservation,
+        requestState: any CBv2MTPRequestState,
+        warm: Bool
+    ) {
         let state = typed(requestState)
         precondition(!state.isReleased, "Qwen4Exp MTP observed released request state")
         precondition(!state.roundInFlight, "Qwen4Exp MTP observed target during a round")
@@ -301,18 +364,43 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         let count = observation.tokens.dim(1)
         guard count > 0 else { return }
 
-        // Cross-chunk transition: the preceding chunk's final multi stream
-        // pairs with this chunk's first target input.
+        // The transitions this observation completes: the preceding chunk's
+        // final multi stream paired with this chunk's first target input,
+        // then the intra-chunk pairs (multi[t] conditions token[t+1]).
+        var pairTokens: [MLXArray] = []
+        var pairMulti: [MLXArray] = []
         if let frontier = state.multiFrontier {
-            state.backlogMulti.append(frontier)
-            state.backlogTokens.append(observation.tokens[0..., 0 ..< 1])
+            pairTokens.append(observation.tokens[0..., 0 ..< 1])
+            pairMulti.append(frontier)
         }
-        // Intra-chunk transitions: multi[t] conditions token[t+1].
         if count > 1 {
-            state.backlogMulti.append(observation.hidden[0..., 0 ..< count - 1, 0...])
-            state.backlogTokens.append(observation.tokens[0..., 1 ..< count])
+            pairMulti.append(observation.hidden[0..., 0 ..< count - 1, 0...])
+            pairTokens.append(observation.tokens[0..., 1 ..< count])
         }
         state.multiFrontier = observation.hidden[0..., (count - 1) ..< count, 0...]
+
+        // Fallback: the toggle is off, or the pairing came out inconsistent
+        // (a shape change the preconditions above do not name). Accumulate
+        // exactly as the fork's copy does and let the next round replay.
+        let pairedTokens = pairTokens.reduce(0) { $0 + $1.dim(1) }
+        let pairedMulti = pairMulti.reduce(0) { $0 + $1.dim(1) }
+        guard warm, pairedTokens > 0, pairedTokens == pairedMulti else {
+            state.backlogMulti.append(contentsOf: pairMulti)
+            state.backlogTokens.append(contentsOf: pairTokens)
+            return
+        }
+
+        // Warm feed: the same rows `beginRound` would concatenate, run
+        // through the head now, while the engine is still building the step
+        // graph that produced them. Only the cache rows are evaluated, so the
+        // history rows never pay for the attention output, the MoE block or
+        // the output head. `asyncEval` queues without blocking; it is the
+        // primitive the engine itself submits step graphs with, so this adds
+        // no host sync to the engine thread.
+        let tokens = pairTokens.count == 1 ? pairTokens[0] : concatenated(pairTokens, axis: 1)
+        let multi = pairMulti.count == 1 ? pairMulti[0] : concatenated(pairMulti, axis: 1)
+        _ = headStep(tokens: tokens, multiStream: multi, cache: state.caches, stepIndex: 0)
+        asyncEval(state.caches.flatMap { $0.innerState() })
     }
 
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
@@ -356,6 +444,10 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             stepIndex: state.roundDraftSteps)
         state.roundRoots.append(contentsOf: [step.multi, step.draft])
         state.roundDraftSteps += 1
+        // Kick the lazy draft-token ids onto the GPU as soon as they exist,
+        // so the verify-round asArray is a copy of a finished buffer, not a
+        // wait for all k heads. The engine only asyncEvals draft index 0.
+        if TrackPLEVerifyPrefetch.enabled { asyncEval(step.draft) }
 
         if isFirstStep {
             // The engine submits this generation's evaluation targets before
