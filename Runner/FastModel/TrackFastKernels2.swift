@@ -188,7 +188,7 @@ extension TrackFastKernels {
     nonisolated(unsafe) static var wideNormMinS = 9
 
     /// Simdgroups per (row, stream) in the wide inject+norm launch.
-    static let wideNormSimdgroups = 4
+    static let wideNormSimdgroups = 8
 
     static func injectNorm(
         residual: MLXArray, out: MLXArray?, inject: MLXArray?, scale: MLXArray,
