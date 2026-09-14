@@ -134,6 +134,7 @@ struct TrackHC {
     let down: TrackProj
     let inject: TrackProj?
     let up: TrackProj
+    let decodeUp: TrackQuantWeight?
     let lowrank: Int
     let hasInject: Bool
 }
@@ -239,7 +240,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// Layers in the first partial-dispatch chunk (0 = same as asyncChunk):
     /// the first dispatch lands right after the PLE layer, whose host row
     /// gather is the one host sync of the step.
-    nonisolated(unsafe) public static var asyncFirst: Int = 2
+    nonisolated(unsafe) public static var asyncFirst: Int = 4
     /// Layer count at an optional second dispatch (0 = none).
     nonisolated(unsafe) public static var asyncSecond: Int = 0
 
@@ -284,6 +285,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         self.layers = built
         self.finalMixer = Self.bindHC(tower.trackChild("hyper_connection_mixer"), cfg: cfg)
         super.init()
+        if finalMixer.normScaleQ.dtype == .bfloat16 && StreamOrDevice.default.stream === Stream.gpu {
+            _ = TrackBF16Functions.sigmoid
+        }
     }
 
     // MARK: binding
@@ -292,10 +296,29 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let scale = m.trackChild("hc_norm").trackArray("weight")
         let down = TrackProj(m.trackChild("input_mix_weight_down"))
         let up = TrackProj(m.trackChild("input_mix_weight_up"))
+        let decodeUp: TrackQuantWeight?
+        if cfg.hcCount == 4, cfg.hiddenSize % 2 == 0,
+            case .quant(let uq) = up, uq.bits == 4, uq.biases != nil,
+            uq.rows == cfg.hcCount * cfg.hiddenSize
+        {
+            var order = [Int32]()
+            order.reserveCapacity(uq.rows)
+            for d in stride(from: 0, to: cfg.hiddenSize, by: 2) {
+                for s in 0 ..< cfg.hcCount {
+                    order.append(Int32(s * cfg.hiddenSize + d))
+                    order.append(Int32(s * cfg.hiddenSize + d + 1))
+                }
+            }
+            let packed = uq.rowsReordered(order)
+            eval(packed.weight, packed.scales, packed.biases!)
+            decodeUp = packed
+        } else {
+            decodeUp = nil
+        }
         let inject = m.children()[unwrapping: "block_inject_weight"].map { TrackProj($0) }
         let q = (scale * MLXArray(Float(1) / Float(cfg.hcCount), dtype: scale.dtype))
         return TrackHC(
-            normScaleQ: q, down: down, inject: inject, up: up, lowrank: cfg.hcLowrank,
+            normScaleQ: q, down: down, inject: inject, up: up, decodeUp: decodeUp, lowrank: cfg.hcLowrank,
             hasInject: inject != nil)
     }
 
@@ -474,9 +497,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             if !hc.hasInject || injQ != nil {
                 let n2 = normed.reshaped(S, hcCount * hidden)
                 let d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
+                let packedUp = S == 1 ? hc.decodeUp : nil
                 let u = TrackFastMixerKernels.upMix(
-                    act: d.act, normed: n2, up: uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
-                    hasInject: hc.hasInject, emitF32: emitF32)
+                    act: d.act, normed: n2, up: packedUp ?? uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
+                    hasInject: hc.hasInject, emitF32: emitF32, packedRows: packedUp != nil)
                 let f32 = emitF32 ? u.inputF32.reshaped(1, S, hidden) : nil
                 if Self.debugTaps != nil, !tag.isEmpty {
                     Self.debugTaps?.append((tag + ".normedQ", normed))
