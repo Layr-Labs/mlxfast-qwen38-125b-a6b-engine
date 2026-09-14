@@ -283,6 +283,21 @@ public enum SwiftTransform {
             stagedHeaders[shardName] = try Safetensors.readHeader(destination)
         }
 
+        var keptTextKeys = textKeys
+        var expertLayoutWeightMap: [String: String] = [:]
+        if modelFamily == .qwen4Exp,
+            let repack = try ExpertLayout.repackStagedQwen4Exp(
+                stagingDirectory: stagingDirectory,
+                index: index,
+                selectedKeys: textKeys,
+                headers: stagedHeaders
+            )
+        {
+            keptTextKeys = repack.keptKeys
+            expertLayoutWeightMap = repack.fusedWeightMap
+            copiedTensors += repack.tensorCountDelta
+        }
+
         try beforeSidecarGeneration?()
         let generatedProjectionMetadata: GeneratedAffineMetadataReport
         let generatedTiedHeadMetadata: GeneratedAffineMetadataReport
@@ -313,7 +328,11 @@ public enum SwiftTransform {
             // checkpoint's own affine-quantized tensors directly, so neither
             // the Gemma projection sidecar nor the tied-head packed13 sidecar
             // means anything on this family -- emit nothing beyond the
-            // pass-through tensor set. For Laguna, the Poolside v2
+            // pass-through tensor set. Qwen 3.8 125B A6B still emits no
+            // Gemma sidecar; its routed-expert gate/up/down tiles are reordered
+            // in-place into one block per expert (`ExpertLayout`), which is
+            // a storage permutation of the same packed codes, not a
+            // requantization. For Laguna, the Poolside v2
             // contract forbids derived layouts and
             // metadata sidecars, and the runtime loads exactly the
             // indexed checkpoint tensors (its untied lm_head makes the
@@ -339,16 +358,24 @@ public enum SwiftTransform {
         guard !projectionSizeOverflow, !tiedHeadSizeOverflow else {
             throw MLXFastError.invalidInput("transformed tensor byte count overflows Int")
         }
-        let generatedWeightMap = generatedProjectionMetadata.weightMap.merging(
+        var generatedWeightMap = generatedProjectionMetadata.weightMap.merging(
             generatedTiedHeadMetadata.weightMap
         ) { _, _ in
             preconditionFailure("generated metadata tensor names collide")
+        }
+        for name in expertLayoutWeightMap.keys.sorted() {
+            guard generatedWeightMap[name] == nil else {
+                throw MLXFastError.invalidInput(
+                    "expert layout tensor name collides with generated metadata \(name)"
+                )
+            }
+            generatedWeightMap[name] = expertLayoutWeightMap[name]
         }
 
         try writeMetadataFiles(metadataSnapshot, to: stagingDirectory)
         try index.writeStripped(
             to: stagingDirectory.appendingPathComponent("model.safetensors.index.json"),
-            keeping: textKeys,
+            keeping: keptTextKeys,
             totalTensorByteCount: outputTensorByteCount,
             additionalWeightMap: generatedWeightMap
         )

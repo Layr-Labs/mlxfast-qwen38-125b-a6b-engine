@@ -1248,7 +1248,7 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
     loader_w.load_unsafe();
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    STEEL_PRAGMA_NO_UNROLL
+    STEEL_PRAGMA_UNROLL
     for (int kk1 = 0; kk1 < BK; kk1 += SK) {
       NAXTile<T, TM, TK> Atile;
       NAXTile<T, TK, TN> Btile;
@@ -1868,7 +1868,7 @@ template <
   constexpr bool p17_shape =
       metal::is_same_v<T, bfloat16_t> && group_size == 32 && bits == 4 &&
       transpose && BM == 32 && BN == 64 && BK == 64 && WM == 2 && WN == 2;
-  threadgroup T As[p17_shape ? BM * BK_padded : 1];
+  alignas(16) threadgroup T As[p17_shape ? BM * BK_padded : 1];
 
   // P17 is a scheduling/load-address variant of THIS kernel, not a different
   // GEMM family. Ineligible shapes retain the original body byte for byte.
@@ -1991,7 +1991,7 @@ template <
 
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          STEEL_PRAGMA_NO_UNROLL
+          STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             if (sg_active) {
               NAXTile<T, TM, TK> Atile;
@@ -2031,7 +2031,7 @@ template <
           loader_w.load_safe(tile_w);
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          STEEL_PRAGMA_NO_UNROLL
+          STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             if (sg_active) {
               NAXTile<T, TM, TK> Atile;

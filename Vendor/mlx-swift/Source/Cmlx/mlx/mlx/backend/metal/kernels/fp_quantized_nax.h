@@ -288,7 +288,7 @@ METAL_FUNC void fp_qmm_t_impl(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        STEEL_PRAGMA_NO_UNROLL
+        STEEL_PRAGMA_UNROLL
         for (int kk1 = 0; kk1 < BK; kk1 += SK) {
           NAXTile<T, TM, TK> Atile;
           NAXTile<Wtype, TN, TK> Btile;
@@ -421,7 +421,7 @@ METAL_FUNC void fp_qmm_n_impl(
     loader_w.load_unsafe();
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    STEEL_PRAGMA_NO_UNROLL
+    STEEL_PRAGMA_UNROLL
     for (int kk1 = 0; kk1 < BK; kk1 += SK) {
       NAXTile<T, TM, TK> Atile;
       NAXTile<Wtype, TK, TN> Btile;
@@ -629,7 +629,7 @@ template <
   constexpr int BN_padded = (BN + 16 / sizeof(T));
 
   threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BK * BN_padded];
+  alignas(16) threadgroup T Ws[BK * BN_padded];
 
   if (batched) {
     adjust_matrix_offsets(
@@ -759,7 +759,7 @@ template <
   constexpr int BN_padded = (BN + 16 / sizeof(T));
 
   threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BK * BN_padded];
+  alignas(16) threadgroup T Ws[BK * BN_padded];
 
   adjust_matrix_offsets(
       x,
@@ -928,7 +928,7 @@ template <
 
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          STEEL_PRAGMA_NO_UNROLL
+          STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             if (sg_active) {
               NAXTile<T, TM, TK> Atile;
@@ -970,7 +970,7 @@ template <
           loader_w.load_safe(tile_w);
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          STEEL_PRAGMA_NO_UNROLL
+          STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             if (sg_active) {
               NAXTile<T, TM, TK> Atile;
