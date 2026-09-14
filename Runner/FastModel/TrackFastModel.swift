@@ -235,7 +235,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// inputs/outputs are appended here.
     nonisolated(unsafe) static var debugTaps: [(String, MLXArray)]? = nil
     /// Layers per partial dispatch inside a forward (0 = one dispatch per step).
-    nonisolated(unsafe) public static var asyncChunk: Int = 3
+    nonisolated(unsafe) public static var asyncChunk: Int = 1
     /// Layers in the first partial-dispatch chunk (0 = same as asyncChunk):
     /// the first dispatch lands right after the PLE layer, whose host row
     /// gather is the one host sync of the step.
@@ -284,6 +284,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         self.layers = built
         self.finalMixer = Self.bindHC(tower.trackChild("hyper_connection_mixer"), cfg: cfg)
         super.init()
+        if finalMixer.normScaleQ.dtype == .bfloat16 && StreamOrDevice.default.stream === Stream.gpu {
+            _ = TrackBF16Functions.sigmoid
+        }
     }
 
     // MARK: binding
