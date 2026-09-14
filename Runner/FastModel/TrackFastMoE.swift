@@ -1181,11 +1181,10 @@ extension TrackFastMoEKernels {
                 float g[4], u[4];
                 qmv_fast_reg<T, GS, BITS>(wsh, ssh, bsh, x, KD, out_row, thread_index_in_simdgroup, g);
                 qmv_fast_reg<T, GS, BITS>(wsh + (size_t)N * kw2, ssh + (size_t)N * kg2, bsh + (size_t)N * kg2, x, KD, out_row, thread_index_in_simdgroup, u);
-                // MLXFAST-ACTLANES: g/u are post-simd_sum, identical on every
-                // lane, so each of the four entries can be stored by its own lane.
-                if (thread_index_in_simdgroup < 4) {
-                    const int i = (int)thread_index_in_simdgroup;
-                    act[(size_t)BR * (size_t)N + (size_t)(out_row + i)] = mlx_silu(static_cast<T>(g[i])) * static_cast<T>(u[i]);
+                if (thread_index_in_simdgroup == 0) {
+                    for (int i = 0; i < 4; ++i) {
+                        act[(size_t)BR * (size_t)N + (size_t)(out_row + i)] = mlx_silu(static_cast<T>(g[i])) * static_cast<T>(u[i]);
+                    }
                 }
             } else {
                 const int row = tile * 8 + (int)simdgroup_index_in_threadgroup * 4 + (int)(thread_index_in_simdgroup / 8);
@@ -1215,12 +1214,12 @@ extension TrackFastMoEKernels {
             qmv_reg<T, GS, BITS, (KD % get_pack_factor<BITS, 32>()) == 0>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
             qmv_reg<T, GS, BITS, (KD % get_pack_factor<BITS, 32>()) == 0>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
         }
-        // MLXFAST-ACTLANES: same argument as the shared-expert staging above.
-        if (thread_index_in_simdgroup < 4) {
-            const int i = (int)thread_index_in_simdgroup;
-            const T gv = static_cast<T>(g[i]);
-            const T uv = static_cast<T>(u[i]);
-            act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+        if (thread_index_in_simdgroup == 0) {
+            for (int i = 0; i < 4; ++i) {
+                const T gv = static_cast<T>(g[i]);
+                const T uv = static_cast<T>(u[i]);
+                act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+            }
         }
         """
 
@@ -1406,11 +1405,9 @@ extension TrackFastMoEKernels {
             if (FAST) { qmv_fast_reg<T, GS, BITS, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
             else { qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
             const float wk = w[z];
-            // MLXFAST-STAGELANES: `qmv_reg`/`qmv_fast_reg` close with a
-            // `simd_sum` on every row, so every lane of the simdgroup already
-            // holds the identical `res[RPS]`. The staging write therefore only
-            // needs *a* lane per entry, not lane 0 for all of them; each k slot
-            // is written by the simdgroup that owns it (`k = sgi + kk * KSG`).
+            // MLXFAST-STAGELANES: qmv_reg/qmv_fast_reg close with simd_sum on
+            // every row, so every lane holds the identical res[RPS]; each k slot
+            // is written by the simdgroup that owns it, one lane per entry.
             if constexpr (VPT == 1 && RPS <= 32) {
                 if (lid < RPS) {
                     prod[k][lid] = static_cast<float>(static_cast<T>(res[lid])) * wk;
@@ -1429,9 +1426,6 @@ extension TrackFastMoEKernels {
             if constexpr (VPT == 1) {
                 float rs[RPS];
                 qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wsd, ssd, bsd, xs, F, d0, lid, rs);
-                // MLXFAST-STAGELANES: same argument as the routed staging above —
-                // `rs` is post-`simd_sum`, so the RPS entries are identical on
-                // every lane and each can be stored by its own lane.
                 if constexpr (RPS <= 32) {
                     if (lid < RPS) { shvT[lid] = static_cast<float>(static_cast<T>(rs[lid])); }
                 } else {
@@ -1447,11 +1441,9 @@ extension TrackFastMoEKernels {
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // MLXFAST-EPILANES: the RPS output columns of one tile fold
-        // independently, one lane each, instead of all of them in a serial loop
-        // on lane 0. `mlx_colsum_small_f32` is thread-local (no collectives, no
-        // threadgroup memory), so each column keeps its own K iteration order
-        // and its own fold; only which lane performs it changes.
+        // MLXFAST-EPILANES: the RPS columns fold independently, one lane each;
+        // mlx_colsum_small_f32 is thread-local, so each column keeps its own K
+        // order and its own fold and only the performing lane changes.
         if constexpr (VPT == 1 && RPS <= 32) {
             if (sgi == 0 && lid < RPS) {
                 const int i = (int)lid;
