@@ -1386,8 +1386,14 @@ extension TrackFastMoEKernels {
             if (FAST) { qmv_fast_reg<T, GS, BITS, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
             else { qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
             const float wk = w[z];
-            if (lid == 0) {
-                for (int i = 0; i < RPS; ++i) { prod[k][i] = static_cast<float>(static_cast<T>(res[i])) * wk; }
+            if constexpr (VPT == 1 && RPS <= 32) {
+                if (lid < RPS) {
+                    prod[k][lid] = static_cast<float>(static_cast<T>(res[lid])) * wk;
+                }
+            } else {
+                if (lid == 0) {
+                    for (int i = 0; i < RPS; ++i) { prod[k][i] = static_cast<float>(static_cast<T>(res[i])) * wk; }
+                }
             }
         }
         // Shared expert down rows d0..d0+3 for token t: one token routes to `qmv`'s
@@ -1398,7 +1404,11 @@ extension TrackFastMoEKernels {
             if constexpr (VPT == 1) {
                 float rs[RPS];
                 qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wsd, ssd, bsd, xs, F, d0, lid, rs);
-                if (lid == 0) { for (int i = 0; i < RPS; ++i) { shvT[i] = static_cast<float>(static_cast<T>(rs[i])); } }
+                if constexpr (RPS <= 32) {
+                    if (lid < RPS) { shvT[lid] = static_cast<float>(static_cast<T>(rs[lid])); }
+                } else {
+                    if (lid == 0) { for (int i = 0; i < RPS; ++i) { shvT[i] = static_cast<float>(static_cast<T>(rs[i])); } }
+                }
             } else {
                 float rw[1];
                 qmv_wide_reg_full<T, GS, BITS, 1, 8, false>(wsd, ssd, bsd, xs, F, 1, d0 + (int)(lid / 8), lid, rw);
@@ -1409,14 +1419,27 @@ extension TrackFastMoEKernels {
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sgi == 0 && lid == 0) {
-            const T sg = mlx_sigmoid(gate[t]);
-            for (int i = 0; i < RPS; ++i) {
+        if constexpr (VPT == 1 && RPS <= 32) {
+            if (sgi == 0 && lid < RPS) {
+                const int i = (int)lid;
+                const T sg = mlx_sigmoid(gate[t]);
                 float col[K];
+                #pragma unroll
                 for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
                 const T r = static_cast<T>(mlx_colsum_small_f32<K>(col));
                 const T sh = sg * static_cast<T>(shvT[i]);
                 out[(size_t)t * (size_t)H + (size_t)(d0 + i)] = r + sh;
+            }
+        } else {
+            if (sgi == 0 && lid == 0) {
+                const T sg = mlx_sigmoid(gate[t]);
+                for (int i = 0; i < RPS; ++i) {
+                    float col[K];
+                    for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
+                    const T r = static_cast<T>(mlx_colsum_small_f32<K>(col));
+                    const T sh = sg * static_cast<T>(shvT[i]);
+                    out[(size_t)t * (size_t)H + (size_t)(d0 + i)] = r + sh;
+                }
             }
         }
         """
