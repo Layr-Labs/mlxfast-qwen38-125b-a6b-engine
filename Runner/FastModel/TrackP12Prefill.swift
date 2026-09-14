@@ -62,6 +62,11 @@ enum TrackP12Prefill {
     static let sortedCombine = on("TRACK_P12_SORTED_COMBINE")
     static let splitShared = on("TRACK_P12_SPLIT_SHARED_INPUTS")
     static let omitUnusedIndexer = on("TRACK_P12_OMIT_UNUSED_INDEXER")
+    /// Skips the fast path's indexer-tape append (and the S>8 `indexerFull`
+    /// projection feeding it). The appended tape is write-only inside the
+    /// fast window: the fast gate requires `offset + S <= indexerBudget` and
+    /// the only tape reader returns nil while `kvLength <= tokenBudget`.
+    static let omitIndexerTape = on("TRACK_P12_OMIT_INDEXER_TAPE")
     static let splitAttention = on("TRACK_P12_SPLIT_ATTN_INPUTS")
 
     /// Wide, batch-one, activation-dtype windows only: the decode and verify
@@ -210,11 +215,8 @@ enum TrackP12Prefill {
         let activated: MLXArray
         let sortedIDs: MLXArray
         let inverse: MLXArray
-        let down: MLXArray
         if let indirect = TrackPrefillIndirect.apply(m, x: x, indices: indices) {
-            (activated, sortedIDs, inverse) = (indirect.activated, indirect.sortedIDs, indirect.inverse)
-            down = TrackPrefillIndirect.down(m, activated: activated, sortedIDs: sortedIDs, tiles: indirect.tiles)
-                ?? parts.down(activated, sortedIDs, sortedIndices: true)
+            (activated, sortedIDs, inverse, _) = indirect
         } else {
             let expanded = MLX.expandedDimensions(x, axes: [-2, -3])
             let sorted = gatherSort(x: expanded, indices: indices)
@@ -223,8 +225,8 @@ enum TrackP12Prefill {
             let up = parts.up(sorted.0, sortedIDs, sortedIndices: true)
             let gateAct = parts.gate(sorted.0, sortedIDs, sortedIndices: true)
             activated = compiledSiluProduct(gateAct, up)
-            down = parts.down(activated, sortedIDs, sortedIndices: true)
         }
+        let down = parts.down(activated, sortedIDs, sortedIndices: true)
         guard down.ndim == 3, down.dim(0) == B * S * K, down.dim(1) == 1, down.dim(2) == H,
             inverse.size == B * S * K
         else { return nil }
