@@ -231,7 +231,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    const bool Activate = true>
 METAL_FUNC void track_mixer_act_dense(
     const device uint32_t* w,
     const device T* scales,
@@ -371,10 +372,12 @@ METAL_FUNC void track_mixer_act_dense(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (short e = 0; e < Dtile.kElemsPerTile; ++e) {
-          const T rounded = static_cast<T>(Dtile.elems()[e]);
-          const T activated = mlx_silu(rounded);
-          Dtile.elems()[e] = static_cast<AccumType>(activated);
+        if constexpr (Activate) {
+          for (short e = 0; e < Dtile.kElemsPerTile; ++e) {
+            const T rounded = static_cast<T>(Dtile.elems()[e]);
+            const T activated = mlx_silu(rounded);
+            Dtile.elems()[e] = static_cast<AccumType>(activated);
+          }
         }
 
         if constexpr (kAlignedM.value && kAlignedN.value) {

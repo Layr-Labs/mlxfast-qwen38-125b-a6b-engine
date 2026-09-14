@@ -526,18 +526,18 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         evaluation: CBv2RecurrentStateEvaluation, capture: Bool
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
-        // A wide window already runs the four input projections as four
-        // separate GEMMs (the split-K choice depends on N). `separate` drops
-        // only the concatenation that followed them: the prep kernel reads the
-        // beta/alpha gates from their own buffers and the gated RMS kernel
-        // reads z from its own, so every GEMM, shape and rounding is unchanged.
+        // Wide projections keep separate outputs for prep and gated RMS.
+        // QKV and z can share a launch when both retain the original NAX walk;
+        // the narrow beta/alpha gates keep their own split-K projections.
         let separate =
             TrackP12Prefill.splitGDN && TrackP12Prefill.eligible(x) && !capture
             && g.proj.parts.count == 4
         let geo = separate ? TrackP12Prefill.splitGeometry(g.geometry) : g.geometry
         let prof = TrackFastProfile.prefill != nil && S >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
-        let split = separate ? g.proj.parts.map { $0.apply(x) } : nil
+        let split = separate
+            ? (TrackGDNProjectionPair.apply(g.proj.parts, x: x)
+                ?? g.proj.parts.map { $0.apply(x) }) : nil
         let proj = split?[0] ?? g.proj.apply(x)  // [B,S,PROJ_W]
         if prof { TrackFastProfile.tick("gdn.proj", &pt, split ?? [proj]) }
         let state = evaluation.inputState(modelLayerIndex: layerIndex)
