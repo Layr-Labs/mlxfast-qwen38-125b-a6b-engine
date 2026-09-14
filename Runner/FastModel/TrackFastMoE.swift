@@ -775,14 +775,23 @@ extension TrackFastMoEKernels {
                 if (valid) { gate[row] = static_cast<T>(r[0]); }
             }
         }
+        constexpr bool REGISTER_RESULTS = VPT != 1 || HAS_GATE;
+        constexpr int N_READS = 4;
+        float ld[N_READS];
+        uint selected[N_READS];
+        for (int i = 0; i < N_READS; ++i) {
+            ld[i] = -INFINITY;
+            selected[i] = 0xffffffffu;
+        }
         threadgroup float selv[K];
         threadgroup uint seli[K];
         // MLXFAST-ROUTESG1: for one token the shared-gate GEMV above runs on
         // simdgroup 0 alone (`track_inject_qmv` returns at once on simdgroup 1),
         // and the top-K walk used to queue behind it on the same simdgroup. Run
         // the walk on simdgroup 1 instead so the two latency chains overlap; the
-        // walk's arithmetic, tie rule and the softmax below are untouched. Wide
-        // windows keep the gate on both simdgroups and the walk on simdgroup 0.
+        // walk's arithmetic and tie rule are unchanged. Its SIMD group also
+        // normalizes the selected logits. Wide windows keep the gate on both
+        // simdgroups and the walk on simdgroup 0.
         constexpr uint SEL_SG = (VPT == 1) ? 1u : 0u;
         if (sg == SEL_SG) {
         const device float* lr = logits + (size_t)row * (size_t)E;
@@ -804,19 +813,28 @@ extension TrackFastMoEKernels {
             const float gmax = simd_max(bv);
             const uint cand = (bv == gmax && bj >= 0) ? (uint)(lane + 32 * bj) : 0xffffffffu;
             const uint gidx = simd_min(cand);
-            if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
+            if constexpr (REGISTER_RESULTS) {
+                for (int i = 0; i < N_READS; ++i) {
+                    if (k == (int)lane * N_READS + i) {
+                        ld[i] = gmax;
+                        selected[i] = gidx;
+                    }
+                }
+            } else if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
             if (gidx == (uint)(lane + 32 * bj) && bj >= 0) { taken[bj] = true; }
         }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg != 0) { return; }
-        // softmax_single_row over the K selected logits (AccT = float)
-        constexpr int N_READS = 4;
-        float ld[N_READS];
-        for (int i = 0; i < N_READS; i++) {
-            const int p = (int)lane * N_READS + i;
-            ld[i] = (p < K) ? selv[p] : -INFINITY;
+        if constexpr (REGISTER_RESULTS) {
+            if (sg != SEL_SG) { return; }
+        } else {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg != 0) { return; }
+            for (int i = 0; i < N_READS; i++) {
+                const int p = (int)lane * N_READS + i;
+                ld[i] = (p < K) ? selv[p] : -INFINITY;
+            }
         }
+        // softmax_single_row over the K selected logits (AccT = float)
         float maxval = -FLT_MAX;
         for (int i = 0; i < N_READS; i++) { maxval = (maxval < ld[i]) ? ld[i] : maxval; }
         maxval = simd_max(maxval);
@@ -832,7 +850,9 @@ extension TrackFastMoEKernels {
             const int p = (int)lane * N_READS + i;
             if (p < K) {
                 w[(size_t)row * K + p] = ld[i] * normalizer;
-                idx[(size_t)row * K + p] = seli[p];
+                if constexpr (REGISTER_RESULTS) {
+                    idx[(size_t)row * K + p] = selected[i];
+                } else { idx[(size_t)row * K + p] = seli[p]; }
             }
         }
         """
