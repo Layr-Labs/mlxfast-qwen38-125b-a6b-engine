@@ -775,17 +775,6 @@ extension TrackFastMoEKernels {
                 if (valid) { gate[row] = static_cast<T>(r[0]); }
             }
         }
-        // MLXFAST-ROUTEREG: the walk's winners come from a simd_max/simd_min
-        // pair, so logit and index are already broadcast across the walk's own
-        // simdgroup. Normalize them there and skip the threadgroup round trip.
-        constexpr bool REGISTER_RESULTS = VPT != 1 || HAS_GATE;
-        constexpr int N_READS = 4;
-        float ld[N_READS];
-        uint selected[N_READS];
-        for (int i = 0; i < N_READS; ++i) {
-            ld[i] = -INFINITY;
-            selected[i] = 0xffffffffu;
-        }
         threadgroup float selv[K];
         threadgroup uint seli[K];
         // MLXFAST-ROUTESG1: for one token the shared-gate GEMV above runs on
@@ -815,25 +804,19 @@ extension TrackFastMoEKernels {
             const float gmax = simd_max(bv);
             const uint cand = (bv == gmax && bj >= 0) ? (uint)(lane + 32 * bj) : 0xffffffffu;
             const uint gidx = simd_min(cand);
-            if constexpr (REGISTER_RESULTS) {
-                for (int i = 0; i < N_READS; ++i) {
-                    if (k == (int)lane * N_READS + i) { ld[i] = gmax; selected[i] = gidx; }
-                }
-            } else if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
+            if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
             if (gidx == (uint)(lane + 32 * bj) && bj >= 0) { taken[bj] = true; }
         }
         }
-        if constexpr (REGISTER_RESULTS) {
-            if (sg != SEL_SG) { return; }
-        } else {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (sg != 0) { return; }
-            for (int i = 0; i < N_READS; i++) {
-                const int p = (int)lane * N_READS + i;
-                ld[i] = (p < K) ? selv[p] : -INFINITY;
-            }
-        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg != 0) { return; }
         // softmax_single_row over the K selected logits (AccT = float)
+        constexpr int N_READS = 4;
+        float ld[N_READS];
+        for (int i = 0; i < N_READS; i++) {
+            const int p = (int)lane * N_READS + i;
+            ld[i] = (p < K) ? selv[p] : -INFINITY;
+        }
         float maxval = -FLT_MAX;
         for (int i = 0; i < N_READS; i++) { maxval = (maxval < ld[i]) ? ld[i] : maxval; }
         maxval = simd_max(maxval);
@@ -849,9 +832,7 @@ extension TrackFastMoEKernels {
             const int p = (int)lane * N_READS + i;
             if (p < K) {
                 w[(size_t)row * K + p] = ld[i] * normalizer;
-                if constexpr (REGISTER_RESULTS) {
-                    idx[(size_t)row * K + p] = selected[i];
-                } else { idx[(size_t)row * K + p] = seli[p]; }
+                idx[(size_t)row * K + p] = seli[p];
             }
         }
         """
