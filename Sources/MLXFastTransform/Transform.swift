@@ -8,10 +8,15 @@ import Darwin
 public struct TransformOptions: Equatable {
     public let referencePath: String
     public let outputPath: String
+    /// Where the served MTP head's shards are. REQUIRED for the Qwen 3.8
+    /// 125B A6B family (the head the tree serves is the 8-bit one, spliced in
+    /// from these shards) and refused for every other family.
+    public let mtpHeadSourcePath: String?
 
-    public init(referencePath: String, outputPath: String) {
+    public init(referencePath: String, outputPath: String, mtpHeadSourcePath: String? = nil) {
         self.referencePath = referencePath
         self.outputPath = outputPath
+        self.mtpHeadSourcePath = mtpHeadSourcePath
     }
 }
 
@@ -22,6 +27,9 @@ public struct TransformReport: Equatable {
     public let denseShardCount: Int
     public let configPath: String
     public let indexPath: String
+    /// The head source the served head was spliced from; nil for families
+    /// that carry no such head.
+    public let mtpHeadSourcePath: String?
 
     public init(
         referencePath: String,
@@ -29,7 +37,8 @@ public struct TransformReport: Equatable {
         denseTensorCount: Int,
         denseShardCount: Int,
         configPath: String,
-        indexPath: String
+        indexPath: String,
+        mtpHeadSourcePath: String? = nil
     ) {
         self.referencePath = referencePath
         self.outputPath = outputPath
@@ -37,6 +46,7 @@ public struct TransformReport: Equatable {
         self.denseShardCount = denseShardCount
         self.configPath = configPath
         self.indexPath = indexPath
+        self.mtpHeadSourcePath = mtpHeadSourcePath
     }
 }
 
@@ -160,6 +170,15 @@ public enum SwiftTransform {
         )
         let sourceConfigRoot = try loadReferenceConfigRoot(referenceConfigPath)
         let modelFamily = try detectModelFamily(sourceConfigRoot: sourceConfigRoot)
+        // THE SERVED HEAD. For this track's family the tree serves the 8-bit
+        // head spliced in from a second pinned source; the refusal for a
+        // missing or foreign source fires here, before any multi-GB work.
+        let headSource = try loadMTPHeadSource(
+            options.mtpHeadSourcePath,
+            family: modelFamily,
+            referenceDirectory: referenceDirectory,
+            outputDirectory: outputDirectory
+        )
         let runtimeConfigData = try makeRuntimeConfigData(
             sourceConfigRoot: sourceConfigRoot,
             family: modelFamily
@@ -184,12 +203,19 @@ public enum SwiftTransform {
         }
         var totalTensorByteCount = 0
         for key in textKeys.sorted() {
-            guard let shardName = index.weightMap[key],
-                  let info = validatedHeaders[shardName]?.tensors[key]
-            else {
-                throw MLXFastError.invalidInput(
-                    "missing validated tensor metadata for \(key)"
-                )
+            let info: SafetensorInfo
+            if let headSource, isMTPHeadKey(key) {
+                // The served head's bytes, not the target's own copy.
+                info = try headSource.tensorInfo(named: key)
+            } else {
+                guard let shardName = index.weightMap[key],
+                      let towerInfo = validatedHeaders[shardName]?.tensors[key]
+                else {
+                    throw MLXFastError.invalidInput(
+                        "missing validated tensor metadata for \(key)"
+                    )
+                }
+                info = towerInfo
             }
             let (nextTotal, overflow) = totalTensorByteCount.addingReportingOverflow(
                 info.byteCount
@@ -265,7 +291,35 @@ public enum SwiftTransform {
                 throw MLXFastError.invalidInput("missing validated header for checkpoint shard \(shardName)")
             }
             let selectedNames = textKeysByShard[shardName, default: []].sorted()
-            if Set(selectedNames) == Set(header.tensors.keys) {
+            let headNames = headSource == nil ? [] : selectedNames.filter(isMTPHeadKey)
+            if let headSource, !headNames.isEmpty {
+                // THE SPLICE. The tower's tensors come out of this shard, the
+                // head's tensors out of the head source's shards, into one
+                // ordinary shard under this shard's name -- so the index maps
+                // the head where it always did and the loader sees one file.
+                var parts = [
+                    SafetensorsCompositePart(
+                        source: source,
+                        validatedHeader: header,
+                        tensorNames: selectedNames.filter { !isMTPHeadKey($0) })
+                ]
+                let headNamesByShard = Dictionary(grouping: headNames) { name in
+                    headSource.index.weightMap[name] ?? ""
+                }
+                for headShardName in headNamesByShard.keys.sorted() {
+                    guard let headHeader = headSource.headers[headShardName] else {
+                        throw MLXFastError.invalidInput(
+                            "missing validated header for MTP head source shard \(headShardName)")
+                    }
+                    parts.append(
+                        SafetensorsCompositePart(
+                            source: headSource.directory.appendingPathComponent(headShardName),
+                            validatedHeader: headHeader,
+                            tensorNames: headNamesByShard[headShardName, default: []].sorted()))
+                }
+                copiedTensors += try Safetensors.copyComposite(
+                    parts: parts, to: destination, metadata: header.metadata)
+            } else if Set(selectedNames) == Set(header.tensors.keys) {
                 // Poolside's reference is already text-only. Preserve the
                 // byte-identical shard and use an APFS copy-on-write clone
                 // when source/output share a volume; fall back to a normal
@@ -375,6 +429,19 @@ public enum SwiftTransform {
                 against: header
             )
         }
+        if let headSource {
+            for shardName in headSource.headers.keys.sorted() {
+                guard let header = headSource.headers[shardName] else {
+                    throw MLXFastError.invalidInput(
+                        "missing validated header for MTP head source shard \(shardName)"
+                    )
+                }
+                try Safetensors.validateSourceIdentity(
+                    headSource.directory.appendingPathComponent(shardName),
+                    against: header
+                )
+            }
+        }
         try validateConfigAndIndexSnapshot(
             referenceDirectory: referenceDirectory,
             referenceConfigPath: referenceConfigPath,
@@ -402,8 +469,102 @@ public enum SwiftTransform {
                 + generatedProjectionMetadata.shardCount
                 + generatedTiedHeadMetadata.shardCount,
             configPath: configPath.path,
-            indexPath: indexPath.path
+            indexPath: indexPath.path,
+            mtpHeadSourcePath: headSource?.directory.path
         )
+    }
+
+    /// The served MTP head's source, validated and bound to its files.
+    struct MTPHeadSource {
+        let directory: URL
+        let index: CheckpointIndex
+        let headers: [String: SafetensorsHeader]
+
+        func tensorInfo(named name: String) throws -> SafetensorInfo {
+            guard let shardName = index.weightMap[name],
+                  let info = headers[shardName]?.tensors[name]
+            else {
+                throw MLXFastError.invalidInput(
+                    "missing validated MTP head source metadata for \(name)"
+                )
+            }
+            return info
+        }
+    }
+
+    /// The embedded head's namespace inside the text tower.
+    static func isMTPHeadKey(_ key: String) -> Bool {
+        key.hasPrefix("\(textTowerPrefix)mtp.")
+    }
+
+    /// Resolve and validate `--head-source` for the family at hand.
+    ///
+    /// Qwen 3.8 125B A6B REQUIRES one: the served head is the 8-bit head, and
+    /// a transform that ran without it would silently publish the 4-bit copy
+    /// the target embeds. Every other family REFUSES one: it has no embedded
+    /// head to replace, so a head source can only be a mistake. The directory
+    /// is read like a reference checkpoint -- `config.json` plus whatever
+    /// `*.safetensors` files it holds -- so it may be the two pinned shards
+    /// alone or the publisher's whole 8-bit checkpoint; the transform takes
+    /// the head out of it and nothing else.
+    static func loadMTPHeadSource(
+        _ path: String?,
+        family: TransformModelFamily,
+        referenceDirectory: URL,
+        outputDirectory: URL
+    ) throws -> MTPHeadSource? {
+        guard family == .qwen4Exp else {
+            if let path, !path.isEmpty {
+                throw MLXFastError.invalidInput(
+                    "--head-source is only accepted for the Qwen 3.8 125B A6B "
+                        + "family; this checkpoint carries no embedded head to replace"
+                )
+            }
+            return nil
+        }
+        guard let path, !path.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "the Qwen 3.8 125B A6B transform needs --head-source: the served "
+                    + "MTP head is the \(Qwen4ExpCheckpointValidation.PinnedGeometry.mtpHeadServedQuantizationBits)-bit "
+                    + "head of \(MLXFastConstants.mtpHeadSourceRepository) @ "
+                    + "\(MLXFastConstants.mtpHeadSourceRevision), spliced into the "
+                    + "tree from the shards \(MLXFastConstants.mtpHeadSourceManifestPath) "
+                    + "pins; pass the verified directory (./setup.sh provisions it)"
+            )
+        }
+        let directory = canonicalURL(
+            try findReferenceDirectory(URL(fileURLWithPath: path))
+        )
+        for (other, role) in [(referenceDirectory, "reference"), (outputDirectory, "output")] {
+            let nested = directory.path.hasPrefix(other.path + "/")
+                || other.path.hasPrefix(directory.path + "/")
+            guard directory.path != other.path, !nested else {
+                throw MLXFastError.invalidInput(
+                    "MTP head source \(directory.path) must be separate from the "
+                        + "\(role) directory \(other.path)"
+                )
+            }
+        }
+        let configPath = directory.appendingPathComponent("config.json")
+        let configRoot = try loadReferenceConfigRoot(configPath)
+        guard try detectModelFamily(sourceConfigRoot: configRoot) == .qwen4Exp else {
+            throw MLXFastError.invalidInput(
+                "MTP head source at \(directory.path) is not a Qwen 3.8 125B A6B "
+                    + "checkpoint"
+            )
+        }
+        let quantization = try Qwen4ExpCheckpointValidation.headSourceQuantizationSpec(
+            fromConfigRoot: configRoot
+        )
+        // No index is read here: the pinned source is two shards of a 42-shard
+        // checkpoint, and the publisher's index would name the other 40. The
+        // shards on disk ARE the index.
+        let index = try CheckpointIndex.buildFromSafetensors(in: directory)
+        let headers = try validateCheckpointIndex(index, referenceDirectory: directory)
+        try Qwen4ExpCheckpointValidation.validateHeadSource(
+            index: index, headers: headers, quantization: quantization
+        )
+        return MTPHeadSource(directory: directory, index: index, headers: headers)
     }
 
     private static func loadIndex(_ referenceDirectory: URL) throws -> CheckpointIndex {
@@ -853,11 +1014,23 @@ public enum SwiftTransform {
                 fromConfigRoot: root
             )
             runtimeConfig.removeValue(forKey: "quantization_config")
-            runtimeConfig["quantization"] = [
+            // THE SERVED HEAD'S WIDTH TRAVELS WITH THE TREE. The tower keeps
+            // the checkpoint's uniform scalars; every quantized head module
+            // gets its own entry at the served width, keyed the way the
+            // runtime walks its module tree (`mtp.*`). The entries come from
+            // the pinned geometry, never from a file, so the emitted block is
+            // the same bytes whether or not a head source was read.
+            var quantization: [String: Any] = [
                 "group_size": spec.groupSize,
                 "bits": spec.bits,
                 "mode": spec.mode,
             ]
+            for (module, geometry) in Qwen4ExpCheckpointValidation
+                .runtimeHeadQuantizationOverrides()
+            {
+                quantization[module] = geometry
+            }
+            runtimeConfig["quantization"] = quantization
             // THE NORM CONVENTION MUST TRAVEL WITH THE TREE. This checkpoint
             // BAKES the RMSNorm offset -- its non-gated norm tensors hold
             // `1 + w`, so the model must compute `y * w` -- and no published

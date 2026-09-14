@@ -1564,7 +1564,8 @@ template <
     const bool aligned_N,
     const int BM = 32,
     const int BK = 32,
-    const int BN = 32>
+    const int BN = 32,
+    const bool DB = false>
 METAL_FUNC void qmm_t_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1649,6 +1650,39 @@ METAL_FUNC void qmm_t_impl(
         mma_op.mma(Xs, Ws);
         loader_x.next();
         loader_w.next();
+      }
+    }
+  } else if (DB) {
+    // MLXFAST-SPLITKDB: two staging buffers per operand. Tile k + 1 is loaded
+    // (device -> threadgroup, the loaders' own code and dequantisation) after
+    // the MMA of tile k is issued, into the buffer that MMA is not reading, so
+    // the loads overlap the MMA and one barrier per K step suffices. Every
+    // tile is staged by the same loader code into an identically laid out
+    // buffer and consumed by the same mma call, so the results are unchanged.
+    threadgroup T* Xs2 = Xs + BM * BK_padded;
+    threadgroup T* Ws2 = Ws + BN * BK_padded;
+    loader_x_t loader_x2(x + BK, K, Xs2, simd_gid, simd_lid);
+    loader_w_t loader_w2(wl + BK * bytes_per_pack / pack_factor, scales + BK / group_size,
+                         biases + BK / group_size, K, Ws2, simd_gid, simd_lid);
+    const bool safe_w = !aligned_N && num_outs < BN;
+    loader_x.load_unsafe();
+    if (safe_w) { loader_w.load_safe(short2(BK, num_outs)); } else { loader_w.load_unsafe(); }
+    for (int k = 0; k < K_eff; k += 2 * BK) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      mma_op.mma(Xs, Ws);
+      if (k + BK < K_eff) {
+        loader_x2.load_unsafe();
+        if (safe_w) { loader_w2.load_safe(short2(BK, num_outs)); } else { loader_w2.load_unsafe(); }
+        loader_x2.next(); loader_x2.next();
+        loader_w2.next(); loader_w2.next();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs2, Ws2);
+        if (k + 2 * BK < K_eff) {
+          loader_x.next(); loader_x.next();
+          loader_w.next(); loader_w.next();
+          loader_x.load_unsafe();
+          if (safe_w) { loader_w.load_safe(short2(BK, num_outs)); } else { loader_w.load_unsafe(); }
+        }
       }
     }
   } else {
@@ -2363,8 +2397,8 @@ template <
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
-  threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Xs[2 * BM * BK_padded];
+  threadgroup T Ws[2 * BN * BK_padded];
 
   const int k_start = tid.z * k_partition_size;
   x += k_start;
@@ -2375,7 +2409,7 @@ template <
   biases += k_start / group_size;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
-  qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
+  qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN, true>(
       (const device uint32_t*)wl,
       scales,
       biases,

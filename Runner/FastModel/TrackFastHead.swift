@@ -31,10 +31,16 @@ final class TrackFastHead {
     let mlpHC: TrackHC
     let attn: TrackAttn
     let moe: TrackMoE
+    let moePairReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let finalMixer: TrackHC
 
     static let enabled: Bool = {
         (ProcessInfo.processInfo.environment["TRACK_FAST_HEAD"] ?? "1") != "0"
+    }()
+
+    /// HEADTAPE: skip the head's indexer-tape append inside the fast window.
+    static let omitIndexerTape: Bool = {
+        (ProcessInfo.processInfo.environment["TRACK_HEAD_OMIT_INDEXER_TAPE"] ?? "1") != "0"
     }()
 
     init(_ mtp: TrackQwen4ExpMTPModule, configuration cfg: Qwen4ExpTextConfiguration) {
@@ -58,6 +64,10 @@ final class TrackFastHead {
         self.mlpHC = TrackQwen4ExpFastModel.bindHC(layer.trackChild("mlp_hyper_connection"), cfg: cfg)
         self.attn = TrackQwen4ExpFastModel.bindAttn(layer.trackChild("self_attn"), cfg: cfg)
         self.moe = TrackQwen4ExpFastModel.bindMoE(layer.trackChild("mlp"), cfg: cfg)
+        // MOEREPLAY-HEAD: compile the target decode path's opaque two-launch
+        // MoE pair once for the head's draft steps (same kernels/guards, only
+        // graph build hoisted out of every draft step).
+        self.moePairReplay = TrackQwen4ExpFastModel.makeMoEPairReplay(self.moe)
         self.finalMixer = TrackQwen4ExpFastModel.bindHC(mtp.trackChild("hyper_connection_mixer"), cfg: cfg)
     }
 
@@ -124,30 +134,81 @@ final class TrackFastHead {
             residual: st, out: attended, inject: injectW, scale: mlpHC.normScaleQ,
             hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
         (input, injectW) = hcMix(mlpHC, normed: normed)
-        let moeOut = TrackQwen4ExpFastModel.moeForwardShared(moe, input, replay: nil)
+        // HEAD-TAIL-SLICE: non-frontier rows' only consumed outputs are their
+        // KV entries (written inside `attentionWithCacheUpdate`). Slice the
+        // frontier row before the MoE/mixer tail so the S==1 router/expert
+        // fast paths fire; bit-exact for every consumed output.
+        var tailInput = input
+        var tailSt = st
+        if S > 1 {
+            tailInput = input[0..., -1, 0...]
+            tailSt = st[0..., -1, 0...]
+        }
+        let moeOut = TrackQwen4ExpFastModel.moeForwardShared(moe, tailInput, replay: moePairReplay)
         let (multiNext, finalNormed) = TrackFastKernels.injectNorm(
-            residual: st, out: moeOut, inject: injectW, scale: finalMixer.normScaleQ,
+            residual: tailSt, out: moeOut, inject: injectW, scale: finalMixer.normScaleQ,
             hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
         let (sample, _) = hcMix(finalMixer, normed: finalNormed)
+        if S > 1 {
+            return (sample.reshaped(1, 1, sample.dim(2)), multiNext)
+        }
         return (sample, multiNext)
     }
+
+    static let ropeSpan = 4096
+    /// HEADROPE-CACHE kill switch: `TRACK_ROPE_CACHE=0` also restores the
+    /// head's per-call device tables.
+    nonisolated(unsafe) static var ropeEnabled =
+        (ProcessInfo.processInfo.environment["TRACK_ROPE_CACHE"] ?? "1") != "0"
+    private var headRopeCache: (cos: MLXArray, sin: MLXArray)? = nil
 
     private func attention(_ x: MLXArray, cache: Qwen4ExpAttentionCache, offset: Int) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let heads = cfg.attentionHeads, kvHeads = cfg.kvHeads, d = cfg.headDim
         let qkv = attn.qkv.apply(x)
         let idxStart = 2 * attn.qWidth + 2 * attn.kvWidth
-        _ = cache.updateIndexer(keys: qkv[.ellipsis, idxStart ..< (idxStart + cfg.indexerHeadDim)])
-        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: S))
+        // HEADTAPE: inside the fast window the head's indexer tape is
+        // write-only (nothing on this path pools or reads it back; the slow
+        // path appends its own tape if ever re-entered past the budget), so
+        // skipping the append is behavior-preserving — same argument as the
+        // target-side TRACK_P12_OMIT_INDEXER_TAPE cell.
+        // HEADIDX-TRIM: with the tape append skipped, the trailing indexer
+        // rows of the fused qkv are consumed by nothing on this path (attnPrep
+        // and attnGate read only the first idxStart columns), so project the
+        // kept parts only — bit-exact by row concatenation on the GEMV path.
+        let consumedQkv = Self.omitIndexerTape
+            ? attn.qkv.applyTrailing(x, trailingPartsToDrop: 1)
+            : qkv
+        if !Self.omitIndexerTape {
+            _ = cache.updateIndexer(keys: qkv[.ellipsis, idxStart ..< (idxStart + cfg.indexerHeadDim)])
+        }
+        let (c, s): (MLXArray, MLXArray)
+        // HEADROPE-CACHE: the head is the other per-step cosSin builder —
+        // every draft step re-runs exp/cos/sin graph nodes here. The head
+        // window is always tiny (S = draft depth, decode S = 1) and its
+        // offset is bounded by indexerBudget (2048), so slice a cached
+        // 4096-position table exactly as the tower's ROPECACHE path does;
+        // any other shape falls back to the per-call device path.
+        if S <= 8, offset + S <= Self.ropeSpan, Self.ropeEnabled {
+            let tab = headRopeCache ?? {
+                let t = rotary.cosSin(qwen4ExpPositions(offset: 0, count: Self.ropeSpan))
+                headRopeCache = t
+                return t
+            }()
+            c = tab.cos[offset ..< (offset + S)].reshaped(S, rotaryDims).asType(x.dtype)
+            s = tab.sin[offset ..< (offset + S)].reshaped(S, rotaryDims).asType(x.dtype)
+        } else {
+            (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: S))
+        }
         let prep = TrackFastKernels.attnPrep(
-            qkv: qkv, qNorm: attn.qNormW, kNorm: attn.kNormW,
+            qkv: consumedQkv, qNorm: attn.qNormW, kNorm: attn.kNormW,
             cos: c.asType(x.dtype).reshaped(S, rotaryDims), sin: s.asType(x.dtype).reshaped(S, rotaryDims),
             heads: heads, kvHeads: kvHeads, headDim: d, rotaryDims: rotaryDims, eps: eps)
         let mask = makeAttentionMask(n: S, cache: cache)
         let att = attentionWithCacheUpdate(
             queries: prep.q, keys: prep.k, values: prep.v, cache: cache,
             scale: attentionScale, mask: mask)
-        let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: attn.qWidth)
+        let out = TrackFastKernels.attnGate(att: att, qkv: consumedQkv, gateOffset: attn.qWidth)
         return attn.out.apply(out)
     }
 }

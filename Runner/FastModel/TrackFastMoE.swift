@@ -935,9 +935,7 @@ extension TrackFastMoEKernels {
         // MLXFAST-FULLTAIL: EXACT_TAIL says the caller's `in_vec_size` is a
         // multiple of values_per_thread. See the tail block below for what that
         // buys and why it stays bit-identical.
-        // MLXFAST-DOWNRPS: NR contiguous rows per simdgroup; each row's walk,
-        // accumulation order and simd_sum are unchanged for any NR.
-        template <typename T, int group_size, int bits, bool EXACT_TAIL = false, int NR = 4>
+        template <typename T, int group_size, int bits, bool EXACT_TAIL = false>
         METAL_FUNC void qmv_reg(
             const device uint32_t* w,
             const device T* scales,
@@ -946,8 +944,8 @@ extension TrackFastMoEKernels {
             const int in_vec_size,
             const int out_row,
             uint simd_lid,
-            thread float (&result)[NR]) {
-          constexpr int results_per_simdgroup = NR;
+            thread float (&result)[4]) {
+          constexpr int results_per_simdgroup = 4;
           constexpr int packs_per_thread = 1;
           constexpr int pack_factor = get_pack_factor<bits, 32>();
           constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
@@ -1362,9 +1360,7 @@ extension TrackFastMoEKernels {
     /// 4 output columns for one token across all K experts.
     static let downCombineSource = """
         const uint t = threadgroup_position_in_grid.z;
-        // MLXFAST-DOWNRPS: RPS output rows per threadgroup (4 for wide windows).
-        static_assert(VPT == 1 || RPS == 4, "wide windows keep four rows");
-        const int d0 = (int)threadgroup_position_in_grid.y * RPS;
+        const int d0 = (int)threadgroup_position_in_grid.y * 4;
         const uint kw = (uint)F / 8;
         const uint kg = (uint)F / GS;
         const uint sgi = simdgroup_index_in_threadgroup;
@@ -1372,9 +1368,9 @@ extension TrackFastMoEKernels {
         // The K expert walks are independent of one another, so they are spread
         // over KSG simdgroups; each product lands in threadgroup memory as the
         // float it already was, and the epilogue folds them in the same k order.
-        threadgroup float prod[K][RPS];
-        threadgroup float shvT[RPS];
-        float res[RPS];
+        threadgroup float prod[K][4];
+        threadgroup float shvT[4];
+        float res[4];
         // K % KSG == 0, so the trip count is the constant K / KSG and the loop
         // still unrolls: each simdgroup keeps that many expert walks in flight.
         for (int kk = 0; kk < K / KSG; ++kk) {
@@ -1383,11 +1379,11 @@ extension TrackFastMoEKernels {
             const uint e = idx[z];
             const size_t eoff = (size_t)e * (size_t)H;
             const device T* xb = act + (size_t)z * (size_t)F;
-            if (FAST) { qmv_fast_reg<T, GS, BITS, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
-            else { qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
+            if (FAST) { qmv_fast_reg<T, GS, BITS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
+            else { qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
             const float wk = w[z];
             if (lid == 0) {
-                for (int i = 0; i < RPS; ++i) { prod[k][i] = static_cast<float>(static_cast<T>(res[i])) * wk; }
+                for (int i = 0; i < 4; ++i) { prod[k][i] = static_cast<float>(static_cast<T>(res[i])) * wk; }
             }
         }
         // Shared expert down rows d0..d0+3 for token t: one token routes to `qmv`'s
@@ -1396,9 +1392,9 @@ extension TrackFastMoEKernels {
         if (sgi == (KSG > K ? (uint)K : 0u)) {
             const device T* xs = act + (size_t)(BR + t) * (size_t)F;
             if constexpr (VPT == 1) {
-                float rs[RPS];
-                qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wsd, ssd, bsd, xs, F, d0, lid, rs);
-                if (lid == 0) { for (int i = 0; i < RPS; ++i) { shvT[i] = static_cast<float>(static_cast<T>(rs[i])); } }
+                float rs[4];
+                qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0>(wsd, ssd, bsd, xs, F, d0, lid, rs);
+                if (lid == 0) { for (int i = 0; i < 4; ++i) { shvT[i] = static_cast<float>(static_cast<T>(rs[i])); } }
             } else {
                 float rw[1];
                 qmv_wide_reg_full<T, GS, BITS, 1, 8, false>(wsd, ssd, bsd, xs, F, 1, d0 + (int)(lid / 8), lid, rw);
@@ -1411,7 +1407,7 @@ extension TrackFastMoEKernels {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sgi == 0 && lid == 0) {
             const T sg = mlx_sigmoid(gate[t]);
-            for (int i = 0; i < RPS; ++i) {
+            for (int i = 0; i < 4; ++i) {
                 float col[K];
                 for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
                 const T r = static_cast<T>(mlx_colsum_small_f32<K>(col));
@@ -1439,11 +1435,6 @@ extension TrackFastMoEKernels {
     /// shortens each simdgroup's serial chain and drops the per-thread product
     /// array into threadgroup memory. Every product and the fold order are
     /// unchanged, so the output is bit-identical for any value.
-    /// MLXFAST-DOWNRPS: output rows per down+combine threadgroup in a one-token
-    /// window. Each row's expert walks and the fold are unchanged for any value;
-    /// fewer rows per threadgroup means more threadgroups in flight (H / rows).
-    static let downRowsPerSimdgroup = 4
-
     static let downCombineSimdgroups =
         ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 5
 
@@ -1457,11 +1448,10 @@ extension TrackFastMoEKernels {
         precondition(BR % topK == 0 && H % 4 == 0 && bits == 4 && w.dtype == .float32 && S >= 1 && S <= 8)
         precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
-        let rps = S == 1 ? downRowsPerSimdgroup : 4
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
-            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
-            grid: (32, (H / rps) * ksg, S), threadGroup: (32, ksg, 1),
+            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg)],
+            grid: (32, (H / 4) * ksg, S), threadGroup: (32, ksg, 1),
             outputShapes: [[S, H]], outputDTypes: [act.dtype])[0]
     }
 }
@@ -2128,13 +2118,13 @@ extension TrackFastMoEKernels {
 // MARK: router GEMV for one-token windows: MLX's float `gemv` kernel
 //       (GEMVKernel<float, BM=4, BN=1, SM=1, SN=32, TM=4, TN=4>, the
 //       parameters `gemv_axbpy` selects for a [512 x 2560] matrix and a
-//       2560-vector). Each row keeps that walk while the target shape assigns
-//       two rows per SIMD group. Reading bf16 weights instead of a float32
-//       copy preserves every product and partial sum.
+//       2560-vector) verbatim, reading the bf16 router weight instead of a
+//       float32 copy: bf16 -> float is exact, so every product and every
+//       partial sum is the reference's.
 
 extension TrackFastMoEKernels {
     static let routerGemvSource = """
-        constexpr int TM = RPS, TN = 4, SN = 32, blockM = 4 * RPS, blockN = 128;
+        constexpr int TM = 4, TN = 4, SN = 32, blockM = 16, blockN = 128;
         const int tid_x = (int)threadgroup_position_in_grid.x;
         const int simd_gid = (int)simdgroup_index_in_threadgroup;
         const int simd_lid = (int)thread_index_in_simdgroup;
@@ -2177,16 +2167,15 @@ extension TrackFastMoEKernels {
         source: routerGemvSource, ensureRowContiguous: true)
 
     /// x float32 [K], w bf16 [N, K] -> logits float32 [N]. One-token windows only
-    /// Retains MLX's per-row arithmetic for K in [65, 16N) with N < 4096.
+    /// (MLX dispatches this exact kernel shape for K in [65, 16N) with N < 4096).
     static func routerGemv(x: MLXArray, w: MLXArray) -> MLXArray {
         let K = w.dim(1), N = w.dim(0)
         precondition(x.dtype == .float32 && x.size == K && w.dtype == .bfloat16)
         precondition(K % 128 == 0 && K > 64 && K < 16 * N && N % 16 == 0 && N < 4096)
-        let rowsPerSimdgroup = K == 2560 && N == 512 ? 1 : 4  // MLXFAST-ROUTERRPS1
         return routerGemvKernel(
             [x.reshaped(K), w],
-            template: [("T", w.dtype), ("K", K), ("N", N), ("RPS", rowsPerSimdgroup)],
-            grid: (32 * (N / (4 * rowsPerSimdgroup)), 1, 4), threadGroup: (32, 1, 4),
+            template: [("T", w.dtype), ("K", K), ("N", N)],
+            grid: (32 * (N / 16), 1, 4), threadGroup: (32, 1, 4),
             outputShapes: [[N]], outputDTypes: [.float32])[0]
     }
 }
