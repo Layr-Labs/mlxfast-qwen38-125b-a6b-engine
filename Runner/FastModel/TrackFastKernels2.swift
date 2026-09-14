@@ -18,7 +18,7 @@ extension TrackFastKernels {
 
     /// Shared helpers: MLX's `Sigmoid` / `LogAddExp` functors verbatim, and
     /// compiled `silu`.
-    static let exactHeader = """
+    static let exactHeader = TrackBitmaskRings.metalHelper + """
         template <typename T>
         METAL_FUNC T mlx_sigmoid(T x) {
             auto y = 1 / (1 + metal::exp(metal::abs(x)));
@@ -112,6 +112,12 @@ extension TrackFastKernels {
         outputNames: ["stream", "normed"],
         source: injectNormSource, header: exactHeader, ensureRowContiguous: true)
 
+    nonisolated(unsafe) static let injectNormGenericKernel = MLXFast.metalKernel(
+        name: "track_inject_norm_eps",
+        inputNames: ["residual", "out", "inject", "scale", "eps"],
+        outputNames: ["stream", "normed"],
+        source: runtimeEpsSource(injectNormSource), header: exactHeader, ensureRowContiguous: true)
+
 
     /// Wide-window variant (prefill): ONE simdgroup per (row, stream). Lane l
     /// plays virtual thread 32g + l of the 640-thread layout for g = 0..NT/32-1,
@@ -185,10 +191,51 @@ extension TrackFastKernels {
         outputNames: ["stream", "normed"],
         source: injectNormWideSource, ensureRowContiguous: true)
 
+    nonisolated(unsafe) static let injectNormWideGenericKernel = MLXFast.metalKernel(
+        name: "track_inject_norm_wide_eps",
+        inputNames: ["residual", "out", "inject", "scale", "eps"],
+        outputNames: ["stream", "normed"],
+        source: runtimeEpsSource(injectNormWideSource), ensureRowContiguous: true)
+
     nonisolated(unsafe) static var wideNormMinS = 9
 
     /// Simdgroups per (row, stream) in the wide inject+norm launch.
     static let wideNormSimdgroups = 4
+
+    /// `TRACK_NORMSG_NARROW=0` restores the 640-thread narrow launch from the tip.
+    nonisolated(unsafe) static var narrowNormSGEnabled: Bool = {
+        (ProcessInfo.processInfo.environment["TRACK_NORMSG_NARROW"] ?? "1") != "0"
+    }()
+
+    /// Preferred simdgroups per (row, stream) on the narrow (decode) path.
+    ///
+    /// Production H = 2560: simd_groups = ceil(H / (32 * N_READS)) = 20.
+    /// SG = 4 divides 20, so SLICES = 5 and each thread keeps
+    /// `SLICES * N_READS` = 20 InT registers. 20 is less than 64; spilling
+    /// would start at 64. SG = 2 would keep 40. SG = 1 would keep 80 and spill.
+    static let narrowNormSimdgroups = 4
+
+    /// 128-element slices in the `rms_single_row` layout (32 lanes × 4 reads).
+    static func normSimdGroups(hidden: Int) -> Int {
+        (hidden + 32 * 4 - 1) / (32 * 4)
+    }
+
+    /// SG for the narrow launch, or `nil` to keep the 640-thread kernel.
+    /// Try 4 first; if `simd_groups` is not a multiple of 4, try 2; otherwise
+    /// the shape does not split evenly and the tip's kernel runs.
+    static func narrowNormSG(hidden: Int) -> Int? {
+        let groups = normSimdGroups(hidden: hidden)
+        guard groups > 0 else { return nil }
+        if groups % narrowNormSimdgroups == 0 { return narrowNormSimdgroups }
+        if groups % 2 == 0 { return 2 }
+        return nil
+    }
+
+    /// Register-kept InT count per thread (`SLICES * N_READS`), or `nil` on fallback.
+    static func narrowNormKeptCount(hidden: Int) -> Int? {
+        guard let sg = narrowNormSG(hidden: hidden) else { return nil }
+        return (normSimdGroups(hidden: hidden) / sg) * 4
+    }
 
     static func injectNorm(
         residual: MLXArray, out: MLXArray?, inject: MLXArray?, scale: MLXArray,
@@ -198,26 +245,46 @@ extension TrackFastKernels {
         let W = hcCount * hidden
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024)
         let hasInject = out != nil
+        let useEps = TrackScalarTemplates.useTemplateEps(eps)
+        var inputs: [MLXArray] = [residual, out ?? residual, inject ?? residual, scale]
+        if !useEps { inputs.append(scalar(eps, dtype: .float32)) }
+        var template: [(String, any KernelTemplateArg)] = [
+            ("InT", residual.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+            ("HAS_INJECT", hasInject), ("TILE", tile),
+        ]
+        if useEps { template.append(("EPS_BITS", Int(eps.bitPattern))) }
         if S >= wideNormMinS {
             let sg = wideNormSimdgroups
-            let outs = injectNormWideKernel(
-                [residual, out ?? residual, inject ?? residual, scale],
-                template: [
-                    ("InT", residual.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
-                    ("HAS_INJECT", hasInject), ("TILE", tile), ("EPS_BITS", Int(eps.bitPattern)),
-                    ("SG", sg),
-                ],
+            template.append(("SG", sg))
+            let kernel = useEps ? injectNormWideKernel : injectNormWideGenericKernel
+            let outs = kernel(
+                inputs, template: template,
                 grid: (32 * sg, hcCount, B * S), threadGroup: (32 * sg, 1, 1),
                 outputShapes: [[B, S, W], [B, S, W]],
                 outputDTypes: [residual.dtype, residual.dtype])
             return (outs[0], outs[1])
         }
-        let outs = injectNormKernel(
-            [residual, out ?? residual, inject ?? residual, scale],
-            template: [
-                ("InT", residual.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
-                ("HAS_INJECT", hasInject), ("TILE", tile), ("EPS_BITS", Int(eps.bitPattern)),
-            ],
+        // MLXFAST-NORMSG on the decode path: same slice partition as the wide
+        // kernel (g = sgi + si * SG, local_sums[g] written by lane 0 of that
+        // slice, then one 32-lane simd_sum). Same lanes compute the same
+        // slices, so the sums are bit-identical with the 640-thread kernel.
+        // Reuses track_inject_norm_wide; SG is shape-gated so the static_assert
+        // (simd_groups % SG == 0) holds. TRACK_NORMSG_NARROW=0 and H that do
+        // not divide skip this launch. Cargo scalar-eps split is unchanged.
+        if narrowNormSGEnabled, let sg = narrowNormSG(hidden: hidden) {
+            var sgTemplate = template
+            sgTemplate.append(("SG", sg))
+            let kernel = useEps ? injectNormWideKernel : injectNormWideGenericKernel
+            let outs = kernel(
+                inputs, template: sgTemplate,
+                grid: (32 * sg, hcCount, B * S), threadGroup: (32 * sg, 1, 1),
+                outputShapes: [[B, S, W], [B, S, W]],
+                outputDTypes: [residual.dtype, residual.dtype])
+            return (outs[0], outs[1])
+        }
+        let kernel = useEps ? injectNormKernel : injectNormGenericKernel
+        let outs = kernel(
+            inputs, template: template,
             grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
             outputShapes: [[B, S, W], [B, S, W]],
             outputDTypes: [residual.dtype, residual.dtype])
@@ -228,14 +295,16 @@ extension TrackFastKernels {
 
     /// input[d] = bf16( sum_s f32(bf16(sigmoid(w[s,d])) * normed[s,d]) ) (row-order f32 sum, one rounding)
     /// inject[s] = 2 * sigmoid(inj[s])   (bf16 ops)
-    static let mixSource = """
+    static func makeMixSource(hc: Int? = nil) -> String {
+        let hcTok = hc.map(String.init) ?? "HC"
+        return """
         const uint d = thread_position_in_grid.x;
         const uint row = thread_position_in_grid.y;
         if (d >= H) return;
         // `sum` over the stream axis of a bf16 array accumulates in bf16, one
         // rounding per add, in row order.
         InT acc = InT(0);
-        for (int s = 0; s < HC; ++s) {
+        for (int s = 0; s < \(hcTok); ++s) {
             const uint i = row * W + s * H + d;
             InT sg = mlx_sigmoid(w[i]);
             InT p = sg * normed[i];
@@ -248,6 +317,9 @@ extension TrackFastKernels {
             inject[row * HC + d] = InT(2) * sg;
         }
         """
+    }
+
+    static let mixSource = makeMixSource()
 
     nonisolated(unsafe) static let mixKernel = MLXFast.metalKernel(
         name: "track_hc_mix",
@@ -255,17 +327,29 @@ extension TrackFastKernels {
         outputNames: ["input", "inject"],
         source: mixSource, header: exactHeader, ensureRowContiguous: true)
 
+    nonisolated(unsafe) static let mixStaged = MLXFast.metalKernel(
+        name: "track_hc_mix_hc\(TrackHCStaging.liveHC)",
+        inputNames: ["w", "normed", "inj"],
+        outputNames: ["input", "inject"],
+        source: makeMixSource(hc: TrackHCStaging.liveHC), header: exactHeader, ensureRowContiguous: true)
+
+    /// Threads per threadgroup for `hcMix`. 256 is the tip launch.
+    static let mixThreadsPerThreadgroup = 256
+
     static func hcMix(
-        w: MLXArray, normed: MLXArray, inj: MLXArray, hcCount: Int, hidden: Int, hasInject: Bool
+        w: MLXArray, normed: MLXArray, inj: MLXArray, hcCount: Int, hidden: Int, hasInject: Bool,
+        staging: Bool = TrackHCStaging.enabled
     ) -> (input: MLXArray, inject: MLXArray) {
         let B = w.dim(0), S = w.dim(1)
-        let outs = mixKernel(
+        let kernel =
+            TrackHCStaging.mixPath(hc: hcCount, staging: staging) == .staged ? mixStaged : mixKernel
+        let outs = kernel(
             [w, normed, inj],
             template: [
                 ("InT", w.dtype), ("H", hidden), ("W", hcCount * hidden), ("HC", hcCount),
                 ("LW", inj.dim(2)), ("HAS_INJECT", hasInject),
             ],
-            grid: (hidden, B * S, 1), threadGroup: (256, 1, 1),
+            grid: (hidden, B * S, 1), threadGroup: (mixThreadsPerThreadgroup, 1, 1),
             outputShapes: [[B, S, hidden], [B, S, hcCount]],
             outputDTypes: [w.dtype, w.dtype])
         return (outs[0], outs[1])
@@ -334,17 +418,27 @@ extension TrackFastKernels {
         outputNames: ["out"],
         source: gatedRMSSource, header: exactHeader, ensureRowContiguous: true)
 
+    nonisolated(unsafe) static let gatedRMSGenericKernel = MLXFast.metalKernel(
+        name: "track_gated_rms_eps",
+        inputNames: ["y", "proj", "w", "eps"],
+        outputNames: ["out"],
+        source: runtimeEpsSource(gatedRMSSource), header: exactHeader, ensureRowContiguous: true)
+
     static func gatedRMS(y: MLXArray, proj: MLXArray, w: MLXArray, zOffset: Int, eps: Float)
         -> MLXArray
     {
         let B = y.dim(0), S = y.dim(1), Hv = y.dim(2), Dv = y.dim(3)
         precondition(Dv == 128)
-        return gatedRMSKernel(
-            [y, proj, w],
-            template: [
-                ("InT", y.dtype), ("Hv", Hv), ("Dv", Dv), ("PW", proj.dim(2)),
-                ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)),
-            ],
+        let useEps = TrackScalarTemplates.useTemplateEps(eps)
+        var inputs: [MLXArray] = [y, proj, w]
+        if !useEps { inputs.append(scalar(eps, dtype: .float32)) }
+        var template: [(String, any KernelTemplateArg)] = [
+            ("InT", y.dtype), ("Hv", Hv), ("Dv", Dv), ("PW", proj.dim(2)), ("Z_OFF", zOffset),
+        ]
+        if useEps { template.append(("EPS_BITS", Int(eps.bitPattern))) }
+        let kernel = useEps ? gatedRMSKernel : gatedRMSGenericKernel
+        return kernel(
+            inputs, template: template,
             grid: (32, Hv, B * S), threadGroup: (32, 1, 1),
             outputShapes: [[B, S, Hv * Dv]], outputDTypes: [y.dtype])[0]
     }
@@ -361,7 +455,7 @@ extension TrackFastKernels {
         const uint h = thread_position_in_grid.y;
         const uint row = thread_position_in_grid.z;
         const uint b = row / S;
-        const uint s = row % S;
+        const uint s = track_ring(row, (uint)S);
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
         threadgroup float local_sums[32];
@@ -431,17 +525,108 @@ extension TrackFastKernels {
         outputNames: ["qout", "kout", "vout"],
         source: attnPrepSource, header: exactHeader, ensureRowContiguous: true)
 
+    nonisolated(unsafe) static let attnPrepGenericKernel = MLXFast.metalKernel(
+        name: "track_attn_prep_eps",
+        inputNames: ["qkv", "qnorm", "knorm", "cosb", "sinb", "eps"],
+        outputNames: ["qout", "kout", "vout"],
+        source: runtimeEpsSource(attnPrepSource), header: exactHeader, ensureRowContiguous: true)
+
     static func attnPrep(
         qkv: MLXArray, qNorm: MLXArray, kNorm: MLXArray, cos: MLXArray, sin: MLXArray,
         heads: Int, kvHeads: Int, headDim: Int, rotaryDims: Int, eps: Float
     ) -> (q: MLXArray, k: MLXArray, v: MLXArray) {
         let B = qkv.dim(0), S = qkv.dim(1)
         precondition(headDim % 4 == 0 && rotaryDims % 8 == 0 && cos.dim(1) == rotaryDims)
-        let outs = attnPrepKernel(
-            [qkv, qNorm, kNorm, cos, sin],
+        let useEps = TrackScalarTemplates.useTemplateEps(eps)
+        var inputs: [MLXArray] = [qkv, qNorm, kNorm, cos, sin]
+        if !useEps { inputs.append(scalar(eps, dtype: .float32)) }
+        var template: [(String, any KernelTemplateArg)] = [
+            ("InT", qkv.dtype), ("D", headDim), ("HQ", heads), ("HK", kvHeads), ("S", S),
+            ("QW", qkv.dim(2)), ("ROT", rotaryDims),
+        ]
+        if useEps { template.append(("EPS_BITS", Int(eps.bitPattern))) }
+        let kernel = useEps ? attnPrepKernel : attnPrepGenericKernel
+        let outs = kernel(
+            inputs, template: template,
+            grid: (headDim / 4, heads + 2 * kvHeads, B * S), threadGroup: (headDim / 4, 1, 1),
+            outputShapes: [[B, heads, S, headDim], [B, kvHeads, S, headDim], [B, kvHeads, S, headDim]],
+            outputDTypes: [qkv.dtype, qkv.dtype, qkv.dtype])
+        return (outs[0], outs[1], outs[2])
+    }
+
+    // MARK: attnPrep + in-place KV ring store (PB-177)
+
+    /// attnPrepSource with the two ring stores spliced at unique anchors.
+    /// Arithmetic, TG arrays, and the q/k/v slice layout stay verbatim.
+    static let attnPrepFuseSource: String = {
+        var source = attnPrepSource
+        let vec = "threadgroup InT vec[D];\n"
+        precondition(
+            source.components(separatedBy: vec).count == 2,
+            "TrackKVFuse: vec[D] anchor is no longer unique")
+        source = source.replacingOccurrences(
+            of: vec,
+            with: vec + """
+                device InT* k_ring = (device InT*)kcache;
+                device InT* v_ring = (device InT*)vcache;
+                const int kv_off = kvmeta[0];
+                const int kv_cap = kvmeta[1];
+
+        """)
+        let vStore = "vout[((b * HK + hh) * S + s) * D + d] = qkv[src + d];"
+        precondition(
+            source.components(separatedBy: vStore).count == 2,
+            "TrackKVFuse: V-store anchor is no longer unique")
+        source = source.replacingOccurrences(
+            of: vStore,
+            with: """
+                const InT vv = qkv[src + d];
+                vout[((b * HK + hh) * S + s) * D + d] = vv;
+                uint vslot = (uint)(kv_off + (int)s);
+                if (WRAP && vslot >= (uint)kv_cap) { vslot -= (uint)kv_cap; }
+                v_ring[(((b * HK + hh) * (uint)kv_cap) + vslot) * D + d] = vv;
+                """)
+        let kStore = "dst[d] = o;"
+        precondition(
+            source.components(separatedBy: kStore).count == 2,
+            "TrackKVFuse: K-store anchor is no longer unique")
+        source = source.replacingOccurrences(
+            of: kStore,
+            with: """
+            dst[d] = o;
+            if (!isQ) {
+                uint kslot = (uint)(kv_off + (int)s);
+                if (WRAP && kslot >= (uint)kv_cap) { kslot -= (uint)kv_cap; }
+                k_ring[(((b * HK + hh) * (uint)kv_cap) + kslot) * D + d] = o;
+            }
+            """)
+        return source
+    }()
+
+    nonisolated(unsafe) static let attnPrepFuseKernel = MLXFast.metalKernel(
+        name: "track_attn_prep_kv_fuse",
+        inputNames: ["qkv", "qnorm", "knorm", "cosb", "sinb", "kcache", "vcache", "kvmeta"],
+        outputNames: ["qout", "kout", "vout"],
+        source: attnPrepFuseSource, header: exactHeader, ensureRowContiguous: true)
+
+    static func attnPrepFused(
+        qkv: MLXArray, qNorm: MLXArray, kNorm: MLXArray, cos: MLXArray, sin: MLXArray,
+        kCache: MLXArray, vCache: MLXArray, writeOffset: Int,
+        heads: Int, kvHeads: Int, headDim: Int, rotaryDims: Int, eps: Float,
+        wrap: Bool = false
+    ) -> (q: MLXArray, k: MLXArray, v: MLXArray) {
+        let B = qkv.dim(0), S = qkv.dim(1), cap = kCache.dim(2)
+        precondition(headDim % 4 == 0 && rotaryDims % 8 == 0 && cos.dim(1) == rotaryDims)
+        precondition(kCache.shape == [B, kvHeads, cap, headDim])
+        precondition(vCache.shape == kCache.shape && vCache.dtype == qkv.dtype)
+        precondition(TrackKVFuse.canAppend(offset: writeOffset, count: S, cap: cap, wrap: wrap))
+        let meta = MLXArray([Int32(writeOffset), Int32(cap)])
+        let outs = attnPrepFuseKernel(
+            [qkv, qNorm, kNorm, cos, sin, kCache, vCache, meta],
             template: [
                 ("InT", qkv.dtype), ("D", headDim), ("HQ", heads), ("HK", kvHeads), ("S", S),
                 ("QW", qkv.dim(2)), ("ROT", rotaryDims), ("EPS_BITS", Int(eps.bitPattern)),
+                ("WRAP", wrap),
             ],
             grid: (headDim / 4, heads + 2 * kvHeads, B * S), threadGroup: (headDim / 4, 1, 1),
             outputShapes: [[B, heads, S, headDim], [B, kvHeads, S, headDim], [B, kvHeads, S, headDim]],
@@ -457,9 +642,9 @@ extension TrackFastKernels {
         const uint row = thread_position_in_grid.y;
         if (j >= HQ * D) return;
         const uint h = j / D;
-        const uint d = j % D;
+        const uint d = track_ring(j, (uint)D);
         const uint b = row / S;
-        const uint s = row % S;
+        const uint s = track_ring(row, (uint)S);
         const InT a = att[((b * HQ + h) * S + s) * D + d];
         const InT g = qkv[row * QW + GATE_OFF + j];
         out[row * HQ * D + j] = a * mlx_sigmoid(g);
@@ -582,7 +767,7 @@ extension TrackFastKernels {
         // `qmv_impl`'s `out_vec_size < num_simdgroups * results_per_simdgroup`
         // branch with compile-time sizes and the K walk unrolled. Same lanes,
         // same per-lane accumulation order, same simd_sum.
-        template <typename T, int group_size, int bits, int in_vec_size, int out_vec_size, int UNR>
+        template <typename T, int group_size, int bits, int in_vec_size, int out_vec_size, int UNR, bool EXACT_TAIL>
         METAL_FUNC void track_inject_qmv(
             const device uint32_t* w,
             const device T* scales,
@@ -652,7 +837,7 @@ extension TrackFastKernels {
           // keeps x_thread dynamically indexed and so pins it in thread-local
           // scratch for the whole function rather than registers. Compile that
           // branch away. Bit-identical by construction.
-          if constexpr (in_vec_size % values_per_thread == 0) {
+          if constexpr (EXACT_TAIL) {
             if (remaining > 0) {
               U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
               for (int row = 0; row < NR; row++) {
@@ -687,7 +872,7 @@ extension TrackFastKernels {
         // only the base addresses. Lane-to-K mapping, ascending block updates,
         // qdot/qdot_safe, and simd_sum are verbatim from track_inject_qmv above.
         // UNR is a scheduling hint only; never split or reassociate the sum.
-        template <typename T, int group_size, int bits, int in_vec_size, int ROW, int UNR = 8>
+        template <typename T, int group_size, int bits, int in_vec_size, int ROW, bool EXACT_TAIL, int UNR = 8>
         METAL_FUNC void track_inject_qmv_row(
             const device uint32_t* w,
             const device T* scales,
@@ -749,7 +934,7 @@ extension TrackFastKernels {
           // keeps x_thread dynamically indexed and so pins it in thread-local
           // scratch for the whole function rather than registers. Compile that
           // branch away. Bit-identical by construction.
-          if constexpr (in_vec_size % values_per_thread == 0) {
+          if constexpr (EXACT_TAIL) {
             if (remaining > 0) {
               U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
               for (int row = 0; row < NR; row++) {
@@ -784,7 +969,10 @@ extension TrackFastKernels {
     /// lo [B,S,LW] -> act [B,S,LMIX] (compiled silu); normed [B,S,KDIM] x
     /// inject weight [HC, KDIM/8] (4-bit, group GS) -> inj [B,S,HC] with the
     /// `qmv` arithmetic. grid threads (64, B*S, 1), threadgroup (64,1,1).
-    static let mixerHeadSource = """
+    static func makeMixerHeadSource(kdim: Int? = nil, hc: Int? = nil) -> String {
+        let kTok = kdim.map(String.init) ?? "KDIM"
+        let hcTok = hc.map(String.init) ?? "HC"
+        return """
         const uint row = thread_position_in_grid.y;
         const uint lid = thread_position_in_threadgroup.x;
         const uint simd_gid = simdgroup_index_in_threadgroup;
@@ -794,8 +982,11 @@ extension TrackFastKernels {
         }
         const device InT* xr = normed + (size_t)row * (size_t)KDIM;
         device InT* yr = inj + (size_t)row * (size_t)HC;
-        track_inject_qmv<InT, GS, BITS, KDIM, HC, UNR>(injW, injS, injB, xr, yr, simd_gid, simd_lid);
+        track_inject_qmv<InT, GS, BITS, \(kTok), \(hcTok), UNR, EXACT_TAIL>(injW, injS, injB, xr, yr, simd_gid, simd_lid);
         """
+    }
+
+    static let mixerHeadSource = makeMixerHeadSource()
 
     nonisolated(unsafe) static let mixerHeadKernel = MLXFast.metalKernel(
         name: "track_mixer_head",
@@ -803,17 +994,29 @@ extension TrackFastKernels {
         outputNames: ["act", "inj"],
         source: mixerHeadSource, header: mixerHeadHeader, ensureRowContiguous: true)
 
+    nonisolated(unsafe) static let mixerHeadStaged = MLXFast.metalKernel(
+        name: "track_mixer_head_k\(TrackHCStaging.liveHidden)_hc\(TrackHCStaging.liveHC)",
+        inputNames: ["lo", "normed", "injW", "injS", "injB"],
+        outputNames: ["act", "inj"],
+        source: makeMixerHeadSource(kdim: TrackHCStaging.liveHidden, hc: TrackHCStaging.liveHC),
+        header: mixerHeadHeader, ensureRowContiguous: true)
+
     static func mixerHead(
         lo: MLXArray, normed: MLXArray, w: MLXArray, s: MLXArray, b: MLXArray,
-        groupSize: Int, bits: Int, width: Int, unroll: Int = 4
+        groupSize: Int, bits: Int, width: Int, unroll: Int = 4,
+        staging: Bool = TrackHCStaging.enabled
     ) -> (act: MLXArray, inj: MLXArray) {
         let B = lo.dim(0), S = lo.dim(1), K = normed.dim(2), HC = w.dim(0)
         precondition(bits == 4 && HC < 8 && K % 256 == 0 && K > 256 && unroll >= 1)
-        let outs = mixerHeadKernel(
+        let kernel =
+            TrackHCStaging.mixerHeadPath(kdim: K, hc: HC, staging: staging) == .staged
+            ? mixerHeadStaged : mixerHeadKernel
+        let outs = kernel(
             [lo, normed, w, s, b],
             template: [
                 ("InT", lo.dtype), ("LW", lo.dim(2)), ("LMIX", width), ("KDIM", K), ("HC", HC),
                 ("GS", groupSize), ("BITS", bits), ("UNR", unroll),
+                ("EXACT_TAIL", TrackFastMoEKernels.useExactTail(k: K, bits: bits)),
             ],
             grid: (64, B * S, 1), threadGroup: (64, 1, 1),
             outputShapes: [[B, S, width], [B, S, HC]], outputDTypes: [lo.dtype, lo.dtype])

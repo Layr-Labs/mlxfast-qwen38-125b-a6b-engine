@@ -862,15 +862,21 @@ struct PackedNAXGroup32 {
     const float s = float(scale);
     const float b = float(bias);
     float sc[2] = {s, s / 16.0f};
+    // MLXFAST-WVEC2: the same per-value arithmetic, stored four values at a
+    // time (dst is 8-byte aligned: padded rows and 32-element column offsets,
+    // and the staging arrays below are declared alignas(16)).
+    threadgroup vec<bfloat16_t, 4>* d4 = (threadgroup vec<bfloat16_t, 4>*)dst;
     STEEL_PRAGMA_UNROLL
     for (int j = 0; j < 4; j++) {
       STEEL_PRAGMA_UNROLL
-      for (int i = 0; i < 4; i++) {
-        const uint8_t w = uint8_t(words[j] >> (8 * i));
-        dst[8 * j + 2 * i] =
-            static_cast<bfloat16_t>(sc[0] * (w & 0x0f) + b);
-        dst[8 * j + 2 * i + 1] =
-            static_cast<bfloat16_t>(sc[1] * (w & 0xf0) + b);
+      for (int i = 0; i < 4; i += 2) {
+        const uint8_t w0 = uint8_t(words[j] >> (8 * i));
+        const uint8_t w1 = uint8_t(words[j] >> (8 * (i + 1)));
+        d4[2 * j + i / 2] = vec<bfloat16_t, 4>(
+            static_cast<bfloat16_t>(sc[0] * (w0 & 0x0f) + b),
+            static_cast<bfloat16_t>(sc[1] * (w0 & 0xf0) + b),
+            static_cast<bfloat16_t>(sc[0] * (w1 & 0x0f) + b),
+            static_cast<bfloat16_t>(sc[1] * (w1 & 0xf0) + b));
       }
     }
   }
@@ -1087,7 +1093,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
             }
           }
 
-          STEEL_PRAGMA_NO_UNROLL
+          STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             NAXTile<T, TM, TK> Atile;
             NAXTile<T, TN, TK> Btile;
@@ -1229,7 +1235,7 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
     loader_w.load_unsafe();
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    STEEL_PRAGMA_NO_UNROLL
+    STEEL_PRAGMA_UNROLL
     for (int kk1 = 0; kk1 < BK; kk1 += SK) {
       NAXTile<T, TM, TK> Atile;
       NAXTile<T, TK, TN> Btile;
@@ -1304,7 +1310,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  alignas(16) threadgroup T Ws[BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1363,7 +1369,7 @@ template <
 
   constexpr int BN_padded = (BN + 16 / sizeof(T));
 
-  threadgroup T Ws[BK * BN_padded];
+  alignas(16) threadgroup T Ws[BK * BN_padded];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1429,7 +1435,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  alignas(16) threadgroup T Ws[BN * BK_padded];
 
   adjust_matrix_offsets<T>(
       x,
@@ -1497,7 +1503,7 @@ template <
 
   constexpr int BN_padded = (BN + 16 / sizeof(T));
 
-  threadgroup T Ws[BK * BN_padded];
+  alignas(16) threadgroup T Ws[BK * BN_padded];
 
   adjust_matrix_offsets<T>(
       x,
@@ -1715,28 +1721,15 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
       // not have one. 16 bf16 per thread, statically indexed, so it stays in
       // registers. The values published to `As` are byte for byte what the
       // in-place copy published, only fetched earlier.
-      // MLXFAST-AVEC: a_col is a multiple of 16 elements (32 bytes), K is
-      // 2560 or 640 elements and BK is 64, so both ends of the copy are
-      // 16-byte aligned and the 16 elements move as two whole vectors.
-      constexpr short A_VECS = 16 * sizeof(T) / sizeof(uint4);
-      uint4 a_buf[A_VECS];
+      T a_buf[16];
       PackedNAXGroup32 packed_w;
       if (K_it > 0) {
         packed_w.prefetch(loader_w);
         if (a_live) {
-          const device uint4* a0 =
-              (const device uint4*)(xb + size_t(a_row) * K + a_col);
+          const device T* a0 = xb + size_t(a_row) * K + a_col;
           STEEL_PRAGMA_UNROLL
-          for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a0[v]; }
+          for (short e = 0; e < 16; ++e) { a_buf[e] = a0[e]; }
         }
-      }
-      if (!a_live) {
-        // A dead row's slice of the activation stage is zero for every K step:
-        // `a_dst` never advances, so the fill is written once here instead of
-        // once per step by the else branch that used to sit in the loop.
-        threadgroup uint4* d0 = (threadgroup uint4*)a_dst;
-        STEEL_PRAGMA_UNROLL
-        for (short v = 0; v < A_VECS; ++v) { d0[v] = uint4(0); }
       }
       for (int k = 0; k < K_it; k++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1754,9 +1747,15 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
         // rows are excluded by `store_slice` either way. Same values, same
         // order, bit-identical output.
         if (a_live) {
-          threadgroup uint4* d4 = (threadgroup uint4*)a_dst;
           STEEL_PRAGMA_UNROLL
-          for (short v = 0; v < A_VECS; ++v) { d4[v] = a_buf[v]; }
+          for (short e = 0; e < 16; ++e) {
+            a_dst[e] = a_buf[e];
+          }
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short e = 0; e < 16; ++e) {
+            a_dst[e] = T(0);
+          }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1765,10 +1764,9 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
           loader_w.next();
           packed_w.prefetch(loader_w);
           if (a_live) {
-            const device uint4* a_next =
-                (const device uint4*)(xb + BK + size_t(a_row) * K + a_col);
+            const device T* a_next = xb + BK + size_t(a_row) * K + a_col;
             STEEL_PRAGMA_UNROLL
-            for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a_next[v]; }
+            for (short e = 0; e < 16; ++e) { a_buf[e] = a_next[e]; }
           }
         }
 
@@ -1850,14 +1848,14 @@ template <
       group_size,
       bits>;
 
-  threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
+  alignas(16) threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
   // MLXFAST-ASTAGE: 32 x 72 bf16 = 4,608 B, only for the P17-eligible shape. An
   // in-situ probe that added exactly this much untouched threadgroup memory to
   // this kernel cost 0.8%, so the allocation is close to free here.
   constexpr bool p17_shape =
       metal::is_same_v<T, bfloat16_t> && group_size == 32 && bits == 4 &&
       transpose && BM == 32 && BN == 64 && BK == 64 && WM == 2 && WN == 2;
-  threadgroup T As[p17_shape ? BM * BK_padded : 1];
+  alignas(16) threadgroup T As[p17_shape ? BM * BK_padded : 1];
 
   // P17 is a scheduling/load-address variant of THIS kernel, not a different
   // GEMM family. Ineligible shapes retain the original body byte for byte.
@@ -1980,7 +1978,7 @@ template <
 
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          STEEL_PRAGMA_NO_UNROLL
+          STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             if (sg_active) {
               NAXTile<T, TM, TK> Atile;
@@ -2020,7 +2018,7 @@ template <
           loader_w.load_safe(tile_w);
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          STEEL_PRAGMA_NO_UNROLL
+          STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             if (sg_active) {
               NAXTile<T, TM, TK> Atile;

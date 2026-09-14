@@ -222,6 +222,32 @@ struct TrackMixerActBlockLoader<
     }
   }
 };
+// MLXFAST-MIXACTBM: constexpr M-tile table. BN/BK/WM/WN are fixed so the K
+// traversal and N-tile stay identical across variants. Only BM changes.
+// Production geometry M=1024, K=10240, N=320; 40-core GPU; tgp=128.
+//   BM  SM  TM  TGs  thr/core  shm
+//   32  16   1  160       512  9216 B  (default; tip 711083e)
+//   64  32   2   80       256  9216 B  (opt-in; MLXFAST_MIXACT_TILE=64)
+//   16   8   0  320      1024  9216 B  REJECT: TM=0
+// BM=16 / WM=1 / WN=4 would recover TM=1 but halves TN and changes N
+// simdgroups (loader forces WM*WN=4 for tgp=128). Not shipped.
+template <int kBM, int kBN = 64, int kBK = 64, int kWM = 2, int kWN = 2>
+struct MixActMTile {
+  MLX_MTL_CONST int BM = kBM;
+  MLX_MTL_CONST int BN = kBN;
+  MLX_MTL_CONST int BK = kBK;
+  MLX_MTL_CONST int WM = kWM;
+  MLX_MTL_CONST int WN = kWN;
+  MLX_MTL_CONST int SM = BM / WM;
+  MLX_MTL_CONST int TM = SM / 16;
+  MLX_MTL_CONST int tgp = WM * WN * 32;
+  static_assert(
+      BM == 64 || BM == 32,
+      "MixAct M-tile: BM=16 is TM-degenerate under WM=2 WN=2");
+  static_assert(TM >= 1, "MixAct M-tile: per-thread register tile is empty");
+  static_assert(tgp == 128, "MixAct M-tile: loader requires 128-thread TGs");
+};
+
 template <
     typename T,
     const int group_size,
@@ -248,6 +274,8 @@ METAL_FUNC void track_mixer_act_dense(
     uint simd_lid [[thread_index_in_simdgroup]]) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
+  using mixact_tile = MixActMTile<BM, BN, BK, WM, WN>;
+  (void)mixact_tile::TM;
 
   (void)lid;
 
