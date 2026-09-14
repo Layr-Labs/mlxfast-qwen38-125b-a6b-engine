@@ -239,7 +239,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// Layers in the first partial-dispatch chunk (0 = same as asyncChunk):
     /// the first dispatch lands right after the PLE layer, whose host row
     /// gather is the one host sync of the step.
-    nonisolated(unsafe) public static var asyncFirst: Int = 2
+    nonisolated(unsafe) public static var asyncFirst: Int = 1
     /// Layer count at an optional second dispatch (0 = none).
     nonisolated(unsafe) public static var asyncSecond: Int = 0
 
@@ -284,6 +284,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         self.layers = built
         self.finalMixer = Self.bindHC(tower.trackChild("hyper_connection_mixer"), cfg: cfg)
         super.init()
+        if finalMixer.normScaleQ.dtype == .bfloat16 && StreamOrDevice.default.stream === Stream.gpu {
+            _ = TrackBF16Functions.sigmoid
+        }
     }
 
     // MARK: binding
