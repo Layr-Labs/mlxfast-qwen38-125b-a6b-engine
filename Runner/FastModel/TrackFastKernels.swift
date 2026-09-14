@@ -29,6 +29,65 @@ enum TrackFastKernels {
         let a = MLXArray(v, dtype: dtype); eval(a); typedScalars[key] = a; return a
     }
 
+    /// Zero adoption word for launches that do not select a bank slot.
+    private static let adoptLock = NSLock()
+    nonisolated(unsafe) private static var zeroAdoptFlag: MLXArray?
+    static func adoptFlag(_ flag: MLXArray?) -> (flag: MLXArray, on: Bool) {
+        if let flag { return (flag, true) }
+        adoptLock.lock(); defer { adoptLock.unlock() }
+        if let zero = zeroAdoptFlag { return (zero, false) }
+        let zero = MLXArray([UInt32(0)])
+        eval(zero)
+        zeroAdoptFlag = zero
+        return (zero, false)
+    }
+
+    static func intScalar(_ v: Int32) -> MLXArray {
+        scalarLock.lock(); defer { scalarLock.unlock() }
+        let key = "i32:\(v)"
+        if let a = typedScalars[key] { return a }
+        let a = MLXArray(v); eval(a); typedScalars[key] = a; return a
+    }
+
+    /// Recurrence sources bind `T` as a template. The generic fallback reads
+    /// the same length from a 0-dim `tlen` argument.
+    ///
+    /// Generic launches also carry no `ADOPT` template and no `adopted_slot`
+    /// input (`gdnRecurrence` has no slot to adopt), so the adopt ternary must
+    /// fold to its false branch here — the value a template `ADOPT = false`
+    /// launch computes. Without the fold, the first generic launch at an
+    /// unlisted T is an uncatchable JIT compile fatal that kills the resident
+    /// mid-phase: `useTemplateT` whitelists 1...8 and the powers of two up to
+    /// 1024, the boot warm pass compiles 1024 and 1, and the first fast-path
+    /// window at any other width dies there (submission 2dfb3f32's death,
+    /// reproduced locally at decode_begin(1900)).
+    static func runtimeTSource(_ source: String) -> String {
+        var next = source.replacingOccurrences(
+            of: "const int T_ = T;", with: "const int T_ = tlen;")
+        precondition(next != source, "GDN recurrence source is missing the T_ binding")
+        let adopt = "const uint adopt = ADOPT ? adopted_slot[0] : b_idx;"
+        next = next.replacingOccurrences(of: adopt, with: "const uint adopt = b_idx;")
+        precondition(
+            !next.contains("ADOPT") && !next.contains("adopted_slot"),
+            "GDN recurrence source carries an adopt reference the generic variant cannot compile")
+        return next
+    }
+
+    /// RMS sources bind eps as `EPS_BITS`. The generic fallback reads a 0-dim `eps`.
+    static func runtimeEpsSource(_ source: String) -> String {
+        let old = "as_type<float>((uint)EPS_BITS)"
+        let next = source.replacingOccurrences(of: old, with: "eps")
+        precondition(next != source, "RMS source is missing EPS_BITS")
+        return next
+    }
+
+    static func templateEpsSource(_ source: String) -> String {
+        let old = "+ eps)"
+        let next = source.replacingOccurrences(of: old, with: "+ as_type<float>((uint)EPS_BITS))")
+        precondition(next != source, "RMS source is missing a scalar eps addend")
+        return next
+    }
+
     struct GDNGeometry {
         let projWidth: Int  // PROJ_W
         let convDim: Int  // CONV_DIM = 2*Hk*Dk + Hv*Dv
@@ -53,9 +112,10 @@ enum TrackFastKernels {
         const uint vec = thread_position_in_grid.y;           // vector index
         const uint bt = thread_position_in_grid.z;            // b*T + t
         const uint b = bt / T;
-        const uint t = bt % T;
+        const uint t = track_ring(bt, (uint)T);
+        const uint adopt = ADOPT ? adopted_slot[0] : b;
         const device InT* proj_b = proj + (uint)(b * T * PROJ_W);
-        const device InT* cst_b = conv_state + (uint)(b * KM1 * CONV_DIM);
+        const device InT* cst_b = conv_state + (uint)(adopt * KM1 * CONV_DIM);
         auto win = [&](int r, uint ch) -> float {
             if (r < KM1) { return static_cast<float>(cst_b[(uint)(r * CONV_DIM) + ch]); }
             return static_cast<float>(proj_b[(uint)((r - KM1) * PROJ_W) + ch]);
@@ -118,25 +178,27 @@ enum TrackFastKernels {
 
     nonisolated(unsafe) static let prepKernel = MLXFast.metalKernel(
         name: "track_gdn_prep",
-        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias"],
+        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "adopted_slot"],
         outputNames: ["qn", "kn", "vv", "g", "beta", "conv_out"],
         source: prepSource, header: exactHeader, ensureRowContiguous: true)
 
     /// The prep half alone (tests).
     static func gdnPrep(
         proj: MLXArray, convState: MLXArray, convW: MLXArray,
-        negExpALog: MLXArray, dtBias: MLXArray, T: Int, capture: Bool, geometry g: GDNGeometry
+        negExpALog: MLXArray, dtBias: MLXArray, T: Int, capture: Bool, geometry g: GDNGeometry,
+        adoptedSlot: MLXArray? = nil
     ) -> [MLXArray] {
         let B = proj.dim(0)
         let slots = capture ? B * T : B
         precondition(g.dk == 128 && g.dv == 128 && g.convDim % 128 == 0)
+        let adopt = Self.adoptFlag(adoptedSlot)
         return prepKernel(
-            [proj, convState, convW, negExpALog, dtBias],
+            [proj, convState, convW, negExpALog, dtBias, adopt.flag],
             template: [
                 ("InT", proj.dtype), ("T", T), ("Dk", g.dk), ("Dv", g.dv), ("Hk", g.hk),
                 ("Hv", g.hv), ("KC", g.convKernel), ("PROJ_W", g.projWidth),
                 ("CONV_DIM", g.convDim), ("B_OFF", g.bOffset), ("A_OFF", g.aOffset),
-                ("CAPTURE", capture),
+                ("CAPTURE", capture), ("ADOPT", adopt.on),
             ],
             grid: (32, g.convDim / 128, B * T), threadGroup: (32, 4, 1),
             outputShapes: [
@@ -163,7 +225,8 @@ enum TrackFastKernels {
         const uint dv_idx = thread_position_in_grid.y;
         const device float* g_ = g + b_idx * T_ * Hv;
         const device float* beta_ = beta + b_idx * T_ * Hv;
-        const device StT* i_state = state_in + (n * Dv + dv_idx) * Dk;
+        const uint adopt = ADOPT ? adopted_slot[0] : b_idx;
+        const device StT* i_state = state_in + ((adopt * Hv + hv_idx) * Dv + dv_idx) * Dk;
         float state[n_per_t];
         // Each lane owns n_per_t consecutive state entries: one vector load /
         // store per lane when that is a float4 (same values, one instruction
@@ -220,9 +283,15 @@ enum TrackFastKernels {
 
     nonisolated(unsafe) static let leanKernel = MLXFast.metalKernel(
         name: "track_gdn_lean",
-        inputNames: ["q", "k", "v", "g", "beta", "state_in"],
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "adopted_slot"],
         outputNames: ["y", "state_out"],
         source: leanSource, ensureRowContiguous: true)
+
+    nonisolated(unsafe) static let leanGenericKernel = MLXFast.metalKernel(
+        name: "track_gdn_lean_tlen",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "tlen"],
+        outputNames: ["y", "state_out"],
+        source: runtimeTSource(leanSource), ensureRowContiguous: true)
 
     // MLXFAST-GDNTILE: Two adjacent value rows share Q/K and gate loads in prefill.
     // Keep the original grid/threadgroup; surplus SIMD groups return uniformly.
@@ -245,7 +314,8 @@ enum TrackFastKernels {
         const uint dk_idx = thread_position_in_threadgroup.x;
         const device float* g_ = g + b_idx * T_ * Hv;
         const device float* beta_ = beta + b_idx * T_ * Hv;
-        const device StT* i_state = state_in + (n * Dv + dv_idx) * Dk;
+        const uint adopt = ADOPT ? adopted_slot[0] : b_idx;
+        const device StT* i_state = state_in + ((adopt * Hv + hv_idx) * Dv + dv_idx) * Dk;
         float state0[n_per_t], state1[n_per_t];
         for (int i = 0; i < n_per_t; ++i) {
             state0[i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);
@@ -315,9 +385,15 @@ enum TrackFastKernels {
     // MLXFAST-GDNTILE: Keep the one-row kernel intact for decode and comparison.
     nonisolated(unsafe) static let leanTwoRowKernel = MLXFast.metalKernel(
         name: "track_gdn_lean_two_row",
-        inputNames: ["q", "k", "v", "g", "beta", "state_in"],
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "adopted_slot"],
         outputNames: ["y", "state_out"],
         source: leanTwoRowSource, ensureRowContiguous: true)
+
+    nonisolated(unsafe) static let leanTwoRowGenericKernel = MLXFast.metalKernel(
+        name: "track_gdn_lean_two_row_tlen",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "tlen"],
+        outputNames: ["y", "state_out"],
+        source: runtimeTSource(leanTwoRowSource), ensureRowContiguous: true)
 
     private static let prefetchGDNInputs =
         ProcessInfo.processInfo.environment["TRACK_GDN_INPUT_PREFETCH"] != "0"
@@ -338,7 +414,8 @@ enum TrackFastKernels {
         const uint dk_idx = thread_position_in_threadgroup.x;
         const device float* g_ = g + b_idx * T_ * Hv;
         const device float* beta_ = beta + b_idx * T_ * Hv;
-        const device StT* i_state = state_in + (n * Dv + dv_idx) * Dk;
+        const uint adopt = ADOPT ? adopted_slot[0] : b_idx;
+        const device StT* i_state = state_in + ((adopt * Hv + hv_idx) * Dv + dv_idx) * Dk;
         float state0[n_per_t], state1[n_per_t];
         for (int i = 0; i < n_per_t; ++i) {
             state0[i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);
@@ -435,9 +512,15 @@ enum TrackFastKernels {
 
     private static let leanPrefetchKernel = MLXFast.metalKernel(
         name: "track_gdn_input_prefetch",
-        inputNames: ["q", "k", "v", "g", "beta", "state_in"],
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "adopted_slot"],
         outputNames: ["y", "state_out"],
         source: leanPrefetchSource, ensureRowContiguous: true)
+
+    private static let leanPrefetchGenericKernel = MLXFast.metalKernel(
+        name: "track_gdn_input_prefetch_tlen",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "tlen"],
+        outputNames: ["y", "state_out"],
+        source: runtimeTSource(leanPrefetchSource), ensureRowContiguous: true)
 
     // MARK: MLXFAST-GDNROWS -- the prefill recurrence, four rows per simdgroup
     //
@@ -631,7 +714,7 @@ enum TrackFastKernels {
 
     nonisolated(unsafe) private static let leanRowsKernel = MLXFast.metalKernel(
         name: "track_gdn_rows",
-        inputNames: ["q", "k", "v", "g", "beta", "state_in"],
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "adopted_slot"],
         outputNames: ["y", "state_out"],
         source: leanRowsSource(prefillRows > 0 ? prefillRows : 4), ensureRowContiguous: true)
 
@@ -641,10 +724,9 @@ enum TrackFastKernels {
         proj: MLXArray, convState: MLXArray, convW: MLXArray,
         negExpALog: MLXArray, dtBias: MLXArray, stateIn: MLXArray,
         T: Int, capture: Bool, geometry g: GDNGeometry,
-        separateBA: (b: MLXArray, a: MLXArray)? = nil
+        separateBA: (b: MLXArray, a: MLXArray)? = nil,
+        adoptedSlot: MLXArray? = nil
     ) -> (y: MLXArray, convOut: MLXArray, stateOut: MLXArray) {
-        let B = proj.dim(0)
-        let slots = capture ? B * T : B
         precondition(g.dk == 128 && g.dv == 128 && g.convDim % 128 == 0)
         let prof = TrackFastProfile.prefill != nil && T >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
@@ -655,37 +737,91 @@ enum TrackFastKernels {
             prep = TrackP12Prefill.gdnPrepSplit(
                 proj: proj, b: separateBA.b, a: separateBA.a, convState: convState,
                 convW: convW, negExpALog: negExpALog, dtBias: dtBias, T: T,
-                capture: capture, geometry: g)
+                capture: capture, geometry: g, adoptedSlot: adoptedSlot)
         } else {
             prep = gdnPrep(
                 proj: proj, convState: convState, convW: convW, negExpALog: negExpALog,
-                dtBias: dtBias, T: T, capture: capture, geometry: g)
+                dtBias: dtBias, T: T, capture: capture, geometry: g,
+                adoptedSlot: adoptedSlot)
         }
         if prof { TrackFastProfile.tick("gdn.prep", &pt, prep) }
-        // MLXFAST-GDNROWS: each prefill SIMD group owns `prefillRows` value rows
-        // (four, measured); decode (S == 1) and the capture window keep the
-        // kernels they had. Omit the unused grid rows.
-        let rows: Int
-        let recurrence: MLXFast.MLXFastKernel
-        if prefillRows > 0 && T > 8 && !capture {
-            (rows, recurrence) = (prefillRows, leanRowsKernel)
-        } else if prefetchGDNInputs && T > 8 && !capture {
-            (rows, recurrence) = (2, leanPrefetchKernel)
-        } else if T > 1 {
-            (rows, recurrence) = (2, leanTwoRowKernel)
-        } else {
-            (rows, recurrence) = (1, leanKernel)
+        if TrackScalarTemplates.useTemplateT(T) {
+            let B = proj.dim(0)
+            let slots = capture ? B * T : B
+            // MLXFAST-GDNROWS: each prefill SIMD group owns `prefillRows` value rows
+            // (four, measured); decode (S == 1) and the capture window keep the
+            // kernels they had. Omit the unused grid rows.
+            let rows: Int
+            let recurrence: MLXFast.MLXFastKernel
+            if prefillRows > 0 && T > 8 && !capture {
+                (rows, recurrence) = (prefillRows, leanRowsKernel)
+            } else if prefetchGDNInputs && T > 8 && !capture {
+                (rows, recurrence) = (2, leanPrefetchKernel)
+            } else if T > 1 {
+                (rows, recurrence) = (2, leanTwoRowKernel)
+            } else {
+                (rows, recurrence) = (1, leanKernel)
+            }
+            let adopt = Self.adoptFlag(adoptedSlot)
+            let rec = recurrence(
+                [prep[0], prep[1], prep[2], prep[3], prep[4], stateIn, adopt.flag],
+                template: [
+                    ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
+                    ("Hk", g.hk), ("Hv", g.hv), ("CAPTURE", capture), ("T", T),
+                    ("ADOPT", adopt.on),
+                ],
+                grid: (32, g.dv / rows, B * g.hv), threadGroup: (32, 4, 1),
+                outputShapes: [[B, T, g.hv, g.dv], [slots, g.hv, g.dv, g.dk]],
+                outputDTypes: [proj.dtype, stateIn.dtype])
+            if prof { TrackFastProfile.tick("gdn.lean", &pt, rec) }
+            return (rec[0], prep[5], rec[1])
         }
-        let rec = recurrence(
-            [prep[0], prep[1], prep[2], prep[3], prep[4], stateIn],
-            template: [
-                ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
-                ("Hk", g.hk), ("Hv", g.hv), ("CAPTURE", capture), ("T", T),
-            ],
-            grid: (32, g.dv / rows, B * g.hv), threadGroup: (32, 4, 1),
-            outputShapes: [[B, T, g.hv, g.dv], [slots, g.hv, g.dv, g.dk]],
-            outputDTypes: [proj.dtype, stateIn.dtype])
-        if prof { TrackFastProfile.tick("gdn.lean", &pt, rec) }
-        return (rec[0], prep[5], rec[1])
+        let rec = gdnRecurrence(
+            q: prep[0], k: prep[1], v: prep[2], g: prep[3], beta: prep[4],
+            stateIn: stateIn, T: T, capture: capture, geometry: g)
+        if prof { TrackFastProfile.tick("gdn.lean", &pt, [rec.y, rec.stateOut]) }
+        return (rec.y, prep[5], rec.stateOut)
+    }
+
+    /// Delta-rule recurrence. Known T is a template constant; unseen T (or
+    /// `TRACK_SCALAR_TEMPLATES=0`) passes the length as a 0-dim scalar.
+    static func gdnRecurrence(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray,
+        stateIn: MLXArray, T: Int, capture: Bool, geometry geo: GDNGeometry
+    ) -> (y: MLXArray, stateOut: MLXArray) {
+        let B = q.dim(0)
+        let slots = capture ? B * T : B
+        let useT = TrackScalarTemplates.useTemplateT(T)
+        let kernel: MLXFast.MLXFastKernel
+        if prefetchGDNInputs && T > 8 && !capture {
+            kernel = useT ? leanPrefetchKernel : leanPrefetchGenericKernel
+        } else if T > 1 {
+            kernel = useT ? leanTwoRowKernel : leanTwoRowGenericKernel
+        } else {
+            kernel = useT ? leanKernel : leanGenericKernel
+        }
+        var inputs: [MLXArray] = [q, k, v, g, beta, stateIn]
+        var template: [(String, any KernelTemplateArg)] = [
+            ("InT", q.dtype), ("StT", stateIn.dtype), ("Dk", geo.dk), ("Dv", geo.dv),
+            ("Hk", geo.hk), ("Hv", geo.hv), ("CAPTURE", capture),
+        ]
+        if useT {
+            // The templated registrations take `adopted_slot` as their seventh
+            // input and compile the adopt ternary, so a no-adoption launch
+            // still passes the zero flag and ADOPT = false (this entry point
+            // has no slot to adopt; `gdn` owns the adopting launches).
+            let adopt = adoptFlag(nil)
+            inputs.append(adopt.flag)
+            template.append(("T", T))
+            template.append(("ADOPT", adopt.on))
+        } else {
+            inputs.append(intScalar(Int32(T)))
+        }
+        let rec = kernel(
+            inputs, template: template,
+            grid: (32, T > 1 ? geo.dv / 2 : geo.dv, B * geo.hv), threadGroup: (32, 4, 1),
+            outputShapes: [[B, T, geo.hv, geo.dv], [slots, geo.hv, geo.dv, geo.dk]],
+            outputDTypes: [q.dtype, stateIn.dtype])
+        return (rec[0], rec[1])
     }
 }
