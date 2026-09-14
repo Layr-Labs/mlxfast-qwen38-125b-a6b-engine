@@ -76,6 +76,11 @@ enum TrackPrefillSort {
         outputNames: ["sorted_ids", "token_rows", "inverse"],
         source: scatterSource, header: "", ensureRowContiguous: true)
 
+    private static let expertRankKernel = MLXFast.metalKernel(
+        name: "track_route_expert_ranks",
+        inputNames: ["ids"], outputNames: ["sorted_ids", "token_rows", "inverse"],
+        source: expertRankSource, header: "", ensureRowContiguous: true)
+
     /// `(sortedIDs, tokenRows, inverse)` for `flatIDs` over `E` expert ids,
     /// or nil when the shape is outside the supported window.
     static func apply(flatIDs: MLXArray, experts E: Int, topK: Int)
@@ -86,6 +91,14 @@ enum TrackPrefillSort {
             E > 0, E % blockSize == 0, E <= 4096, R % topK == 0,
             R >= blockSize, R % blockSize == 0
         else { return nil }
+        if E == 512, R <= 16384 {
+            let outs = expertRankKernel(
+                [flatIDs], template: [("R", R), ("TOPK", topK)],
+                grid: (E * blockSize, 1, 1), threadGroup: (blockSize, 1, 1),
+                outputShapes: [[R], [R], [R]],
+                outputDTypes: [.uint32, .uint32, .uint32])
+            return (outs[0], outs[1], outs[2])
+        }
         let nBlocks = R / blockSize
         let counts = countKernel(
             [flatIDs],
@@ -102,6 +115,58 @@ enum TrackPrefillSort {
     }
 
     // MARK: - kernels
+
+    static let expertRankSource = #"""
+        constexpr uint CHUNK = R / 256;
+        static_assert(R % 256 == 0 && CHUNK >= 1 && CHUNK <= 64);
+        const uint expert = threadgroup_position_in_grid.x;
+        const uint t = thread_position_in_threadgroup.x;
+        const uint lane = t % 32;
+        const uint sg = t / 32;
+        const uint first = t * CHUNK;
+        uint matches0 = 0, matches1 = 0, lower = 0;
+        for (uint j = 0; j < CHUNK; ++j) {
+            const uint v = ids[first + j];
+            lower += uint(v < expert);
+            if (v == expert) {
+                if (j < 32) { matches0 |= 1u << j; }
+                else { matches1 |= 1u << (j - 32); }
+            }
+        }
+        const uint equal = popcount(matches0) + popcount(matches1);
+        const uint lane_prefix = simd_prefix_exclusive_sum(equal);
+        const uint group_equal = simd_sum(equal);
+        const uint group_lower = simd_sum(lower);
+        threadgroup uint equal_prefix[8];
+        threadgroup uint lower_sums[8];
+        threadgroup uint bucket_base;
+        if (lane == 0) {
+            equal_prefix[sg] = group_equal;
+            lower_sums[sg] = group_lower;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            const uint count = lane < 8 ? equal_prefix[lane] : 0u;
+            const uint below = lane < 8 ? lower_sums[lane] : 0u;
+            const uint prefix = simd_prefix_exclusive_sum(count);
+            const uint base = simd_sum(below);
+            if (lane < 8) { equal_prefix[lane] = prefix; }
+            if (lane == 0) { bucket_base = base; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint dest = bucket_base + equal_prefix[sg] + lane_prefix;
+        for (uint part = 0; part < 2; ++part) {
+            uint bits = part == 0 ? matches0 : matches1;
+            while (bits != 0) {
+                const uint gi = first + part * 32 + __builtin_ctz(bits);
+                sorted_ids[dest] = expert;
+                token_rows[dest] = gi / uint(TOPK);
+                inverse[gi] = dest;
+                ++dest;
+                bits &= bits - 1;
+            }
+        }
+        """#
 
     /// One threadgroup per block of `BLK` assignments. Bucket `b` is counted by
     /// the thread that owns it, by scanning the block's own value tile, so
