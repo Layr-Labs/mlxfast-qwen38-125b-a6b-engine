@@ -1409,14 +1409,31 @@ extension TrackFastMoEKernels {
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sgi == 0 && lid == 0) {
-            const T sg = mlx_sigmoid(gate[t]);
-            for (int i = 0; i < RPS; ++i) {
+        // MLXFAST-EPILANES: the RPS output columns of one tile fold
+        // independently, one lane each, instead of all of them in a serial loop
+        // on lane 0. `mlx_colsum_small_f32` is thread-local (no collectives, no
+        // threadgroup memory), so each column keeps its own K iteration order
+        // and its own fold; only which lane performs it changes.
+        if constexpr (VPT == 1 && RPS <= 32) {
+            if (sgi == 0 && lid < RPS) {
+                const int i = (int)lid;
+                const T sg = mlx_sigmoid(gate[t]);
                 float col[K];
                 for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
                 const T r = static_cast<T>(mlx_colsum_small_f32<K>(col));
                 const T sh = sg * static_cast<T>(shvT[i]);
                 out[(size_t)t * (size_t)H + (size_t)(d0 + i)] = r + sh;
+            }
+        } else {
+            if (sgi == 0 && lid == 0) {
+                const T sg = mlx_sigmoid(gate[t]);
+                for (int i = 0; i < RPS; ++i) {
+                    float col[K];
+                    for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
+                    const T r = static_cast<T>(mlx_colsum_small_f32<K>(col));
+                    const T sh = sg * static_cast<T>(shvT[i]);
+                    out[(size_t)t * (size_t)H + (size_t)(d0 + i)] = r + sh;
+                }
             }
         }
         """
@@ -1445,7 +1462,7 @@ extension TrackFastMoEKernels {
     static let downRowsPerSimdgroup = 4
 
     static let downCombineSimdgroups =
-        ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 5
+        ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 2
 
     /// act [BR + S, F] (routed slots, then the shared expert per token), gate [S] pre-sigmoid.
     static func downCombine(
