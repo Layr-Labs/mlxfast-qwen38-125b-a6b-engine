@@ -1386,8 +1386,8 @@ extension TrackFastMoEKernels {
             if (FAST) { qmv_fast_reg<T, GS, BITS, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
             else { qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
             const float wk = w[z];
-            if (lid == 0) {
-                for (int i = 0; i < RPS; ++i) { prod[k][i] = static_cast<float>(static_cast<T>(res[i])) * wk; }
+            if (lid < RPS) {
+                prod[k][lid] = static_cast<float>(static_cast<T>(res[lid])) * wk;
             }
         }
         // Shared expert down rows d0..d0+3 for token t: one token routes to `qmv`'s

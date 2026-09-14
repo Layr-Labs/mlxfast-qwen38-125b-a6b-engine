@@ -583,9 +583,41 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
+        // ROPECACHE: decode/small windows (S <= 8) see only 8 positions per
+        // forward, so the rope tables for a 4k-window are a fixed [4096, 64]
+        // fp32 pair (~2 MiB). Build each position's cos/sin once on the host
+        // (same `exp/cos/sin` op order as `Qwen4ExpRotary.cosSin`, fp32
+        // throughout) and slice; the activation dtype cast stays lazy.
+        // Windows past the cached span fall back to the per-call device path.
+        // PREFILL-ROPE: a fresh prefill (offset 0, S up to the span) is just a
+        // longer slice of the same table — same ops, bit-exact.
+        if count <= 8 || offset == 0, offset + count <= TrackQwen4ExpFastModel.ropeSpan, Self.ropeEnabled {
+            let tab = ropeCache ?? {
+                let t = rotary.cosSin(qwen4ExpPositions(offset: 0, count: TrackQwen4ExpFastModel.ropeSpan))
+                ropeCache = t
+                return t
+            }()
+            let lo = max(0, offset - 1), hi = min(TrackQwen4ExpFastModel.ropeSpan, offset + count)
+            if hi - lo == count {
+                return (
+                    tab.cos[lo ..< hi].reshaped(count, rotaryDims).asType(dtype),
+                    tab.sin[lo ..< hi].reshaped(count, rotaryDims).asType(dtype)
+                )
+            }
+        }
         let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
         return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
     }
+
+    /// Cached rope table span (positions 0..<span). Decode offsets never
+    /// exceed the fixture's 1024 prefill + 128 decode budget, and a wide
+    /// window would, so the guard above rejects it.
+    nonisolated(unsafe) static let ropeSpan = 4096
+    /// Kill switch for A/B: `TRACK_ROPE_CACHE=0` restores the per-call device
+    /// tables everywhere.
+    nonisolated(unsafe) static var ropeEnabled =
+        (ProcessInfo.processInfo.environment["TRACK_ROPE_CACHE"] ?? "1") != "0"
+    private var ropeCache: (cos: MLXArray, sin: MLXArray)? = nil
 
     private func attnForward(
         _ a: TrackAttn, _ x: MLXArray, cache: Qwen4ExpCBv2LayerCache,
@@ -1188,7 +1220,16 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentMTPForwardable {
 
 extension TrackQwen4ExpFastModel: CBv2MTPPolicyTopTwoProviding {
     public func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray) {
-        base.cbv2MTPTopTwo(logits)
+        // argMax matches the custom top-2 kernel's winner semantics (value
+        // desc, lowest id on exact ties; arg_reduce.metal ArgMax), so
+        // ids[..., 0] stays bit-equal to the engine's scores. The second
+        // column feeds only the inert marginal-depth policy (fixedDraftTokens
+        // is pinned on the scored build), so the two-kernel reduction chain is
+        // retired; values are never read by a live consumer.
+        let rows = logits.dim(1)
+        let first = argMax(logits, axis: -1).reshaped([1, rows, 1])
+        let firstValues = takeAlong(logits, first, axis: -1)
+        return (MLX.concatenated([first, first], axis: -1), MLX.concatenated([firstValues, firstValues], axis: -1))
     }
 }
 

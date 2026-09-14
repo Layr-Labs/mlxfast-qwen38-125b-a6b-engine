@@ -132,13 +132,45 @@ final class TrackFastHead {
         return (sample, multiNext)
     }
 
+    static let ropeSpan = 4096
+    /// HEADROPE-CACHE kill switch: `TRACK_ROPE_CACHE=0` also restores the
+    /// head's per-call device tables.
+    nonisolated(unsafe) static var ropeEnabled =
+        (ProcessInfo.processInfo.environment["TRACK_ROPE_CACHE"] ?? "1") != "0"
+    private var headRopeCache: (cos: MLXArray, sin: MLXArray)? = nil
+
     private func attention(_ x: MLXArray, cache: Qwen4ExpAttentionCache, offset: Int) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let heads = cfg.attentionHeads, kvHeads = cfg.kvHeads, d = cfg.headDim
         let qkv = attn.qkv.apply(x)
         let idxStart = 2 * attn.qWidth + 2 * attn.kvWidth
+        // HEADTAPE: inside the fast window the head's indexer tape is
+        // write-only (nothing on this path pools or reads it back; the slow
+        // path appends its own tape if ever re-entered past the budget), so
+        // skipping the append is behavior-preserving — same argument as the
+        // target-side TRACK_P12_OMIT_INDEXER_TAPE cell.
+        // HEADIDX-TRIM: with the tape append skipped, the trailing indexer
+        // rows of the fused qkv are consumed by nothing on this path (attnPrep
+        // and attnGate read only the first idxStart columns), so project the
+        // kept parts only — bit-exact by row concatenation on the GEMV path.
         _ = cache.updateIndexer(keys: qkv[.ellipsis, idxStart ..< (idxStart + cfg.indexerHeadDim)])
-        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: S))
+        let (c, s): (MLXArray, MLXArray)
+        // HEADROPE-CACHE: the head is a per-step cosSin builder — draft
+        // steps re-run exp/cos/sin graph nodes here. Small windows (S =
+        // draft depth, decode S = 1) with bounded offset slice a cached
+        // 4096-position table exactly as the tower's ROPECACHE path does;
+        // any other shape falls back to the per-call device path.
+        if S <= 8, offset + S <= Self.ropeSpan, Self.ropeEnabled {
+            let tab = headRopeCache ?? {
+                let t = rotary.cosSin(qwen4ExpPositions(offset: 0, count: Self.ropeSpan))
+                headRopeCache = t
+                return t
+            }()
+            c = tab.cos[offset ..< (offset + S)].reshaped(S, rotaryDims).asType(x.dtype)
+            s = tab.sin[offset ..< (offset + S)].reshaped(S, rotaryDims).asType(x.dtype)
+        } else {
+            (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: S))
+        }
         let prep = TrackFastKernels.attnPrep(
             qkv: qkv, qNorm: attn.qNormW, kNorm: attn.kNormW,
             cos: c.asType(x.dtype).reshaped(S, rotaryDims), sin: s.asType(x.dtype).reshaped(S, rotaryDims),
