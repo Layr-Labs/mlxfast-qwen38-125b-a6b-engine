@@ -34,7 +34,7 @@ final class TrackFastHead {
     let finalMixer: TrackHC
 
     static let enabled: Bool = {
-        (ProcessInfo.processInfo.environment["TRACK_FAST_HEAD"] ?? "1") != "0"
+        (ProcessInfo.processInfo.environment["TRACK_FAST_HEAD"] ?? "0") != "0"
     }()
 
     init(_ mtp: TrackQwen4ExpMTPModule, configuration cfg: Qwen4ExpTextConfiguration) {
