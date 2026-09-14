@@ -103,11 +103,38 @@ enum TrackPrefillSort {
 
     // MARK: - kernels
 
-    /// One threadgroup per block of `BLK` assignments. Bucket `b` is counted by
-    /// the thread that owns it, by scanning the block's own value tile, so
-    /// there is no atomic anywhere and the result is independent of thread
-    /// scheduling.
+    /// One threadgroup per assignment block. The 512-bucket path intersects
+    /// ballot bit planes; other geometries scan the original value tile.
+    /// Each bucket has one counter owner and neither path uses atomics.
     static let countSource = #"""
+        if constexpr (E == 512 && BLK == 256) {
+            threadgroup uint planes[8][10];
+            const uint blk = threadgroup_position_in_grid.x;
+            const uint t = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint value = ids[blk * BLK + t];
+            const uint valid = (uint)((simd_vote::vote_t)simd_ballot(value < (uint)E));
+            if (lane == 0) { planes[sg][9] = valid; }
+            for (uint bit = 0; bit < 9; ++bit) {
+                const uint mask = (uint)((simd_vote::vote_t)simd_ballot((value & (1u << bit)) != 0));
+                if (lane == 0) { planes[sg][bit] = mask; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint b = t; b < (uint)E; b += BLK) {
+                uint count = 0;
+                for (uint word = 0; word < 8; ++word) {
+                    uint matches = planes[word][9];
+                    #pragma clang loop unroll(full)
+                    for (uint bit = 0; bit < 9; ++bit) {
+                        const uint mask = planes[word][bit];
+                        matches &= (b & (1u << bit)) ? mask : ~mask;
+                    }
+                    count += popcount(matches);
+                }
+                counts[blk * (uint)E + b] = count;
+            }
+        } else {
         threadgroup uint vals[BLK];
         const uint blk = threadgroup_position_in_grid.x;
         const uint t = thread_position_in_threadgroup.x;
@@ -118,6 +145,7 @@ enum TrackPrefillSort {
             uint c = 0;
             for (uint j = 0; j < BLK; ++j) { c += (vals[j] == b) ? 1u : 0u; }
             counts[blk * (uint)E + b] = c;
+        }
         }
         """#
 
