@@ -238,11 +238,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// Layers per partial dispatch inside a forward (0 = one dispatch per step).
     nonisolated(unsafe) public static var asyncChunk: Int = 3
     /// Layers in the first partial-dispatch chunk (0 = same as asyncChunk):
-    /// the first dispatch lands right after the PLE layer, whose host row
-    /// gather is the one host sync of the step.
-    nonisolated(unsafe) public static var asyncFirst: Int = 2
-    /// Layer count at an optional second dispatch (0 = none).
-    nonisolated(unsafe) public static var asyncSecond: Int = 0
+    /// layer 0 is dispatched before the PLE layer's host row gather, so the
+    /// GPU runs it while the host hashes, gathers and uploads the rows.
+    nonisolated(unsafe) public static var asyncFirst: Int = 1
+    /// Layer count at an optional second dispatch (0 = none): right after the
+    /// PLE layer, so later chunks keep their 3-layer boundaries.
+    nonisolated(unsafe) public static var asyncSecond: Int = 2
 
     /// Kill switch for A/B: `TRACK_FAST_FORWARD=0` routes every forward to the
     /// wrapped model.
