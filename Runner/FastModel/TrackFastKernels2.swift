@@ -36,12 +36,15 @@ extension TrackFastKernels {
         METAL_FUNC float mlx_colsum_small_f32(thread const float* r) {
             constexpr int TY = K < 8 ? K : 8;
             float t[TY];
+            #pragma unroll
             for (int y = 0; y < TY; ++y) {
                 float acc = 0.0f;
+                #pragma unroll
                 for (int rr = y; rr < K; rr += TY) { acc = r[rr] + acc; }
                 t[y] = acc;
             }
             float total = t[0];
+            #pragma unroll
             for (int j = 1; j < TY; ++j) { total = t[j] + total; }
             return total;
         }

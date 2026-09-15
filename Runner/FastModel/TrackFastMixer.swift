@@ -167,6 +167,7 @@ enum TrackFastMixerKernels {
             const int d = d0 + (int)t;
             for (int v = 0; v < VPT; ++v) {
                 T acc = T(0);
+                #pragma unroll
                 for (int s = 0; s < HC; ++s) {
                     const T p = products[s * 2 + (int)t][v];
                     acc = acc + p;

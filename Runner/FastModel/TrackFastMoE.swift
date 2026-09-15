@@ -1328,12 +1328,13 @@ extension TrackFastMoEKernels {
         qmv_fast_reg_dual<T, GS, BITS, RPS>(
             gw, gs, gb, uw, us, ub, x + (size_t)r * (size_t)KD,
             KD, out_row, thread_index_in_simdgroup, g, u);
-        if (thread_index_in_simdgroup == 0) {
-            for (int i = 0; i < RPS; ++i) {
-                const T gv = static_cast<T>(g[i]);
-                const T uv = static_cast<T>(u[i]);
-                act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
-            }
+        // MLXFAST-ACTLANES: g/u are post-simd_sum, identical on every
+        // lane, so each of the RPS entries can be stored by its own lane.
+        if (thread_index_in_simdgroup < (uint)RPS) {
+            const int i = (int)thread_index_in_simdgroup;
+            const T gv = static_cast<T>(g[i]);
+            const T uv = static_cast<T>(u[i]);
+            act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
         }
         """
 
@@ -1457,6 +1458,7 @@ extension TrackFastMoEKernels {
                 const int i = (int)lid;
                 const T sg = mlx_sigmoid(gate[t]);
                 float col[K];
+                #pragma unroll
                 for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
                 const T r = static_cast<T>(mlx_colsum_small_f32<K>(col));
                 const T sh = sg * static_cast<T>(shvT[i]);

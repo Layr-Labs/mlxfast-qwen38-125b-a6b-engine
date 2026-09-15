@@ -184,6 +184,7 @@ enum TrackFastGDNDecode {
         if (sg == 0) {
             float thread_x[4];
             float acc = 0.0f;
+            #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 thread_x[i] = static_cast<float>(y_shared[lane * 4 + i]);
                 acc += thread_x[i] * thread_x[i];
@@ -193,6 +194,7 @@ enum TrackFastGDNDecode {
             const auto w4 = *reinterpret_cast<const device vec<InT, 4>*>(w + lane * 4);
             const auto z4 = *reinterpret_cast<const device vec<InT, 4>*>(proj + (b_idx * PW + Z_OFF + hv_idx * Dv + lane * 4));
             vec<InT, 4> out4;
+            #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 InT normalized = w4[i] * static_cast<InT>(thread_x[i] * inv_mean);
                 const float zg = mlx_sigmoid(static_cast<float>(z4[i]));
