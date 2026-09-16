@@ -60,12 +60,28 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 4) {
-    for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+    if constexpr (values_per_thread % 4 == 0) {
+      // The activation slice is `values_per_thread` contiguous elements, so
+      // read it as vec<T, 4>: values_per_thread/4 loads instead of
+      // values_per_thread. The element order and the left-to-right sum are
+      // unchanged -- bit identical.
+      const device vec<T, 4>* xv4 = (const device vec<T, 4>*)x;
+      for (int i = 0; i < values_per_thread / 4; i++) {
+        const vec<T, 4> xv = xv4[i];
+        sum += xv.x + xv.y + xv.z + xv.w;
+        x_thread[4 * i] = xv.x;
+        x_thread[4 * i + 1] = xv.y / 16.0f;
+        x_thread[4 * i + 2] = xv.z / 256.0f;
+        x_thread[4 * i + 3] = xv.w / 4096.0f;
+      }
+    } else {
+      for (int i = 0; i < values_per_thread; i += 4) {
+        sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+        x_thread[i] = x[i];
+        x_thread[i + 1] = x[i + 1] / 16.0f;
+        x_thread[i + 2] = x[i + 2] / 256.0f;
+        x_thread[i + 3] = x[i + 3] / 4096.0f;
+      }
     }
   }
 
@@ -233,13 +249,34 @@ inline U qdot(
   }
 
   else if (bits == 4) {
-    const device uint16_t* ws = (const device uint16_t*)w;
-    for (int i = 0; i < (values_per_thread / 4); i++) {
-      accum +=
-          (x_thread[4 * i] * (ws[i] & 0x000f) +
-           x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-           x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-           x_thread[4 * i + 3] * (ws[i] & 0xf000));
+    if constexpr (values_per_thread % 8 == 0) {
+      // Two uint16 packs sit in one aligned uint32; load once and split. The
+      // extracted nibbles are the same integers the uint16 reads produced, so
+      // the accumulation is bit identical.
+      const device uint32_t* wp = (const device uint32_t*)w;
+      for (int i = 0; i < (values_per_thread / 8); i++) {
+        const uint32_t p = wp[i];
+        const uint32_t lo = p & 0xffffu;
+        const uint32_t hi = p >> 16;
+        accum +=
+            (x_thread[8 * i] * (lo & 0x000f) + x_thread[8 * i + 1] * (lo & 0x00f0) +
+             x_thread[8 * i + 2] * (lo & 0x0f00) +
+             x_thread[8 * i + 3] * (lo & 0xf000));
+        accum +=
+            (x_thread[8 * i + 4] * (hi & 0x000f) +
+             x_thread[8 * i + 5] * (hi & 0x00f0) +
+             x_thread[8 * i + 6] * (hi & 0x0f00) +
+             x_thread[8 * i + 7] * (hi & 0xf000));
+      }
+    } else {
+      const device uint16_t* ws = (const device uint16_t*)w;
+      for (int i = 0; i < (values_per_thread / 4); i++) {
+        accum +=
+            (x_thread[4 * i] * (ws[i] & 0x000f) +
+             x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+             x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+             x_thread[4 * i + 3] * (ws[i] & 0xf000));
+      }
     }
   }
 
