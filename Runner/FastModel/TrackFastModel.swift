@@ -21,6 +21,7 @@
 // past the indexer budget, wider batches) is delegated to the wrapped model.
 
 import Foundation
+import Dispatch
 import MLX
 import MLXLLM
 import MLXLMCommon
@@ -202,6 +203,46 @@ struct TrackPLE {
     let stateLength: Int
     let stateLayerIndex: Int
 }
+
+/// The PLE block's host row lookup, run on a side queue so the n-gram gather
+/// overlaps the embed and layer-0 enqueues instead of serialising between
+/// them. The lookup reads only inputs fixed at window entry, so the result is
+/// bit-for-bit the inline computation's.
+final class TrackPleHostPrefetch {
+    private let done = DispatchSemaphore(value: 0)
+    private var result: (history: [Int64], rows: MLXArray)?
+
+    init(
+        embedding: Qwen4ExpNGramEmbedding, host: Qwen4ExpNGramHostRowSource,
+        rawPrev: MLXArray?, ids: MLXArray, eos: Int64, contextLength: Int,
+        rowHeads: Int, batch: Int, positions: Int
+    ) {
+        DispatchQueue.global().async {
+            let ctx: [Int64] = rawPrev.map {
+                $0.dtype == .int32
+                    ? $0.asArray(Int32.self).map(Int64.init)
+                    : $0.asType(.int64).asArray(Int64.self)
+            } ?? Array(repeating: eos, count: contextLength)
+            let toks: [Int64] = ids.dtype == .int32
+                ? ids.asArray(Int32.self).map(Int64.init)
+                : ids.asType(.int64).asArray(Int64.self)
+            let history = ctx + toks
+            let gid = embedding.hostRowIds(history: [history], newCount: positions)
+            self.result = (
+                history,
+                host.rows(globalIds: gid, shape: [batch, positions, rowHeads])
+            )
+            self.done.signal()
+        }
+    }
+
+    /// The semaphore orders the background stores before this read.
+    func wait() -> (history: [Int64], rows: MLXArray) {
+        done.wait()
+        return result!
+    }
+}
+
 
 struct TrackLayer {
     let index: Int
@@ -823,7 +864,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
-        evaluation: CBv2RecurrentStateEvaluation, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, capture: Bool,
+        prefetch: TrackPleHostPrefetch?
     ) -> MLXArray {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
@@ -847,12 +889,18 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
-            let rawPrev = state?.ssm
-            let ctx: [Int64] = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
-            let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
-            let history = ctx + toks
-            let gid = p.embedding.hostRowIds(history: [history], newCount: S)
-            let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
+            // The same lookup the prefetch box runs on a side queue; kept as a
+            // closure so the inline fallback and the prefetch share one body.
+            func lookup() -> (history: [Int64], rows: MLXArray) {
+                let rawPrev = state?.ssm
+                let ctx: [Int64] = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+                let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
+                let history = ctx + toks
+                let gid = p.embedding.hostRowIds(history: [history], newCount: S)
+                let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
+                return (history, rows)
+            }
+            let (history, rows) = prefetch?.wait() ?? lookup()
             embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
             hostHistory = history
         } else {
@@ -952,6 +1000,22 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     ) -> (mixed: MLXArray, multi: MLXArray) {
         precondition(recurrentState.count == 1)
         let evaluation = recurrentState[0]
+        // The PLE host row lookup reads only inputs fixed at window entry, so
+        // it can run on a side queue while the embed and layer-0 enqueues are
+        // still being built and executed; pleForward waits on it once.
+        var plePrefetch: TrackPleHostPrefetch? = nil
+        if let pleLayer = layers.first(where: { $0.ple != nil }), let ple = pleLayer.ple,
+            let host = ple.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource,
+            ids.dim(1) <= 8
+        {
+            plePrefetch = TrackPleHostPrefetch(
+                embedding: ple.embedding, host: host,
+                rawPrev: evaluation.inputState(modelLayerIndex: ple.stateLayerIndex)?.ssm,
+                ids: ids, eos: Int64(cfg.eosTokenId),
+                contextLength: max(1, ple.dilation - 1),
+                rowHeads: (cfg.ngramSize - 1) * cfg.headsPerNGram,
+                batch: ids.dim(0), positions: ids.dim(1))
+        }
         var residual = inputEmbeddings ?? embedTokens(ids)  // [B,S,H] until tiled
         // A fully injected hyper-stream can continue through a layer block.
         // Normal token/embedding entry points retain the initial tiling.
@@ -976,7 +1040,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 stream =
                     stream
                     + pleForward(
-                        ple, stream: stream, ids: ids, evaluation: evaluation, capture: capture)
+                        ple, stream: stream, ids: ids, evaluation: evaluation, capture: capture,
+                        prefetch: plePrefetch)
+                plePrefetch = nil
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
