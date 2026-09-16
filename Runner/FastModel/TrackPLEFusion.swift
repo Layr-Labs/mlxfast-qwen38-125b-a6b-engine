@@ -171,9 +171,12 @@ enum TrackPLEFusion {
             grid: (640, 4, 1), threadGroup: (640, 1, 1),
             outputShapes: [[1, 1, 10240], [1, 10, 10240]],
             outputDTypes: [stream.dtype, stream.dtype])
+        // One simdgroup per channel threadgroup: the kernel body already
+        // returns on simdgroup_index != 0, so the other three were dead
+        // threads. Same lanes, same tap owners, same output.
         let output = convolutionKernel(
             [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
-            grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
+            grid: (32, 1, 10240), threadGroup: (32, 1, 1),
             outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
         return (r[1], output)
     }
