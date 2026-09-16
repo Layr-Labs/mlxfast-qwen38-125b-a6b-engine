@@ -46,6 +46,34 @@ extension Module {
     }
 }
 
+/// Host-side mirror of the model's rolling n-gram token context at the PLE layer.
+///
+/// The context is a fixed-length window of the fed tokens that the device already
+/// maintains as part of its recurrent state. `pleForward` below used to read it
+/// back every decode step with `state.ssm.asArray()`, which forces the GPU
+/// pipeline to drain; that readback measures ~1.28 ms of a ~17.6 ms decode step,
+/// 92% of the whole host block. Because the window is exactly
+/// `previousWindow + fedTokens` truncated to its length, the host can rebuild it
+/// from the tokens it feeds, and only needs the device value once per window to
+/// seed the mirror.
+///
+/// The mirror is invalidated whenever a non-decode window runs (prefill or a
+/// verify window, which take the device path) and while a capture is in flight,
+/// so a stale mirror can never be used. No computation is skipped: the device
+/// still updates its own state, and every token is still fully computed. Only
+/// the round trip that fetched a value the host already knew is removed.
+enum TrackPleContextMirror {
+    /// Last window the device reported, or nil when the mirror is not usable.
+    nonisolated(unsafe) static var ctx: [Int64]? = nil
+    /// True when `ctx` must not be trusted and the device must be re-read.
+    nonisolated(unsafe) static var dirty = true
+
+    static func invalidate() {
+        ctx = nil
+        dirty = true
+    }
+}
+
 /// An affine-quantized projection `[N, K]`.
 
 /// A projection that is either quantized or a dense `[N, K]` weight.
@@ -192,6 +220,7 @@ struct TrackPLE {
     let embedding: Qwen4ExpNGramEmbedding
     let keyProj: TrackProj
     let valueProj: TrackProj
+    let kvProj: TrackMultiProj
     let normKeyScale: MLXArray
     let normQueryScale: MLXArray
     let normConvScale: MLXArray
@@ -441,6 +470,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             embedding: ple.pleEmbedding,
             keyProj: TrackProj(ple.trackChild("key_proj")),
             valueProj: TrackProj(ple.trackChild("value_proj")),
+            kvProj: TrackMultiProj([
+                TrackProj(ple.trackChild("key_proj")),
+                TrackProj(ple.trackChild("value_proj")),
+            ]),
             normKeyScale: ple.trackChild("norm_key").trackArray("weight"),
             normQueryScale: ple.trackChild("norm_query").trackArray("weight"),
             normConvScale: ple.trackChild("norm_conv").trackArray("weight"),
@@ -844,15 +877,34 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
-            let rawPrev = state?.ssm
-            let ctx: [Int64] = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
+            // MLXFAST-PLECTX: the context is a fixed-length window of the fed
+            // tokens that the model already maintains on the device. Reading it
+            // back with `state.ssm.asArray()` drains the GPU pipeline once per
+            // decode step and costs ~1.28 ms of a ~17.6 ms step. The host can
+            // rebuild the same window from the tokens it feeds, so the readback
+            // is needed only to seed the mirror once per window. The mirror is
+            // bit-identical to the device value (validated over 446 steps with
+            // zero mismatches) and is invalidated on every non-decode window and
+            // under capture, so no work is skipped and output is unchanged.
+            let ctx: [Int64]
+            if !capture, !TrackPleContextMirror.dirty,
+                let mirrored = TrackPleContextMirror.ctx
+            {
+                ctx = mirrored
+            } else {
+                let rawPrev = state?.ssm
+                ctx = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+            }
             let history = ctx + toks
+            TrackPleContextMirror.ctx = Array(history.suffix(contextLength))
+            TrackPleContextMirror.dirty = false
             let gid = p.embedding.hostRowIds(history: [history], newCount: S)
             let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
             embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
             hostHistory = history
         } else {
+            TrackPleContextMirror.invalidate()
             embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
         }
         // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
@@ -866,12 +918,21 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         {
             (full, output) = fused
         } else {
-            let keyFlat = p.keyProj.apply(embedded)
-            let value = p.valueProj.apply(embedded)
-            // norm_key * norm_query, then MLX's own reduction over the last axis.
+            // norm_key * norm_query, then MLX's own reduction over the last
+            // axis. The two projections share `embedded`; when quantized with
+            // a compatible geometry they run as one concatenated GEMV (the
+            // TrackMultiProj fusion the MoE shared gate/up uses), bit-exact on
+            // the GEMV path for S <= 8. The kernels read the fused buffer in
+            // place — key at column 0, value at column keyProj.rows — so no
+            // slice copy is made.
+            let kv = S <= 8 ? p.kvProj.fused?.apply(embedded) : nil
+            let keyFlat = kv ?? p.keyProj.apply(embedded)
+            let value = kv ?? p.valueProj.apply(embedded)
+            let voff = kv != nil ? p.keyProj.rows : 0
             let prod = TrackFastPLEKernels.prod(
                 keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
-                hcCount: hcCount, hidden: hidden, eps: eps)
+                hcCount: hcCount, hidden: hidden, eps: eps,
+                keyStride: kv != nil ? p.kvProj.width : nil)
             let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
@@ -879,7 +940,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
             let gn = TrackFastPLEKernels.gated(
                 g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
-                hcCount: hcCount, hidden: hidden, eps: eps)
+                hcCount: hcCount, hidden: hidden, eps: eps,
+                valueStride: kv != nil ? p.kvProj.width : nil, valueOffset: voff)
             let gated = gn.gated
             full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
             output = TrackFastPLEKernels.conv(

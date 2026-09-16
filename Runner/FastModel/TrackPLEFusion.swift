@@ -83,7 +83,7 @@ enum TrackPLEFusion {
         InT g[4];
         acc = 0.0f;
         for (uint i = 0; i < 4; ++i) {
-            g[i] = activation * value[d + i];
+            g[i] = activation * value[(uint)VOFF + d + i];
             gated[base + i] = g[i];
             float v = float(g[i]);
             acc += v * v;
@@ -157,17 +157,25 @@ enum TrackPLEFusion {
     static func forward(
         _ p: TrackPLE, embedded: MLXArray, stream: MLXArray, convState: MLXArray, eps: Float
     ) -> (full: MLXArray, output: MLXArray)? {
-        // The original two projections stay separate, with unchanged kernels,
-        // quantization, tiling, and weight-loading lane ownership.
-        let key = p.keyProj.apply(embedded)
-        let value = p.valueProj.apply(embedded)
-        guard key.shape == [1, 1, 10240], value.shape == [1, 1, 2560],
+        // The two projections share one input; when they are quantized with a
+        // compatible geometry they run as ONE concatenated GEMV (the same
+        // TrackMultiProj fusion the MoE shared gate/up uses). Row
+        // concatenation is bit-exact on the GEMV path — one row is one
+        // accumulation — and the kernels below read the fused buffer in place
+        // (key at column 0, value at column VOFF), so no slice copy is made.
+        let kv = p.kvProj.fused?.apply(embedded)
+        let key = kv ?? p.keyProj.apply(embedded)
+        let value = kv ?? p.valueProj.apply(embedded)
+        let voff = kv != nil ? p.keyProj.rows : 0
+        guard key.dim(2) == (kv != nil ? p.kvProj.width : 10240),
+            kv != nil || value.shape == [1, 1, 2560],
             key.dtype == stream.dtype, value.dtype == stream.dtype
         else { return nil }
         let r = prepareKernel(
             [key, stream, value, p.normKeyScale, p.normQueryScale, p.normConvScale, convState],
             template: [("InT", stream.dtype), ("EPS_BITS", Int(eps.bitPattern)),
-                       ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern))],
+                       ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern)),
+                       ("VOFF", voff)],
             grid: (640, 4, 1), threadGroup: (640, 1, 1),
             outputShapes: [[1, 1, 10240], [1, 10, 10240]],
             outputDTypes: [stream.dtype, stream.dtype])
