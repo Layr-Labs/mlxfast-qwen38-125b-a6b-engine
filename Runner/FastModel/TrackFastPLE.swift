@@ -65,6 +65,19 @@ enum TrackFastPLEKernels {
         }
         """
 
+    /// The two scalars the gate chain divides and clamps by, cached per dtype
+    /// so a verify window does not allocate and upload a fresh 0-dim array for
+    /// each. The values are identical to what the call site built inline.
+    nonisolated(unsafe) private static var scalarCache: [DType: (divisor: MLXArray, floor: MLXArray)] = [:]
+    static func gateScalars(hidden: Int, dtype: DType) -> (divisor: MLXArray, floor: MLXArray) {
+        if let cached = scalarCache[dtype] { return cached }
+        let pair = (
+            Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dtype),
+            TrackFastKernels.scalar(Float(1e-6), dtype: dtype))
+        scalarCache[dtype] = pair
+        return pair
+    }
+
     // MARK: norm_key(key_proj(e)) * norm_query(stream)
 
     /// keyFlat [B,S,W], stream [B,S,W], kscale [W], qscale [W], eps
@@ -99,8 +112,8 @@ enum TrackFastPLEKernels {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         kacc = simd_sum(ksums[lane]);
         qacc = simd_sum(qsums[lane]);
-        const float kinv = metal::precise::rsqrt(kacc / (float)H + eps);
-        const float qinv = metal::precise::rsqrt(qacc / (float)H + eps);
+        const float kinv = metal::precise::rsqrt(kacc / (float)H + as_type<float>((uint)EPS_BITS));
+        const float qinv = metal::precise::rsqrt(qacc / (float)H + as_type<float>((uint)EPS_BITS));
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
             const InT kn = static_cast<InT>(kx[i] * kinv) * kscale[hc * H + d];
@@ -111,7 +124,7 @@ enum TrackFastPLEKernels {
 
     nonisolated(unsafe) static let prodKernel = MLXFast.metalKernel(
         name: "track_ple_prod",
-        inputNames: ["keyFlat", "stream", "kscale", "qscale", "eps"],
+        inputNames: ["keyFlat", "stream", "kscale", "qscale"],
         outputNames: ["prod"],
         source: prodSource, header: header, ensureRowContiguous: true)
 
@@ -122,8 +135,9 @@ enum TrackFastPLEKernels {
         let B = keyFlat.dim(0), S = keyFlat.dim(1), W = hcCount * hidden
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && keyFlat.dim(2) == W)
         return prodKernel(
-            [keyFlat, stream, kScale, qScale, MLXArray(eps)],
-            template: [("InT", keyFlat.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+            [keyFlat, stream, kScale, qScale],
+            template: [("InT", keyFlat.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+                       ("EPS_BITS", Int(eps.bitPattern))],
             grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
             outputShapes: [[B, S, W]], outputDTypes: [keyFlat.dtype])[0]
     }
@@ -163,7 +177,7 @@ enum TrackFastPLEKernels {
         if (lane == 0) { sums[sg] = acc; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         acc = simd_sum(sums[lane]);
-        const float inv = metal::precise::rsqrt(acc / (float)H + eps);
+        const float inv = metal::precise::rsqrt(acc / (float)H + as_type<float>((uint)EPS_BITS));
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
             normed[base + d] = static_cast<InT>(gx[i] * inv) * cscale[hc * H + d];
@@ -172,7 +186,7 @@ enum TrackFastPLEKernels {
 
     nonisolated(unsafe) static let gatedKernel = MLXFast.metalKernel(
         name: "track_ple_gated",
-        inputNames: ["g0", "value", "cscale", "divisor", "floorv", "eps"],
+        inputNames: ["g0", "value", "cscale", "divisor", "floorv"],
         outputNames: ["gated", "normed"],
         source: gatedSource,
         header: header + """
@@ -188,8 +202,9 @@ enum TrackFastPLEKernels {
         let B = value.dim(0), S = value.dim(1), W = hcCount * hidden
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && value.dim(2) == hidden)
         let outs = gatedKernel(
-            [g0, value, cScale, divisor, floor, MLXArray(eps)],
-            template: [("InT", value.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+            [g0, value, cScale, divisor, floor],
+            template: [("InT", value.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+                       ("EPS_BITS", Int(eps.bitPattern))],
             grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
             outputShapes: [[B, S, W], [B, S, W]],
             outputDTypes: [value.dtype, value.dtype])
