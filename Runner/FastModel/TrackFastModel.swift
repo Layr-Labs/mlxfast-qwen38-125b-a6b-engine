@@ -46,6 +46,43 @@ extension Module {
     }
 }
 
+/// Host-side mirror of the PLE layer's rolling token context.
+///
+/// The device recurrent state already contains the last `contextLength` fed
+/// tokens.  A normal decode can therefore carry that window forward from the
+/// host's own token list instead of synchronising `state.ssm` on every step.
+/// The offset and state-layer guards make reuse conditional on being the
+/// immediate continuation of the same state tape; prefill/delegated paths and
+/// capture paths invalidate it.  In particular, a captured verify window never
+/// publishes speculative history that a later rollback could leave behind.
+enum TrackPleContextMirror {
+    nonisolated(unsafe) static var ctx: [Int64]? = nil
+    nonisolated(unsafe) static var nextOffset: Int? = nil
+    nonisolated(unsafe) static var stateLayerIndex: Int? = nil
+    nonisolated(unsafe) static var contextLength: Int? = nil
+
+    static func reuse(offset: Int, layerIndex: Int, length: Int) -> [Int64]? {
+        guard let ctx, nextOffset == offset, stateLayerIndex == layerIndex,
+            contextLength == length
+        else { return nil }
+        return ctx
+    }
+
+    static func store(_ ctx: [Int64], nextOffset: Int, layerIndex: Int, length: Int) {
+        self.ctx = ctx
+        self.nextOffset = nextOffset
+        self.stateLayerIndex = layerIndex
+        self.contextLength = length
+    }
+
+    static func invalidate() {
+        ctx = nil
+        nextOffset = nil
+        stateLayerIndex = nil
+        contextLength = nil
+    }
+}
+
 /// An affine-quantized projection `[N, K]`.
 
 /// A projection that is either quantized or a dense `[N, K]` weight.
@@ -820,7 +857,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
-        evaluation: CBv2RecurrentStateEvaluation, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
     ) -> MLXArray {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
@@ -844,10 +881,27 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
-            let rawPrev = state?.ssm
-            let ctx: [Int64] = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
+            let ctx: [Int64]
+            if !capture,
+                let mirrored = TrackPleContextMirror.reuse(
+                    offset: offset, layerIndex: p.stateLayerIndex, length: contextLength)
+            {
+                ctx = mirrored
+            } else {
+                let rawPrev = state?.ssm
+                ctx = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+            }
             let history = ctx + toks
+            if capture {
+                // The recurrent evaluator may discard this entire window.
+                // Never let speculative tokens become the next decode seed.
+                TrackPleContextMirror.invalidate()
+            } else {
+                TrackPleContextMirror.store(
+                    Array(history.suffix(contextLength)), nextOffset: offset + S,
+                    layerIndex: p.stateLayerIndex, length: contextLength)
+            }
             let gid = p.embedding.hostRowIds(history: [history], newCount: S)
             let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
             embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
@@ -970,7 +1024,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 stream =
                     stream
                     + pleForward(
-                        ple, stream: stream, ids: ids, evaluation: evaluation, capture: capture)
+                        ple, stream: stream, ids: ids, evaluation: evaluation, offset: offset,
+                        capture: capture)
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
@@ -1068,7 +1123,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         guard let plan = fastPlan(
             tokens: tokens, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds)
-        else { return nil }
+        else {
+            TrackPleContextMirror.invalidate()
+            return nil
+        }
         return fastStreams(
             tokens, inputEmbeddings: inputEmbeddings, caches: plan.caches,
             recurrentState: recurrentState, offset: plan.offset, capture: capture)
