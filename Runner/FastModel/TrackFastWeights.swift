@@ -51,12 +51,6 @@ struct TrackQuantWeight {
 /// every block and accumulate wall time per block kind.
 public enum TrackFastProfile {
     nonisolated(unsafe) public static var prefill: [String: Double]? = nil
-    /// Peak MLX active memory (bytes) reached inside each block kind, when set.
-    nonisolated(unsafe) public static var memory: [String: Int]? = nil
-    /// `TRACK_FAST_PROFILE=1` turns the ticks on in the worker and prints one
-    /// report per wide window to stderr (diagnostic; ticks eval per block).
-    public static let environmentEnabled: Bool =
-        ProcessInfo.processInfo.environment["TRACK_FAST_PROFILE"] == "1"
     /// Smallest window the ticks apply to (9 = prefill only; 2 = also MTP verify windows).
     nonisolated(unsafe) public static var minWindow: Int = 9
     nonisolated(unsafe) public static var windows: Int = 0
@@ -71,26 +65,5 @@ public enum TrackFastProfile {
         let t = CFAbsoluteTimeGetCurrent()
         prefill![key, default: 0] += t - t0
         t0 = t
-        if memory != nil {
-            memory![key] = max(memory![key] ?? 0, Memory.peakMemory)
-            Memory.peakMemory = 0  // resets the peak to the current active level
-        }
-    }
-
-    /// One stderr line per wide window: wall per block kind, peak active
-    /// memory per block kind, and the allocator's state now.
-    static func report(window: Int, offset: Int) {
-        guard let times = prefill else { return }
-        let gb = { (b: Int) in String(format: "%.1f", Double(b) / 1e9) }
-        let keys = times.keys.sorted()
-        let parts = keys.map { k in
-            "\(k)=\(String(format: "%.2f", times[k]!))s/\(gb(memory?[k] ?? 0))GB"
-        }
-        FileHandle.standardError.write(
-            Data(("track-fast-profile: window S=\(window) offset=\(offset) "
-                + "active=\(gb(Memory.activeMemory))GB cache=\(gb(Memory.cacheMemory))GB "
-                + parts.joined(separator: " ") + "\n").utf8))
-        prefill = [:]
-        memory = [:]
     }
 }
