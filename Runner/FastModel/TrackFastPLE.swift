@@ -18,12 +18,15 @@
 // ~180-300 us block.
 //
 // Three kernels replace all of it except the two projections and the one
-// reduction:
+// reduction; a fourth fuses the conv with the carried-state write so the
+// concat never materializes on non-capture windows:
 //
 //   `track_ple_prod`  norm_key(key_proj) * norm_query(stream)
 //   <MLX's own sum over the last axis, untouched>
 //   `track_ple_gated` the gate transform, the gated value, norm_conv
 //   `track_ple_conv`  the dilated conv, silu, and the residual add
+//   `track_ple_conv_state`  conv + silu + residual + new carried state,
+//   reading convState and normed directly (no concat)
 //
 // EXACTNESS. The two norms are `rms_single_row`'s layout at axis 2560 -- four
 // consecutive elements per thread, a simd sum, a simd sum over the
@@ -236,5 +239,74 @@ enum TrackFastPLEKernels {
             ],
             grid: (W, S, B), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, W]], outputDTypes: [gated.dtype])[0]
+    }
+
+    // MARK: conv + carried-state write, no concat (non-capture windows)
+
+    /// convState [B,NSTATE,W], normed [B,S,W], convw [W,KC], gated [B,S,W]
+    ///   -> out [B,S,W] = gated + silu(conv), newState [B,NSTATE,W]
+    /// grid (W, max(S,NSTATE), B), threadgroup (256, 1, 1)
+    ///
+    /// `track_ple_conv` reads `full = concat(convState, normed)`, a [B,NSTATE+S,W]
+    /// tensor that exists only so the conv can index one array, and the caller
+    /// then slices the last NSTATE rows back out as the new carried state. This
+    /// kernel takes both sources directly: conv tap row `t + j*DIL` reads
+    /// convState below NSTATE and normed at or above it, and the state rows are
+    /// written in the same launch (newState[t] = full row S+t, again split
+    /// across the two sources). The accumulation is the same float sum over
+    /// the same KC taps in the same ascending order with the same single
+    /// rounding, and the state write is a pure copy, so every output bit is
+    /// identical to the concat + conv + slice path.
+    static let convStateSource = """
+        const uint c = thread_position_in_grid.x;
+        const uint t = thread_position_in_grid.y;
+        const uint b = thread_position_in_grid.z;
+        if (c >= (uint)W) return;
+        if (t < (uint)S) {
+            float acc = 0.0f;
+            for (int j = 0; j < KC; ++j) {
+                const int src = (int)t + j * DIL;
+                const InT v = (src < NSTATE)
+                    ? convState[((size_t)b * (size_t)NSTATE + (size_t)src) * (size_t)W + c]
+                    : normed[((size_t)b * (size_t)S + (size_t)(src - NSTATE)) * (size_t)W + c];
+                acc += static_cast<float>(v) * static_cast<float>(convw[c * KC + j]);
+            }
+            const size_t o = ((size_t)b * (size_t)S + (size_t)t) * (size_t)W + c;
+            out[o] = gated[o] + mlx_silu(static_cast<InT>(acc));
+        }
+        if (t < (uint)NSTATE) {
+            const int src = (int)S + (int)t;
+            const InT v = (src < NSTATE)
+                ? convState[((size_t)b * (size_t)NSTATE + (size_t)src) * (size_t)W + c]
+                : normed[((size_t)b * (size_t)S + (size_t)(src - NSTATE)) * (size_t)W + c];
+            newState[((size_t)b * (size_t)NSTATE + (size_t)t) * (size_t)W + c] = v;
+        }
+        """
+
+    nonisolated(unsafe) static let convStateKernel = MLXFast.metalKernel(
+        name: "track_ple_conv_state",
+        inputNames: ["convState", "normed", "convw", "gated"],
+        outputNames: ["out", "newState"],
+        source: convStateSource, header: header, ensureRowContiguous: true)
+
+    static func convState(
+        convState: MLXArray, normed: MLXArray, convW: MLXArray, gated: MLXArray,
+        dilation: Int
+    ) -> (out: MLXArray, state: MLXArray) {
+        let B = gated.dim(0), S = gated.dim(1), W = gated.dim(2)
+        let n = convState.dim(1), kc = convW.dim(1)
+        precondition(
+            convState.dim(2) == W && normed.dim(0) == B && normed.dim(1) == S
+                && normed.dim(2) == W)
+        let outs = convStateKernel(
+            [convState, normed, convW, gated],
+            template: [
+                ("InT", gated.dtype), ("W", W), ("S", S), ("KC", kc),
+                ("DIL", dilation), ("NSTATE", n),
+            ],
+            grid: (W, max(S, n), B), threadGroup: (256, 1, 1),
+            outputShapes: [[B, S, W], [B, n, W]],
+            outputDTypes: [gated.dtype, gated.dtype])
+        return (outs[0], outs[1])
     }
 }
