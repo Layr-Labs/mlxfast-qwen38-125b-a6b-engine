@@ -258,6 +258,13 @@ struct TrackLayer {
     let ple: TrackPLE?
 }
 
+/// Reusable host container for the fixed input vector of a compiled MoE pair.
+/// The MLXArray handles are replaced between sequential layers; the container
+/// itself is scoped to one forward, so no tensor or graph state crosses calls.
+final class TrackMoEReplayInputScratch {
+    var inputs: [MLXArray] = []
+}
+
 // MARK: - The model
 
 public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
@@ -748,7 +755,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     static func moeForwardShared(
         _ m: TrackMoE, _ x: MLXArray, inputF32: MLXArray? = nil,
-        replay: (@Sendable ([MLXArray]) -> [MLXArray])?
+        replay: (@Sendable ([MLXArray]) -> [MLXArray])?,
+        replayScratch: TrackMoEReplayInputScratch? = nil
     ) -> MLXArray {
         let prof = TrackFastProfile.prefill != nil && x.dim(1) >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
@@ -789,14 +797,52 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let flatIdx = idx.reshaped(S * K)
             let xrow = Self.xrowTable(S: S, K: K)
             if let replay, StreamOrDevice.default.stream === Stream.gpu {
-                return replay([
-                    x2, flatIdx, weights.reshaped(S * K), gate, xrow,
-                    m.expertGate.w, m.expertGate.s, m.expertGate.b,
-                    m.expertUp.w, m.expertUp.s, m.expertUp.b,
-                    guq.weight, guq.scales, guq.biases!,
-                    m.expertDown.w, m.expertDown.s, m.expertDown.b,
-                    dq.weight, dq.scales, dq.biases!,
-                ])[0].reshaped(1, S, H)
+                let replayOutputs: [MLXArray]
+                if let replayScratch {
+                    if replayScratch.inputs.count == 20 {
+                        replayScratch.inputs[0] = x2
+                        replayScratch.inputs[1] = flatIdx
+                        replayScratch.inputs[2] = weights.reshaped(S * K)
+                        replayScratch.inputs[3] = gate
+                        replayScratch.inputs[4] = xrow
+                        replayScratch.inputs[5] = m.expertGate.w
+                        replayScratch.inputs[6] = m.expertGate.s
+                        replayScratch.inputs[7] = m.expertGate.b
+                        replayScratch.inputs[8] = m.expertUp.w
+                        replayScratch.inputs[9] = m.expertUp.s
+                        replayScratch.inputs[10] = m.expertUp.b
+                        replayScratch.inputs[11] = guq.weight
+                        replayScratch.inputs[12] = guq.scales
+                        replayScratch.inputs[13] = guq.biases!
+                        replayScratch.inputs[14] = m.expertDown.w
+                        replayScratch.inputs[15] = m.expertDown.s
+                        replayScratch.inputs[16] = m.expertDown.b
+                        replayScratch.inputs[17] = dq.weight
+                        replayScratch.inputs[18] = dq.scales
+                        replayScratch.inputs[19] = dq.biases!
+                    } else {
+                        replayScratch.inputs.reserveCapacity(20)
+                        replayScratch.inputs.append(contentsOf: [
+                            x2, flatIdx, weights.reshaped(S * K), gate, xrow,
+                            m.expertGate.w, m.expertGate.s, m.expertGate.b,
+                            m.expertUp.w, m.expertUp.s, m.expertUp.b,
+                            guq.weight, guq.scales, guq.biases!,
+                            m.expertDown.w, m.expertDown.s, m.expertDown.b,
+                            dq.weight, dq.scales, dq.biases!,
+                        ])
+                    }
+                    replayOutputs = replay(replayScratch.inputs)
+                } else {
+                    replayOutputs = replay([
+                        x2, flatIdx, weights.reshaped(S * K), gate, xrow,
+                        m.expertGate.w, m.expertGate.s, m.expertGate.b,
+                        m.expertUp.w, m.expertUp.s, m.expertUp.b,
+                        guq.weight, guq.scales, guq.biases!,
+                        m.expertDown.w, m.expertDown.s, m.expertDown.b,
+                        dq.weight, dq.scales, dq.biases!,
+                    ])
+                }
+                return replayOutputs[0].reshaped(1, S, H)
             }
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
@@ -1022,6 +1068,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         var tile = !inputIsMultiStream
         var pendingOut: MLXArray? = nil
         var pendingInject: MLXArray? = nil
+        // The decode-only compiled MoE pair is called once per layer. Reuse
+        // its 20-slot host argument buffer across this sequential loop.
+        let moeReplayScratch = ids.shape == [1, 1] ? TrackMoEReplayInputScratch() : nil
         var attentionIndex = 0
         var stream = residual
         let ropeTab = ropeTables(offset: offset, count: ids.dim(1), dtype: residual.dtype)
@@ -1088,7 +1137,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
                 Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
                 pendingOut = Self.moeForwardShared(
-                    layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay)
+                    layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay,
+                    replayScratch: moeReplayScratch)
                 if profiling { TrackFastProfile.tick("moe", &profT, [pendingOut!]) }
                 Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
             }
