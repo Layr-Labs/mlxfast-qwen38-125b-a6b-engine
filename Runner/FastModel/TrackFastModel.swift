@@ -577,6 +577,23 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 act = TrackFastKernels.siluHead(lo: lo, width: hc.lowrank)
             }
         }
+        // MLXFAST-MIXFUSE: the up projection and the mix in one launch. The pair
+        // below writes `w` [B,S,HC*H] out of the GEMM and reads every byte of it
+        // straight back; nothing else consumes it. Falls through whenever the
+        // packed rows are unavailable, the shape is not the prefill one, or a
+        // debug tap wants `w` itself.
+        if Self.debugTaps == nil, act.ndim == 3, act.dim(0) == 1, normed.ndim == 3,
+            inj.ndim == 3, let packed = hc.decodeUp,
+            let fused = TrackPrefillMixFuse.apply(
+                act: act.reshaped(act.dim(1), act.dim(2)), up: packed,
+                normed: normed.reshaped(normed.dim(1), normed.dim(2)),
+                inj: inj.reshaped(inj.dim(1), inj.dim(2)),
+                hidden: hidden, hcCount: hcCount, hasInject: hc.hasInject)
+        {
+            let S = act.dim(1)
+            return (fused.input.reshaped(1, S, hidden),
+                    fused.inject.reshaped(1, S, hcCount), nil)
+        }
         let w = hc.up.apply(act)  // [B,S,W], pre-sigmoid
         if Self.debugTaps != nil, !tag.isEmpty {
             Self.debugTaps?.append((tag + ".normedQ", normed))
@@ -650,11 +667,29 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return o
     }
 
+    /// MLXFAST-ROPETAB: the table depends only on the position index, so it is
+    /// built once over `[0, indexerBudget)` and sliced. `cosSin` forms
+    /// `freqs = position * invFreq` and then concatenates, cosines and sines
+    /// elementwise, so row `p` of the whole-range table is exactly what a
+    /// build over `[p, p+1)` returns; the per-step rebuild was recomputing
+    /// `invFreq` -- which does not depend on the position at all -- along with
+    /// two host uploads and the elementwise chain, every step.
+    private var ropeTableCache: (dtype: DType, rows: Int, cos: MLXArray, sin: MLXArray)?
+
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
-        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
-        return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
+        let need = offset + count
+        if let cached = ropeTableCache, cached.dtype == dtype, cached.rows >= need {
+            return (cached.cos[offset ..< need, 0...], cached.sin[offset ..< need, 0...])
+        }
+        let rows = Swift.max(need, indexerBudget)
+        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: 0, count: rows))
+        let cosAll = c.asType(dtype).reshaped(rows, rotaryDims)
+        let sinAll = s.asType(dtype).reshaped(rows, rotaryDims)
+        eval(cosAll, sinAll)
+        ropeTableCache = (dtype, rows, cosAll, sinAll)
+        return (cosAll[offset ..< need, 0...], sinAll[offset ..< need, 0...])
     }
 
     private func attnForward(
