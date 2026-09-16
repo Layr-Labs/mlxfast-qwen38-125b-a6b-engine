@@ -866,7 +866,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
-        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool,
+        hoistedHistory: [Int64]? = nil
     ) -> MLXArray {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
@@ -890,23 +891,29 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
-            let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
-            let ctx: [Int64]
-            if !capture,
-                TrackPleContextMirror.matches(
-                    offset: offset, layer: p.stateLayerIndex, length: contextLength),
-                let mirrored = TrackPleContextMirror.context
-            {
-                ctx = mirrored
+            let history: [Int64]
+            if let hoistedHistory {
+                // MLXFAST-PLEHOIST: readbacks already ran at forward entry.
+                history = hoistedHistory
             } else {
-                let rawPrev = state?.ssm
-                ctx = rawPrev.map {
-                    $0.dtype == .int32
-                        ? $0.asArray(Int32.self).map(Int64.init)
-                        : $0.asType(.int64).asArray(Int64.self)
-                } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+                let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
+                let ctx: [Int64]
+                if !capture,
+                    TrackPleContextMirror.matches(
+                        offset: offset, layer: p.stateLayerIndex, length: contextLength),
+                    let mirrored = TrackPleContextMirror.context
+                {
+                    ctx = mirrored
+                } else {
+                    let rawPrev = state?.ssm
+                    ctx = rawPrev.map {
+                        $0.dtype == .int32
+                            ? $0.asArray(Int32.self).map(Int64.init)
+                            : $0.asType(.int64).asArray(Int64.self)
+                    } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+                }
+                history = ctx + toks
             }
-            let history = ctx + toks
             if capture {
                 TrackPleContextMirror.invalidate()
             } else {
@@ -1017,6 +1024,39 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         precondition(recurrentState.count == 1)
         let evaluation = recurrentState[0]
         var residual = inputEmbeddings ?? embedTokens(ids)  // [B,S,H] until tiled
+        // MLXFAST-PLEHOIST: the host n-gram path needs the fed ids and the
+        // rolling context on the CPU.  Read them here, before the layer loop
+        // enqueues any GPU work, so the two readbacks complete against an
+        // empty pipeline instead of draining whatever layer 0 has launched.
+        // The values are identical to the ones `pleForward` read at layer 1.
+        var pleHostHistory: [Int64]? = nil
+        if let ple = layers.first(where: { $0.ple != nil })?.ple,
+            ple.embedding.rowSourceHolder.source is Qwen4ExpNGramHostRowSource,
+            ids.dim(1) <= 8
+        {
+            let contextLength = max(1, ple.dilation - 1)
+            let toks: [Int64] =
+                ids.dtype == .int32
+                ? ids.asArray(Int32.self).map(Int64.init)
+                : ids.asType(.int64).asArray(Int64.self)
+            let ctx: [Int64]
+            if !capture,
+                TrackPleContextMirror.matches(
+                    offset: offset, layer: ple.stateLayerIndex, length: contextLength),
+                let mirrored = TrackPleContextMirror.context
+            {
+                ctx = mirrored
+            } else {
+                let rawPrev = evaluation.inputState(modelLayerIndex: ple.stateLayerIndex)?.ssm
+                ctx =
+                    rawPrev.map {
+                        $0.dtype == .int32
+                            ? $0.asArray(Int32.self).map(Int64.init)
+                            : $0.asType(.int64).asArray(Int64.self)
+                    } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+            }
+            pleHostHistory = ctx + toks
+        }
         // A fully injected hyper-stream can continue through a layer block.
         // Normal token/embedding entry points retain the initial tiling.
         var tile = !inputIsMultiStream
@@ -1041,7 +1081,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     stream
                     + pleForward(
                         ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
+                        offset: offset, capture: capture, hoistedHistory: pleHostHistory)
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
