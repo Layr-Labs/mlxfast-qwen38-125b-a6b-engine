@@ -199,6 +199,15 @@ enum TrackP12Prefill {
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
     /// Keep sorted expert rows through the projections and weighted combine.
+    ///
+    /// MEASURED: this switch is a null. A paired, counterbalanced local PREFILL
+    /// A/B of ON (shipping) vs OFF over 7 pairs gave ON ~3.1% SLOWER at t=+0.87,
+    /// i.e. no resolvable benefit -- and note that local prefill per-pair sd is
+    /// ~9.4%, so a local prefill A/B can only settle effects of 10% or more. The
+    /// sorted path is therefore not measurably better than the `gatherSort`
+    /// fallback below, and the 42%-of-prefill cost attributed to this stage by
+    /// the first prefill profile ever taken (artifacts/prefill-prof.sh) is the
+    /// indirect GEMM's own access pattern, not a missing optimisation here.
     static func sortedMoE(
         _ m: TrackMoE, _ x: MLXArray, indices: MLXArray, weights: MLXArray,
         shared: MLXArray, gate: MLXArray
