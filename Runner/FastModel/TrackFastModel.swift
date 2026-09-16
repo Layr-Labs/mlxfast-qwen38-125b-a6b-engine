@@ -878,8 +878,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
-            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
-            let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
+            let (divisor, floor) = TrackFastPLEKernels.gateScalars(hidden: hidden, dtype: dot.dtype)
             let gn = TrackFastPLEKernels.gated(
                 g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
                 hcCount: hcCount, hidden: hidden, eps: eps)
