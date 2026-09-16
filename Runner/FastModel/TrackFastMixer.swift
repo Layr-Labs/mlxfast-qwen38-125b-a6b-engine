@@ -41,12 +41,20 @@ enum TrackFastMixerKernels {
             if constexpr (VPT == 1) {
                 float r[RPS];
                 qmv_fast_reg<T, GS, BITS, RPS>(wd, sd, bd, normed, KD, tile * (2 * RPS) + (int)sg * RPS, lid, r);
-                if (lid == 0) {
-                    for (int i = 0; i < RPS; ++i) {
-                        const T l = static_cast<T>(r[i]);
-                        lo[tile * (2 * RPS) + (int)sg * RPS + i] = l;
-                        act[tile * (2 * RPS) + (int)sg * RPS + i] = mlx_silu(l);
-                    }
+                // MLXFAST-MIXLANES: `qmv_fast_reg` closes with a `simd_sum` on
+                // every row, so all RPS entries of `r` hold identical bits on
+                // every lane of the simdgroup. The staging write therefore only
+                // needs *a* lane per entry rather than lane 0 writing all of
+                // them. Same values, same addresses, same `mlx_silu` per entry;
+                // only which lane issues each store changes. At the shipped
+                // RPS = 1 this is identically the lane-0 write (the guard keeps
+                // the distributed form to RPS <= 32, the static_assert above
+                // pins RPS to 1, 2 or 4, and the wide path is untouched).
+                if (lid < RPS) {
+                    const int i = (int)lid;
+                    const T l = static_cast<T>(r[i]);
+                    lo[tile * (2 * RPS) + (int)sg * RPS + i] = l;
+                    act[tile * (2 * RPS) + (int)sg * RPS + i] = mlx_silu(l);
                 }
             } else {
                 float r[VPT];
@@ -163,12 +171,22 @@ enum TrackFastMixerKernels {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const uint t = sg * 32 + lid;
-        if (t < 2) {
-            const int d = d0 + (int)t;
-            for (int v = 0; v < VPT; ++v) {
+        // MLXFAST-MIXFOLD: the (row, token) outputs of this tile used to be
+        // folded by two threads, each walking all VPT tokens while the other 62
+        // threads waited at the barrier below. The fold is independent per
+        // (row, token) pair -- its own accumulator, its own output address --
+        // so the tokens are handed out across the whole threadgroup instead.
+        // The sum over HC keeps its original order, so every output value is
+        // bit-identical; only which thread computes it changes. The threadgroup
+        // is (32, 2, 1), so `t` runs over 64 threads and the stride is 32.
+        // At VPT = 1 (decode) only threads 0 and 1 enter the loop, exactly as
+        // the original guard did.
+        {
+            const int d = d0 + (int)(t & 1u);
+            for (int v = (int)(t >> 1); v < VPT; v += 32) {
                 T acc = T(0);
                 for (int s = 0; s < HC; ++s) {
-                    const T p = products[s * 2 + (int)t][v];
+                    const T p = products[s * 2 + (int)(t & 1u)][v];
                     acc = acc + p;
                 }
                 input[(size_t)v * (size_t)H + (size_t)d] = acc;
