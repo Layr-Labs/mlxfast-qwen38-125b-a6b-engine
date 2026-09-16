@@ -547,7 +547,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func gdnForward(
         _ g: TrackGDN, _ x: MLXArray, layerIndex: Int,
-        evaluation: CBv2RecurrentStateEvaluation, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, capture: Bool, compactReplay: Bool
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         // A wide window already runs the four input projections as four
@@ -569,6 +569,19 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             state?.conv ?? MLXArray.zeros([B, geo.convKernel - 1, geo.convDim], dtype: x.dtype)
         let ssm =
             state?.ssm ?? MLXArray.zeros([B, geo.hv, geo.dv, geo.dk], dtype: .float32)
+        if compactReplay {
+            do {
+                let y = try TrackGDNPrefixReplay.forward(
+                    proj: proj, convState: convState, convW: g.convW,
+                    negExpALog: g.negExpALog, dtBias: g.dtBias, stateIn: ssm,
+                    geometry: geo, evaluation: evaluation, layerIndex: layerIndex)
+                let gated = TrackFastKernels.gatedRMS(
+                    y: y, proj: proj, w: g.normW, zOffset: g.zOffset, eps: 1e-6)
+                return g.out.apply(gated)
+            } catch {
+                preconditionFailure("TrackFastModel: GDN prefix replay stage failed: \(error)")
+            }
+        }
         let gated: MLXArray, convOut: MLXArray, stateOut: MLXArray
         if let fused = TrackFastGDNDecode.apply(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
@@ -820,7 +833,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
-        evaluation: CBv2RecurrentStateEvaluation, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, capture: Bool, compactReplay: Bool
     ) -> MLXArray {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
@@ -890,20 +903,42 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 let n = p.stateLength
                 let convStack = asStrided(full, [S, n, wide], strides: [wide, wide, 1], offset: wide)
                 let contextStack: MLXArray
+                let contextBacking: MLXArray
                 if let h = hostHistory {
                     // Row s = the context after consuming window token s.
                     var flat: [Int32] = []
                     flat.reserveCapacity(S * contextLength)
                     for s in 0 ..< S { flat.append(contentsOf: h[(s + 1) ..< (s + 1 + contextLength)].map(Int32.init)) }
                     contextStack = MLXArray(flat).reshaped(S, contextLength)
+                    contextBacking = contextStack
                 } else {
-                    let history = concatenated([devicePrevious(), ids], axis: 1)
+                    let history = concatenated([devicePrevious(), ids], axis: 1).asType(.int32)
                     contextStack = asStrided(
-                        history.asType(.int32), [S, contextLength], strides: [1, 1], offset: 1)
+                        history, [S, contextLength], strides: [1, 1], offset: 1)
+                    contextBacking = history
                 }
-                try evaluation.stageCaptured(
-                    modelLayerIndex: p.stateLayerIndex, conv: convStack, ssm: contextStack,
-                    positions: S)
+                if compactReplay {
+                    // Every recurrent layer must use the same transaction mode.
+                    // PLE retains its ordinary views, not a recomputed embedding.
+                    let roots = [full, contextBacking]
+                    let bytes = TrackGDNPrefixReplay.bytes(roots)
+                    try evaluation.stagePrefixReplay(
+                        modelLayerIndex: p.stateLayerIndex, positions: S,
+                        finalConv: convStack[(S - 1)..<S],
+                        finalSSM: contextStack[(S - 1)..<S],
+                        materializedByteCount: bytes, evaluationRoots: roots,
+                        strictReplayRetainedByteCount: bytes, strictReplayRetainedRoots: roots,
+                        fullAcceptanceRetainedByteCount: bytes, fullAcceptanceRetainedRoots: roots,
+                        replay: { keep in
+                            CBv2RecurrentLayerState(
+                                conv: convStack[(keep - 1)..<keep],
+                                ssm: contextStack[(keep - 1)..<keep])
+                        })
+                } else {
+                    try evaluation.stageCaptured(
+                        modelLayerIndex: p.stateLayerIndex, conv: convStack, ssm: contextStack,
+                        positions: S)
+                }
             } else {
                 let ssm: MLXArray
                 if let h = hostHistory {
@@ -949,6 +984,25 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         precondition(recurrentState.count == 1)
         let evaluation = recurrentState[0]
         var residual = inputEmbeddings ?? embedTokens(ids)  // [B,S,H] until tiled
+        // Select transaction mode once for all GDN layers and the PLE slot.
+        // No cross-request cache or identity-based state side table is needed.
+        let compactReplay = capture && TrackGDNPrefixReplay.enabled
+            && (2...7).contains(ids.dim(1)) && residual.dtype == .bfloat16
+            && layers.allSatisfy { layer in
+                guard let g = layer.gdn else { return true }
+                let geo = g.geometry
+                let state = evaluation.inputState(modelLayerIndex: layer.index)
+                return geo.dk == 128 && geo.dv == 128 && geo.hk > 0
+                    && geo.hv % geo.hk == 0
+                    && geo.convDim == (2 * geo.hk + geo.hv) * 128 && geo.convKernel > 1
+                    && (state?.ssm.map {
+                        $0.dtype == .float32 && $0.shape == [1, geo.hv, geo.dv, geo.dk]
+                    } ?? true)
+                    && (state?.conv.map {
+                        $0.dtype == residual.dtype
+                            && $0.shape == [1, geo.convKernel - 1, geo.convDim]
+                    } ?? true)
+            }
         var tile = true
         var pendingOut: MLXArray? = nil
         var pendingInject: MLXArray? = nil
@@ -970,7 +1024,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 stream =
                     stream
                     + pleForward(
-                        ple, stream: stream, ids: ids, evaluation: evaluation, capture: capture)
+                        ple, stream: stream, ids: ids, evaluation: evaluation, capture: capture,
+                        compactReplay: compactReplay)
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
@@ -991,7 +1046,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let attended: MLXArray
             if let gdn = layer.gdn {
                 attended = gdnForward(
-                    gdn, input, layerIndex: layer.index, evaluation: evaluation, capture: capture)
+                    gdn, input, layerIndex: layer.index, evaluation: evaluation, capture: capture,
+                    compactReplay: compactReplay)
             } else {
                 let cache = caches[attentionIndex]
                 attentionIndex += 1
