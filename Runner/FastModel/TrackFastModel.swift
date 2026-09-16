@@ -236,11 +236,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// inputs/outputs are appended here.
     nonisolated(unsafe) static var debugTaps: [(String, MLXArray)]? = nil
     /// Layers per partial dispatch inside a forward (0 = one dispatch per step).
-    nonisolated(unsafe) public static var asyncChunk: Int = 3
+    // MLXFAST-CHUNK1FIRST1: dispatch after every layer, starting at the first.
+    // The gradient on this knob has always favoured smaller spacing; 1 is its
+    // limit. `asyncFirst` moves independently of it: at 2 the step never
+    // dispatches after layer 1, which is when the GPU has the least queued
+    // work, so the first interval is the most valuable one to shorten.
+    nonisolated(unsafe) public static var asyncChunk: Int = 1
     /// Layers in the first partial-dispatch chunk (0 = same as asyncChunk):
     /// the first dispatch lands right after the PLE layer, whose host row
     /// gather is the one host sync of the step.
-    nonisolated(unsafe) public static var asyncFirst: Int = 2
+    nonisolated(unsafe) public static var asyncFirst: Int = 1
     /// Layer count at an optional second dispatch (0 = none).
     nonisolated(unsafe) public static var asyncSecond: Int = 0
 
