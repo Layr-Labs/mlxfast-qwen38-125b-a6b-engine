@@ -138,6 +138,29 @@ enum TrackPrefillIndirect {
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
         """#
 
+    /// MEASURED DEAD END: this width is NOT freely tunable, and 64 is invalid
+    /// rather than merely slower. A paired interleaved A/B (six pairs) gave
+    /// `corr=False` and a zero prefill time for every `downBlockN = 64` run,
+    /// first pair and last pair alike, while all six `128` controls passed.
+    /// The width is coupled to the threadgroup shape and to the
+    /// `Ws[<BN> * 40]` / `As[32 * 40]` padding, so halving it breaks the
+    /// launch outright. Change it only together with those, and only behind a
+    /// correctness check.
+    ///
+    /// The same six control runs measured the local prefill noise directly: the
+    /// SAME binary produced 0.000816 to 0.001041 s/token, a spread of +-13%.
+    /// That is why no conclusion in this artifact is ever drawn from a single
+    /// local prefill number; the prefill leg is verified for correctness and
+    /// gross regression only.
+    ///
+    /// The K block is fixed for the same reason. Moving `BK` from 32 to 64 --
+    /// template argument AND the `[BN][BK + 8]` padding together, the edit
+    /// checked on a copy before it was run -- gives `corr=False`: the launch is
+    /// invalid, not merely slower. So both neighbourhoods of this kernel's
+    /// geometry are invalid, and the geometry is load-bearing rather than
+    /// autotunable. Prefill's remaining headroom, whatever it is, is not
+    /// reachable by retiling, and this direction is closed rather than
+    /// unexplored.
     static let downBlockN = 128
 
     static let sourceDown = #"""
