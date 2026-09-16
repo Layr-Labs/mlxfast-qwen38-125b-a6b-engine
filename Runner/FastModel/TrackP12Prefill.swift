@@ -192,8 +192,8 @@ enum TrackP12Prefill {
             TrackFastKernels.moeCombineSource,
             [
                 (
-                    "routed[(row * K + k) * H + d]",
-                    "routed[static_cast<uint>(inverse_order[row * K + k]) * H + d]"
+                    "*reinterpret_cast<const device vec<InT, 4>*>(routed + (row * K + k) * H + d)",
+                    "*reinterpret_cast<const device vec<InT, 4>*>(routed + static_cast<uint>(inverse_order[row * K + k]) * H + d)"
                 )
             ]),
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
@@ -225,13 +225,13 @@ enum TrackP12Prefill {
             activated = compiledSiluProduct(gateAct, up)
             down = parts.down(activated, sortedIDs, sortedIndices: true)
         }
-        guard down.ndim == 3, down.dim(0) == B * S * K, down.dim(1) == 1, down.dim(2) == H,
+        guard down.ndim == 3, down.dim(0) == B * S * K, down.dim(1) == 1, down.dim(2) == H, H % 4 == 0,
             inverse.size == B * S * K
         else { return nil }
         return sortedCombineKernel(
             [down, weights, shared, gate, inverse],
             template: [("InT", down.dtype), ("K", K), ("H", H)],
-            grid: (H, B * S, 1), threadGroup: (256, 1, 1),
+            grid: (H / 4, B * S, 1), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, H]], outputDTypes: [down.dtype])[0]
     }
 }
