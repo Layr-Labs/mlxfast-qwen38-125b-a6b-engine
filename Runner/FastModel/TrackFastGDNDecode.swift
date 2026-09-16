@@ -1,4 +1,4 @@
-// Decode GDN preparation, state transition and gated normalization in one launch.
+// Single-token decode and two-token captured GDN windows in one launch.
 // Each threadgroup owns one value head; each SIMD group owns four value rows.
 // Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
 // TrackFastKernels.prepSource, leanSource and gatedRMSSource.
@@ -17,7 +17,10 @@ enum TrackFastGDNDecode {
         negExpALog: MLXArray, dtBias: MLXArray, stateIn: MLXArray, normW: MLXArray,
         zOffset: Int, eps: Float, capture: Bool, geometry g: TrackFastKernels.GDNGeometry
     ) -> (gated: MLXArray, stateOut: MLXArray, convOut: MLXArray)? {
-        guard !capture, proj.ndim == 3, proj.dim(1) == 1, proj.dtype == .bfloat16,
+        guard proj.ndim == 3,
+            (!capture && proj.dim(1) == 1)
+                || (capture && TrackFastGDNWindow.enabled && proj.dim(0) == 1 && proj.dim(1) == 2),
+            proj.dtype == .bfloat16,
             stateIn.dtype == .float32, g.dk == 128, g.dv == 128,
             g.hk > 0, g.hv % g.hk == 0, g.convKernel > 1,
             g.convDim == (2 * g.hk + g.hv) * 128, g.projWidth == proj.dim(2),
@@ -32,6 +35,11 @@ enum TrackFastGDNDecode {
             negExpALog.shape == [g.hv], dtBias.shape == [g.hv], normW.shape == [g.dv],
             convState.dtype == proj.dtype
         else { return nil }
+        if capture {
+            return TrackFastGDNWindow.apply(
+                proj: proj, conv: convState, cw: convW, decay: negExpALog, bias: dtBias,
+                state: stateIn, norm: normW, zOffset: zOffset, eps: eps, geometry: g)
+        }
         let result = kernel(
             [proj, convState, convW, negExpALog, dtBias, stateIn, normW],
             template: [
