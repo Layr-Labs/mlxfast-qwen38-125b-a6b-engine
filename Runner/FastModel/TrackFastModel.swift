@@ -236,6 +236,23 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// Debug taps (tests): when set, every layer's output stream and the block
     /// inputs/outputs are appended here.
     nonisolated(unsafe) static var debugTaps: [(String, MLXArray)]? = nil
+    /// Windows at least this wide release the MLX buffer cache when they end.
+    nonisolated(unsafe) public static var cacheReleaseMinWindow: Int = 256
+    /// Abort the PROCESS when MLX active + cache reaches this many bytes after
+    /// a window (0 = off). TrackMemoryBudget sets it from `iogpu.wired_limit_mb`
+    /// minus a margin: past that ceiling the GPU driver stalls the machine
+    /// and the kernel resets it, so a dead worker is the safe outcome.
+    nonisolated(unsafe) public static var wiredGuardLimit: Int = 0
+    static func wiredGuard(window: Int, offset: Int) {
+        guard wiredGuardLimit > 0 else { return }
+        let used = Memory.activeMemory + Memory.cacheMemory
+        guard used >= wiredGuardLimit else { return }
+        FileHandle.standardError.write(
+            Data(("track-fast: WIRED GUARD active+cache=\(used >> 20)MiB >= \(wiredGuardLimit >> 20)MiB "
+                + "after window S=\(window) offset=\(offset); aborting this process before the GPU wires past "
+                + "iogpu.wired_limit_mb\n").utf8))
+        exit(3)
+    }
     /// Layers per partial dispatch inside a forward (0 = one dispatch per step).
     nonisolated(unsafe) public static var asyncChunk: Int = 3
     /// Layers in the first partial-dispatch chunk (0 = same as asyncChunk):
@@ -1043,6 +1060,14 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             scale: finalMixer.normScaleQ,
             tile: false)
         let mixed = hcMix(finalMixer, normed: finalNormed).input
+        if ids.dim(1) >= Self.cacheReleaseMinWindow {
+            // A wide window's intermediates would otherwise sit in the MLX
+            // buffer cache (measured: 19 GB by 32K of prefill) on top of the
+            // weights; release them at the chunk boundary, as mlx-serve does.
+            eval(mixed, multi)
+            Memory.clearCache()
+        }
+        Self.wiredGuard(window: ids.dim(1), offset: offset)
         return (mixed, multi)
     }
 
