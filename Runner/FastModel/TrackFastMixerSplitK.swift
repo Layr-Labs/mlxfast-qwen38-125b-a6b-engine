@@ -5,6 +5,14 @@ import MLX
 // ascending block fold and the final simd_sum. No target weight changes.
 enum TrackFastMixerSplitK {
     // Four partitions in production; zero selects the original A/B control.
+    //
+    // MEASURED: the shipped 4 is correct. A paired, counterbalanced local decode
+    // A/B of 4 vs 0 over 28 pairs gave mean(4-0) = -17.3 us, i.e. 4 is 0.098%
+    // FASTER, t = -0.34, with 0 faster in 12/28 -- a null. The lean regressed
+    // completely to zero as n grew (+144 us at n=6, +58 us at n=14, -17 us at
+    // n=28), which is the signature this campaign saw in every null: an early
+    // 0.7-1% apparent effect that was noise. The 95% CI (-0.67% to +0.47%) lies
+    // inside the ~0.7% resolution floor of a 28-pair decode A/B.
     nonisolated(unsafe) static var split = 4
     static let helper = #"""
         template <typename T, int K, int V, int R, int SPLIT, bool ORDERED>
