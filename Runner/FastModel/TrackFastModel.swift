@@ -935,17 +935,22 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } else {
             let keyFlat = p.keyProj.apply(embedded)
             let value = p.valueProj.apply(embedded)
-            // norm_key * norm_query, then MLX's own reduction over the last axis.
-            let prod = TrackFastPLEKernels.prod(
+            // norm_key * norm_query; the kernel also folds each row's dot in
+            // the same pass, bit-exact with `row_reduce_looped` -- the kernel
+            // MLX dispatches for this reduction whenever 4*S < 32 rows, i.e.
+            // exactly S <= 7. S >= 8 takes `row_reduce_simple`, whose fold
+            // differs, so wide windows keep MLX's own reduction.
+            let pe = TrackFastPLEKernels.prod(
                 keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
                 hcCount: hcCount, hidden: hidden, eps: eps)
-            let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
-            // The two scalars the reference's `/` and `maximum` build, built the
-            // same way so they carry the same rounding into the activation dtype.
-            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
-            let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
+            let dot: MLXArray
+            if S <= 7 {
+                dot = pe.dots
+            } else {
+                dot = pe.prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
+            }
             let gn = TrackFastPLEKernels.gated(
-                g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
+                g0: dot, value: value, cScale: p.normConvScale,
                 hcCount: hcCount, hidden: hidden, eps: eps)
             let gated = gn.gated
             full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
