@@ -211,6 +211,7 @@ struct TrackLayer {
     let attn: TrackAttn?
     let moe: TrackMoE
     let moePairReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
+    let mlpReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let ple: TrackPLE?
 }
 
@@ -470,7 +471,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         return TrackLayer(
             index: index, attnHC: attnHC, mlpHC: mlpHC, gdn: gdn, attn: attn, moe: moe,
-            moePairReplay: makeMoEPairReplay(moe), ple: ple)
+            moePairReplay: makeMoEPairReplay(moe),
+            mlpReplay: TrackFastMLPReplay.make(hc: mlpHC, moe: moe,
+                hcCount: cfg.hcCount, hidden: cfg.hiddenSize, eps: cfg.rmsNormEps), ple: ple)
     }
 
     // MARK: forward pieces
@@ -944,12 +947,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// next mixer consumes it.
     func fastStreams(
         _ ids: MLXArray, inputEmbeddings: MLXArray?, caches: [Qwen4ExpCBv2LayerCache],
-        recurrentState: [CBv2RecurrentStateEvaluation], offset: Int, capture: Bool
+        recurrentState: [CBv2RecurrentStateEvaluation], offset: Int, capture: Bool,
+        inputIsMultiStream: Bool = false
     ) -> (mixed: MLXArray, multi: MLXArray) {
         precondition(recurrentState.count == 1)
         let evaluation = recurrentState[0]
         var residual = inputEmbeddings ?? embedTokens(ids)  // [B,S,H] until tiled
-        var tile = true
+        // A fully injected hyper-stream can continue through a layer block.
+        // Normal token/embedding entry points retain the initial tiling.
+        var tile = !inputIsMultiStream
         var pendingOut: MLXArray? = nil
         var pendingInject: MLXArray? = nil
         var attentionIndex = 0
@@ -999,20 +1005,28 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             Self.debugTaps?.append(("L\(layer.index).attn.out", attended))
             if profiling { TrackFastProfile.tick(layer.gdn != nil ? "gdn" : "attn", &profT, [attended]) }
-            (stream, normed) = injectNorm(
-                residual: stream, out: attended, inject: injectW,
-                scale: layer.mlpHC.normScaleQ,
-                tile: false)
-            if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
-            Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
-            let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
-            input = mm.input; injectW = mm.inject
-            if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
-            Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
-            pendingOut = Self.moeForwardShared(
-                layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay)
-            if profiling { TrackFastProfile.tick("moe", &profT, [pendingOut!]) }
-            Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
+            if TrackFastMLPReplay.enabled, ids.shape == [1, 1], stream.dtype == .bfloat16,
+                !profiling, Self.debugTaps == nil, StreamOrDevice.default.stream === Stream.gpu,
+                let replay = layer.mlpReplay
+            {
+                let r = replay([stream, attended, injectW])
+                stream = r[0]; pendingOut = r[1]; injectW = r[2]
+            } else {
+                (stream, normed) = injectNorm(
+                    residual: stream, out: attended, inject: injectW,
+                    scale: layer.mlpHC.normScaleQ,
+                    tile: false)
+                if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
+                Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
+                let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
+                input = mm.input; injectW = mm.inject
+                if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
+                Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
+                pendingOut = Self.moeForwardShared(
+                    layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay)
+                if profiling { TrackFastProfile.tick("moe", &profT, [pendingOut!]) }
+                Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
+            }
             pendingInject = injectW
             residual = stream
             // Dispatch the graph so far: the GPU starts on these layers while the
