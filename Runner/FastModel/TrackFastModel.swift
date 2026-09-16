@@ -35,34 +35,45 @@ import MLXNN
 /// state-layer identity and window length so a reset or a different model
 /// state cannot reuse an old host window.
 enum TrackPleContextMirror {
-    nonisolated(unsafe) private(set) static var context: [Int64]? = nil
-    nonisolated(unsafe) private(set) static var nextOffset: Int? = nil
+    nonisolated(unsafe) private(set) static var history: [Int64]? = nil
+    nonisolated(unsafe) private(set) static var baseOffset: Int? = nil
+    nonisolated(unsafe) private(set) static var fedCount: Int = 0
     nonisolated(unsafe) private(set) static var stateLayerIndex: Int? = nil
     nonisolated(unsafe) private(set) static var contextLength: Int? = nil
     nonisolated(unsafe) private(set) static var dirty = true
 
-    static func matches(offset: Int, layer: Int, length: Int) -> Bool {
-        guard !dirty else { return false }
-        return hasSameWindow(offset: offset, layer: layer, length: length)
-    }
-
-    private static func hasSameWindow(offset: Int, layer: Int, length: Int) -> Bool {
-        nextOffset == offset && stateLayerIndex == layer && contextLength == length
+    /// The rolling context for a window starting at `offset`, or nil when the
+    /// mirror cannot prove it. The harness's own staged context is built from
+    /// the fed token history (`contextStack` row s is `history[s+1..<s+1+len]`),
+    /// so after a verify that commits k of the S fed tokens the next window's
+    /// context is `history[k ..< k+len]` — the same fed-token derivation the
+    /// single-offset mirror already relied on, now keyed by where the next
+    /// window actually lands instead of only the full-accept offset.
+    static func context(offset: Int, layer: Int, length: Int) -> [Int64]? {
+        guard !dirty, let history, let baseOffset,
+            stateLayerIndex == layer, contextLength == length
+        else { return nil }
+        let k = offset - baseOffset
+        guard k >= 0, k <= fedCount, k + length <= history.count else { return nil }
+        return Array(history[k ..< k + length])
     }
 
     static func store(
-        _ context: [Int64], nextOffset: Int, stateLayerIndex: Int, contextLength: Int
+        history: [Int64], baseOffset: Int, fedCount: Int, stateLayerIndex: Int,
+        contextLength: Int
     ) {
-        self.context = context
-        self.nextOffset = nextOffset
+        self.history = history
+        self.baseOffset = baseOffset
+        self.fedCount = fedCount
         self.stateLayerIndex = stateLayerIndex
         self.contextLength = contextLength
         dirty = false
     }
 
     static func invalidate() {
-        context = nil
-        nextOffset = nil
+        history = nil
+        baseOffset = nil
+        fedCount = 0
         stateLayerIndex = nil
         contextLength = nil
         dirty = true
@@ -893,9 +904,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
             let ctx: [Int64]
             if !capture,
-                TrackPleContextMirror.matches(
-                    offset: offset, layer: p.stateLayerIndex, length: contextLength),
-                let mirrored = TrackPleContextMirror.context
+                let mirrored = TrackPleContextMirror.context(
+                    offset: offset, layer: p.stateLayerIndex, length: contextLength)
             {
                 ctx = mirrored
             } else {
@@ -911,7 +921,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 TrackPleContextMirror.invalidate()
             } else {
                 TrackPleContextMirror.store(
-                    Array(history.suffix(contextLength)), nextOffset: offset + S,
+                    history, baseOffset: offset, fedCount: S,
                     stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
             }
             let gid = p.embedding.hostRowIds(history: [history], newCount: S)
