@@ -393,35 +393,74 @@ extension TrackFastKernels {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         acc = simd_sum(local_sums[lane]);
         const float inv_mean = metal::precise::rsqrt(acc / (float)D + as_type<float>((uint)EPS_BITS));
+        InT val[N_READS];
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
             const InT wgt = isQ ? qnorm[d] : knorm[d];
-            vec[d] = wgt * static_cast<InT>(thread_x[i] * inv_mean);
+            val[i] = wgt * static_cast<InT>(thread_x[i] * inv_mean);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         constexpr int hrot = ROT / 2;
         device InT* dst = isQ ? (qout + ((b * HQ + hh) * S + s) * D) : (kout + ((b * HK + hh) * S + s) * D);
-        for (int i = 0; i < N_READS; ++i) {
-            const uint d = lid * N_READS + i;
-            InT o = vec[d];
-            if (d < ROT) {
-                const InT c = cosb[s * ROT + d];
-                const InT sn = sinb[s * ROT + d];
-                if (d < hrot) {
-                    InT x1 = vec[d];
-                    InT x2 = vec[d + hrot];
-                    InT t1 = x1 * c;
-                    InT t2 = (-x2) * sn;
-                    o = t1 + t2;
-                } else {
-                    InT x2 = vec[d];
-                    InT x1 = vec[d - hrot];
-                    InT t1 = x2 * c;
-                    InT t2 = x1 * sn;
-                    o = t1 + t2;
+        if (ROT <= 128) {
+            // RoPE partner d +/- hrot lives at lane lid +/- hrot/4 inside the
+            // same simdgroup (|offset| <= 16 when ROT <= 128), so a register
+            // shuffle replaces the vec buffer and its barrier. The shuffled
+            // value is the partner lane's own val[i] — bit-identical to what
+            // it would have stored in vec[d +/- hrot]. All lanes execute the
+            // shuffle; only d < ROT consumes it.
+            const ushort pl = lane < (uint)(hrot / 4)
+                ? (ushort)(lane + hrot / 4) : (ushort)(lane - hrot / 4);
+            for (int i = 0; i < N_READS; ++i) {
+                const uint d = lid * N_READS + i;
+                const InT pv = simd_shuffle(val[i], pl);
+                InT o = val[i];
+                if (d < ROT) {
+                    const InT c = cosb[s * ROT + d];
+                    const InT sn = sinb[s * ROT + d];
+                    if (d < hrot) {
+                        InT x1 = val[i];
+                        InT x2 = pv;
+                        InT t1 = x1 * c;
+                        InT t2 = (-x2) * sn;
+                        o = t1 + t2;
+                    } else {
+                        InT x2 = val[i];
+                        InT x1 = pv;
+                        InT t1 = x2 * c;
+                        InT t2 = x1 * sn;
+                        o = t1 + t2;
+                    }
                 }
+                dst[d] = o;
             }
-            dst[d] = o;
+        } else {
+            for (int i = 0; i < N_READS; ++i) {
+                const uint d = lid * N_READS + i;
+                vec[d] = val[i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = 0; i < N_READS; ++i) {
+                const uint d = lid * N_READS + i;
+                InT o = vec[d];
+                if (d < ROT) {
+                    const InT c = cosb[s * ROT + d];
+                    const InT sn = sinb[s * ROT + d];
+                    if (d < hrot) {
+                        InT x1 = vec[d];
+                        InT x2 = vec[d + hrot];
+                        InT t1 = x1 * c;
+                        InT t2 = (-x2) * sn;
+                        o = t1 + t2;
+                    } else {
+                        InT x2 = vec[d];
+                        InT x1 = vec[d - hrot];
+                        InT t1 = x2 * c;
+                        InT t2 = x1 * sn;
+                        o = t1 + t2;
+                    }
+                }
+                dst[d] = o;
+            }
         }
         """
 
