@@ -46,6 +46,8 @@ public final class TrackQwen4ExpInlineMTPAssistant {
     /// 6 on both mlx and cuda"); the CUDA track serves the same head at
     /// depth <= 6 with per-depth oracles.
     public static let maximumDepth = 6
+    /// Widest window one head forward takes during a trusted flush.
+    public static let headFlushChunk = 2048
 
     private let target: Qwen4ExpModel
     private let mtp: TrackQwen4ExpMTPModule
@@ -351,9 +353,32 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             feed = (tokens, hidden)
         }
 
-        let step = headStep(
-            tokens: feed.tokens, multiStream: feed.multi, cache: state.caches,
-            stepIndex: state.roundDraftSteps)
+        let step: (draft: MLXArray, multi: MLXArray)
+        if isFirstStep, feed.tokens.dim(1) > Self.headFlushChunk {
+            // A long trusted flush (the whole prompt after prefill) enters the
+            // head in chunks, like the target's own prefill: one forward over
+            // it would attend a [S, S] window. Only the last chunk drafts; the
+            // earlier ones exist to put the head's history in place, and their
+            // cache writes are evaluated as they go so no chunk-sized graph
+            // accumulates.
+            let width = feed.tokens.dim(1)
+            var start = 0
+            var last: (draft: MLXArray, multi: MLXArray)? = nil
+            while start < width {
+                let end = min(start + Self.headFlushChunk, width)
+                last = headStep(
+                    tokens: feed.tokens[0..., start ..< end],
+                    multiStream: feed.multi[0..., start ..< end, 0...],
+                    cache: state.caches, stepIndex: state.roundDraftSteps)
+                if end < width { eval(state.caches.flatMap { $0.innerState() }) }
+                start = end
+            }
+            step = last!
+        } else {
+            step = headStep(
+                tokens: feed.tokens, multiStream: feed.multi, cache: state.caches,
+                stepIndex: state.roundDraftSteps)
+        }
         state.roundRoots.append(contentsOf: [step.multi, step.draft])
         state.roundDraftSteps += 1
 
