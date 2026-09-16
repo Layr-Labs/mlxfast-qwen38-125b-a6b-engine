@@ -250,6 +250,30 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         (ProcessInfo.processInfo.environment["TRACK_FAST_FORWARD"] ?? "1") != "0"
     }()
 
+    // Adapted from GumbiiDigital PR #669. Reuse only a context derived for
+    // the exact live state object; no process-global history crosses requests.
+    private let pleMirrorLock = NSLock()
+    private var pleMirror: (layer: Int, state: MLXArray, tokens: [Int64])? = nil
+
+    private func mirroredPLEContext(layer: Int, state: MLXArray?, count: Int) -> [Int64]? {
+        pleMirrorLock.lock()
+        defer { pleMirrorLock.unlock() }
+        guard let state, let mirror = pleMirror, mirror.layer == layer,
+            mirror.state === state, mirror.tokens.count == count
+        else { return nil }
+        return mirror.tokens
+    }
+
+    private func setPLEMirror(layer: Int, state: MLXArray?, tokens: [Int64]?) {
+        pleMirrorLock.lock()
+        defer { pleMirrorLock.unlock() }
+        if let state, let tokens {
+            pleMirror = (layer, state, tokens)
+        } else {
+            pleMirror = nil
+        }
+    }
+
     public init(base: Qwen4ExpModel) {
         self.base = base
         let cfg = base.configuration
@@ -843,9 +867,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // host-backed int32 array, so the only device sync of the step is the
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
+        if capture {
+            setPLEMirror(layer: p.stateLayerIndex, state: nil, tokens: nil)
+        }
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
             let rawPrev = state?.ssm
-            let ctx: [Int64] = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+            let mirrored = capture ? nil : mirroredPLEContext(
+                layer: p.stateLayerIndex, state: rawPrev, count: contextLength)
+            let ctx: [Int64] = mirrored ?? (rawPrev.map {
+                $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init)
+                    : $0.asType(.int64).asArray(Int64.self)
+            } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength))
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
             let history = ctx + toks
             let gid = p.embedding.hostRowIds(history: [history], newCount: S)
@@ -853,6 +885,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
             hostHistory = history
         } else {
+            setPLEMirror(layer: p.stateLayerIndex, state: nil, tokens: nil)
             embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
         }
         // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
@@ -916,6 +949,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     modelLayerIndex: p.stateLayerIndex,
                     conv: full[0..., (-p.stateLength)..., 0...],
                     ssm: ssm)
+                // Store only after staging, keyed to the exact staged array.
+                // A rollback or another request presents a different object
+                // and must read its own authoritative state instead.
+                setPLEMirror(
+                    layer: p.stateLayerIndex, state: hostHistory == nil ? nil : ssm,
+                    tokens: hostHistory.map { Array($0.suffix(contextLength)) })
             }
         } catch {
             preconditionFailure("TrackFastModel: PLE stage failed: \(error)")
