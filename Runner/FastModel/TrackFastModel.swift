@@ -927,7 +927,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     }
 
     private func injectNorm(
-        residual: MLXArray, out: MLXArray?, inject: MLXArray?, scale: MLXArray, tile: Bool
+        residual: MLXArray, out: MLXArray?, inject: MLXArray?, scale: MLXArray, tile: Bool,
+        emitStream: Bool = true
     ) -> (stream: MLXArray, normed: MLXArray) {
         // Native replay does not key Swift task-local streams; trace and replay
         // only on the canonical GPU stream. Other contexts retain the raw path.
@@ -937,7 +938,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         return TrackFastKernels.injectNorm(
             residual: residual, out: out, inject: inject, scale: scale,
-            hcCount: hcCount, hidden: hidden, eps: eps, tile: tile)
+            hcCount: hcCount, hidden: hidden, eps: eps, tile: tile,
+            emitStream: emitStream)
     }
 
     /// Both tower streams. `caches` is the compact attention layout.
@@ -977,10 +979,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     stream
                     + pleForward(
                         ple, stream: stream, ids: ids, evaluation: evaluation, capture: capture)
-                (stream, normed) = injectNorm(
+                // MLXFAST-EMITSTREAM: with `out == nil` and `tile == false`
+                // the kernel's `stream` output is `residual` element for
+                // element, so keep the array already in hand and let the
+                // kernel skip the store. `normed` is unaffected: it is
+                // reduced from the registers the same loop fills.
+                normed = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
-                    tile: false)
+                    tile: false, emitStream: false).normed
             } else {
                 (stream, normed) = injectNorm(
                     residual: residual, out: pendingOut, inject: pendingInject,
