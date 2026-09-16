@@ -800,17 +800,26 @@ extension TrackFastMoEKernels {
         // each lane owns E_PER experts: e = lane + 32 * j (strided so a tie at
         // the same value resolves to the lowest index across lanes too)
         float v[E_PER];
+        // CUDA cumulative frontier: one live bit per lane-owned expert.
+        // Keep the MLX max/min and softmax reductions unchanged. Wider expert
+        // envelopes retain the original per-element bookkeeping.
+        constexpr bool LIVE_MASK = E_PER <= 32;
+        uint live = 0u;
         bool taken[E_PER];
         for (int j = 0; j < E_PER; ++j) {
             const int e = (int)lane + 32 * j;
             v[j] = (e < E) ? lr[e] : -INFINITY;
-            taken[j] = (e >= E);
+            if constexpr (LIVE_MASK) { if (e < E) live |= 1u << j; }
+            else { taken[j] = (e >= E); }
         }
         for (int k = 0; k < K; ++k) {
             // lane-local best: largest value, then lowest index
             float bv = -INFINITY; int bj = -1;
             for (int j = 0; j < E_PER; ++j) {
-                if (!taken[j] && (v[j] > bv)) { bv = v[j]; bj = j; }
+                bool available;
+                if constexpr (LIVE_MASK) { available = (live & (1u << j)) != 0; }
+                else { available = !taken[j]; }
+                if (available && (v[j] > bv)) { bv = v[j]; bj = j; }
             }
             const float gmax = simd_max(bv);
             const uint cand = (bv == gmax && bj >= 0) ? (uint)(lane + 32 * bj) : 0xffffffffu;
@@ -820,7 +829,10 @@ extension TrackFastMoEKernels {
                     if (k == (int)lane * N_READS + i) { ld[i] = gmax; selected[i] = gidx; }
                 }
             } else if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
-            if (gidx == (uint)(lane + 32 * bj) && bj >= 0) { taken[bj] = true; }
+            if (bj >= 0 && gidx == (uint)(lane + 32 * bj)) {
+                if constexpr (LIVE_MASK) { live &= ~(1u << bj); }
+                else { taken[bj] = true; }
+            }
         }
         }
         if constexpr (REGISTER_RESULTS) {
@@ -1308,6 +1320,58 @@ extension TrackFastMoEKernels {
         }
         """#
 
+    // CUDA's wide payload reads and independent gate/up operand staging,
+    // adapted to MLX affine-4 group32. No Q4_K decoder, DP4A, activation
+    // quantization, weight permutation, or cross-iteration prefetch is used.
+    static let stagedGateUp = ProcessInfo.processInfo.environment["TRACK_CUDA_STAGED_GU"] != "0"
+    static let gateUpStagedHelpers = #"""
+        METAL_FUNC float track_qdot4_words(uint2 packed, const thread float* x,
+                                           float scale, float bias, float sum) {
+            const ushort4 words = as_type<ushort4>(packed);
+            float accum = 0;
+            for (int i = 0; i < 4; ++i) {
+                accum += (x[4*i] * (words[i] & 0x000f) +
+                          x[4*i+1] * (words[i] & 0x00f0) +
+                          x[4*i+2] * (words[i] & 0x0f00) +
+                          x[4*i+3] * (words[i] & 0xf000));
+            }
+            return scale * accum + sum * bias;
+        }
+
+        template <typename T, int rows>
+        METAL_FUNC void track_gateup_staged(
+            const device uint32_t* w0, const device T* s0, const device T* b0,
+            const device uint32_t* w1, const device T* s1, const device T* b1,
+            const device T* x, int out_row, uint lane,
+            thread float (&g)[rows], thread float (&u)[rows]) {
+            // K=2560, 16 activations per lane, five ascending 512-column blocks.
+            constexpr int KW = 320, KG = 80;
+            for (int r = 0; r < rows; ++r) { g[r] = 0; u[r] = 0; }
+            for (int block = 0; block < 5; ++block) {
+                uint2 gw[rows], uw[rows];
+                T gs[rows], gb[rows], us[rows], ub[rows];
+                // These are the original row bytes. Eight-byte loads are
+                // aligned: row pitch=1280 bytes, block=256, lane=8 bytes.
+                for (int r = 0; r < rows; ++r) {
+                    const int wp = (out_row + r) * KW + block * 64 + lane * 2;
+                    const int sp = (out_row + r) * KG + block * 16 + lane / 2;
+                    gw[r] = *reinterpret_cast<const device uint2*>(w0 + wp);
+                    uw[r] = *reinterpret_cast<const device uint2*>(w1 + wp);
+                    gs[r] = s0[sp]; gb[r] = b0[sp];
+                    us[r] = s1[sp]; ub[r] = b1[sp];
+                }
+                float xt[16];
+                // Preserve MLX's BF16 sum rounding and nibble scaling.
+                const float sum = load_vector<T, float, 16, 4>(x + block * 512 + lane * 16, xt);
+                for (int r = 0; r < rows; ++r) {
+                    g[r] += track_qdot4_words(gw[r], xt, float(gs[r]), float(gb[r]), sum);
+                    u[r] += track_qdot4_words(uw[r], xt, float(us[r]), float(ub[r]), sum);
+                }
+            }
+            for (int r = 0; r < rows; ++r) { g[r] = simd_sum(g[r]); u[r] = simd_sum(u[r]); }
+        }
+        """#
+
     static let gateUpReuseSource = """
         const uint z = threadgroup_position_in_grid.z;
         const bool shared = z == (uint)BR;
@@ -1325,9 +1389,15 @@ extension TrackFastMoEKernels {
         const int out_row = (int)threadgroup_position_in_grid.y * (2 * RPS)
             + (int)simdgroup_index_in_threadgroup * RPS;
         float g[RPS], u[RPS];
-        qmv_fast_reg_dual<T, GS, BITS, RPS>(
-            gw, gs, gb, uw, us, ub, x + (size_t)r * (size_t)KD,
-            KD, out_row, thread_index_in_simdgroup, g, u);
+        if constexpr (STAGED_PACKS) {
+            static_assert(KD == 2560 && GS == 32 && BITS == 4, "staged Flash shape");
+            track_gateup_staged<T, RPS>(gw, gs, gb, uw, us, ub,
+                x + (size_t)r * (size_t)KD, out_row, thread_index_in_simdgroup, g, u);
+        } else {
+            qmv_fast_reg_dual<T, GS, BITS, RPS>(
+                gw, gs, gb, uw, us, ub, x + (size_t)r * (size_t)KD,
+                KD, out_row, thread_index_in_simdgroup, g, u);
+        }
         if (thread_index_in_simdgroup == 0) {
             for (int i = 0; i < RPS; ++i) {
                 const T gv = static_cast<T>(g[i]);
@@ -1342,7 +1412,7 @@ extension TrackFastMoEKernels {
         inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
         outputNames: ["act"],
         source: gateUpReuseSource,
-        header: helpersCore + TrackFastKernels.exactHeader + gateUpReuseHelpers,
+        header: helpersCore + TrackFastKernels.exactHeader + gateUpReuseHelpers + gateUpStagedHelpers,
         ensureRowContiguous: true)
 
     /// Routed slots [0, BR) then the shared expert for the S tokens: act [BR + S, N].
@@ -1362,7 +1432,7 @@ extension TrackFastMoEKernels {
                 [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
                 template: [
                     ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N),
-                    ("KD", KD), ("BR", BR), ("RPS", rows),
+                    ("KD", KD), ("BR", BR), ("RPS", rows), ("STAGED_PACKS", stagedGateUp),
                 ],
                 grid: (32, N / rows, BR + 1), threadGroup: (32, 2, 1),
                 outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]

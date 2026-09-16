@@ -25,6 +25,8 @@ enum TrackFastMixerKernels {
         + TrackFastKernels.mixerHeadHeaderTail + TrackFastMoEKernels.wideDecls
 
     /// normed [S, KD] -> lo [S, ND] (down), inj [S, HC] (inject).
+    /// CUDA producer/consumer principle: when keepLowRank is false, only act
+    /// is consumed, so lo is a zero placeholder [1,1], not an ND-wide buffer.
     /// S == 1: each simdgroup owns downRowsPerSimdgroup adjacent down rows.
     /// S == 1: two inject tiles each own two rows, one per simdgroup.
     /// S > 1 retains 8 down rows/tile and one two-simdgroup inject tile.
@@ -33,6 +35,7 @@ enum TrackFastMixerKernels {
         const int tile = (int)threadgroup_position_in_grid.y;
         const uint sg = simdgroup_index_in_threadgroup;
         const uint lid = thread_index_in_simdgroup;
+        if (!EMIT_LO && tile == 0 && sg == 0 && lid == 0) { lo[0] = T(0); }
         // MLXFAST-MIX2ROW: the wide path retains its original four-row ownership.
         constexpr int RPS = VPT == 1 ? \(downRowsPerSimdgroup) : 4;
         static_assert(RPS == 1 || RPS == 2 || RPS == 4, "down row ownership");
@@ -44,7 +47,7 @@ enum TrackFastMixerKernels {
                 if (lid == 0) {
                     for (int i = 0; i < RPS; ++i) {
                         const T l = static_cast<T>(r[i]);
-                        lo[tile * (2 * RPS) + (int)sg * RPS + i] = l;
+                        if (EMIT_LO) { lo[tile * (2 * RPS) + (int)sg * RPS + i] = l; }
                         act[tile * (2 * RPS) + (int)sg * RPS + i] = mlx_silu(l);
                     }
                 }
@@ -55,7 +58,7 @@ enum TrackFastMixerKernels {
                 if ((lid % 8) == 0) {
                     for (int v = 0; v < VPT; ++v) {
                         const T l = static_cast<T>(r[v]);
-                        lo[v * ND + row] = l;
+                        if (EMIT_LO) { lo[v * ND + row] = l; }
                         act[v * ND + row] = mlx_silu(l);
                     }
                 }
@@ -95,7 +98,7 @@ enum TrackFastMixerKernels {
         source: downInjectSource, header: header1, ensureRowContiguous: true)
 
     static func downInject(
-        normed: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?
+        normed: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?, keepLowRank: Bool = true
     ) -> (lo: MLXArray, act: MLXArray, inj: MLXArray) {
         let S = normed.dim(0), KD = normed.dim(1), ND = down.rows
         let HC = inject?.rows ?? 4
@@ -109,10 +112,10 @@ enum TrackFastMixerKernels {
             [normed, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
             template: [
                 ("T", normed.dtype), ("GS", down.groupSize), ("BITS", down.bits), ("KD", KD), ("ND", ND),
-                ("HC", HC), ("VPT", S), ("HAS_INJECT", inject != nil),
+                ("HC", HC), ("VPT", S), ("HAS_INJECT", inject != nil), ("EMIT_LO", keepLowRank),
             ],
             grid: (32, tiles * 2, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[S, ND], [S, ND], [S, HC]], outputDTypes: [normed.dtype, normed.dtype, normed.dtype])
+            outputShapes: [keepLowRank ? [S, ND] : [1, 1], [S, ND], [S, HC]], outputDTypes: [normed.dtype, normed.dtype, normed.dtype])
         return (outs[0], outs[1], outs[2])
     }
 

@@ -471,15 +471,37 @@ extension TrackFastKernels {
         outputNames: ["out"],
         source: attnGateSource, header: exactHeader, ensureRowContiguous: true)
 
+    static let directAttentionGate = ProcessInfo.processInfo.environment["TRACK_CUDA_GATE_VIEW"] != "0"
+
+    // CUDA's direct gate-source consumption, adapted to MLX view strides.
+    // Token-major SDPA outputs need no head-major copy. The head is a grid
+    // coordinate rather than a quotient in each thread. BF16 gate math stays.
+    nonisolated(unsafe) static let attnGateViewKernel = MLXFast.metalKernel(
+        name: "track_attn_gate_view_v5", inputNames: ["att", "qkv"], outputNames: ["out"],
+        source: """
+            const uint d = thread_position_in_grid.x;
+            const uint row = thread_position_in_grid.y;
+            const uint h = thread_position_in_grid.z;
+            if (d >= D) return;
+            const uint b = row / S, s = row % S;
+            const uint j = h * D + d;
+            const InT a = att[b * att_strides[0] + h * att_strides[1]
+                             + s * att_strides[2] + d * att_strides[3]];
+            const InT g = qkv[b * qkv_strides[0] + s * qkv_strides[1]
+                             + (GATE_OFF + j) * qkv_strides[2]];
+            out[row * HQ * D + j] = a * mlx_sigmoid(g);
+            """, header: exactHeader, ensureRowContiguous: false)
+
     static func attnGate(att: MLXArray, qkv: MLXArray, gateOffset: Int) -> MLXArray {
         let B = att.dim(0), HQ = att.dim(1), S = att.dim(2), D = att.dim(3)
-        return attnGateKernel(
+        let direct = directAttentionGate && S > 8 && D == 256
+        return (direct ? attnGateViewKernel : attnGateKernel)(
             [att, qkv],
             template: [
                 ("InT", att.dtype), ("HQ", HQ), ("D", D), ("S", S), ("QW", qkv.dim(2)),
                 ("GATE_OFF", gateOffset),
             ],
-            grid: (HQ * D, B * S, 1), threadGroup: (256, 1, 1),
+            grid: direct ? (D, B * S, HQ) : (HQ * D, B * S, 1), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, HQ * D]], outputDTypes: [att.dtype])[0]
     }
 
