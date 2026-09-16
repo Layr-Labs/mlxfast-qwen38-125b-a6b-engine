@@ -128,6 +128,96 @@ enum TrackFastPLEKernels {
             outputShapes: [[B, S, W]], outputDTypes: [keyFlat.dtype])[0]
     }
 
+    // MARK: norm_key(key_proj(e)) * norm_query(stream), folded over the row
+
+    /// keyFlat [B,S,W], stream [B,S,W], kscale [W], qscale [W], eps
+    ///   -> dot [B,S,HC,1]
+    /// Same launch shape as `prod`, but the product row is reduced in place
+    /// with `row_reduce_looped`'s exact fold: a per-thread four-element chain
+    /// in the activation dtype, `simd_sum`, one partial per simdgroup, and a
+    /// second `simd_sum` over the 32-lane padded partials. MLX dispatches
+    /// `row_reduce_looped` for this reduce whenever B*S*HC < 32 (S <= 7 here),
+    /// so the result is bit-identical to `prod(...).sum(axis: -1)` on every
+    /// window this kernel is called for. Saves the [B,S,W] product write, its
+    /// readback, and one launch per window.
+    /// grid (H/4, HC, B*S), threadgroup (H/4, 1, 1)
+    static let prodDotSource = """
+        constexpr int N_READS = 4;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint hc = thread_position_in_grid.y;
+        const uint row = thread_position_in_grid.z;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        threadgroup float ksums[32];
+        threadgroup float qsums[32];
+        threadgroup InT dsums[32];
+        const uint base = row * W + hc * H;
+        float kx[N_READS];
+        float qx[N_READS];
+        float kacc = 0.0f;
+        float qacc = 0.0f;
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            kx[i] = static_cast<float>(keyFlat[base + d]);
+            qx[i] = static_cast<float>(stream[base + d]);
+            kacc += kx[i] * kx[i];
+            qacc += qx[i] * qx[i];
+        }
+        kacc = simd_sum(kacc);
+        qacc = simd_sum(qacc);
+        constexpr uint simd_groups = (H + 32 * N_READS - 1) / (32 * N_READS);
+        if (sg == 0 && lane >= simd_groups) { ksums[lane] = 0; qsums[lane] = 0; }
+        if (lane == 0) { ksums[sg] = kacc; qsums[sg] = qacc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        kacc = simd_sum(ksums[lane]);
+        qacc = simd_sum(qsums[lane]);
+        const float kinv = metal::precise::rsqrt(kacc / (float)H + eps);
+        const float qinv = metal::precise::rsqrt(qacc / (float)H + eps);
+        // The looped row reduce: each thread's four products fold into a
+        // running total in the activation dtype, then one simd_sum, then the
+        // per-simdgroup partials fold through a second simd_sum. `InT(0) + dot`
+        // is the non-row aggregate step (`total = op(total, row_total)` with a
+        // single non-row reduction).
+        InT dacc = InT(0);
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            const InT kn = static_cast<InT>(kx[i] * kinv) * kscale[hc * H + d];
+            const InT qn = static_cast<InT>(qx[i] * qinv) * qscale[hc * H + d];
+            dacc = (kn * qn) + dacc;
+        }
+        dacc = InT(0) + dacc;
+        dacc = simd_sum(dacc);
+        if (sg == 0 && lane >= simd_groups) { dsums[lane] = InT(0); }
+        if (lane == 0) { dsums[sg] = dacc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dacc = simd_sum(dsums[lane]);
+        if (sg == 0 && lane == 0) { dot[row * HC + hc] = dacc; }
+        """
+
+    nonisolated(unsafe) static let prodDotKernel = MLXFast.metalKernel(
+        name: "track_ple_prod_dot",
+        inputNames: ["keyFlat", "stream", "kscale", "qscale", "eps"],
+        outputNames: ["dot"],
+        source: prodDotSource, header: header, ensureRowContiguous: true)
+
+    static func prodDot(
+        keyFlat: MLXArray, stream: MLXArray, kScale: MLXArray, qScale: MLXArray,
+        hcCount: Int, hidden: Int, eps: Float
+    ) -> MLXArray {
+        let B = keyFlat.dim(0), S = keyFlat.dim(1), W = hcCount * hidden
+        // The in-kernel fold reproduces `row_reduce_looped` only when MLX would
+        // pick it (B*S*HC < 32) and when the threadgroup covers the row in one
+        // four-element read per thread (hidden % 128 == 0, hidden/4 <= 1024).
+        precondition(
+            B * S * hcCount < 32 && hidden % 128 == 0 && hidden / 4 <= 1024
+                && keyFlat.dim(2) == W)
+        return prodDotKernel(
+            [keyFlat, stream, kScale, qScale, MLXArray(eps)],
+            template: [("InT", keyFlat.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+            grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
+            outputShapes: [[B, S, hcCount, 1]], outputDTypes: [keyFlat.dtype])[0]
+    }
+
     // MARK: the gate scalar chain, the gated value, and norm_conv
 
     /// g0 [B,S,HC,1] (the reduced dot), value [B,S,H], cscale [W], divisor and
