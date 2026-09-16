@@ -101,7 +101,7 @@ enum TrackPrefillIndirect {
         let activated = gateUpKernel(
             [x, g.w, g.s, g.b, u.w, u.s, u.b, sortedIDs, tokenRows, tiles],
             template: [("T", x.dtype), ("N", 640), ("K", 2560), ("SILU", true)],
-            grid: (10 * 32, maxT * 2, 2),
+            grid: ((640 / gateUpBlockN) * 32, maxT * 2, 2),
             threadGroup: (32, 2, 2),
             outputShapes: [[rows, 1, 640]], outputDTypes: [.bfloat16])[0]
         return (activated, sortedIDs, inverse, tiles)
@@ -129,16 +129,21 @@ enum TrackPrefillIndirect {
     }
 
     static let sourceGU = #"""
-        alignas(16) threadgroup T Ws0[64 * 72];
-        alignas(16) threadgroup T Ws1[64 * 72];
-        alignas(16) threadgroup T As[32 * 72];
-        track_prefill_indirect_gu<T, 32, 4, 32, 64, 64, 2, 2, true, SILU, N>(
+        alignas(16) threadgroup T Ws0[128 * 40];
+        alignas(16) threadgroup T Ws1[128 * 40];
+        alignas(16) threadgroup T As[32 * 40];
+        track_prefill_indirect_gu<T, 32, 4, 32, 128, 32, 2, 2, true, SILU, N>(
             x, w0, scales0, biases0, w1, scales1, biases1, indices, token_rows, tiles,
             y0, y1, N, K, Ws0, Ws1, As, threadgroup_position_in_grid,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
         """#
 
     static let downBlockN = 128
+
+    /// Gate/up weight-block width, the `BN` the fused kernel is instantiated
+    /// at. N = 640, so 128 gives five column tiles where 64 gave ten; the
+    /// activation staging is re-read once per column tile.
+    static let gateUpBlockN = 128
 
     static let sourceDown = #"""
         alignas(16) threadgroup T Ws[128 * 40];
