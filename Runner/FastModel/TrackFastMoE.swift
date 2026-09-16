@@ -1306,6 +1306,134 @@ extension TrackFastMoEKernels {
             result1[row] = simd_sum(result1[row]);
           }
         }
+        // Software-pipelined dual: the next k-block's raw operands (both
+        // weight streams' packs, scales, biases, and the activations) are
+        // fetched while the current block's qdots run. Same arithmetic as
+        // qmv_fast_reg_dual: identical nibble masks, identical x scaling,
+        // identical s*accum + sum*b per row, identical simd_sum.
+        template <typename T, int group_size, int bits, int rows>
+        METAL_FUNC void qmv_fast_reg_dual_pf(
+            const device uint32_t* w0,
+            const device T* scales0,
+            const device T* biases0,
+            const device uint32_t* w1,
+            const device T* scales1,
+            const device T* biases1,
+            const device T* x,
+            const int in_vec_size,
+            const int out_row,
+            uint simd_lid,
+            thread float (&result0)[rows],
+            thread float (&result1)[rows]) {
+          constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+          constexpr int pack_factor = get_pack_factor<bits, 32>();
+          constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+          constexpr int values_per_thread = pack_factor * packs_per_thread;
+          constexpr int block_size = values_per_thread * SIMD_SIZE;
+          constexpr int scale_step_per_thread = group_size / values_per_thread;
+          static_assert(bits == 4 && packs_per_thread == 2, "pipelined path: 4-bit");
+          const device uint8_t* ws0 = (const device uint8_t*)w0;
+          const device uint8_t* ws1 = (const device uint8_t*)w1;
+          typedef float U;
+          thread U x_thread[values_per_thread];
+          for (int row = 0; row < rows; row++) {
+            result0[row] = 0;
+            result1[row] = 0;
+          }
+          const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+          const int in_vec_size_g = in_vec_size / group_size;
+          ws0 += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+          ws1 += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+          scales0 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          scales1 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          biases0 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          biases1 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          x += simd_lid * values_per_thread;
+          // Prefetched raw operands of the NEXT block: the two 32-bit packs of
+          // each row of each weight stream, the scale and bias of each row of
+          // each stream, and the activations.
+          uint32_t pk0[rows][2], pk1[rows][2];
+          T sc0[rows], bi0[rows], sc1[rows], bi1[rows];
+          T xr[values_per_thread];
+          auto fetch = [&](const device uint8_t* wsb0, const device T* scb0, const device T* bib0,
+                           const device uint8_t* wsb1, const device T* scb1, const device T* bib1,
+                           const device T* xb) {
+            for (int row = 0; row < rows; row++) {
+              const device uint32_t* wl0 = (const device uint32_t*)(wsb0 + row * in_vec_size_w);
+              pk0[row][0] = wl0[0]; pk0[row][1] = wl0[1];
+              sc0[row] = scb0[row * in_vec_size_g];
+              bi0[row] = bib0[row * in_vec_size_g];
+              const device uint32_t* wl1 = (const device uint32_t*)(wsb1 + row * in_vec_size_w);
+              pk1[row][0] = wl1[0]; pk1[row][1] = wl1[1];
+              sc1[row] = scb1[row * in_vec_size_g];
+              bi1[row] = bib1[row * in_vec_size_g];
+            }
+            for (int i = 0; i < values_per_thread; i++) { xr[i] = xb[i]; }
+          };
+          fetch(ws0, scales0, biases0, ws1, scales1, biases1, x);
+          for (int k = 0; k < in_vec_size; k += block_size) {
+            // hold this block's operands, then issue the next block's loads
+            uint32_t cpk0[rows][2], cpk1[rows][2];
+            T csc0[rows], cbi0[rows], csc1[rows], cbi1[rows];
+            T cx[values_per_thread];
+            for (int row = 0; row < rows; row++) {
+              cpk0[row][0] = pk0[row][0]; cpk0[row][1] = pk0[row][1];
+              csc0[row] = sc0[row]; cbi0[row] = bi0[row];
+              cpk1[row][0] = pk1[row][0]; cpk1[row][1] = pk1[row][1];
+              csc1[row] = sc1[row]; cbi1[row] = bi1[row];
+            }
+            for (int i = 0; i < values_per_thread; i++) { cx[i] = xr[i]; }
+            ws0 += block_size * bytes_per_pack / pack_factor;
+            ws1 += block_size * bytes_per_pack / pack_factor;
+            scales0 += block_size / group_size;
+            scales1 += block_size / group_size;
+            biases0 += block_size / group_size;
+            biases1 += block_size / group_size;
+            x += block_size;
+            if (k + block_size < in_vec_size) {
+              fetch(ws0, scales0, biases0, ws1, scales1, biases1, x);
+            }
+            // load_vector on the held activations (same expression as load_vector)
+            U sum = 0;
+            for (int i = 0; i < values_per_thread; i += 4) {
+              sum += cx[i] + cx[i + 1] + cx[i + 2] + cx[i + 3];
+              x_thread[i] = cx[i];
+              x_thread[i + 1] = cx[i + 1] / 16.0f;
+              x_thread[i + 2] = cx[i + 2] / 256.0f;
+              x_thread[i + 3] = cx[i + 3] / 4096.0f;
+            }
+            for (int row = 0; row < rows; row++) {
+              U s0 = csc0[row];
+              U b0 = cbi0[row];
+              U accum0 = 0;
+              const thread uint16_t* wsh0 = (const thread uint16_t*)&cpk0[row][0];
+              for (int i = 0; i < (values_per_thread / 4); i++) {
+                accum0 +=
+                    (x_thread[4 * i] * (wsh0[i] & 0x000f) +
+                     x_thread[4 * i + 1] * (wsh0[i] & 0x00f0) +
+                     x_thread[4 * i + 2] * (wsh0[i] & 0x0f00) +
+                     x_thread[4 * i + 3] * (wsh0[i] & 0xf000));
+              }
+              result0[row] += s0 * accum0 + sum * b0;
+              U s1 = csc1[row];
+              U b1 = cbi1[row];
+              U accum1 = 0;
+              const thread uint16_t* wsh1 = (const thread uint16_t*)&cpk1[row][0];
+              for (int i = 0; i < (values_per_thread / 4); i++) {
+                accum1 +=
+                    (x_thread[4 * i] * (wsh1[i] & 0x000f) +
+                     x_thread[4 * i + 1] * (wsh1[i] & 0x00f0) +
+                     x_thread[4 * i + 2] * (wsh1[i] & 0x0f00) +
+                     x_thread[4 * i + 3] * (wsh1[i] & 0xf000));
+              }
+              result1[row] += s1 * accum1 + sum * b1;
+            }
+          }
+          for (int row = 0; row < rows; row++) {
+            result0[row] = simd_sum(result0[row]);
+            result1[row] = simd_sum(result1[row]);
+          }
+        }
         """#
 
     static let gateUpReuseSource = """
@@ -1325,7 +1453,7 @@ extension TrackFastMoEKernels {
         const int out_row = (int)threadgroup_position_in_grid.y * (2 * RPS)
             + (int)simdgroup_index_in_threadgroup * RPS;
         float g[RPS], u[RPS];
-        qmv_fast_reg_dual<T, GS, BITS, RPS>(
+        qmv_fast_reg_dual_pf<T, GS, BITS, RPS>(
             gw, gs, gb, uw, us, ub, x + (size_t)r * (size_t)KD,
             KD, out_row, thread_index_in_simdgroup, g, u);
         if (thread_index_in_simdgroup == 0) {
