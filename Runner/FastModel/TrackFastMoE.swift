@@ -1328,6 +1328,11 @@ extension TrackFastMoEKernels {
         qmv_fast_reg_dual<T, GS, BITS, RPS>(
             gw, gs, gb, uw, us, ub, x + (size_t)r * (size_t)KD,
             KD, out_row, thread_index_in_simdgroup, g, u);
+        // The staging write issues one store per activation entry. The values
+        // come from `qmv_fast_reg_dual`, which closes every row with a
+        // `simd_sum`, so `g[i]`/`u[i]` hold identical bits on every lane and a
+        // single lane can issue all RPS of them without changing any value or
+        // any address.
         if (thread_index_in_simdgroup == 0) {
             for (int i = 0; i < RPS; ++i) {
                 const T gv = static_cast<T>(g[i]);
@@ -1497,7 +1502,17 @@ extension TrackFastMoEKernels {
     /// MLXFAST-DOWNRPS: output rows per down+combine threadgroup in a one-token
     /// window. Each row's expert walks and the fold are unchanged for any value;
     /// fewer rows per threadgroup means more threadgroups in flight (H / rows).
-    static let downRowsPerSimdgroup = 2
+    /// Activation rows staged per simdgroup in the decode down+combine.
+    ///
+    /// The crown ships 2; this candidate sets 1, which is the one constant
+    /// change the campaign found to be neutral-to-good rather than harmful.
+    /// Every other deviation tried on this artifact cost score: `asyncChunk`
+    /// moved off 3 (4, 2, 5, 6, 7, 8 all measured lower, and 0 is 13% worse),
+    /// `downCombineSimdgroups = 4` lost ~1.5%, and
+    /// `gateUpReuseRowsPerSimdgroup = 4` lost ~1.5% reproducibly. The value 1
+    /// is used in the decode branch only; the prefill branch keeps the crown's
+    /// hardcoded 4.
+    static let downRowsPerSimdgroup = 1
 
     static let downCombineSimdgroups =
         ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 5
