@@ -794,7 +794,7 @@ extension TrackFastMoEKernels {
         // the walk on simdgroup 1 instead so the two latency chains overlap; the
         // walk's arithmetic, tie rule and the softmax below are untouched. Wide
         // windows keep the gate on both simdgroups and the walk on simdgroup 0.
-        constexpr uint SEL_SG = (VPT == 1) ? 1u : 0u;
+        constexpr uint SEL_SG = (VPT == 1 && HAS_GATE) ? 1u : 0u;
         if (sg == SEL_SG) {
         const device float* lr = logits + (size_t)row * (size_t)E;
         // each lane owns E_PER experts: e = lane + 32 * j (strided so a tie at
@@ -871,7 +871,7 @@ extension TrackFastMoEKernels {
     /// logits f32 [..., E] -> (idx uint32 [..., K], w f32 [..., K])
     /// Also the shared-expert gate logit per row: x [..., KD] x sharedGate [1, KD] -> gate [...] (pre-sigmoid).
     static func route(logits: MLXArray, x: MLXArray, sharedGate: TrackQuantWeight?, topK: Int)
-        -> (idx: MLXArray, w: MLXArray, gate: MLXArray)
+        -> (idx: MLXArray, w: MLXArray, gate: MLXArray, prepared: MLXArray?)
     {
         precondition(logits.dtype == .float32 && (sharedGate == nil || (sharedGate!.rows == 1 && sharedGate!.bits == 4)))
         let g = sharedGate
@@ -879,13 +879,17 @@ extension TrackFastMoEKernels {
         let lead = Array(logits.shape.dropLast())
         let R = lead.reduce(1, *)
         precondition(topK <= 32 && topK <= E && R >= 1 && (g == nil || R <= 8) && KD % 256 == 0)
-        let simdgroups = g == nil ? 1 : 2
-        let outs = (R == 1 ? routeKernel1 : routeKernel)(
+        let prepare = prepareActivationEnabled && R == 1 && KD == 2560
+            && x.dtype == .bfloat16 && StreamOrDevice.default.stream === Stream.gpu
+        let simdgroups = prepare || g != nil ? 2 : 1
+        let kernel = prepare ? preparedRouteKernel : (R == 1 ? routeKernel1 : routeKernel)
+        let outs = kernel(
             [logits.reshaped(R, E), x.reshaped(R, KD), g?.weight ?? x, g?.scales ?? x, g?.biases ?? x],
             template: [("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32), ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R), ("HAS_GATE", g != nil)],
             grid: (32, R * simdgroups, 1), threadGroup: (32, simdgroups, 1),
-            outputShapes: [[R, topK], [R, topK], [R]], outputDTypes: [.uint32, .float32, x.dtype])
-        return (outs[0].reshaped(lead + [topK]), outs[1].reshaped(lead + [topK]), outs[2].reshaped(lead))
+            outputShapes: prepare ? [[R, topK], [R, topK], [R], [KD + KD / 16]] : [[R, topK], [R, topK], [R]],
+            outputDTypes: prepare ? [.uint32, .float32, x.dtype, .float32] : [.uint32, .float32, x.dtype])
+        return (outs[0].reshaped(lead + [topK]), outs[1].reshaped(lead + [topK]), outs[2].reshaped(lead), prepare ? outs[3] : nil)
     }
 }
 
@@ -1348,7 +1352,8 @@ extension TrackFastMoEKernels {
     /// Routed slots [0, BR) then the shared expert for the S tokens: act [BR + S, N].
     static func gateUpAct(
         wg: MLXArray, sg: MLXArray, bg: MLXArray, wu: MLXArray, su: MLXArray, bu: MLXArray,
-        shared: TrackQuantWeight, x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int
+        shared: TrackQuantWeight, x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int,
+        prepared: MLXArray? = nil
     ) -> MLXArray {
         let BR = idx.dim(0), S = x.dim(0), KD = x.dim(1), N = wg.dim(1)
         precondition(N % 8 == 0 && bits == 4 && idx.dtype == .uint32 && xrow.dtype == .uint32)
@@ -1358,8 +1363,12 @@ extension TrackFastMoEKernels {
             && groupSize == 32 && bits == 4 && shared.mode == .affine
         {
             let rows = gateUpReuseRowsPerSimdgroup
-            return gateUpReuseKernel(
-                [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
+            let usePrepared = prepared?.dtype == .float32 && prepared?.size == KD + KD / 16
+            let kernel = usePrepared ? preparedGateKernel : gateUpReuseKernel
+            var inputs = [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow]
+            if usePrepared { inputs.append(prepared!) }
+            return kernel(
+                inputs,
                 template: [
                     ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N),
                     ("KD", KD), ("BR", BR), ("RPS", rows),

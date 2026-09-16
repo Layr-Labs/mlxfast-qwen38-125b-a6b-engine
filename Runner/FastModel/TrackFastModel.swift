@@ -229,6 +229,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     private let injectNormReplay: @Sendable ([MLXArray]) -> [MLXArray]
     let rotaryDims: Int
     let rotary: Qwen4ExpRotary
+    let rotaryAtlas: TrackRotaryAtlas?
     let indexerBudget: Int
     let attentionScale: Float
 
@@ -265,7 +266,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             return [result.stream, result.normed]
         }
         self.rotaryDims = cfg.rotaryDimensions
-        self.rotary = Qwen4ExpRotary(dimensions: cfg.rotaryDimensions, base: cfg.ropeTheta)
+        let rotary = Qwen4ExpRotary(dimensions: cfg.rotaryDimensions, base: cfg.ropeTheta)
+        self.rotary = rotary
+        self.rotaryAtlas = TrackRotaryAtlas(rotary: rotary, positionLimit: cfg.indexerBudget)
         self.indexerBudget = cfg.indexerBudget
         self.attentionScale = Foundation.pow(Float(cfg.headDim), -0.5)
         precondition(
@@ -607,19 +610,32 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
+        if let tables = rotaryAtlas?.tables(offset: offset, count: count, dtype: dtype) { return tables }
         let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
         return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
     }
 
     private func attnForward(
         _ a: TrackAttn, _ x: MLXArray, cache: Qwen4ExpCBv2LayerCache,
-        rope: (cos: MLXArray, sin: MLXArray)
+        rope: (cos: MLXArray, sin: MLXArray), lastQueryOnly: Bool = false
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let heads = cfg.attentionHeads, kvHeads = cfg.kvHeads, d = cfg.headDim
+        let terminalQuery = lastQueryOnly && B == 1 && S > 8
+            && cache.kind.attention == .full && !cache.kind.isBidirectional && !cache.kind.hasSinks
+            && cache.kind.sharesKVWithLayer == nil
+            && ProcessInfo.processInfo.environment["MLX_TRACK_PREFILL_LAST_QUERY"] != "0"
+        let terminalProjection = terminalQuery && TrackP12Prefill.eligible(x)
+            && a.qkv.parts.count == 4
+            && ProcessInfo.processInfo.environment["MLX_TRACK_PREFILL_LAST_PROJECTION"] != "0"
         let splitInputs: [MLXArray]?
         let qkv: MLXArray
-        if TrackP12Prefill.splitAttention && TrackP12Prefill.eligible(x)
+        if terminalProjection {
+            let parts = [a.qkv.parts[0].apply(x[0..., (-1)..., 0...]),
+                         a.qkv.parts[1].apply(x), a.qkv.parts[2].apply(x)]
+            splitInputs = parts
+            qkv = parts[0]
+        } else if TrackP12Prefill.splitAttention && TrackP12Prefill.eligible(x)
             && a.qkv.parts.count == 4
         {
             let parts = a.qkv.parts.prefix(3).map { $0.apply(x) }
@@ -644,7 +660,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         _ = cache.updateIndexerTape(keys: idxKeys)
 
         let prep: (q: MLXArray, k: MLXArray, v: MLXArray)
-        if let parts = splitInputs {
+        if terminalProjection, let parts = splitInputs {
+            prep = TrackTerminalAttention.prepare(
+                qGate: parts[0], k: parts[1], v: parts[2],
+                qNorm: a.qNormW, kNorm: a.kNormW, cos: rope.cos, sin: rope.sin,
+                heads: heads, kvHeads: kvHeads, headDim: d, rotaryDims: rotaryDims, eps: eps)
+        } else if let parts = splitInputs {
             prep = TrackP12Prefill.attnPrepSplit(
                 qGate: parts[0], k: parts[1], v: parts[2],
                 qNorm: a.qNormW, kNorm: a.kNormW, cos: rope.cos, sin: rope.sin,
@@ -654,10 +675,28 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 qkv: qkv, qNorm: a.qNormW, kNorm: a.kNormW, cos: rope.cos, sin: rope.sin,
                 heads: heads, kvHeads: kvHeads, headDim: d, rotaryDims: rotaryDims, eps: eps)
         }
-        let att = cache.updateAndAttend(
-            queries: prep.q, keys: prep.k, values: prep.v,
-            scale: attentionScale, sinks: nil, keepMask: nil)  // [B,HQ,S,D]
-        let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: a.qWidth)
+        let att: MLXArray
+        let gateQKV: MLXArray
+        if terminalQuery {
+            // The public contiguous-cache capability writes the COMPLETE KV
+            // window but attends only the final query. Share the actual row
+            // objects; keep the QSA tape on its original owning wrapper.
+            let terminalCache = CBv2LayerCache(
+                layerIndex: cache.layerIndex, kind: cache.kind, rows: cache.rows)
+            att = terminalCache.updateAndAttendLastQuery(
+                queries: prep.q[0..., 0..., (-1)..., 0...], keys: prep.k, values: prep.v,
+                scale: attentionScale, sinks: nil)
+            // Rebind those same rows so the wrapper's position array advances
+            // by the full KV length. Live row identities preserve its tape.
+            cache.setRows(cache.rows)
+            gateQKV = qkv[0..., (-1)..., 0...]
+        } else {
+            att = cache.updateAndAttend(
+                queries: prep.q, keys: prep.k, values: prep.v,
+                scale: attentionScale, sinks: nil, keepMask: nil)
+            gateQKV = qkv
+        }
+        let out = TrackFastKernels.attnGate(att: att, qkv: gateQKV, gateOffset: a.qWidth)
         return a.out.apply(out)
     }
 
@@ -676,7 +715,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: inputs[5], sg: inputs[6], bg: inputs[7],
                 wu: inputs[8], su: inputs[9], bu: inputs[10], shared: sharedGU,
-                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits)
+                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits,
+                prepared: inputs.count > 20 ? inputs[20] : nil)
             let sharedDown = TrackQuantWeight(
                 weight: inputs[17], scales: inputs[18], biases: inputs[19],
                 groupSize: downGroupSize, bits: downBits, mode: downMode)
@@ -750,12 +790,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     guq.weight, guq.scales, guq.biases!,
                     m.expertDown.w, m.expertDown.s, m.expertDown.b,
                     dq.weight, dq.scales, dq.biases!,
-                ])[0].reshaped(1, S, H)
+                ] + (r.prepared.map { [$0] } ?? []))[0].reshaped(1, S, H)
             }
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
                 wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b, shared: guq,
-                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits)
+                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits,
+                prepared: r.prepared)
             return TrackFastMoEKernels.downCombine(
                 wd: m.expertDown.w, sd: m.expertDown.s, bd: m.expertDown.b, sharedDown: dq,
                 act: act, idx: flatIdx, w: weights.reshaped(S * K), gate: gate, topK: K,
@@ -944,7 +985,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// next mixer consumes it.
     func fastStreams(
         _ ids: MLXArray, inputEmbeddings: MLXArray?, caches: [Qwen4ExpCBv2LayerCache],
-        recurrentState: [CBv2RecurrentStateEvaluation], offset: Int, capture: Bool
+        recurrentState: [CBv2RecurrentStateEvaluation], offset: Int, capture: Bool, lastRowOnly: Bool = false
     ) -> (mixed: MLXArray, multi: MLXArray) {
         precondition(recurrentState.count == 1)
         let evaluation = recurrentState[0]
@@ -995,12 +1036,28 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             } else {
                 let cache = caches[attentionIndex]
                 attentionIndex += 1
-                attended = attnForward(layer.attn!, input, cache: cache, rope: ropeTab)
+                attended = attnForward(
+                    layer.attn!, input, cache: cache, rope: ropeTab,
+                    lastQueryOnly: lastRowOnly && !capture && layer.index == layers.count - 1
+                        && Self.debugTaps == nil
+                        && ProcessInfo.processInfo.environment["MLX_TRACK_PREFILL_TAIL"] != "0")
             }
             Self.debugTaps?.append(("L\(layer.index).attn.out", attended))
             if profiling { TrackFastProfile.tick(layer.gdn != nil ? "gdn" : "attn", &profT, [attended]) }
+            // All attention KV and recurrent updates above consume the full
+            // window. Only a prefill API requesting the final row may narrow
+            // the stateless final MLP and final hyper-connection mixer.
+            // Full-logit and MTP capture calls never request this specialization.
+            let terminal = lastRowOnly && !capture && ids.dim(1) > 8
+                && layer.index == layers.count - 1 && Self.debugTaps == nil
+                && ProcessInfo.processInfo.environment["MLX_TRACK_PREFILL_TAIL"] != "0"
+            if terminal {
+                stream = stream[0..., (-1)..., 0...]
+                injectW = injectW[0..., (-1)..., 0...]
+            }
+            let mlpAttention = terminal ? attended[0..., (-1)..., 0...] : attended
             (stream, normed) = injectNorm(
-                residual: stream, out: attended, inject: injectW,
+                residual: stream, out: mlpAttention, inject: injectW,
                 scale: layer.mlpHC.normScaleQ,
                 tile: false)
             if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
@@ -1063,7 +1120,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     func streamsOrDelegate(
         _ tokens: MLXArray, inputEmbeddings: MLXArray?, caches: [KVCache],
-        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, capture: Bool
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, capture: Bool, lastRowOnly: Bool = false
     ) -> (mixed: MLXArray, multi: MLXArray)? {
         guard let plan = fastPlan(
             tokens: tokens, caches: caches, recurrentState: recurrentState,
@@ -1071,7 +1128,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         else { return nil }
         return fastStreams(
             tokens, inputEmbeddings: inputEmbeddings, caches: plan.caches,
-            recurrentState: recurrentState, offset: plan.offset, capture: capture)
+            recurrentState: recurrentState, offset: plan.offset, capture: capture, lastRowOnly: lastRowOnly)
     }
 }
 
@@ -1177,7 +1234,7 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentLanguageModelPrefillForwardable {
         }
         if let s = streamsOrDelegate(
             inputs, inputEmbeddings: inputEmbedding, caches: cache ?? [],
-            recurrentState: recurrentState, positionIds: positionIds, capture: false)
+            recurrentState: recurrentState, positionIds: positionIds, capture: false, lastRowOnly: true)
         {
             switch requirement {
             case .evaluationOnly:
