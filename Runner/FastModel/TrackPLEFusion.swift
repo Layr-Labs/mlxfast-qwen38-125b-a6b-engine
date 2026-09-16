@@ -9,6 +9,7 @@ enum TrackPLEFusion {
     static let header = """
         // MLXFAST-PLEFUSE2: rms_single_row's four adjacent elements per thread,
         // 640 threads / 20 SIMD groups. Reuse its existing 128-byte buffer.
+        template <bool REUSE>
         METAL_FUNC float ple_row_sum(
             float acc, threadgroup float* partials, uint lane, uint sg) {
             acc = simd_sum(acc);
@@ -16,8 +17,8 @@ enum TrackPLEFusion {
             if (lane == 0) { partials[sg] = acc; }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             acc = simd_sum(partials[lane]);
-            // All readers finish before the next reduction reuses the buffer.
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // Only a later reduction can overwrite this scratch.
+            if constexpr (REUSE) { threadgroup_barrier(mem_flags::mem_threadgroup); }
             return acc;
         }
         """
@@ -43,14 +44,14 @@ enum TrackPLEFusion {
             acc += k * k;
         }
         const float ik = metal::precise::rsqrt(
-            ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
+            ple_row_sum<true>(acc, partials, lane, sg) / float(H) + eps);
         acc = 0.0f;
         for (uint i = 0; i < 4; ++i) {
             float q = float(query[base + i]);
             acc += q * q;
         }
         const float iq = metal::precise::rsqrt(
-            ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
+            ple_row_sum<true>(acc, partials, lane, sg) / float(H) + eps);
 
         // Keep the original dtype boundaries: round RMS before scale, round
         // product before sum, and use row_reduce_looped's four-element fold.
@@ -89,7 +90,7 @@ enum TrackPLEFusion {
             acc += v * v;
         }
         const float iv = metal::precise::rsqrt(
-            ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
+            ple_row_sum<false>(acc, partials, lane, sg) / float(H) + eps);
         for (uint i = 0; i < 4; ++i) {
             InT n = InT(float(g[i]) * iv);
             full[9 * W + base + i] = n * convScale[base + i];
