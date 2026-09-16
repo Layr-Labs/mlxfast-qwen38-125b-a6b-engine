@@ -76,10 +76,16 @@ enum TrackPrefillSort {
         outputNames: ["sorted_ids", "token_rows", "inverse"],
         source: scatterSource, header: "", ensureRowContiguous: true)
 
+    private static let flashScatterKernel = MLXFast.metalKernel(
+        name: "track_flash_counting_scatter_tiles_v3",
+        inputNames: ["ids", "counts"],
+        outputNames: ["sorted_ids", "token_rows", "inverse", "tiles"],
+        source: flashScatterSource, ensureRowContiguous: true)
+
     /// `(sortedIDs, tokenRows, inverse)` for `flatIDs` over `E` expert ids,
     /// or nil when the shape is outside the supported window.
     static func apply(flatIDs: MLXArray, experts E: Int, topK: Int)
-        -> (sortedIDs: MLXArray, tokenRows: MLXArray, inverse: MLXArray)?
+        -> (sortedIDs: MLXArray, tokenRows: MLXArray, inverse: MLXArray, tiles: MLXArray?)?
     {
         let R = flatIDs.size
         guard enabled, flatIDs.ndim == 1, flatIDs.dtype == .uint32, topK > 0,
@@ -92,13 +98,24 @@ enum TrackPrefillSort {
             template: [("E", E), ("BLK", blockSize), ("R", R)],
             grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
             outputShapes: [[nBlocks * E]], outputDTypes: [.uint32])[0]
+        if E == 512 {
+            let maxT = TrackPrefillIndirect.maxTiles(rows: R, experts: E)
+            let outs = flashScatterKernel(
+                [flatIDs, counts],
+                template: [("E", E), ("BLK", blockSize), ("R", R), ("NB", nBlocks),
+                           ("TOPK", topK), ("BM", TrackPrefillIndirect.tileRows), ("MAXT", maxT)],
+                grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
+                outputShapes: [[R], [R], [R], [2 * maxT]],
+                outputDTypes: [.uint32, .uint32, .uint32, .uint32])
+            return (outs[0], outs[1], outs[2], outs[3])
+        }
         let outs = scatterKernel(
             [flatIDs, counts],
             template: [("E", E), ("BLK", blockSize), ("R", R), ("NB", nBlocks), ("TOPK", topK)],
             grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
             outputShapes: [[R], [R], [R]],
             outputDTypes: [.uint32, .uint32, .uint32])
-        return (outs[0], outs[1], outs[2])
+        return (outs[0], outs[1], outs[2], nil)
     }
 
     // MARK: - kernels
@@ -159,6 +176,88 @@ enum TrackPrefillSort {
     ///
     /// is the stable rank of the assignment among its equals, i.e. exactly the
     /// position `argSort` gives it.
+    /// Flash has exactly 512 buckets. Two consecutive buckets per thread
+    /// make their exclusive scan one SIMD scan plus eight SIMD totals.
+    /// Each assignment's stable predecessor count uses nine ballot planes.
+    /// Only block zero emits expert-aligned tiles, directly from bucket counts.
+    static let flashScatterSource = #"""
+        static_assert(E == 512 && BLK == 256, "Flash routing geometry");
+        threadgroup uint before[512], bases[512];
+        threadgroup uint group_totals[8];
+        threadgroup uint planes[8][9];
+        const uint blk = threadgroup_position_in_grid.x;
+        const uint t = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint gi = blk * 256 + t;
+        const uint v = ids[gi];
+        for (uint bit = 0; bit < 9; ++bit) {
+            const uint mask = uint((simd_vote::vote_t)simd_ballot((v & (1u << bit)) != 0));
+            if (lane == 0) { planes[sg][bit] = mask; }
+        }
+        uint n[2], prior[2];
+        for (uint j = 0; j < 2; ++j) {
+            const uint expert = 2 * t + j;
+            n[j] = 0; prior[j] = 0;
+            for (uint block = 0; block < NB; ++block) {
+                const uint c = counts[block * 512 + expert];
+                n[j] += c;
+                if (block < blk) { prior[j] += c; }
+            }
+            before[expert] = prior[j];
+        }
+        const uint pair_total = n[0] + n[1];
+        const uint local_base = simd_prefix_exclusive_sum(pair_total);
+        if (lane == 31) { group_totals[sg] = local_base + pair_total; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint base = local_base;
+        for (uint group = 0; group < sg; ++group) { base += group_totals[group]; }
+        bases[2 * t] = base;
+        bases[2 * t + 1] = base + n[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint rank = 0;
+        for (uint group = 0; group <= sg; ++group) {
+            uint matches = 0xffffffffu;
+            for (uint bit = 0; bit < 9; ++bit) {
+                const uint mask = planes[group][bit];
+                matches &= (v & (1u << bit)) ? mask : ~mask;
+            }
+            if (group == sg) { matches &= (1u << lane) - 1u; }
+            rank += popcount(matches);
+        }
+        const uint dest = bases[v] + before[v] + rank;
+        sorted_ids[dest] = v;
+        token_rows[dest] = gi / TOPK;
+        inverse[gi] = dest;
+        if (blk == 0) {
+            // Protect group_totals until every lane finished the first scan.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint tiles0 = (n[0] + BM - 1) / BM;
+            const uint tiles1 = (n[1] + BM - 1) / BM;
+            const uint pair_tiles = tiles0 + tiles1;
+            const uint local_slot = simd_prefix_exclusive_sum(pair_tiles);
+            if (lane == 31) { group_totals[sg] = local_slot + pair_tiles; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint slot = local_slot, total = 0;
+            for (uint group = 0; group < 8; ++group) {
+                if (group < sg) { slot += group_totals[group]; }
+                total += group_totals[group];
+            }
+            for (uint j = 0; j < 2; ++j) {
+                const uint start = base + (j == 0 ? 0u : n[0]);
+                const uint count = j == 0 ? tiles0 : tiles1;
+                for (uint tile = 0; tile < count; ++tile) {
+                    tiles[2 * (slot + tile)] = start + tile * BM;
+                    tiles[2 * (slot + tile) + 1] = start + min(n[j], (tile + 1) * BM);
+                }
+                slot += count;
+            }
+            for (uint tile = total + t; tile < MAXT; tile += 256) {
+                tiles[2 * tile] = 0; tiles[2 * tile + 1] = 0;
+            }
+        }
+        """#
+
     static let scatterSource = #"""
         threadgroup uint vals[BLK];
         threadgroup uint tot[E];

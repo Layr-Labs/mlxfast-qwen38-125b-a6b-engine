@@ -1628,7 +1628,9 @@ template <
     int WN,
     bool transpose,
     bool SILU,
-    int NS>
+    int NS,
+    bool DENSE = false,
+    int ROWS = 0>
 METAL_FUNC void track_prefill_indirect_gu(
     const device T* x,
     const device uint32_t* w0,
@@ -1696,12 +1698,12 @@ METAL_FUNC void track_prefill_indirect_gu(
   // run's start exactly as the former in-kernel scan aligned them; padding
   // slots are [0, 0) and exit at once. Uniform over the whole threadgroup.
   {
-    const int tile_begin = int(tiles[2 * tid.y]);
-    const int tile_end = int(tiles[2 * tid.y + 1]);
+    const int tile_begin = DENSE ? int(tid.y) * BM : int(tiles[2 * tid.y]);
+    const int tile_end = DENSE ? min(tile_begin + BM, ROWS) : int(tiles[2 * tid.y + 1]);
     if (tile_begin == tile_end) {
       return;
     }
-    const uint32_t index = indices[tile_begin];
+    const uint32_t index = DENSE ? 0u : indices[tile_begin];
     const short tile_m = short(tile_end - tile_begin);
     const short sgp_sm = short(min(int(SM), max(0, int(tile_m) - int(tm))));
     const bool sg_active = sgp_sm > 0;
@@ -1752,7 +1754,7 @@ METAL_FUNC void track_prefill_indirect_gu(
     const bool a_live = a_row < tile_m;
     const device T* xb = x;
     if (a_live) {
-      xb += size_t(token_rows[tile_begin + a_row]) * K + a_col;
+      xb += size_t(DENSE ? uint(tile_begin + a_row) : token_rows[tile_begin + a_row]) * K + a_col;
     }
 
     thread loader_w_t loader_w0(

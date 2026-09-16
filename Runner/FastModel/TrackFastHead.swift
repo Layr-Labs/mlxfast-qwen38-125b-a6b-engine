@@ -20,6 +20,7 @@ final class TrackFastHead {
     let eps: Float
     let rotaryDims: Int
     let rotary: Qwen4ExpRotary
+    let rotaryAtlas: TrackRotaryAtlas?
     let attentionScale: Float
     let indexerBudget: Int
 
@@ -43,7 +44,9 @@ final class TrackFastHead {
         self.hidden = cfg.hiddenSize
         self.eps = cfg.rmsNormEps
         self.rotaryDims = cfg.rotaryDimensions
-        self.rotary = Qwen4ExpRotary(dimensions: cfg.rotaryDimensions, base: cfg.ropeTheta)
+        let rotary = Qwen4ExpRotary(dimensions: cfg.rotaryDimensions, base: cfg.ropeTheta)
+        self.rotary = rotary
+        self.rotaryAtlas = TrackRotaryAtlas(rotary: rotary, positionLimit: cfg.indexerBudget)
         self.attentionScale = Foundation.pow(Float(cfg.headDim), -0.5)
         self.indexerBudget = cfg.indexerBudget
         precondition(cfg.rmsNormWeightOffset == 0)
@@ -107,10 +110,19 @@ final class TrackFastHead {
         let offset = cache.offset
 
         // embed -> pre-norm -> fc ; multi -> pre-norm (one statistic) -> per-stream fc ; add
-        let embedded = fcEmbedding.apply(
-            MLXFast.rmsNorm(embedTokens(ids), weight: preNormEmbeddingW, eps: eps))
-        var stream = MLXFast.rmsNorm(multi, weight: preNormHiddenW, eps: eps)
-            .reshaped(B, S, hcCount, hidden)
+        let tokenEmbedding = embedTokens(ids)
+        let embeddingNorm: MLXArray, hiddenNorm: MLXArray
+        if let dual = TrackDualRMS.apply(
+            embedding: tokenEmbedding, multi: multi,
+            embeddingWeight: preNormEmbeddingW, hiddenWeight: preNormHiddenW, eps: eps)
+        {
+            (embeddingNorm, hiddenNorm) = (dual.embedding, dual.multi)
+        } else {
+            embeddingNorm = MLXFast.rmsNorm(tokenEmbedding, weight: preNormEmbeddingW, eps: eps)
+            hiddenNorm = MLXFast.rmsNorm(multi, weight: preNormHiddenW, eps: eps)
+        }
+        let embedded = fcEmbedding.apply(embeddingNorm)
+        var stream = hiddenNorm.reshaped(B, S, hcCount, hidden)
         stream = fcHidden.apply(stream)
         stream = embedded[.ellipsis, .newAxis, 0...] + stream
         let hyper = stream.reshaped(B, S, hcCount * hidden)
@@ -139,10 +151,16 @@ final class TrackFastHead {
         let qkv = attn.qkv.apply(x)
         let idxStart = 2 * attn.qWidth + 2 * attn.kvWidth
         _ = cache.updateIndexer(keys: qkv[.ellipsis, idxStart ..< (idxStart + cfg.indexerHeadDim)])
-        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: S))
+        let rope: (cos: MLXArray, sin: MLXArray)
+        if let cached = rotaryAtlas?.tables(offset: offset, count: S, dtype: x.dtype) {
+            rope = cached
+        } else {
+            let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: S))
+            rope = (c.asType(x.dtype).reshaped(S, rotaryDims), s.asType(x.dtype).reshaped(S, rotaryDims))
+        }
         let prep = TrackFastKernels.attnPrep(
             qkv: qkv, qNorm: attn.qNormW, kNorm: attn.kNormW,
-            cos: c.asType(x.dtype).reshaped(S, rotaryDims), sin: s.asType(x.dtype).reshaped(S, rotaryDims),
+            cos: rope.cos, sin: rope.sin,
             heads: heads, kvHeads: kvHeads, headDim: d, rotaryDims: rotaryDims, eps: eps)
         let mask = makeAttentionMask(n: S, cache: cache)
         let att = attentionWithCacheUpdate(

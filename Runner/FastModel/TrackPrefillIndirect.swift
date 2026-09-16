@@ -83,11 +83,13 @@ enum TrackPrefillIndirect {
         let sortedIDs: MLXArray
         let inverse: MLXArray
         let tokenRows: MLXArray
+        var producerTiles: MLXArray? = nil
         if let c = TrackPrefillSort.apply(
             flatIDs: flatIDs, experts: g.w.dim(0), topK: indices.dim(2))
         {
             // The identical permutation in two launches (see TrackPrefillSort).
             (sortedIDs, tokenRows, inverse) = (c.sortedIDs, c.tokenRows, c.inverse)
+            producerTiles = c.tiles
         } else {
             let order = argSort(flatIDs)
             inverse = argSort(order)
@@ -96,7 +98,7 @@ enum TrackPrefillIndirect {
         }
         let rows = indices.size
         let experts = g.w.dim(0)
-        let tiles = tileTable(sortedIDs: sortedIDs, rows: rows, experts: experts)
+        let tiles = producerTiles ?? tileTable(sortedIDs: sortedIDs, rows: rows, experts: experts)
         let maxT = maxTiles(rows: rows, experts: experts)
         let activated = gateUpKernel(
             [x, g.w, g.s, g.b, u.w, u.s, u.b, sortedIDs, tokenRows, tiles],
@@ -126,6 +128,46 @@ enum TrackPrefillIndirect {
             grid: ((2560 / downBlockN) * 32, maxT * 2, 2),
             threadGroup: (32, 2, 2),
             outputShapes: [[rows, 1, 2560]], outputDTypes: [.bfloat16])[0]
+    }
+
+    /// Dense shared expert specialization of the routed affine-4 GEMM.
+    /// Direct token rows and one expert remove all sort/tile metadata. The
+    /// existing BF16 projection rounding and SiLU product stay in the epilogue.
+    private static let sharedKernel = MLXFast.metalKernel(
+        name: "track_prefill_shared_gate_up_v3",
+        inputNames: ["x", "w0", "scales0", "biases0", "w1", "scales1", "biases1"],
+        outputNames: ["y"], source: """
+            alignas(16) threadgroup T Ws0[64 * 72];
+            alignas(16) threadgroup T Ws1[64 * 72];
+            alignas(16) threadgroup T As[32 * 72];
+            track_prefill_indirect_gu<T, 32, 4, 32, 64, 64, 2, 2, true, true, 640, true, M>(
+                x, w0, scales0, biases0, w1, scales1, biases1, w0, w0, w0,
+                y, y, 640, 2560, Ws0, Ws1, As, threadgroup_position_in_grid,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+            """, header: metalHeader, ensureRowContiguous: true)
+
+    static func sharedActivation(_ m: TrackMoE, x: MLXArray) -> MLXArray? {
+        guard enabled, supportsNAX, StreamOrDevice.default.stream === Stream.gpu,
+            x.ndim == 3, x.dim(0) == 1, x.dim(1) >= 256, x.dim(1) <= 1024,
+            x.dim(2) == 2560, x.dtype == .bfloat16,
+            m.sharedGateUp.parts.count == 2,
+            case .quant(let g) = m.sharedGateUp.parts[0],
+            case .quant(let u) = m.sharedGateUp.parts[1],
+            g.mode == .affine, u.mode == .affine,
+            g.groupSize == 32, u.groupSize == 32, g.bits == 4, u.bits == 4,
+            g.weight.shape == [640, 320], u.weight.shape == g.weight.shape,
+            g.scales.shape == [640, 80], u.scales.shape == g.scales.shape,
+            g.scales.dtype == .bfloat16, u.scales.dtype == .bfloat16,
+            let gb = g.biases, let ub = u.biases,
+            gb.shape == g.scales.shape, ub.shape == u.scales.shape,
+            gb.dtype == .bfloat16, ub.dtype == .bfloat16
+        else { return nil }
+        let rows = x.dim(1)
+        return sharedKernel(
+            [x, g.weight, g.scales, gb, u.weight, u.scales, ub],
+            template: [("T", x.dtype), ("M", rows)],
+            grid: (10 * 32, ((rows + 31) / 32) * 2, 2), threadGroup: (32, 2, 2),
+            outputShapes: [[1, rows, 640]], outputDTypes: [.bfloat16])[0]
     }
 
     static let sourceGU = #"""
