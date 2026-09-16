@@ -39,6 +39,13 @@ enum TrackPleContextMirror {
     nonisolated(unsafe) private(set) static var nextOffset: Int? = nil
     nonisolated(unsafe) private(set) static var stateLayerIndex: Int? = nil
     nonisolated(unsafe) private(set) static var contextLength: Int? = nil
+    // MLXFAST-MIRRORCAP: a captured window's history is kept whole, so the
+    // context the *next* window needs is a slice of it -- `stageCaptured`
+    // stores exactly `history[s+1 ..< s+1+contextLength]` per row, which is
+    // the same slice for every accept count. `baseOffset` is the attention
+    // offset of `history[0]` (offset - contextLength at store time).
+    nonisolated(unsafe) private(set) static var history: [Int64]? = nil
+    nonisolated(unsafe) private(set) static var baseOffset: Int? = nil
     nonisolated(unsafe) private(set) static var dirty = true
 
     static func matches(offset: Int, layer: Int, length: Int) -> Bool {
@@ -50,11 +57,39 @@ enum TrackPleContextMirror {
         nextOffset == offset && stateLayerIndex == layer && contextLength == length
     }
 
+    /// The context for a window starting at `offset`, from either the stored
+    /// tail (non-captured store) or a slice of the captured history. Returns
+    /// nil when the fence does not match or the slice is out of range.
+    static func contextAt(offset: Int, layer: Int, length: Int) -> [Int64]? {
+        guard !dirty, stateLayerIndex == layer, contextLength == length else { return nil }
+        if nextOffset == offset, let context { return context }
+        guard let history, let baseOffset else { return nil }
+        let start = offset - length - baseOffset
+        guard start >= 0, start + length <= history.count else { return nil }
+        return Array(history[start ..< start + length])
+    }
+
     static func store(
         _ context: [Int64], nextOffset: Int, stateLayerIndex: Int, contextLength: Int
     ) {
         self.context = context
         self.nextOffset = nextOffset
+        self.stateLayerIndex = stateLayerIndex
+        self.contextLength = contextLength
+        self.history = nil
+        self.baseOffset = nil
+        dirty = false
+    }
+
+    /// Captured-window store: keep the whole history so any accept count's
+    /// continuation context is servable, and drop the tail-only context.
+    static func storeCaptured(
+        history: [Int64], baseOffset: Int, stateLayerIndex: Int, contextLength: Int
+    ) {
+        self.context = nil
+        self.nextOffset = nil
+        self.history = history
+        self.baseOffset = baseOffset
         self.stateLayerIndex = stateLayerIndex
         self.contextLength = contextLength
         dirty = false
@@ -65,6 +100,8 @@ enum TrackPleContextMirror {
         nextOffset = nil
         stateLayerIndex = nil
         contextLength = nil
+        history = nil
+        baseOffset = nil
         dirty = true
     }
 }
@@ -892,10 +929,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
             let ctx: [Int64]
-            if !capture,
-                TrackPleContextMirror.matches(
-                    offset: offset, layer: p.stateLayerIndex, length: contextLength),
-                let mirrored = TrackPleContextMirror.context
+            if let mirrored = TrackPleContextMirror.contextAt(
+                offset: offset, layer: p.stateLayerIndex, length: contextLength)
             {
                 ctx = mirrored
             } else {
@@ -908,7 +943,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             let history = ctx + toks
             if capture {
-                TrackPleContextMirror.invalidate()
+                // The next window's context is a slice of this history for
+                // every accept count, so keep it whole instead of dropping
+                // the mirror on the floor.
+                TrackPleContextMirror.storeCaptured(
+                    history: history, baseOffset: offset - contextLength,
+                    stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
             } else {
                 TrackPleContextMirror.store(
                     Array(history.suffix(contextLength)), nextOffset: offset + S,
@@ -959,9 +999,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 let contextStack: MLXArray
                 if let h = hostHistory {
                     // Row s = the context after consuming window token s.
-                    var flat: [Int32] = []
+                    var flat = [Int32]()
                     flat.reserveCapacity(S * contextLength)
-                    for s in 0 ..< S { flat.append(contentsOf: h[(s + 1) ..< (s + 1 + contextLength)].map(Int32.init)) }
+                    for s in 0 ..< S {
+                        for j in 0 ..< contextLength { flat.append(Int32(h[s + 1 + j])) }
+                    }
                     contextStack = MLXArray(flat).reshaped(S, contextLength)
                 } else {
                     let history = concatenated([devicePrevious(), ids], axis: 1)
@@ -1144,7 +1186,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         _ tokens: MLXArray, inputEmbeddings: MLXArray?, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, capture: Bool
     ) -> (mixed: MLXArray, multi: MLXArray)? {
-        if capture { TrackPleContextMirror.invalidate() }
+        // The mirror is fenced by (offset, layer, length) and now serves
+        // captured windows too, so it must survive a captured forward.
         guard let plan = fastPlan(
             tokens: tokens, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds)
