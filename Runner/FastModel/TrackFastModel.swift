@@ -890,22 +890,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
+            let mirrored = !capture
+                && TrackPleContextMirror.matches(
+                    offset: offset, layer: p.stateLayerIndex, length: contextLength)
+                ? TrackPleContextMirror.context : nil
+            let rawPrev = mirrored == nil ? state?.ssm : nil
+            // One drain covers the fed token and the staged context together;
+            // a mirror hit leaves the staged state untouched, as before.
+            if let rawPrev { eval(ids, rawPrev) } else { eval(ids) }
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
-            let ctx: [Int64]
-            if !capture,
-                TrackPleContextMirror.matches(
-                    offset: offset, layer: p.stateLayerIndex, length: contextLength),
-                let mirrored = TrackPleContextMirror.context
-            {
-                ctx = mirrored
-            } else {
-                let rawPrev = state?.ssm
-                ctx = rawPrev.map {
-                    $0.dtype == .int32
-                        ? $0.asArray(Int32.self).map(Int64.init)
-                        : $0.asType(.int64).asArray(Int64.self)
-                } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
-            }
+            let ctx: [Int64] = mirrored ?? rawPrev.map {
+                $0.dtype == .int32
+                    ? $0.asArray(Int32.self).map(Int64.init)
+                    : $0.asType(.int64).asArray(Int64.self)
+            } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
             let history = ctx + toks
             if capture {
                 TrackPleContextMirror.invalidate()
@@ -942,7 +940,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
-            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
+            let divisor = TrackFastKernels.scalar(Foundation.sqrt(Float(hidden)), dtype: dot.dtype)
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
             let gn = TrackFastPLEKernels.gated(
                 g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
