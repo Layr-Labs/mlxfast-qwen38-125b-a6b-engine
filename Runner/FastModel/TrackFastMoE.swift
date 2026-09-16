@@ -241,13 +241,41 @@ inline U qdot(
   }
 
   else if (bits == 4) {
-    const device uint16_t* ws = (const device uint16_t*)w;
-    for (int i = 0; i < (values_per_thread / 4); i++) {
-      accum +=
-          (x_thread[4 * i] * (ws[i] & 0x000f) +
-           x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-           x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-           x_thread[4 * i + 3] * (ws[i] & 0xf000));
+    if constexpr (values_per_thread % 16 == 0) {
+      const device ushort4* wv = (const device ushort4*)w;
+      for (int i = 0; i < (values_per_thread / 16); ++i) {
+        const ushort4 packs = wv[i];
+        const int base = 16 * i;
+        accum +=
+            (x_thread[base] * (packs.x & 0x000f) +
+             x_thread[base + 1] * (packs.x & 0x00f0) +
+             x_thread[base + 2] * (packs.x & 0x0f00) +
+             x_thread[base + 3] * (packs.x & 0xf000));
+        accum +=
+            (x_thread[base + 4] * (packs.y & 0x000f) +
+             x_thread[base + 5] * (packs.y & 0x00f0) +
+             x_thread[base + 6] * (packs.y & 0x0f00) +
+             x_thread[base + 7] * (packs.y & 0xf000));
+        accum +=
+            (x_thread[base + 8] * (packs.z & 0x000f) +
+             x_thread[base + 9] * (packs.z & 0x00f0) +
+             x_thread[base + 10] * (packs.z & 0x0f00) +
+             x_thread[base + 11] * (packs.z & 0xf000));
+        accum +=
+            (x_thread[base + 12] * (packs.w & 0x000f) +
+             x_thread[base + 13] * (packs.w & 0x00f0) +
+             x_thread[base + 14] * (packs.w & 0x0f00) +
+             x_thread[base + 15] * (packs.w & 0xf000));
+      }
+    } else {
+      const device uint16_t* ws = (const device uint16_t*)w;
+      for (int i = 0; i < (values_per_thread / 4); ++i) {
+        accum +=
+            (x_thread[4 * i] * (ws[i] & 0x000f) +
+             x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+             x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+             x_thread[4 * i + 3] * (ws[i] & 0xf000));
+      }
     }
   }
 
