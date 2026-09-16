@@ -326,18 +326,59 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
     ) throws -> TrackQwen4ExpMTPModule {
         let head = TrackQwen4ExpMTPModule(configuration, layerCount: loaded.layerCount)
 
-        // The geometry the served head carries. Read off the loaded head, so
-        // the default is the checkpoint's own.
+        // The geometry the served head carries. The checkpoint's own group
+        // size and mode are kept; the bit width is raised to 8 so the head's
+        // draft logits sit closer to the dense projection's and the verifier
+        // accepts more of its proposals per step.
         var geometry: [String: (groupSize: Int, bits: Int, mode: QuantizationMode)] = [:]
         for (path, module) in loaded.leafModules().flattened() {
             guard let quantized = module as? Quantized else { continue }
             geometry[path] = (quantized.groupSize, quantized.bits, quantized.mode)
         }
-        quantize(model: head) { path, _ in geometry[path] }
+        quantize(model: head) { path, _ in
+            geometry[path].map { ($0.groupSize, max($0.bits, 8), $0.mode) }
+        }
+
+        // Re-encode every quantized projection at the served geometry: the
+        // checkpoint's packed tensors are dequantized back to full precision
+        // and quantized again at the raised bit width, in memory, on load.
+        // Tensors the checkpoint did not quantize pass through unchanged.
+        let flat = loaded.parameters().flattened()
+        var byKey = [String: MLXArray](minimumCapacity: flat.count)
+        for (key, value) in flat { byKey[key] = value }
+
+        var served: [(String, MLXArray)] = []
+        served.reserveCapacity(flat.count)
+        var consumed = Set<String>()
+        var eager: [MLXArray] = []
+        for (path, checkpoint) in geometry {
+            guard let w = byKey["\(path).weight"], let s = byKey["\(path).scales"]
+            else { continue }
+            let dense = dequantized(
+                w, scales: s, biases: byKey["\(path).biases"],
+                groupSize: checkpoint.groupSize, bits: checkpoint.bits,
+                mode: checkpoint.mode)
+            let rq = quantized(
+                dense, groupSize: checkpoint.groupSize, bits: max(checkpoint.bits, 8),
+                mode: checkpoint.mode)
+            served.append(("\(path).weight", rq.wq))
+            served.append(("\(path).scales", rq.scales))
+            if let biases = rq.biases {
+                served.append(("\(path).biases", biases))
+                eager.append(biases)
+            }
+            eager.append(rq.wq)
+            eager.append(rq.scales)
+            consumed.formUnion(["\(path).weight", "\(path).scales", "\(path).biases"])
+        }
+        for (key, value) in flat where !consumed.contains(key) {
+            served.append((key, value))
+        }
+        for array in eager { array.eval() }
 
         // Verified in full: a head that took only part of the checkpoint's
         // tensors would still draft, and would draft something else.
-        try head.update(parameters: loaded.parameters(), verify: .all)
+        try head.update(parameters: .unflattened(served), verify: .all)
         return head
     }
 
