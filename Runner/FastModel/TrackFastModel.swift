@@ -254,6 +254,7 @@ struct TrackLayer {
     let attn: TrackAttn?
     let moe: TrackMoE
     let moePairReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
+    let moePacketReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let mlpReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let ple: TrackPLE?
 }
@@ -264,6 +265,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     let base: Qwen4ExpModel
     let cfg: Qwen4ExpTextConfiguration
+
+    /// MLXFAST-TAPEDEFER: indexer keys accumulated while the fast path owns the
+    /// row. `updateIndexerTape` concatenates the whole tape on every call, and
+    /// nothing in the fast path reads the result -- the indexer only selects
+    /// blocks past the budget, which is exactly where `fastPlan` hands the row
+    /// back. The keys are therefore held here, in order, and folded into the
+    /// cache's tape in one concatenation at the moment the wrapped model takes
+    /// over. Bounded by the same `indexerBudget` the fast path already honours.
+    private var pendingIndexerTape: [ObjectIdentifier: (row: ObjectIdentifier, keys: [MLXArray])] = [:]
     let embedTokens: Embedding
     let layers: [TrackLayer]
     let finalMixer: TrackHC
@@ -515,6 +525,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return TrackLayer(
             index: index, attnHC: attnHC, mlpHC: mlpHC, gdn: gdn, attn: attn, moe: moe,
             moePairReplay: makeMoEPairReplay(moe),
+            moePacketReplay: makeMoEPairReplay(moe, packet: true),
             mlpReplay: TrackFastMLPReplay.make(hc: mlpHC, moe: moe,
                 hcCount: cfg.hcCount, hidden: cfg.hiddenSize, eps: cfg.rmsNormEps), ple: ple)
     }
@@ -687,7 +698,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } else {
             idxKeys = a.indexerFull.apply(x)[.ellipsis, a.indexerQWidth...]
         }
-        _ = cache.updateIndexerTape(keys: idxKeys)
+        if let rowID = cache.rows.first.map(ObjectIdentifier.init) {
+            let key = ObjectIdentifier(cache)
+            // A row that left the batch keeps no accumulation: its object
+            // identity can be reused, exactly as the cache drops its own tape
+            // in `setRows`.
+            if var held = pendingIndexerTape[key], held.row == rowID {
+                held.keys.append(idxKeys)
+                pendingIndexerTape[key] = held
+            } else {
+                pendingIndexerTape[key] = (row: rowID, keys: [idxKeys])
+            }
+        } else {
+            _ = cache.updateIndexerTape(keys: idxKeys)
+        }
 
         let prep: (q: MLXArray, k: MLXArray, v: MLXArray)
         if let parts = splitInputs {
@@ -708,7 +732,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     }
 
     /// Replay only the two opaque expert launches; routing and all current arrays stay live.
-    static func makeMoEPairReplay(_ m: TrackMoE) -> (@Sendable ([MLXArray]) -> [MLXArray])? {
+    static func makeMoEPairReplay(_ m: TrackMoE, packet: Bool = false) -> (@Sendable ([MLXArray]) -> [MLXArray])? {
         guard let fused = m.sharedGateUp.fused, case .quant(let guq) = fused,
             case .quant(let dq) = m.sharedDown, guq.biases != nil, dq.biases != nil
         else { return nil }
@@ -719,10 +743,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let sharedGU = TrackQuantWeight(
                 weight: inputs[11], scales: inputs[12], biases: inputs[13],
                 groupSize: guGroupSize, bits: guBits, mode: guMode)
-            let act = TrackFastMoEKernels.gateUpAct(
-                wg: inputs[5], sg: inputs[6], bg: inputs[7],
-                wu: inputs[8], su: inputs[9], bu: inputs[10], shared: sharedGU,
-                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits)
+            let act: MLXArray
+            if packet {
+                act = TrackFastGateUpPacket.apply(
+                    g: (inputs[5], inputs[6], inputs[7]), u: (inputs[8], inputs[9], inputs[10]),
+                    shared: sharedGU, packet: inputs[0], ids: inputs[1], xrow: inputs[4])
+            } else {
+                act = TrackFastMoEKernels.gateUpAct(
+                    wg: inputs[5], sg: inputs[6], bg: inputs[7],
+                    wu: inputs[8], su: inputs[9], bu: inputs[10], shared: sharedGU,
+                    x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits)
+            }
             let sharedDown = TrackQuantWeight(
                 weight: inputs[17], scales: inputs[18], biases: inputs[19],
                 groupSize: downGroupSize, bits: downBits, mode: downMode)
@@ -737,7 +768,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// (uploading it per step was one host copy per layer).
     nonisolated(unsafe) private static var xrowTables: [Int: MLXArray] = [:]
     private static let xrowLock = NSLock()
+    nonisolated(unsafe) private static let singleTokenTop10XRows: MLXArray = {
+        let t = MLXArray(Array(repeating: UInt32(0), count: 10))
+        eval(t)
+        return t
+    }()
     static func xrowTable(S: Int, K: Int) -> MLXArray {
+        if S == 1 && K == 10 { return singleTokenTop10XRows }
         xrowLock.lock(); defer { xrowLock.unlock() }
         if let t = xrowTables[S * 1024 + K] { return t }
         let t = MLXArray((0 ..< (S * K)).map { UInt32($0 / K) })
@@ -748,7 +785,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     static func moeForwardShared(
         _ m: TrackMoE, _ x: MLXArray, inputF32: MLXArray? = nil,
-        replay: (@Sendable ([MLXArray]) -> [MLXArray])?
+        replay: (@Sendable ([MLXArray]) -> [MLXArray])?,
+        packetReplay: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
     ) -> MLXArray {
         let prof = TrackFastProfile.prefill != nil && x.dim(1) >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
@@ -781,6 +819,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // gate|up + SwiGLU for the routed and the shared expert, down + combine.
             let S = x.dim(1), K = m.topK, H = x.dim(2)
             let x2 = x.reshaped(S, H)
+            if let out = TrackFastGateUpPacket.moe(
+                m, x: x2, logits: logits.reshaped(S, -1), sharedGU: guq, sharedDown: dq,
+                replay: packetReplay)
+            {
+                return out.reshaped(1, S, H)
+            }
             let r = TrackFastMoEKernels.route(
                 logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, topK: K)
             let (idx, weights) = (r.idx, r.w)
@@ -931,7 +975,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let fused = TrackPLEFusion.forward(
                 p, embedded: embedded, stream: stream, convState: convState, eps: eps)
         {
-            (full, output) = fused
+            // Same add as before, relocated so every path returns the summed
+            // stream (the S>=2 conv folds it into its epilogue instead).
+            (full, output) = (fused.0, fused.1 + stream)
         } else {
             let keyFlat = p.keyProj.apply(embedded)
             let value = p.valueProj.apply(embedded)
@@ -942,7 +988,14 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
-            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
+            // MLXFAST-DIVCACHE: `sqrt(hidden)` is a constant and both spellings
+            // round identically into the activation dtype (checked at hidden =
+            // 2560/1024/4096/640/320: bit-for-bit equal), so the cached scalar
+            // serves it. `TrackFastKernels.scalar` exists for exactly this --
+            // building one per call is a host allocation and a cast launch --
+            // and the `floor` on the next line already uses it.
+            let divisor = TrackFastKernels.scalar(
+                Foundation.sqrt(Float(hidden)), dtype: dot.dtype)
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
             let gn = TrackFastPLEKernels.gated(
                 g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
@@ -950,7 +1003,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let gated = gn.gated
             full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
             output = TrackFastPLEKernels.conv(
-                full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
+                full: full, convW: p.convW2, gated: gated, dilation: p.dilation,
+                residual: stream)
         }
         do {
             if capture {
@@ -1020,6 +1074,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // A fully injected hyper-stream can continue through a layer block.
         // Normal token/embedding entry points retain the initial tiling.
         var tile = !inputIsMultiStream
+        // MLXFAST-DISHOIST: the dispatch schedule is read from three static
+        // variables on every layer iteration; they cannot change inside the
+        // loop, so read them once. Same schedule, same hits, same enqueues.
+        let dispatchChunk = Self.asyncChunk
+        let dispatchFirst = Self.asyncFirst > 0 ? Self.asyncFirst : dispatchChunk
+        let dispatchSecond = Self.asyncSecond > dispatchFirst ? Self.asyncSecond : dispatchFirst
         var pendingOut: MLXArray? = nil
         var pendingInject: MLXArray? = nil
         var attentionIndex = 0
@@ -1038,8 +1098,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     scale: layer.attnHC.normScaleQ,
                     tile: tile)
                 stream =
-                    stream
-                    + pleForward(
+                    pleForward(
                         ple, stream: stream, ids: ids, evaluation: evaluation,
                         offset: offset, capture: capture)
                 (stream, normed) = injectNorm(
@@ -1088,7 +1147,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
                 Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
                 pendingOut = Self.moeForwardShared(
-                    layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay)
+                    layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay,
+                    packetReplay: layer.moePacketReplay)
                 if profiling { TrackFastProfile.tick("moe", &profT, [pendingOut!]) }
                 Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
             }
@@ -1096,11 +1156,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             residual = stream
             // Dispatch the graph so far: the GPU starts on these layers while the
             // CPU keeps building the rest (the build is otherwise GPU-idle time).
-            if Self.asyncChunk > 0 {
+            if dispatchChunk > 0 {
                 let n = layer.index + 1
-                let first = Self.asyncFirst > 0 ? Self.asyncFirst : Self.asyncChunk
-                let second = Self.asyncSecond > first ? Self.asyncSecond : first
-                if n == first || n == second || (n > second && (n - second) % Self.asyncChunk == 0) { asyncEval(stream) }
+                if n == dispatchFirst || n == dispatchSecond
+                    || (n > dispatchSecond && (n - dispatchSecond) % dispatchChunk == 0)
+                { asyncEval(stream) }
             }
         }
         let (multi, finalNormed) = injectNorm(
@@ -1108,10 +1168,45 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             scale: finalMixer.normScaleQ,
             tile: false)
         let mixed = hcMix(finalMixer, normed: finalNormed).input
+        // MLXFAST-TAILFLUSH: the loop's dispatch schedule lands its last flush
+        // on layer 47 -- with `asyncChunk` 3 and `asyncFirst` 2 the hits are
+        // ... 41, 44, 47 -- so layer 48, the final `injectNorm` above and this
+        // final `hcMix`, plus the head and the sampler the caller builds on top
+        // of `mixed`, are all still unenqueued at this return. On the pure
+        // decode path the engine launches the NEXT step feeding this step's
+        // still-lazy sampled token and only finalizes afterwards, so nothing
+        // enqueues that tail until something reads the token -- and the read
+        // then waits on all of it. Enqueue it here instead.
+        //
+        // `asyncEval` does not block and computes nothing new: the same arrays
+        // are returned, with the same contents, in the same order.
+        asyncEval(mixed, multi)
         return (mixed, multi)
     }
 
     // MARK: routing
+
+    /// MLXFAST-TAPEDEFER: fold the accumulated keys into each layer cache's
+    /// tape, in order, and stop accumulating. `updateIndexerTape` truncates the
+    /// existing tape to the row's pre-update `absoluteOffset` before appending,
+    /// so the accumulated run is trimmed to the committed length here for the
+    /// same reason: a rolled-back step must not leave its keys in the tape.
+    private func flushIndexerTapes(_ caches: [KVCache]) {
+        guard !pendingIndexerTape.isEmpty else { return }
+        for c in caches {
+            guard let typed = c as? Qwen4ExpCBv2LayerCache else { continue }
+            guard let held = pendingIndexerTape.removeValue(forKey: ObjectIdentifier(typed)),
+                !held.keys.isEmpty, let row = typed.rows.first,
+                ObjectIdentifier(row) == held.row
+            else { continue }
+            let pending = held.keys
+            var all = pending.count == 1 ? pending[0] : concatenated(pending, axis: 1)
+            let committed = row.absoluteOffset
+            if all.dim(1) > committed { all = all[0..., ..<committed, 0...] }
+            _ = typed.updateIndexerTape(keys: all)
+        }
+        pendingIndexerTape.removeAll()
+    }
 
     private func typedCaches(_ caches: [KVCache]) -> [Qwen4ExpCBv2LayerCache]? {
         var out: [Qwen4ExpCBv2LayerCache] = []
@@ -1150,6 +1245,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             positionIds: positionIds)
         else {
             TrackPleContextMirror.invalidate()
+            flushIndexerTapes(caches)
             return nil
         }
         return fastStreams(

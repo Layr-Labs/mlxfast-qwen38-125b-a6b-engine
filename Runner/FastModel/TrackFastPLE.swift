@@ -99,8 +99,8 @@ enum TrackFastPLEKernels {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         kacc = simd_sum(ksums[lane]);
         qacc = simd_sum(qsums[lane]);
-        const float kinv = metal::precise::rsqrt(kacc / (float)H + eps);
-        const float qinv = metal::precise::rsqrt(qacc / (float)H + eps);
+        const float kinv = metal::precise::rsqrt(kacc / (float)H + as_type<float>((uint)EPS_BITS));
+        const float qinv = metal::precise::rsqrt(qacc / (float)H + as_type<float>((uint)EPS_BITS));
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
             const InT kn = static_cast<InT>(kx[i] * kinv) * kscale[hc * H + d];
@@ -111,7 +111,7 @@ enum TrackFastPLEKernels {
 
     nonisolated(unsafe) static let prodKernel = MLXFast.metalKernel(
         name: "track_ple_prod",
-        inputNames: ["keyFlat", "stream", "kscale", "qscale", "eps"],
+        inputNames: ["keyFlat", "stream", "kscale", "qscale"],
         outputNames: ["prod"],
         source: prodSource, header: header, ensureRowContiguous: true)
 
@@ -122,8 +122,9 @@ enum TrackFastPLEKernels {
         let B = keyFlat.dim(0), S = keyFlat.dim(1), W = hcCount * hidden
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && keyFlat.dim(2) == W)
         return prodKernel(
-            [keyFlat, stream, kScale, qScale, MLXArray(eps)],
-            template: [("InT", keyFlat.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+            [keyFlat, stream, kScale, qScale],
+            template: [("InT", keyFlat.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+                       ("EPS_BITS", Int(eps.bitPattern))],
             grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
             outputShapes: [[B, S, W]], outputDTypes: [keyFlat.dtype])[0]
     }
@@ -163,7 +164,7 @@ enum TrackFastPLEKernels {
         if (lane == 0) { sums[sg] = acc; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         acc = simd_sum(sums[lane]);
-        const float inv = metal::precise::rsqrt(acc / (float)H + eps);
+        const float inv = metal::precise::rsqrt(acc / (float)H + as_type<float>((uint)EPS_BITS));
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
             normed[base + d] = static_cast<InT>(gx[i] * inv) * cscale[hc * H + d];
@@ -172,7 +173,7 @@ enum TrackFastPLEKernels {
 
     nonisolated(unsafe) static let gatedKernel = MLXFast.metalKernel(
         name: "track_ple_gated",
-        inputNames: ["g0", "value", "cscale", "divisor", "floorv", "eps"],
+        inputNames: ["g0", "value", "cscale", "divisor", "floorv"],
         outputNames: ["gated", "normed"],
         source: gatedSource,
         header: header + """
@@ -188,8 +189,9 @@ enum TrackFastPLEKernels {
         let B = value.dim(0), S = value.dim(1), W = hcCount * hidden
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && value.dim(2) == hidden)
         let outs = gatedKernel(
-            [g0, value, cScale, divisor, floor, MLXArray(eps)],
-            template: [("InT", value.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+            [g0, value, cScale, divisor, floor],
+            template: [("InT", value.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+                       ("EPS_BITS", Int(eps.bitPattern))],
             grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
             outputShapes: [[B, S, W], [B, S, W]],
             outputDTypes: [value.dtype, value.dtype])
@@ -213,26 +215,30 @@ enum TrackFastPLEKernels {
                  * static_cast<float>(convw[c * KC + j]);
         }
         const size_t o = ((size_t)b * (size_t)S + (size_t)t) * (size_t)W + c;
-        out[o] = gated[o] + mlx_silu(static_cast<InT>(acc));
+        const InT ple = gated[o] + mlx_silu(static_cast<InT>(acc));
+        // HAS_RES folds the caller's `stream + ple` elementwise add into this
+        // epilogue: same operand order, same single InT add, one less launch.
+        out[o] = HAS_RES ? (residual[o] + ple) : ple;
         """
 
     nonisolated(unsafe) static let convKernel = MLXFast.metalKernel(
         name: "track_ple_conv",
-        inputNames: ["full", "convw", "gated"],
+        inputNames: ["full", "convw", "gated", "residual"],
         outputNames: ["out"],
         source: convSource, header: header, ensureRowContiguous: true)
 
     static func conv(
-        full: MLXArray, convW: MLXArray, gated: MLXArray, dilation: Int
+        full: MLXArray, convW: MLXArray, gated: MLXArray, dilation: Int,
+        residual: MLXArray? = nil
     ) -> MLXArray {
         let B = gated.dim(0), S = gated.dim(1), W = gated.dim(2)
         let kc = convW.dim(1)
         precondition(full.dim(2) == W && full.dim(1) == S + (kc - 1) * dilation)
         return convKernel(
-            [full, convW, gated],
+            [full, convW, gated, residual ?? gated],
             template: [
                 ("InT", gated.dtype), ("W", W), ("S", S), ("KC", kc), ("DIL", dilation),
-                ("NIN", full.dim(1)),
+                ("NIN", full.dim(1)), ("HAS_RES", residual != nil),
             ],
             grid: (W, S, B), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, W]], outputDTypes: [gated.dtype])[0]
