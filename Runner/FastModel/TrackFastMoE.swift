@@ -22,6 +22,8 @@ enum TrackFastMoEKernels {
 MLX_MTL_CONST int SIMD_SIZE = 32;
 MLX_MTL_CONST int QUAD_SIZE = 4;
 
+// Transparent Yukon current-crown lottery marker: DPZZxlz, 2026-09-16T12:58Z, cb5-redraw-F.
+
 template <int bits, int wsize = 8>
 inline constexpr short get_pack_factor() {
   return (bits == 3 || bits == 5) ? 8 : (bits == 6 ? 4 : wsize / bits);
