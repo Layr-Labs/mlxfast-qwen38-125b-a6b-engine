@@ -297,16 +297,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let down = TrackProj(m.trackChild("input_mix_weight_down"))
         let up = TrackProj(m.trackChild("input_mix_weight_up"))
         let decodeUp: TrackQuantWeight?
-        if cfg.hcCount == 4, cfg.hiddenSize % 2 == 0,
+        let upCols = TrackFastMixerKernels.upPackColumns
+        if cfg.hcCount == 4, cfg.hiddenSize % upCols == 0,
             case .quant(let uq) = up, uq.bits == 4, uq.biases != nil,
             uq.rows == cfg.hcCount * cfg.hiddenSize
         {
             var order = [Int32]()
             order.reserveCapacity(uq.rows)
-            for d in stride(from: 0, to: cfg.hiddenSize, by: 2) {
+            for d in stride(from: 0, to: cfg.hiddenSize, by: upCols) {
                 for s in 0 ..< cfg.hcCount {
-                    order.append(Int32(s * cfg.hiddenSize + d))
-                    order.append(Int32(s * cfg.hiddenSize + d + 1))
+                    for c in 0 ..< upCols { order.append(Int32(s * cfg.hiddenSize + d + c)) }
                 }
             }
             let packed = uq.rowsReordered(order)
