@@ -27,6 +27,8 @@ inline constexpr short get_pack_factor() {
   return (bits == 3 || bits == 5) ? 8 : (bits == 6 ? 4 : wsize / bits);
 }
 
+// Transparent Yukon redraw marker: DPZZxlz, 2026-09-16T09:43Z, redraw-B.
+
 template <int bits, int wsize = 8>
 inline constexpr short get_bytes_per_pack() {
   constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
