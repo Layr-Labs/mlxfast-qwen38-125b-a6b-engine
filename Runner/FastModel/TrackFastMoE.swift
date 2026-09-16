@@ -1397,7 +1397,9 @@ extension TrackFastMoEKernels {
         float res[RPS];
         // K % KSG == 0, so the trip count is the constant K / KSG and the loop
         // still unrolls: each simdgroup keeps that many expert walks in flight.
-        for (int kk = 0; kk < K / KSG; ++kk) {
+        // Decode gives the shared expert its own simdgroup. It must not
+        // participate in the routed walk or write beyond prod[K][RPS].
+        for (int kk = 0; kk < K / KSG && sgi < KSG; ++kk) {
             const int k = (int)sgi + kk * KSG;
             const uint z = t * K + k;
             const uint e = idx[z];
@@ -1424,7 +1426,7 @@ extension TrackFastMoEKernels {
         // Shared expert down rows d0..d0+3 for token t: one token routes to `qmv`'s
         // normal branch (K = 640), two to eight to `qmv_wide` (full tiles; a row's
         // walk does not depend on how many vectors share its tile).
-        if (sgi == (KSG > K ? (uint)K : 0u)) {
+        if (sgi == (VPT == 1 ? (uint)KSG : 0u)) {
             const device T* xs = act + (size_t)(BR + t) * (size_t)F;
             if constexpr (VPT == 1) {
                 float rs[RPS];
@@ -1513,10 +1515,13 @@ extension TrackFastMoEKernels {
         precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
         let rps = S == 1 ? downRowsPerSimdgroup : 4
+        // Overlap shared down with the routed walks instead of adding it to
+        // simdgroup zero's critical path. The ordered epilogue is unchanged.
+        let groups = ksg + (S == 1 ? 1 : 0)
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
             template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
-            grid: (32, (H / rps) * ksg, S), threadGroup: (32, ksg, 1),
+            grid: (32, (H / rps) * groups, S), threadGroup: (32, groups, 1),
             outputShapes: [[S, H]], outputDTypes: [act.dtype])[0]
     }
 }
