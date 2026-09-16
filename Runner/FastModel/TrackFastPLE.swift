@@ -222,6 +222,68 @@ enum TrackFastPLEKernels {
         outputNames: ["out"],
         source: convSource, header: header, ensureRowContiguous: true)
 
+    /// Split-input variant: taps read the carried state rows and the new normed
+    /// rows in place, and the kernel emits the next conv state directly, so the
+    /// caller skips the `concatenated` copy entirely. Same tap order, same f32
+    /// accumulation, same rounding as `convSource` — only the row address
+    /// changes (r < NST -> convState[r], else normed[r-NST]). The next state is
+    /// the last NST rows of the virtual [convState ++ normed] window: thread
+    /// (c, t) writes rows t, t+S, ... so every row is covered for any S.
+    /// grid (W, S, B), threadgroup (256, 1, 1)
+    static let convSplitSource = """
+        const uint c = thread_position_in_grid.x;
+        const uint t = thread_position_in_grid.y;
+        const uint b = thread_position_in_grid.z;
+        if (c >= (uint)W) return;
+        constexpr uint NST = (KC - 1) * DIL;
+        const device InT* nb = normed + (size_t)b * (size_t)S * (size_t)W;
+        float acc = 0.0f;
+        for (int j = 0; j < KC; ++j) {
+            const uint r = t + (uint)(j * DIL);
+            const InT v = r < NST
+                ? convState[(size_t)r * (size_t)W + c]
+                : nb[(size_t)(r - NST) * (size_t)W + c];
+            acc += static_cast<float>(v) * static_cast<float>(convw[c * KC + j]);
+        }
+        const size_t o = ((size_t)b * (size_t)S + (size_t)t) * (size_t)W + c;
+        out[o] = gated[o] + mlx_silu(static_cast<InT>(acc));
+        // Next conv state = last NST rows of [convState ++ normed]: row r holds
+        // convState[r + S] while r + S < NST, else normed[r + S - NST]. The
+        // stride-S loop covers all NST rows across the S threads of a column.
+        for (uint r = t; r < NST; r += (uint)S) {
+            nextState[(size_t)r * (size_t)W + c] = (r + (uint)S < NST)
+                ? convState[(size_t)(r + S) * (size_t)W + c]
+                : nb[(size_t)(r + S - NST) * (size_t)W + c];
+        }
+        """
+
+    nonisolated(unsafe) static let convSplitKernel = MLXFast.metalKernel(
+        name: "track_ple_conv_split",
+        inputNames: ["convState", "normed", "convw", "gated"],
+        outputNames: ["out", "nextState"],
+        source: convSplitSource, header: header, ensureRowContiguous: true)
+
+    /// conv without the concat: convState [1, NST, W], normed [B, S, W].
+    /// Returns the conv output and the next conv state [1, NST, W].
+    static func convSplit(
+        convState: MLXArray, normed: MLXArray, convW: MLXArray, gated: MLXArray, dilation: Int
+    ) -> (out: MLXArray, nextState: MLXArray) {
+        let B = gated.dim(0), S = gated.dim(1), W = gated.dim(2)
+        let kc = convW.dim(1)
+        let nst = (kc - 1) * dilation
+        precondition(
+            convState.dim(0) == 1 && convState.dim(1) == nst
+                && convState.dim(2) == W && normed.dim(2) == W)
+        let outs = convSplitKernel(
+            [convState, normed, convW, gated],
+            template: [
+                ("InT", gated.dtype), ("W", W), ("S", S), ("KC", kc), ("DIL", dilation),
+            ],
+            grid: (W, S, B), threadGroup: (256, 1, 1),
+            outputShapes: [[B, S, W], [1, nst, W]], outputDTypes: [gated.dtype, gated.dtype])
+        return (outs[0], outs[1])
+    }
+
     static func conv(
         full: MLXArray, convW: MLXArray, gated: MLXArray, dilation: Int
     ) -> MLXArray {
