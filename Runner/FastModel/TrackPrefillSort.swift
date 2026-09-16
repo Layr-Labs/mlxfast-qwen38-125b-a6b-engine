@@ -199,3 +199,6 @@ enum TrackPrefillSort {
         inverse[gi] = dest;
         """#
 }
+
+// r1: re-fire of i45 (prefill ratio 1.59516 on 2026-09-13). Identical kernel behavior; the
+// comment exists so this artifact is a distinct tree for the submission dedup.
