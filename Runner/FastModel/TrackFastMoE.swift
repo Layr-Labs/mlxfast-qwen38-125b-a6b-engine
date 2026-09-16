@@ -775,17 +775,6 @@ extension TrackFastMoEKernels {
                 if (valid) { gate[row] = static_cast<T>(r[0]); }
             }
         }
-        // MLXFAST-ROUTEREG: the walk's winners come from a simd_max/simd_min
-        // pair, so logit and index are already broadcast across the walk's own
-        // simdgroup. Normalize them there and skip the threadgroup round trip.
-        constexpr bool REGISTER_RESULTS = VPT != 1 || HAS_GATE;
-        constexpr int N_READS = 4;
-        float ld[N_READS];
-        uint selected[N_READS];
-        for (int i = 0; i < N_READS; ++i) {
-            ld[i] = -INFINITY;
-            selected[i] = 0xffffffffu;
-        }
         threadgroup float selv[K];
         threadgroup uint seli[K];
         // MLXFAST-ROUTESG1: for one token the shared-gate GEMV above runs on
@@ -815,25 +804,19 @@ extension TrackFastMoEKernels {
             const float gmax = simd_max(bv);
             const uint cand = (bv == gmax && bj >= 0) ? (uint)(lane + 32 * bj) : 0xffffffffu;
             const uint gidx = simd_min(cand);
-            if constexpr (REGISTER_RESULTS) {
-                for (int i = 0; i < N_READS; ++i) {
-                    if (k == (int)lane * N_READS + i) { ld[i] = gmax; selected[i] = gidx; }
-                }
-            } else if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
+            if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
             if (gidx == (uint)(lane + 32 * bj) && bj >= 0) { taken[bj] = true; }
         }
         }
-        if constexpr (REGISTER_RESULTS) {
-            if (sg != SEL_SG) { return; }
-        } else {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (sg != 0) { return; }
-            for (int i = 0; i < N_READS; i++) {
-                const int p = (int)lane * N_READS + i;
-                ld[i] = (p < K) ? selv[p] : -INFINITY;
-            }
-        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg != 0) { return; }
         // softmax_single_row over the K selected logits (AccT = float)
+        constexpr int N_READS = 4;
+        float ld[N_READS];
+        for (int i = 0; i < N_READS; i++) {
+            const int p = (int)lane * N_READS + i;
+            ld[i] = (p < K) ? selv[p] : -INFINITY;
+        }
         float maxval = -FLT_MAX;
         for (int i = 0; i < N_READS; i++) { maxval = (maxval < ld[i]) ? ld[i] : maxval; }
         maxval = simd_max(maxval);
@@ -849,9 +832,7 @@ extension TrackFastMoEKernels {
             const int p = (int)lane * N_READS + i;
             if (p < K) {
                 w[(size_t)row * K + p] = ld[i] * normalizer;
-                if constexpr (REGISTER_RESULTS) {
-                    idx[(size_t)row * K + p] = selected[i];
-                } else { idx[(size_t)row * K + p] = seli[p]; }
+                idx[(size_t)row * K + p] = seli[p];
             }
         }
         """
@@ -1181,11 +1162,10 @@ extension TrackFastMoEKernels {
                 float g[4], u[4];
                 qmv_fast_reg<T, GS, BITS>(wsh, ssh, bsh, x, KD, out_row, thread_index_in_simdgroup, g);
                 qmv_fast_reg<T, GS, BITS>(wsh + (size_t)N * kw2, ssh + (size_t)N * kg2, bsh + (size_t)N * kg2, x, KD, out_row, thread_index_in_simdgroup, u);
-                // MLXFAST-ACTLANES: g/u are post-simd_sum, identical on every
-                // lane, so each of the four entries can be stored by its own lane.
-                if (thread_index_in_simdgroup < 4) {
-                    const int i = (int)thread_index_in_simdgroup;
-                    act[(size_t)BR * (size_t)N + (size_t)(out_row + i)] = mlx_silu(static_cast<T>(g[i])) * static_cast<T>(u[i]);
+                if (thread_index_in_simdgroup == 0) {
+                    for (int i = 0; i < 4; ++i) {
+                        act[(size_t)BR * (size_t)N + (size_t)(out_row + i)] = mlx_silu(static_cast<T>(g[i])) * static_cast<T>(u[i]);
+                    }
                 }
             } else {
                 const int row = tile * 8 + (int)simdgroup_index_in_threadgroup * 4 + (int)(thread_index_in_simdgroup / 8);
@@ -1215,12 +1195,12 @@ extension TrackFastMoEKernels {
             qmv_reg<T, GS, BITS, (KD % get_pack_factor<BITS, 32>()) == 0>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
             qmv_reg<T, GS, BITS, (KD % get_pack_factor<BITS, 32>()) == 0>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
         }
-        // MLXFAST-ACTLANES: same argument as the shared-expert staging above.
-        if (thread_index_in_simdgroup < 4) {
-            const int i = (int)thread_index_in_simdgroup;
-            const T gv = static_cast<T>(g[i]);
-            const T uv = static_cast<T>(u[i]);
-            act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+        if (thread_index_in_simdgroup == 0) {
+            for (int i = 0; i < 4; ++i) {
+                const T gv = static_cast<T>(g[i]);
+                const T uv = static_cast<T>(u[i]);
+                act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+            }
         }
         """
 
@@ -1406,19 +1386,8 @@ extension TrackFastMoEKernels {
             if (FAST) { qmv_fast_reg<T, GS, BITS, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
             else { qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
             const float wk = w[z];
-            // MLXFAST-STAGELANES: `qmv_reg`/`qmv_fast_reg` close with a
-            // `simd_sum` on every row, so every lane of the simdgroup already
-            // holds the identical `res[RPS]`. The staging write therefore only
-            // needs *a* lane per entry, not lane 0 for all of them; each k slot
-            // is written by the simdgroup that owns it (`k = sgi + kk * KSG`).
-            if constexpr (VPT == 1 && RPS <= 32) {
-                if (lid < RPS) {
-                    prod[k][lid] = static_cast<float>(static_cast<T>(res[lid])) * wk;
-                }
-            } else {
-                if (lid == 0) {
-                    for (int i = 0; i < RPS; ++i) { prod[k][i] = static_cast<float>(static_cast<T>(res[i])) * wk; }
-                }
+            if (lid == 0) {
+                for (int i = 0; i < RPS; ++i) { prod[k][i] = static_cast<float>(static_cast<T>(res[i])) * wk; }
             }
         }
         // Shared expert down rows d0..d0+3 for token t: one token routes to `qmv`'s
@@ -1429,14 +1398,7 @@ extension TrackFastMoEKernels {
             if constexpr (VPT == 1) {
                 float rs[RPS];
                 qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wsd, ssd, bsd, xs, F, d0, lid, rs);
-                // MLXFAST-STAGELANES: same argument as the routed staging above —
-                // `rs` is post-`simd_sum`, so the RPS entries are identical on
-                // every lane and each can be stored by its own lane.
-                if constexpr (RPS <= 32) {
-                    if (lid < RPS) { shvT[lid] = static_cast<float>(static_cast<T>(rs[lid])); }
-                } else {
-                    if (lid == 0) { for (int i = 0; i < RPS; ++i) { shvT[i] = static_cast<float>(static_cast<T>(rs[i])); } }
-                }
+                if (lid == 0) { for (int i = 0; i < RPS; ++i) { shvT[i] = static_cast<float>(static_cast<T>(rs[i])); } }
             } else {
                 float rw[1];
                 qmv_wide_reg_full<T, GS, BITS, 1, 8, false>(wsd, ssd, bsd, xs, F, 1, d0 + (int)(lid / 8), lid, rw);
