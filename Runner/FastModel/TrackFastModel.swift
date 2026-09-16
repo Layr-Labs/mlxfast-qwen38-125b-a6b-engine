@@ -26,6 +26,30 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 
+/// One host mirror of an immutable PLE state created by this runner. Identity
+/// must match the transaction's input: a reset, rollback or captured-prefix
+/// view otherwise falls back to reading the real state. Weak ownership avoids
+/// retaining a recurrent generation beyond the engine's residency accounting.
+final class TrackPLEHostContextCache {
+    private let lock = NSLock()
+    private weak var state: MLXArray?
+    private var tokens: [Int64] = []
+
+    func lookup(_ input: MLXArray?) -> [Int64]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let input, let state, input === state else { return nil }
+        return tokens
+    }
+
+    func remember(_ output: MLXArray, tokens: [Int64]) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.state = output
+        self.tokens = tokens
+    }
+}
+
 // MARK: - Weight helpers
 
 extension Module {
@@ -231,6 +255,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let rotary: Qwen4ExpRotary
     let indexerBudget: Int
     let attentionScale: Float
+    private let pleHostContext = TrackPLEHostContextCache()
 
     /// Debug taps (tests): when set, every layer's output stream and the block
     /// inputs/outputs are appended here.
@@ -845,7 +870,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
             let rawPrev = state?.ssm
-            let ctx: [Int64] = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+            let ctx: [Int64]
+            if let cached = pleHostContext.lookup(rawPrev) {
+                ctx = cached
+            } else {
+                ctx = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+            }
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
             let history = ctx + toks
             let gid = p.embedding.hostRowIds(history: [history], newCount: S)
@@ -916,6 +946,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     modelLayerIndex: p.stateLayerIndex,
                     conv: full[0..., (-p.stateLength)..., 0...],
                     ssm: ssm)
+                if let h = hostHistory {
+                    pleHostContext.remember(ssm, tokens: Array(h.suffix(contextLength)))
+                }
             }
         } catch {
             preconditionFailure("TrackFastModel: PLE stage failed: \(error)")
