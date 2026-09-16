@@ -142,10 +142,20 @@ public final class TrackQwen4ExpInlineMTPAssistant {
         let lastMulti = step.multi[0..., last..., 0...]
         let draft: MLXArray
         if let sl = shortlist {
-            let logits = quantizedMM(
-                lastSample[0..., -1, 0...], sl.weight, scales: sl.scales, biases: sl.biases,
-                transpose: true, groupSize: sl.groupSize, bits: sl.bits)  // [1, NS]
-            draft = take(sl.ids, argMax(logits, axis: -1), axis: 0).asType(.int32)
+            let sample = lastSample[0..., -1, 0...]
+            let selected: MLXArray
+            if let exact = TrackDraftArgmax.apply(
+                x: sample, weight: sl.weight, scales: sl.scales, biases: sl.biases,
+                groupSize: sl.groupSize, bits: sl.bits)
+            {
+                selected = exact
+            } else {
+                let logits = quantizedMM(
+                    sample, sl.weight, scales: sl.scales, biases: sl.biases,
+                    transpose: true, groupSize: sl.groupSize, bits: sl.bits)
+                selected = argMax(logits, axis: -1)
+            }
+            draft = take(sl.ids, selected, axis: 0).asType(.int32)
         } else {
             draft = argMax(target.head(lastSample)[0..., -1, 0...], axis: -1).asType(.int32)
         }

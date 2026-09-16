@@ -471,9 +471,25 @@ extension TrackFastKernels {
         outputNames: ["out"],
         source: attnGateSource, header: exactHeader, ensureRowContiguous: true)
 
+    /// The full SDPA primitive already writes token-major [B,S,H,D]
+    /// storage with a [B,H,S,D] view. Read its real strides and produce the
+    /// projection operand directly, avoiding a head-major materialization.
+    nonisolated(unsafe) static let attnGateStridedKernel = MLXFast.metalKernel(
+        name: "track_attn_gate_strided_pv_v3",
+        inputNames: ["att", "qkv"], outputNames: ["out"],
+        source: attnGateSource
+            .replacingOccurrences(
+                of: "att[((b * HQ + h) * S + s) * D + d]",
+                with: "att[b * att_strides[0] + h * att_strides[1] + s * att_strides[2] + d * att_strides[3]]")
+            .replacingOccurrences(
+                of: "qkv[row * QW + GATE_OFF + j]",
+                with: "qkv[b * qkv_strides[0] + s * qkv_strides[1] + (GATE_OFF + j) * qkv_strides[2]]"),
+        header: exactHeader, ensureRowContiguous: false)
+
     static func attnGate(att: MLXArray, qkv: MLXArray, gateOffset: Int) -> MLXArray {
         let B = att.dim(0), HQ = att.dim(1), S = att.dim(2), D = att.dim(3)
-        return attnGateKernel(
+        let kernel = S > 8 ? attnGateStridedKernel : attnGateKernel
+        return kernel(
             [att, qkv],
             template: [
                 ("InT", att.dtype), ("HQ", HQ), ("D", D), ("S", S), ("QW", qkv.dim(2)),

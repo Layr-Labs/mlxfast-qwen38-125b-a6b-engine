@@ -301,43 +301,49 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         return summary
     }
 
-    /// Rebuild the checkpoint's `mtp.*` head as this repository's own module
-    /// and move the loaded tensors into it.
-    ///
-    /// THIS IS THE HEAD RE-QUANTIZATION SEAM, and it is code, not
-    /// configuration. `geometry` below is the ONE place that decides what
-    /// quantization the served head carries.
-    ///
-    /// The default is the CHECKPOINT'S OWN geometry: every projection the
-    /// loader quantized is quantized here with that projection's group size,
-    /// bit width and mode, and the loaded arrays are then bound unchanged. So
-    /// the served head is bit-exact with the head the pinned fork builds —
-    /// same tensors, same dtypes, same scales and biases — and the default
-    /// path changes nothing a run can measure.
-    ///
-    /// TO RE-QUANTIZE THE HEAD, change the geometry this call selects. A
-    /// participant who wants a different group size, bit width or mode
-    /// dequantizes the loaded projection and quantizes it again here, at this
-    /// call, before the parameters are bound. The head weights are the
-    /// checkpoint's and stay the checkpoint's: this seam re-encodes what the
-    /// checkpoint carries, it does not replace it and it does not ship a head.
+    /// Adopt the pinned checkpoint's native MTP head. Eligible affine 4-bit
+    /// group32 projections are requantized in memory to group64, reducing
+    /// scale/bias metadata at the cost of draft approximation error. Setting
+    /// TRACK_MTP_COMPACT_SCALES=0 retains the loaded head geometry and arrays.
+    /// Target embeddings, output head, and transformer weights are untouched.
     public static func adoptMTPHead(
         _ loaded: Qwen4ExpMTPModule, configuration: Qwen4ExpTextConfiguration
     ) throws -> TrackQwen4ExpMTPModule {
         let head = TrackQwen4ExpMTPModule(configuration, layerCount: loaded.layerCount)
 
-        // The geometry the served head carries. Read off the loaded head, so
-        // the default is the checkpoint's own.
+        // The target representation is frozen. Only this newly adopted,
+        // proposal-only MTP module uses the permitted on-load requantization.
+        // Group64 halves scale/bias entries relative to checkpoint group32;
+        // this is a lossy head re-encoding, NOT lossless target compression.
+        let compactScales = ProcessInfo.processInfo.environment["TRACK_MTP_COMPACT_SCALES"] != "0"
         var geometry: [String: (groupSize: Int, bits: Int, mode: QuantizationMode)] = [:]
+        var parameters = Dictionary(uniqueKeysWithValues: loaded.parameters().flattened())
         for (path, module) in loaded.leafModules().flattened() {
-            guard let quantized = module as? Quantized else { continue }
-            geometry[path] = (quantized.groupSize, quantized.bits, quantized.mode)
+            guard let q = module as? Quantized else { continue }
+            geometry[path] = (q.groupSize, q.bits, q.mode)
+            let prefix = path.isEmpty ? "" : path + "."
+            guard compactScales, q.groupSize == 32, q.bits == 4, q.mode == .affine,
+                let w = parameters[prefix + "weight"],
+                let scales = parameters[prefix + "scales"],
+                let biases = parameters[prefix + "biases"],
+                w.ndim >= 2, w.dim(-1) * 8 % 64 == 0
+            else { continue }
+            let dense = dequantized(
+                w, scales: scales, biases: biases, groupSize: q.groupSize,
+                bits: q.bits, mode: q.mode, dtype: scales.dtype)
+            let packed = quantized(dense, groupSize: 64, bits: 4, mode: .affine)
+            guard let newBiases = packed.biases else {
+                preconditionFailure("Flash MTP affine requantization requires biases")
+            }
+            // Bound transient dense materialization to one projection at load.
+            eval(packed.wq, packed.scales, newBiases)
+            geometry[path] = (64, 4, .affine)
+            parameters[prefix + "weight"] = packed.wq
+            parameters[prefix + "scales"] = packed.scales
+            parameters[prefix + "biases"] = newBiases
         }
         quantize(model: head) { path, _ in geometry[path] }
-
-        // Verified in full: a head that took only part of the checkpoint's
-        // tensors would still draft, and would draft something else.
-        try head.update(parameters: loaded.parameters(), verify: .all)
+        try head.update(parameters: ModuleParameters.unflattened(parameters), verify: .all)
         return head
     }
 
@@ -403,6 +409,23 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
             newCaches: newCaches,
             mtpDrafter: drafter,
             build: build)
+    }
+
+    /// Explicit production entry point for the pinned native adaptive controller.
+    /// Official benchmark builds call makeEngine and retain their fixed depth.
+    /// No override of the verifier, controller observations or measured config.
+    public func makeAdaptiveEngine(_ build: EngineBuild, maximumDepth: Int = 6) throws
+        -> any CBv2Engine
+    {
+        precondition((1 ... TrackQwen4ExpInlineMTPAssistant.maximumDepth).contains(maximumDepth))
+        var adaptive = build
+        adaptive.decoder = .mtp
+        adaptive.schedulerConfig.maxConcurrentRequests = 1
+        adaptive.mtpConfig = CBv2MTPConfig(
+            enabled: true, maxDraftTokens: maximumDepth, maxSpeculativeBatch: 1,
+            fixedDraftTokens: nil, verificationMode: .automatic,
+            maxAutomaticRectangularTokens: 1 + maximumDepth)
+        return try makeEngine(adaptive)
     }
 
     public func makeStepper() throws -> any TeacherForcedStepper {

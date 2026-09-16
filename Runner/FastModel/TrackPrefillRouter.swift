@@ -45,6 +45,48 @@ enum TrackPrefillRouter {
             outputShapes: [[1, rows, 512]], outputDTypes: [.float32])[0]
     }
 
+    /// Fold the two K partitions into each lane's routing registers. This
+    /// removes the intermediate 512-logit write/read and the sum-only launch.
+    /// The addition is deliberately 0 + partition0 + partition1, as sumSource.
+    private static let routeKernel = MLXFast.metalKernel(
+        name: "track_prefill_router_sum_top10_v3",
+        inputNames: ["partials", "x", "wg", "sgw", "bgw"],
+        outputNames: ["idx", "w", "gate"],
+        source: TrackFastMoEKernels.routeSource
+            .replacingOccurrences(
+                of: "const device float* lr = logits + (size_t)row * (size_t)E;",
+                with: "const device float* lr = partials + (size_t)row * (size_t)E;")
+            .replacingOccurrences(
+                of: "v[j] = (e < E) ? lr[e] : -INFINITY;",
+                with: "float total = 0.0f; total += lr[e]; total += lr[M * E + e]; v[j] = total;"),
+        header: TrackFastKernels.mixerHeadHeader + TrackFastMoEKernels.wideDecls,
+        ensureRowContiguous: true)
+
+    static func routed(x: MLXArray, w: MLXArray, topK: Int)
+        -> (idx: MLXArray, w: MLXArray)?
+    {
+        guard enabled, supportsNAX, StreamOrDevice.default.stream === Stream.gpu,
+            x.ndim == 3, x.dim(0) == 1, x.dim(1) >= 256, x.dim(1) <= 1024,
+            x.dim(2) == 2560, x.dtype == .bfloat16,
+            w.shape == [512, 2560], w.dtype == .bfloat16, topK == 10
+        else { return nil }
+        let rows = x.dim(1), tilesM = (rows + 63) / 64
+        let swizzle = tilesM <= 3 ? 1 : 2
+        let groups = 8 * swizzle * ((tilesM + swizzle - 1) / swizzle) * 2
+        let partials = partialKernel(
+            [x, w], template: [("M", rows)],
+            grid: (groups * 32, 2, 2), threadGroup: (32, 2, 2),
+            outputShapes: [[2, rows, 512]], outputDTypes: [.float32])[0]
+        let out = routeKernel(
+            [partials, x, x, x, x],
+            template: [("M", rows), ("E", 512), ("K", topK), ("T", x.dtype),
+                       ("GS", 32), ("BITS", 4), ("KD", 2560), ("VPT", rows), ("HAS_GATE", false)],
+            grid: (32, rows, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[1, rows, topK], [1, rows, topK], [1]],
+            outputDTypes: [.uint32, .float32, x.dtype])
+        return (out[0], out[1])
+    }
+
     static let source = #"""
         constexpr int tiles_m = (M + 63) / 64;
         constexpr int swizzle_log = tiles_m <= 3 ? 0 : 1;
