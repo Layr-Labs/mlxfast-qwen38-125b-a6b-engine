@@ -142,6 +142,105 @@ enum TrackPLEFusion {
         outputNames: ["out"], source: convolutionSource,
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
+    // MLXFAST-PLEFUSE3: the captured verify window (S = 2...7) takes the same
+    // two-launch epilogue as S = 1. The body is the S=1 prepare kernel with a
+    // window row axis on grid.z. The dot it folds is bit-exact with
+    // `row_reduce_looped` -- the kernel MLX dispatches for this reduction
+    // whenever 4*S < 32 rows, i.e. exactly S <= 7 -- and the gate scalar
+    // chain is copied verbatim from `track_ple_gated` (InT divide,
+    // mlx_maximum, precise::sqrt, mlx_sign, mlx_sigmoid), so every element
+    // matches the unfused prod -> sum -> gated -> concat chain it replaces.
+    static let prepareWindowSource = """
+        constexpr uint H = 2560;
+        constexpr uint W = 4 * H;
+        const uint hc = threadgroup_position_in_grid.y;
+        const uint row = threadgroup_position_in_grid.z;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint d = lid * 4;
+        const uint base = hc * H + d;
+        const uint rbase = row * W + base;
+        threadgroup float partials[32];  // 128 B total, reused throughout.
+        const float eps = as_type<float>((uint)EPS_BITS);
+
+        // Same key/query RMS norms as the S=1 kernel, indexed by window row.
+        float acc = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float k = float(key[rbase + i]);
+            acc += k * k;
+        }
+        const float ik = metal::precise::rsqrt(
+            ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
+        acc = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float q = float(query[rbase + i]);
+            acc += q * q;
+        }
+        const float iq = metal::precise::rsqrt(
+            ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
+
+        // row_reduce_looped's fold: per-thread four-element sequential
+        // accumulate in InT, simd_sum, then the cross-simdgroup partials.
+        InT dot = InT(0);
+        for (uint i = 0; i < 4; ++i) {
+            InT k = InT(float(key[rbase + i]) * ik);
+            k = k * keyScale[base + i];
+            InT q = InT(float(query[rbase + i]) * iq);
+            q = q * queryScale[base + i];
+            InT product = k * q;
+            dot = product + dot;
+        }
+        dot = InT(0) + dot;
+        dot = simd_sum(dot);
+        if (sg == 0 && lane >= 20) { partials[lane] = 0.0f; }
+        if (lane == 0) { partials[sg] = float(dot); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dot = simd_sum(InT(partials[lane]));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // The gate scalar chain verbatim from track_ple_gated.
+        InT g = dot / InT(as_type<float>((uint)DIVISOR_BITS));
+        g = mlx_sqrt_t(mlx_maximum(mlx_abs_t(g), InT(as_type<float>((uint)FLOOR_BITS))))
+            * mlx_sign(g);
+        const InT sgm = mlx_sigmoid(g);
+
+        // The gated value and norm_conv, verbatim from track_ple_gated.
+        InT gv[4];
+        acc = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            gv[i] = sgm * value[row * H + d + i];
+            gated[rbase + i] = gv[i];
+            float v = float(gv[i]);
+            acc += v * v;
+        }
+        const float iv = metal::precise::rsqrt(
+            ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
+        for (uint i = 0; i < 4; ++i) {
+            InT n = InT(float(gv[i]) * iv);
+            full[(9 + row) * W + base + i] = n * convScale[base + i];
+        }
+        // The carried conv state occupies full rows 0..8 once; row 0's
+        // threadgroups stage it, same layout as `concatenated`.
+        if (row == 0) {
+            for (uint t = 0; t < 9; ++t) {
+                for (uint i = 0; i < 4; ++i) {
+                    full[t * W + base + i] = convState[t * W + base + i];
+                }
+            }
+        }
+        """
+
+    static let prepareWindowKernel = MLXFast.metalKernel(
+        name: "track_ple_prepare_window",
+        inputNames: ["key", "query", "value", "keyScale", "queryScale", "convScale", "convState"],
+        outputNames: ["gated", "full"], source: prepareWindowSource,
+        header: TrackFastPLEKernels.header + header + """
+            template <typename T> METAL_FUNC T mlx_abs_t(T x) { return metal::abs(x); }
+            template <typename T> METAL_FUNC T mlx_sqrt_t(T x) { return metal::precise::sqrt(x); }
+            """,
+        ensureRowContiguous: true)
+
     static func supports(_ p: TrackPLE, stream: MLXArray, hidden: Int, hcCount: Int) -> Bool {
         // Guard the exact geometry; every other path builds the original chain.
         hidden == 2560 && hcCount == 4 && stream.shape == [1, 1, 10240]
@@ -175,6 +274,47 @@ enum TrackPLEFusion {
             [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
             grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
             outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
+        return (r[1], output)
+    }
+
+    static func supportsWindow(_ p: TrackPLE, stream: MLXArray, hidden: Int, hcCount: Int) -> Bool {
+        // Same geometry guard as `supports`, for window rows 2...7. S = 8
+        // stays unfused: at 4*S = 32 rows MLX switches the dot reduction to
+        // `row_reduce_simple`, which this kernel does not reproduce.
+        hidden == 2560 && hcCount == 4 && stream.dim(0) == 1
+            && stream.dim(1) >= 2 && stream.dim(1) <= 7 && stream.dim(2) == 10240
+            && [.bfloat16, .float16, .float32].contains(stream.dtype)
+            && p.dilation == 3 && p.stateLength == 9
+            && p.keyProj.rows == 10240 && p.valueProj.rows == 2560
+            && p.convW.shape == [10240, 4, 1] && p.convW.dtype == stream.dtype
+            && [p.normKeyScale, p.normQueryScale, p.normConvScale].allSatisfy {
+                $0.shape == [10240] && $0.dtype == stream.dtype
+            }
+    }
+
+    static func forwardWindow(
+        _ p: TrackPLE, embedded: MLXArray, stream: MLXArray, convState: MLXArray, eps: Float
+    ) -> (full: MLXArray, output: MLXArray)? {
+        // The original two projections stay separate, with unchanged kernels,
+        // quantization, tiling, and weight-loading lane ownership.
+        let S = stream.dim(1)
+        let key = p.keyProj.apply(embedded)
+        let value = p.valueProj.apply(embedded)
+        guard key.shape == [1, S, 10240], value.shape == [1, S, 2560],
+            key.dtype == stream.dtype, value.dtype == stream.dtype
+        else { return nil }
+        let r = prepareWindowKernel(
+            [key, stream, value, p.normKeyScale, p.normQueryScale, p.normConvScale, convState],
+            template: [("InT", stream.dtype), ("EPS_BITS", Int(eps.bitPattern)),
+                       ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern)),
+                       ("FLOOR_BITS", Int(Float(1e-6).bitPattern))],
+            grid: (640, 4, S), threadGroup: (640, 1, 1),
+            outputShapes: [[1, S, 10240], [1, 9 + S, 10240]],
+            outputDTypes: [stream.dtype, stream.dtype])
+        // The dilated conv + silu + residual add is the unfused path's own
+        // kernel, which already dispatches per (channel, window row).
+        let output = TrackFastPLEKernels.conv(
+            full: r[1], convW: p.convW, gated: r[0], dilation: p.dilation)
         return (r[1], output)
     }
 }
