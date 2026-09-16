@@ -963,6 +963,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let ropeTab = ropeTables(offset: offset, count: ids.dim(1), dtype: residual.dtype)
 
         let profiling = TrackFastProfile.prefill != nil && ids.dim(1) >= TrackFastProfile.minWindow
+        // The dispatch settings are sampled once for this forward.  They are
+        // process-level tuning knobs, not per-layer state.
+        let dispatchChunk = Self.asyncChunk
+        let dispatchFirst = Self.asyncFirst > 0 ? Self.asyncFirst : dispatchChunk
+        let dispatchSecond = Self.asyncSecond > dispatchFirst ? Self.asyncSecond : dispatchFirst
         var profT = profiling ? CFAbsoluteTimeGetCurrent() : 0
         if profiling { TrackFastProfile.windows += 1 }
         for layer in layers {
@@ -1031,11 +1036,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             residual = stream
             // Dispatch the graph so far: the GPU starts on these layers while the
             // CPU keeps building the rest (the build is otherwise GPU-idle time).
-            if Self.asyncChunk > 0 {
+            if dispatchChunk > 0 {
                 let n = layer.index + 1
-                let first = Self.asyncFirst > 0 ? Self.asyncFirst : Self.asyncChunk
-                let second = Self.asyncSecond > first ? Self.asyncSecond : first
-                if n == first || n == second || (n > second && (n - second) % Self.asyncChunk == 0) { asyncEval(stream) }
+                if n == dispatchFirst || n == dispatchSecond
+                    || (n > dispatchSecond && (n - dispatchSecond) % dispatchChunk == 0)
+                { asyncEval(stream) }
             }
         }
         let (multi, finalNormed) = injectNorm(
