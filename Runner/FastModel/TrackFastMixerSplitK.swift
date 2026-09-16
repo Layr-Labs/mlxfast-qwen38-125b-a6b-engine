@@ -78,7 +78,7 @@ enum TrackFastMixerSplitK {
 
     static func apply(_ x: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?) -> [MLXArray] {
         let k = x.size, n = down.rows, hc = inject?.rows ?? 4
-        let rows = 2, partitions = split
+        let rows = 1, partitions = split
         let inj = inject ?? down
         precondition(x.shape == [1, k] && k % 512 == 0 && n % rows == 0 && partitions > 0)
         return fusedKernel([x, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
