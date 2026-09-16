@@ -264,6 +264,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     let base: Qwen4ExpModel
     let cfg: Qwen4ExpTextConfiguration
+
+    /// MLXFAST-TAPEDEFER: indexer keys accumulated while the fast path owns the
+    /// row. `updateIndexerTape` concatenates the whole tape on every call, and
+    /// nothing in the fast path reads the result -- the indexer only selects
+    /// blocks past the budget, which is exactly where `fastPlan` hands the row
+    /// back. The keys are therefore held here, in order, and folded into the
+    /// cache's tape in one concatenation at the moment the wrapped model takes
+    /// over. Bounded by the same `indexerBudget` the fast path already honours.
+    private var pendingIndexerTape: [ObjectIdentifier: (row: ObjectIdentifier, keys: [MLXArray])] = [:]
     let embedTokens: Embedding
     let layers: [TrackLayer]
     let finalMixer: TrackHC
@@ -650,11 +659,29 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return o
     }
 
+    /// MLXFAST-ROPETAB: the table depends only on the position index, so it is
+    /// built once over `[0, indexerBudget)` and sliced. `cosSin` forms
+    /// `freqs = position * invFreq` and then concatenates, cosines and sines
+    /// elementwise, so row `p` of the whole-range table is exactly what a
+    /// build over `[p, p+1)` returns; the per-step rebuild was recomputing
+    /// `invFreq` -- which does not depend on the position at all -- along with
+    /// two host uploads and the elementwise chain, every step.
+    private var ropeTableCache: (dtype: DType, rows: Int, cos: MLXArray, sin: MLXArray)?
+
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
-        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
-        return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
+        let need = offset + count
+        if let cached = ropeTableCache, cached.dtype == dtype, cached.rows >= need {
+            return (cached.cos[offset ..< need, 0...], cached.sin[offset ..< need, 0...])
+        }
+        let rows = Swift.max(need, indexerBudget)
+        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: 0, count: rows))
+        let cosAll = c.asType(dtype).reshaped(rows, rotaryDims)
+        let sinAll = s.asType(dtype).reshaped(rows, rotaryDims)
+        eval(cosAll, sinAll)
+        ropeTableCache = (dtype, rows, cosAll, sinAll)
+        return (cosAll[offset ..< need, 0...], sinAll[offset ..< need, 0...])
     }
 
     private func attnForward(
@@ -687,7 +714,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } else {
             idxKeys = a.indexerFull.apply(x)[.ellipsis, a.indexerQWidth...]
         }
-        _ = cache.updateIndexerTape(keys: idxKeys)
+        if let rowID = cache.rows.first.map(ObjectIdentifier.init) {
+            let key = ObjectIdentifier(cache)
+            // A row that left the batch keeps no accumulation: its object
+            // identity can be reused, exactly as the cache drops its own tape
+            // in `setRows`.
+            if var held = pendingIndexerTape[key], held.row == rowID {
+                held.keys.append(idxKeys)
+                pendingIndexerTape[key] = held
+            } else {
+                pendingIndexerTape[key] = (row: rowID, keys: [idxKeys])
+            }
+        } else {
+            _ = cache.updateIndexerTape(keys: idxKeys)
+        }
 
         let prep: (q: MLXArray, k: MLXArray, v: MLXArray)
         if let parts = splitInputs {
@@ -1113,6 +1153,28 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     // MARK: routing
 
+    /// Fold the accumulated keys into each layer cache's tape, in order, and
+    /// stop accumulating. `updateIndexerTape` truncates the existing tape to the
+    /// row's pre-update `absoluteOffset` before appending, so the accumulated
+    /// run is trimmed to the committed length here for the same reason: a
+    /// rolled-back step must not leave its keys in the tape.
+    private func flushIndexerTapes(_ caches: [KVCache]) {
+        guard !pendingIndexerTape.isEmpty else { return }
+        for c in caches {
+            guard let typed = c as? Qwen4ExpCBv2LayerCache else { continue }
+            guard let held = pendingIndexerTape.removeValue(forKey: ObjectIdentifier(typed)),
+                !held.keys.isEmpty, let row = typed.rows.first,
+                ObjectIdentifier(row) == held.row
+            else { continue }
+            let pending = held.keys
+            var all = pending.count == 1 ? pending[0] : concatenated(pending, axis: 1)
+            let committed = row.absoluteOffset
+            if all.dim(1) > committed { all = all[0..., ..<committed, 0...] }
+            _ = typed.updateIndexerTape(keys: all)
+        }
+        pendingIndexerTape.removeAll()
+    }
+
     private func typedCaches(_ caches: [KVCache]) -> [Qwen4ExpCBv2LayerCache]? {
         var out: [Qwen4ExpCBv2LayerCache] = []
         out.reserveCapacity(caches.count)
@@ -1150,6 +1212,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             positionIds: positionIds)
         else {
             TrackPleContextMirror.invalidate()
+            flushIndexerTapes(caches)
             return nil
         }
         return fastStreams(
