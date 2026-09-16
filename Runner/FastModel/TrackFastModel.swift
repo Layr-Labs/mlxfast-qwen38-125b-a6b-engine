@@ -21,6 +21,7 @@
 // past the indexer budget, wider batches) is delegated to the wrapped model.
 
 import Foundation
+import Dispatch
 import MLX
 import MLXLLM
 import MLXLMCommon
@@ -213,6 +214,24 @@ struct TrackLayer {
     let moePairReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let mlpReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let ple: TrackPLE?
+}
+
+/// An in-flight host-side PLE n-gram lookup.
+///
+/// The decode/verify host block in `pleForward` does three serial pieces of
+/// host work in the middle of the window: it reads the fed tokens back to the
+/// host, hashes the n-gram row ids, and gathers the rows from the SSD-backed
+/// LRU row source. While that runs on the caller's thread the GPU goes idle
+/// as soon as the already-enqueued embed and layer-0 work drains. Everything
+/// the block needs — the previous context state, the fed ids, the embedding —
+/// is fixed at the top of the forward, so the whole lookup can start on a
+/// side queue before the first layer is enqueued and overlap the window's
+/// head instead of stalling inside it. The result is bit-identical: same
+/// context, same ids, same hash, same gather — only the thread changes.
+private final class TrackPleHostPrefetch {
+    let done = DispatchSemaphore(value: 0)
+    var history: [Int64]? = nil
+    var rows: MLXArray? = nil
 }
 
 // MARK: - The model
@@ -820,10 +839,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // column reduce uses (verified at float precision for every window size).
         return TrackFastKernels.moeCombine(routed: routed, w: weights, shared: shared, gate: gate)
     }
-
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
-        evaluation: CBv2RecurrentStateEvaluation, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, capture: Bool,
+        prefetch: TrackPleHostPrefetch? = nil
     ) -> MLXArray {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
@@ -847,14 +866,32 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
-            let rawPrev = state?.ssm
-            let ctx: [Int64] = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
-            let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
-            let history = ctx + toks
-            let gid = p.embedding.hostRowIds(history: [history], newCount: S)
-            let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
-            embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
-            hostHistory = history
+            // The serial host lookup, shared by the inline path and by the
+            // prefetch fallback. Same inputs, same outputs.
+            let lookup = { () -> (history: [Int64], rows: MLXArray) in
+                let rawPrev = state?.ssm
+                let ctx: [Int64] = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+                let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
+                let history = ctx + toks
+                let gid = p.embedding.hostRowIds(history: [history], newCount: S)
+                return (history, host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram]))
+            }
+            let resolved: (history: [Int64], rows: MLXArray)
+            if let prefetch {
+                // MLXFAST-PLEPREFETCH: the lookup was started at window entry
+                // on a side queue; by now the embed + layer-0 enqueue and
+                // execution have overlapped the readback, hash and gather.
+                prefetch.done.wait()
+                if let h = prefetch.history, let r = prefetch.rows {
+                    resolved = (h, r)
+                } else {
+                    resolved = lookup()
+                }
+            } else {
+                resolved = lookup()
+            }
+            embedded = resolved.rows.reshaped(B, S, -1).asType(stream.dtype)
+            hostHistory = resolved.history
         } else {
             embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
         }
@@ -952,6 +989,39 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     ) -> (mixed: MLXArray, multi: MLXArray) {
         precondition(recurrentState.count == 1)
         let evaluation = recurrentState[0]
+        // MLXFAST-PLEPREFETCH: the PLE host block (fed-token readback, n-gram
+        // hash, SSD-backed row gather) is fixed at window entry, so start it on
+        // a side queue now and let it overlap the embed + layer-0 enqueue and
+        // execution instead of stalling the window at layer 1. Same inputs,
+        // same outputs — only the thread changes.
+        var plePrefetch: TrackPleHostPrefetch? = nil
+        if let ple = layers.first(where: { $0.ple != nil })?.ple,
+            let host = ple.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource,
+            ids.dim(1) <= 8
+        {
+            let box = TrackPleHostPrefetch()
+            let S = ids.dim(1)
+            let contextLength = max(1, ple.dilation - 1)
+            let rowDim = (cfg.ngramSize - 1) * cfg.headsPerNGram
+            let eos = Int64(cfg.eosTokenId)
+            let state = evaluation.inputState(modelLayerIndex: ple.stateLayerIndex)
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer { box.done.signal() }
+                let ctx: [Int64] = state?.ssm.map {
+                    $0.dtype == .int32
+                        ? $0.asArray(Int32.self).map(Int64.init)
+                        : $0.asType(.int64).asArray(Int64.self)
+                } ?? Array(repeating: eos, count: contextLength)
+                let toks: [Int64] = ids.dtype == .int32
+                    ? ids.asArray(Int32.self).map(Int64.init)
+                    : ids.asType(.int64).asArray(Int64.self)
+                let history = ctx + toks
+                let gid = ple.embedding.hostRowIds(history: [history], newCount: S)
+                box.rows = host.rows(globalIds: gid, shape: [1, S, rowDim])
+                box.history = history
+            }
+            plePrefetch = box
+        }
         var residual = inputEmbeddings ?? embedTokens(ids)  // [B,S,H] until tiled
         // A fully injected hyper-stream can continue through a layer block.
         // Normal token/embedding entry points retain the initial tiling.
@@ -976,7 +1046,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 stream =
                     stream
                     + pleForward(
-                        ple, stream: stream, ids: ids, evaluation: evaluation, capture: capture)
+                        ple, stream: stream, ids: ids, evaluation: evaluation, capture: capture,
+                        prefetch: plePrefetch)
+                plePrefetch = nil
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
