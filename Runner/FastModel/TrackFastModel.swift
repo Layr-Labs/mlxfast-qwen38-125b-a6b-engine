@@ -26,49 +26,6 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 
-/// Host-side mirror of the rolling n-gram context used by the PLE layer.
-///
-/// The device already carries this fixed-length token window in `state.ssm`,
-/// but reading it with `asArray()` drains the GPU once per small decode call.
-/// The mirror is seeded from that authoritative state and then advanced from
-/// the tokens fed to the same call.  It is fenced by the attention offset,
-/// state-layer identity and window length so a reset or a different model
-/// state cannot reuse an old host window.
-enum TrackPleContextMirror {
-    nonisolated(unsafe) private(set) static var context: [Int64]? = nil
-    nonisolated(unsafe) private(set) static var nextOffset: Int? = nil
-    nonisolated(unsafe) private(set) static var stateLayerIndex: Int? = nil
-    nonisolated(unsafe) private(set) static var contextLength: Int? = nil
-    nonisolated(unsafe) private(set) static var dirty = true
-
-    static func matches(offset: Int, layer: Int, length: Int) -> Bool {
-        guard !dirty else { return false }
-        return hasSameWindow(offset: offset, layer: layer, length: length)
-    }
-
-    private static func hasSameWindow(offset: Int, layer: Int, length: Int) -> Bool {
-        nextOffset == offset && stateLayerIndex == layer && contextLength == length
-    }
-
-    static func store(
-        _ context: [Int64], nextOffset: Int, stateLayerIndex: Int, contextLength: Int
-    ) {
-        self.context = context
-        self.nextOffset = nextOffset
-        self.stateLayerIndex = stateLayerIndex
-        self.contextLength = contextLength
-        dirty = false
-    }
-
-    static func invalidate() {
-        context = nil
-        nextOffset = nil
-        stateLayerIndex = nil
-        contextLength = nil
-        dirty = true
-    }
-}
-
 // MARK: - Weight helpers
 
 extension Module {
@@ -254,6 +211,7 @@ struct TrackLayer {
     let attn: TrackAttn?
     let moe: TrackMoE
     let moePairReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
+    let moePacketReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let mlpReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let ple: TrackPLE?
 }
@@ -515,6 +473,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return TrackLayer(
             index: index, attnHC: attnHC, mlpHC: mlpHC, gdn: gdn, attn: attn, moe: moe,
             moePairReplay: makeMoEPairReplay(moe),
+            moePacketReplay: makeMoEPairReplay(moe, packet: true),
             mlpReplay: TrackFastMLPReplay.make(hc: mlpHC, moe: moe,
                 hcCount: cfg.hcCount, hidden: cfg.hiddenSize, eps: cfg.rmsNormEps), ple: ple)
     }
@@ -708,7 +667,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     }
 
     /// Replay only the two opaque expert launches; routing and all current arrays stay live.
-    static func makeMoEPairReplay(_ m: TrackMoE) -> (@Sendable ([MLXArray]) -> [MLXArray])? {
+    static func makeMoEPairReplay(_ m: TrackMoE, packet: Bool = false) -> (@Sendable ([MLXArray]) -> [MLXArray])? {
         guard let fused = m.sharedGateUp.fused, case .quant(let guq) = fused,
             case .quant(let dq) = m.sharedDown, guq.biases != nil, dq.biases != nil
         else { return nil }
@@ -719,10 +678,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let sharedGU = TrackQuantWeight(
                 weight: inputs[11], scales: inputs[12], biases: inputs[13],
                 groupSize: guGroupSize, bits: guBits, mode: guMode)
-            let act = TrackFastMoEKernels.gateUpAct(
-                wg: inputs[5], sg: inputs[6], bg: inputs[7],
-                wu: inputs[8], su: inputs[9], bu: inputs[10], shared: sharedGU,
-                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits)
+            let act: MLXArray
+            if packet {
+                act = TrackFastGateUpPacket.apply(
+                    g: (inputs[5], inputs[6], inputs[7]), u: (inputs[8], inputs[9], inputs[10]),
+                    shared: sharedGU, packet: inputs[0], ids: inputs[1], xrow: inputs[4])
+            } else {
+                act = TrackFastMoEKernels.gateUpAct(
+                    wg: inputs[5], sg: inputs[6], bg: inputs[7],
+                    wu: inputs[8], su: inputs[9], bu: inputs[10], shared: sharedGU,
+                    x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits)
+            }
             let sharedDown = TrackQuantWeight(
                 weight: inputs[17], scales: inputs[18], biases: inputs[19],
                 groupSize: downGroupSize, bits: downBits, mode: downMode)
@@ -748,7 +714,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     static func moeForwardShared(
         _ m: TrackMoE, _ x: MLXArray, inputF32: MLXArray? = nil,
-        replay: (@Sendable ([MLXArray]) -> [MLXArray])?
+        replay: (@Sendable ([MLXArray]) -> [MLXArray])?,
+        packetReplay: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
     ) -> MLXArray {
         let prof = TrackFastProfile.prefill != nil && x.dim(1) >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
@@ -781,6 +748,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // gate|up + SwiGLU for the routed and the shared expert, down + combine.
             let S = x.dim(1), K = m.topK, H = x.dim(2)
             let x2 = x.reshaped(S, H)
+            if let out = TrackFastGateUpPacket.moe(
+                m, x: x2, logits: logits.reshaped(S, -1), sharedGU: guq, sharedDown: dq,
+                replay: packetReplay)
+            {
+                return out.reshaped(1, S, H)
+            }
             let r = TrackFastMoEKernels.route(
                 logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, topK: K)
             let (idx, weights) = (r.idx, r.w)
@@ -866,7 +839,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
-        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, capture: Bool
     ) -> MLXArray {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
@@ -890,36 +863,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
+            let rawPrev = state?.ssm
+            let ctx: [Int64] = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
-            let ctx: [Int64]
-            if !capture,
-                TrackPleContextMirror.matches(
-                    offset: offset, layer: p.stateLayerIndex, length: contextLength),
-                let mirrored = TrackPleContextMirror.context
-            {
-                ctx = mirrored
-            } else {
-                let rawPrev = state?.ssm
-                ctx = rawPrev.map {
-                    $0.dtype == .int32
-                        ? $0.asArray(Int32.self).map(Int64.init)
-                        : $0.asType(.int64).asArray(Int64.self)
-                } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
-            }
             let history = ctx + toks
-            if capture {
-                TrackPleContextMirror.invalidate()
-            } else {
-                TrackPleContextMirror.store(
-                    Array(history.suffix(contextLength)), nextOffset: offset + S,
-                    stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
-            }
             let gid = p.embedding.hostRowIds(history: [history], newCount: S)
             let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
             embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
             hostHistory = history
         } else {
-            TrackPleContextMirror.invalidate()
             embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
         }
         // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
@@ -1040,8 +992,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 stream =
                     stream
                     + pleForward(
-                        ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
+                        ple, stream: stream, ids: ids, evaluation: evaluation, capture: capture)
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
@@ -1088,7 +1039,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
                 Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
                 pendingOut = Self.moeForwardShared(
-                    layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay)
+                    layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay,
+                    packetReplay: layer.moePacketReplay)
                 if profiling { TrackFastProfile.tick("moe", &profT, [pendingOut!]) }
                 Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
             }
@@ -1144,14 +1096,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         _ tokens: MLXArray, inputEmbeddings: MLXArray?, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, capture: Bool
     ) -> (mixed: MLXArray, multi: MLXArray)? {
-        if capture { TrackPleContextMirror.invalidate() }
         guard let plan = fastPlan(
             tokens: tokens, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds)
-        else {
-            TrackPleContextMirror.invalidate()
-            return nil
-        }
+        else { return nil }
         return fastStreams(
             tokens, inputEmbeddings: inputEmbeddings, caches: plan.caches,
             recurrentState: recurrentState, offset: plan.offset, capture: capture)
