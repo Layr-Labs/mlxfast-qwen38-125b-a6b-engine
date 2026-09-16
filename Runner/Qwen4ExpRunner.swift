@@ -326,19 +326,43 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
     ) throws -> TrackQwen4ExpMTPModule {
         let head = TrackQwen4ExpMTPModule(configuration, layerCount: loaded.layerCount)
 
-        // The geometry the served head carries. Read off the loaded head, so
-        // the default is the checkpoint's own.
+        // The geometry the served head carries: the checkpoint's own group
+        // size and mode, but any projection quantized below 8 bits is served
+        // at 8 bits. The head only proposes tokens -- the pinned target
+        // decides every emitted token -- so a more faithful head can only
+        // move the acceptance rate, never the output distribution.
         var geometry: [String: (groupSize: Int, bits: Int, mode: QuantizationMode)] = [:]
+        var byPath = Dictionary(
+            uniqueKeysWithValues: loaded.parameters().flattened())
         for (path, module) in loaded.leafModules().flattened() {
             guard let quantized = module as? Quantized else { continue }
-            geometry[path] = (quantized.groupSize, quantized.bits, quantized.mode)
+            let servedBits = quantized.bits < 8 ? 8 : quantized.bits
+            geometry[path] = (quantized.groupSize, servedBits, quantized.mode)
+            guard servedBits != quantized.bits, quantized.mode == .affine,
+                let wq = byPath[path + ".weight"],
+                let s = byPath[path + ".scales"]
+            else { continue }
+            // Re-encode on load: dequantize the checkpoint's tensors and
+            // quantize them again at the served width. Nothing on disk
+            // changes and no head weights are uploaded.
+            let w = dequantized(
+                wq, scales: s, biases: byPath[path + ".biases"],
+                groupSize: quantized.groupSize, bits: quantized.bits,
+                mode: quantized.mode)
+            let r = MLX.quantized(
+                w, groupSize: quantized.groupSize, bits: servedBits,
+                mode: quantized.mode)
+            guard let nb = r.biases else { continue }
+            eval(r.wq, r.scales, nb)
+            byPath[path + ".weight"] = r.wq
+            byPath[path + ".scales"] = r.scales
+            byPath[path + ".biases"] = nb
         }
         quantize(model: head) { path, _ in geometry[path] }
 
         // Verified in full: a head that took only part of the checkpoint's
         // tensors would still draft, and would draft something else.
-        try head.update(parameters: loaded.parameters(), verify: .all)
-        return head
+        try head.update(parameters: .unflattened(byPath), verify: .all)
     }
 
     /// Refuse a module whose loaded norm weights contradict the offset it
