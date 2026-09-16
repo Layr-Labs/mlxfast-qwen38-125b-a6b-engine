@@ -12,13 +12,14 @@ enum TrackFastMixerSplitK {
             const device uint32_t* w, const device T* scales,
             const device T* biases, const device T* x, int row,
             uint sg, uint lane, threadgroup float* scratch,
-            thread float (&result)[R]) {
+            thread float& result) {
             constexpr int BLOCK = V * 32;
             constexpr int NB = K / BLOCK;
             static_assert(K % BLOCK == 0, "full quantized blocks required");
             constexpr int COUNT = (NB + SPLIT - 1) / SPLIT;
             float partial[R];
-            for (int r = 0; r < R; ++r) { partial[r] = 0; result[r] = 0; }
+            for (int r = 0; r < R; ++r) { partial[r] = 0; }
+            result = 0;
             for (int b = int(sg) * COUNT; b < min((int(sg) + 1) * COUNT, NB); ++b) {
                 float xv[V];
                 const int column = b * BLOCK + int(lane) * V;
@@ -36,11 +37,13 @@ enum TrackFastMixerSplitK {
                 for (int r = 0; r < R; ++r) { scratch[(sg * R + r) * 32 + lane] = partial[r]; }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (sg == 0) {
+            // One SIMD group folds each output row. The block order within
+            // each lane and the final SIMD reduction are unchanged.
+            if (sg < R) {
                 for (int b = 0; b < (ORDERED ? NB : SPLIT); ++b) {
-                    for (int r = 0; r < R; ++r) { result[r] += scratch[(b * R + r) * 32 + lane]; }
+                    result += scratch[(b * R + sg) * 32 + lane];
                 }
-                for (int r = 0; r < R; ++r) { result[r] = simd_sum(result[r]); }
+                result = simd_sum(result);
             }
         }
         """#
@@ -53,21 +56,19 @@ enum TrackFastMixerSplitK {
         constexpr int INJ_SCRATCH = (ORDERED ? K / 256 : SPLIT) * 32;
         threadgroup float scratch[DOWN_SCRATCH > INJ_SCRATCH ? DOWN_SCRATCH : INJ_SCRATCH];
         if (tile < DN) {
-            float r[RPS];
+            float r;
             research_split_qmv<T, K, 16, RPS, SPLIT, ORDERED>(
                 wd, sd, bd, x, tile * RPS, sg, lane, scratch, r);
-            if (sg == 0 && lane == 0) {
-                for (int i = 0; i < RPS; ++i) {
-                    T l = static_cast<T>(r[i]);
-                    lo[tile * RPS + i] = l;
-                    act[tile * RPS + i] = mlx_silu(l);
-                }
+            if (sg < RPS && lane == 0) {
+                T l = static_cast<T>(r);
+                lo[tile * RPS + sg] = l;
+                act[tile * RPS + sg] = mlx_silu(l);
             }
         } else if (HAS_INJECT) {
-            float r[1];
+            float r;
             research_split_qmv<T, K, 8, 1, SPLIT, ORDERED>(
                 wi, si, bi, x, tile - DN, sg, lane, scratch, r);
-            if (sg == 0 && lane == 0) { inj[tile - DN] = static_cast<T>(r[0]); }
+            if (sg == 0 && lane == 0) { inj[tile - DN] = static_cast<T>(r); }
         }
         """#
     static let fusedKernel = MLXFast.metalKernel(name: "track_split_k_mixer",
@@ -80,7 +81,7 @@ enum TrackFastMixerSplitK {
         let k = x.size, n = down.rows, hc = inject?.rows ?? 4
         let rows = 2, partitions = split
         let inj = inject ?? down
-        precondition(x.shape == [1, k] && k % 512 == 0 && n % rows == 0 && partitions > 0)
+        precondition(x.shape == [1, k] && k % 512 == 0 && n % rows == 0 && partitions >= rows)
         return fusedKernel([x, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
             template: [("T", x.dtype), ("K", k), ("ND", n), ("RPS", rows), ("SPLIT", partitions),
                        ("ORDERED", true), ("HAS_INJECT", inject != nil)],
