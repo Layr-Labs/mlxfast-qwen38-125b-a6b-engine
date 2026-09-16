@@ -103,44 +103,11 @@ enum TrackPLEFusion {
         }
         """
 
-    static let convolutionSource = """
-        // MLXFAST-PLEFUSE2: preserve the S=1 dilated implicit-GEMM dispatch:
-        // group=(32,1,4), grid of groups=(1,1,W), channel=group.z.
-        // Its small-channel loaders assign taps 0..3 to SIMD 0 lanes 0..3;
-        // lane 0 owns the single valid output. Keep those owners, discard
-        // the padded matrix work, and require no threadgroup storage.
-        constexpr uint W = 10240;
-        const uint c = threadgroup_position_in_grid.z;
-        const uint lane = thread_index_in_simdgroup;
-        if (simdgroup_index_in_threadgroup != 0) { return; }
-        float product = 0.0f;
-        if (lane < 4) {
-            product = float(full[(lane * 3) * W + c]) * float(weight[c * 4 + lane]);
-        }
-        // FP32 products and chronological FP32 additions, taps 0,1,2,3.
-        // Shuffle broadcasts retain the weight-loading lanes. Unlike a
-        // padded simdgroup MMA, this has no matrix accumulator or spill array.
-        float acc = simd_broadcast(product, 0);
-        acc += simd_broadcast(product, 1);
-        acc += simd_broadcast(product, 2);
-        acc += simd_broadcast(product, 3);
-        if (lane == 0) {
-            InT convolved = InT(acc);
-            InT activated = mlx_silu(convolved);
-            out[c] = gated[c] + activated;
-        }
-        """
-
-    static let prepareKernel = MLXFast.metalKernel(
-        name: "track_ple_prepare_fuse2",
-        inputNames: ["key", "query", "value", "keyScale", "queryScale", "convScale", "convState"],
-        outputNames: ["gated", "full"], source: prepareSource,
-        header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
-
-    static let convolutionKernel = MLXFast.metalKernel(
-        name: "track_ple_convolution_fuse2", inputNames: ["full", "weight", "gated"],
-        outputNames: ["out"], source: convolutionSource,
-        header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
+    // The S=1 convolution is `track_ple_conv` at S=1: same channel-per-thread
+    // layout, the same four taps at rows t + j*DIL, the same ascending-tap
+    // FP32 accumulation, and the same `gated + silu` epilogue. The earlier
+    // padded implicit-GEMM dispatch shape (one threadgroup per channel, one
+    // live lane) is gone; the shared kernel is bit-identical work.
 
     static func supports(_ p: TrackPLE, stream: MLXArray, hidden: Int, hcCount: Int) -> Bool {
         // Guard the exact geometry; every other path builds the original chain.
@@ -171,10 +138,8 @@ enum TrackPLEFusion {
             grid: (640, 4, 1), threadGroup: (640, 1, 1),
             outputShapes: [[1, 1, 10240], [1, 10, 10240]],
             outputDTypes: [stream.dtype, stream.dtype])
-        let output = convolutionKernel(
-            [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
-            grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
-            outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
+        let output = TrackFastPLEKernels.conv(
+            full: r[1], convW: p.convW, gated: r[0], dilation: p.dilation)
         return (r[1], output)
     }
 }
