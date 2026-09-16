@@ -229,6 +229,13 @@ extension TrackFastKernels {
     /// input[d] = bf16( sum_s f32(bf16(sigmoid(w[s,d])) * normed[s,d]) ) (row-order f32 sum, one rounding)
     /// inject[s] = 2 * sigmoid(inj[s])   (bf16 ops)
     static let mixSource = """
+        auto sigmoid = [&](InT value) -> InT {
+            if constexpr (metal::is_same_v<InT, bfloat16_t>) {
+                return sigmoid_lut[as_type<ushort>(static_cast<bfloat16_t>(value))];
+            } else {
+                return mlx_sigmoid(value);
+            }
+        };
         const uint d = thread_position_in_grid.x;
         const uint row = thread_position_in_grid.y;
         if (d >= H) return;
@@ -237,21 +244,21 @@ extension TrackFastKernels {
         InT acc = InT(0);
         for (int s = 0; s < HC; ++s) {
             const uint i = row * W + s * H + d;
-            InT sg = mlx_sigmoid(w[i]);
+            InT sg = sigmoid(w[i]);
             InT p = sg * normed[i];
             acc = acc + p;
         }
         input[row * H + d] = acc;
         if (HAS_INJECT && d < HC) {
             InT x = inj[row * LW + (LW - HC) + d];
-            InT sg = mlx_sigmoid(x);
+            InT sg = sigmoid(x);
             inject[row * HC + d] = InT(2) * sg;
         }
         """
 
     nonisolated(unsafe) static let mixKernel = MLXFast.metalKernel(
         name: "track_hc_mix",
-        inputNames: ["w", "normed", "inj"],
+        inputNames: ["w", "normed", "inj", "sigmoid_lut"],
         outputNames: ["input", "inject"],
         source: mixSource, header: exactHeader, ensureRowContiguous: true)
 
@@ -260,7 +267,7 @@ extension TrackFastKernels {
     ) -> (input: MLXArray, inject: MLXArray) {
         let B = w.dim(0), S = w.dim(1)
         let outs = mixKernel(
-            [w, normed, inj],
+            [w, normed, inj, w.dtype == .bfloat16 ? TrackBF16Functions.sigmoid : w],
             template: [
                 ("InT", w.dtype), ("H", hidden), ("W", hcCount * hidden), ("HC", hcCount),
                 ("LW", inj.dim(2)), ("HAS_INJECT", hasInject),
