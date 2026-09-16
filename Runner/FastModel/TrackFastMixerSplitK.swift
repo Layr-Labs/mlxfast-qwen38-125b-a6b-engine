@@ -5,7 +5,7 @@ import MLX
 // ascending block fold and the final simd_sum. No target weight changes.
 enum TrackFastMixerSplitK {
     // Four partitions in production; zero selects the original A/B control.
-    nonisolated(unsafe) static var split = 4
+    nonisolated(unsafe) static var split = 2
     static let helper = #"""
         template <typename T, int K, int V, int R, int SPLIT, bool ORDERED>
         METAL_FUNC void research_split_qmv(
