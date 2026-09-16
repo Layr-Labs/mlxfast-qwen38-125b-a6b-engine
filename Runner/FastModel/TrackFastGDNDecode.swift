@@ -2,10 +2,12 @@
 // Each threadgroup owns one value head; each SIMD group owns four value rows.
 // Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
 // TrackFastKernels.prepSource, leanSource and gatedRMSSource.
-
 import MLX
 
 enum TrackFastGDNDecode {
+    @inline(__always)
+    private static func sourceIdentityMarkerH() {}
+
     private static let kernel = MLXFast.metalKernel(
         name: "track_gdn_decode_complete",
         inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w"],
