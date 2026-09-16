@@ -71,7 +71,7 @@ final class TrackFastHead {
             if !hc.hasInject || injQ != nil {
                 let n2 = normed.reshaped(S, hcCount * hidden)
                 let d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
-                let packedUp = S == 1 ? hc.decodeUp : nil
+                let packedUp = (S == 1 || S == 2) ? hc.decodeUp : nil
                 let u = TrackFastMixerKernels.upMix(
                     act: d.act, normed: n2, up: packedUp ?? uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
                     hasInject: hc.hasInject, packedRows: packedUp != nil)

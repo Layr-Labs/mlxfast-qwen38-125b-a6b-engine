@@ -153,7 +153,9 @@ enum TrackFastMixerKernels {
             const int s = (int)sg * 4 + (int)(lid / 8);
             const int row = d0 + (s & 1) + H * (s >> 1);
             float r[VPT];
-            qmv_wide_reg_full<T, GS, BITS, VPT, 8, false>(wu, su, bu, act, LW, VPT, row, lid, r);
+            // Packed storage changes the weight row, never the activation/output row.
+            const int weight_row = PACKED_ROWS ? tile * 8 + s : row;
+            qmv_wide_reg_full<T, GS, BITS, VPT, 8, false>(wu, su, bu, act, LW, VPT, weight_row, lid, r);
             if ((lid % 8) == 0 && (s >> 1) < HC) {
                 for (int v = 0; v < VPT; ++v) {
                     const T weight = static_cast<T>(r[v]);
@@ -200,7 +202,7 @@ enum TrackFastMixerKernels {
         precondition(S >= 1 && S <= 8 && hidden % 2 == 0 && up.rows == hcCount * hidden && up.bits == 4)
         precondition(LW % 32 == 0 && LW < 512 + 256)  // K = 320: one full block + a tail, the `qmv` normal branch
         let sigmoidTable = act.dtype == .bfloat16 ? TrackBF16Functions.sigmoid : normed
-        precondition(!packedRows || (S == 1 && hcCount == 4))
+        precondition(!packedRows || ((S == 1 || S == 2) && hcCount == 4))
         let outs = (S == 1 ? upMixKernel1 : upMixKernel)(
             [act, normed, up.weight, up.scales, up.biases!, inj, sigmoidTable],
             template: [
