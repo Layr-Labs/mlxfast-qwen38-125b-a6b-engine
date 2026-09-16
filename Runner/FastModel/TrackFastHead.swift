@@ -97,10 +97,11 @@ final class TrackFastHead {
 
     /// One head application over `[1, S]` inputs; returns `sample` `[1,S,H]`
     /// and the next multi stream `[1,S,hc*H]`. Nil when the fast path does
-    /// not serve the call (context past the indexer budget).
+    /// not serve the call (context past the indexer budget). With
+    /// lastPositionOnly, returns one terminal row while appending all K/V.
     func forward(
         nextTokenIds ids: MLXArray, multiStream multi: MLXArray, embedTokens: Embedding,
-        cache: Qwen4ExpAttentionCache
+        cache: Qwen4ExpAttentionCache, lastPositionOnly: Bool = false
     ) -> (sample: MLXArray, multi: MLXArray)? {
         let B = ids.dim(0), S = ids.dim(1)
         guard Self.enabled, B == 1, cache.offset + S <= indexerBudget else { return nil }
@@ -120,7 +121,15 @@ final class TrackFastHead {
             residual: hyper, out: nil, inject: nil, scale: attnHC.normScaleQ,
             hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
         var (input, injectW) = hcMix(attnHC, normed: normed)
-        let attended = attention(input, cache: cache, offset: offset)
+        let tail = lastPositionOnly && S > 1
+        let attended = attention(input, cache: cache, offset: offset, lastPositionOnly: tail)
+        if tail {
+            // Every prefix K/V has already entered the head cache. The head
+            // has one attention layer: later FFN/mixers are token-local and
+            // only the terminal hidden stream is consumed by draftStep.
+            st = st[0..., (S - 1)..., 0...]
+            injectW = injectW[0..., (S - 1)..., 0...]
+        }
         (st, normed) = TrackFastKernels.injectNorm(
             residual: st, out: attended, inject: injectW, scale: mlpHC.normScaleQ,
             hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
@@ -133,7 +142,9 @@ final class TrackFastHead {
         return (sample, multiNext)
     }
 
-    private func attention(_ x: MLXArray, cache: Qwen4ExpAttentionCache, offset: Int) -> MLXArray {
+    private func attention(
+        _ x: MLXArray, cache: Qwen4ExpAttentionCache, offset: Int, lastPositionOnly: Bool
+    ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let heads = cfg.attentionHeads, kvHeads = cfg.kvHeads, d = cfg.headDim
         let qkv = attn.qkv.apply(x)
@@ -144,6 +155,17 @@ final class TrackFastHead {
             qkv: qkv, qNorm: attn.qNormW, kNorm: attn.kNormW,
             cos: c.asType(x.dtype).reshaped(S, rotaryDims), sin: s.asType(x.dtype).reshaped(S, rotaryDims),
             heads: heads, kvHeads: kvHeads, headDim: d, rotaryDims: rotaryDims, eps: eps)
+        if lastPositionOnly {
+            // Last query can attend the complete valid prefix. Update all K/V
+            // once; do not run a short-window update that loses history rows.
+            let att = attentionWithCacheUpdate(
+                queries: prep.q[0..., 0..., (S - 1)..., 0...],
+                keys: prep.k, values: prep.v, cache: cache,
+                scale: attentionScale, mask: .none)
+            let out = TrackFastKernels.attnGate(
+                att: att, qkv: qkv[0..., (S - 1)..., 0...], gateOffset: attn.qWidth)
+            return attn.out.apply(out)
+        }
         let mask = makeAttentionMask(n: S, cache: cache)
         let att = attentionWithCacheUpdate(
             queries: prep.q, keys: prep.k, values: prep.v, cache: cache,
