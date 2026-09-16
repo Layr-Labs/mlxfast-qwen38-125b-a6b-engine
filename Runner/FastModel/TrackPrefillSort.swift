@@ -68,18 +68,24 @@ enum TrackPrefillSort {
         inputNames: ["ids"], outputNames: ["counts"],
         source: countSource, header: "", ensureRowContiguous: true)
 
-    /// The stable destination of every assignment, plus the three arrays the
-    /// consumers actually read.
+    /// Stable assignment outputs plus the shared expert tile table, produced
+    /// directly from the counting-sort bucket prefixes.
+    private static let fusedScatterKernel = MLXFast.metalKernel(
+        name: "track_route_counting_scatter_tiles",
+        inputNames: ["ids", "counts"],
+        outputNames: ["sorted_ids", "token_rows", "inverse", "tiles"],
+        source: fusedScatterSource, header: "", ensureRowContiguous: true)
+
     private static let scatterKernel = MLXFast.metalKernel(
         name: "track_route_counting_scatter",
         inputNames: ["ids", "counts"],
         outputNames: ["sorted_ids", "token_rows", "inverse"],
         source: scatterSource, header: "", ensureRowContiguous: true)
 
-    /// `(sortedIDs, tokenRows, inverse)` for `flatIDs` over `E` expert ids,
+    /// `(sortedIDs, tokenRows, inverse, tiles)` for `flatIDs` over `E` expert ids,
     /// or nil when the shape is outside the supported window.
     static func apply(flatIDs: MLXArray, experts E: Int, topK: Int)
-        -> (sortedIDs: MLXArray, tokenRows: MLXArray, inverse: MLXArray)?
+        -> (sortedIDs: MLXArray, tokenRows: MLXArray, inverse: MLXArray, tiles: MLXArray?)?
     {
         let R = flatIDs.size
         guard enabled, flatIDs.ndim == 1, flatIDs.dtype == .uint32, topK > 0,
@@ -87,18 +93,22 @@ enum TrackPrefillSort {
             R >= blockSize, R % blockSize == 0
         else { return nil }
         let nBlocks = R / blockSize
+        let maxTiles = TrackPrefillIndirect.maxTiles(rows: R, experts: E)
         let counts = countKernel(
             [flatIDs],
             template: [("E", E), ("BLK", blockSize), ("R", R)],
             grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
             outputShapes: [[nBlocks * E]], outputDTypes: [.uint32])[0]
-        let outs = scatterKernel(
+        let fuseTiles = E == 512 && R >= 8192
+            && ProcessInfo.processInfo.environment["TRACK_PREFILL_SORT_TILES"] != "0"
+        let kernel = fuseTiles ? fusedScatterKernel : scatterKernel
+        let outs = kernel(
             [flatIDs, counts],
-            template: [("E", E), ("BLK", blockSize), ("R", R), ("NB", nBlocks), ("TOPK", topK)],
+            template: [("E", E), ("BLK", blockSize), ("R", R), ("NB", nBlocks), ("TOPK", topK), ("BM", TrackPrefillIndirect.tileRows), ("MAXT", maxTiles)],
             grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
-            outputShapes: [[R], [R], [R]],
-            outputDTypes: [.uint32, .uint32, .uint32])
-        return (outs[0], outs[1], outs[2])
+            outputShapes: fuseTiles ? [[R], [R], [R], [2 * maxTiles]] : [[R], [R], [R]],
+            outputDTypes: Array(repeating: .uint32, count: fuseTiles ? 4 : 3))
+        return (outs[0], outs[1], outs[2], fuseTiles ? outs[3] : nil)
     }
 
     // MARK: - kernels
@@ -159,6 +169,79 @@ enum TrackPrefillSort {
     ///
     /// is the stable rank of the assignment among its equals, i.e. exactly the
     /// position `argSort` gives it.
+    static let fusedScatterSource = #"""
+        threadgroup uint vals[BLK];
+        threadgroup uint tot[E];
+        threadgroup uint pre[E];
+        threadgroup uint sA[E];
+        threadgroup uint sB[E];
+        const uint blk = threadgroup_position_in_grid.x;
+        const uint t = thread_position_in_threadgroup.x;
+        const uint gi = blk * BLK + t;
+        vals[t] = (gi < (uint)R) ? ids[gi] : (uint)E;
+        for (uint b = t; b < (uint)E; b += BLK) {
+            uint s = 0, before = 0;
+            for (uint n = 0; n < (uint)NB; ++n) {
+                const uint c = counts[n * (uint)E + b];
+                if (n < blk) { before += c; }
+                s += c;
+            }
+            tot[b] = s;
+            pre[b] = before;
+            sA[b] = s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint off = 1; off < (uint)E; off <<= 1) {
+            for (uint b = t; b < (uint)E; b += BLK) {
+                sB[b] = sA[b] + ((b >= off) ? sA[b - off] : 0u);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint b = t; b < (uint)E; b += BLK) { sA[b] = sB[b]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (gi >= (uint)R) { return; }
+        const uint v = vals[t];
+        uint rank = 0;
+        for (uint j = 0; j < t; ++j) { rank += (vals[j] == v) ? 1u : 0u; }
+        const uint dest = (sA[v] - tot[v]) + pre[v] + rank;
+        sorted_ids[dest] = v;
+        token_rows[dest] = gi / (uint)TOPK;
+        inverse[gi] = dest;
+        // Producer-supplied expert tiles: the bucket totals already exist.
+        // Only block zero publishes, in expert order, exactly as tileSource.
+        // The other blocks need no extra work or inter-block synchronization.
+        if (blk == 0) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint b = t; b < (uint)E; b += BLK) {
+                pre[b] = sA[b] - tot[b];
+                sB[b] = (tot[b] + (uint)BM - 1) / (uint)BM;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint b = t; b < (uint)E; b += BLK) { sA[b] = sB[b]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint off = 1; off < (uint)E; off <<= 1) {
+                for (uint b = t; b < (uint)E; b += BLK) {
+                    sB[b] = sA[b] + ((b >= off) ? sA[b - off] : 0u);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint b = t; b < (uint)E; b += BLK) { sA[b] = sB[b]; }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            for (uint b = t; b < (uint)E; b += BLK) {
+                const uint n = (tot[b] + (uint)BM - 1) / (uint)BM;
+                const uint slot = sA[b] - n;
+                for (uint j = 0; j < n; ++j) {
+                    tiles[2 * (slot + j)] = pre[b] + j * (uint)BM;
+                    tiles[2 * (slot + j) + 1] = pre[b] + min(tot[b], (j + 1) * (uint)BM);
+                }
+            }
+            for (uint i = sA[E - 1] + t; i < (uint)MAXT; i += BLK) {
+                tiles[2 * i] = 0u;
+                tiles[2 * i + 1] = 0u;
+            }
+        }
+        """#
+
     static let scatterSource = #"""
         threadgroup uint vals[BLK];
         threadgroup uint tot[E];

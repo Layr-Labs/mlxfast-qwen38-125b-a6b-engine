@@ -83,20 +83,22 @@ enum TrackPrefillIndirect {
         let sortedIDs: MLXArray
         let inverse: MLXArray
         let tokenRows: MLXArray
+        let tiles: MLXArray
         if let c = TrackPrefillSort.apply(
             flatIDs: flatIDs, experts: g.w.dim(0), topK: indices.dim(2))
         {
             // The identical permutation in two launches (see TrackPrefillSort).
             (sortedIDs, tokenRows, inverse) = (c.sortedIDs, c.tokenRows, c.inverse)
+            tiles = c.tiles ?? tileTable(sortedIDs: c.sortedIDs, rows: indices.size, experts: g.w.dim(0))
         } else {
             let order = argSort(flatIDs)
             inverse = argSort(order)
             sortedIDs = flatIDs[order]
             tokenRows = order.floorDivide(indices.dim(2))
+            tiles = tileTable(sortedIDs: sortedIDs, rows: indices.size, experts: g.w.dim(0))
         }
         let rows = indices.size
         let experts = g.w.dim(0)
-        let tiles = tileTable(sortedIDs: sortedIDs, rows: rows, experts: experts)
         let maxT = maxTiles(rows: rows, experts: experts)
         let activated = gateUpKernel(
             [x, g.w, g.s, g.b, u.w, u.s, u.b, sortedIDs, tokenRows, tiles],
