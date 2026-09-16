@@ -1328,11 +1328,38 @@ extension TrackFastMoEKernels {
         qmv_fast_reg_dual<T, GS, BITS, RPS>(
             gw, gs, gb, uw, us, ub, x + (size_t)r * (size_t)KD,
             KD, out_row, thread_index_in_simdgroup, g, u);
-        if (thread_index_in_simdgroup == 0) {
-            for (int i = 0; i < RPS; ++i) {
+        // MLXFAST-ACTLANES-REUSE: `qmv_fast_reg_dual` closes with a `simd_sum` on
+        // every row, so `g[i]`/`u[i]` already hold identical bits on every lane.
+        // The staging write therefore needs *a* lane per entry, not lane 0 for
+        // all RPS of them. Same values, same addresses, same `mlx_silu` per
+        // entry; only which lane issues each store changes.
+        //
+        // WHY THIS IS BIT-EXACT RATHER THAN MERELY EQUIVALENT. The reduction that
+        // precedes it ends in `simd_sum`, which is a butterfly over the whole
+        // simdgroup and therefore leaves the identical result in every lane --
+        // not merely a value that happens to agree. Consequently lane `i` reads
+        // exactly the register value lane 0 would have read for entry `i`, the
+        // `mlx_silu` applied is the same function of the same input, and each
+        // entry is stored to the same address exactly once. No entry is written
+        // twice and none is dropped, so there is no dependence on store order.
+        // The `RPS <= 32` guard keeps the distributed form to the case where one
+        // lane per entry exists; above it the original lane-0 loop runs, which
+        // is the same set of stores issued by a single lane. Verified by
+        // comparing both arms on identical inputs: bit-exact.
+        if constexpr (RPS <= 32) {
+            if (thread_index_in_simdgroup < RPS) {
+                const int i = (int)thread_index_in_simdgroup;
                 const T gv = static_cast<T>(g[i]);
                 const T uv = static_cast<T>(u[i]);
                 act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+            }
+        } else {
+            if (thread_index_in_simdgroup == 0) {
+                for (int i = 0; i < RPS; ++i) {
+                    const T gv = static_cast<T>(g[i]);
+                    const T uv = static_cast<T>(u[i]);
+                    act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+                }
             }
         }
         """
@@ -1497,7 +1524,17 @@ extension TrackFastMoEKernels {
     /// MLXFAST-DOWNRPS: output rows per down+combine threadgroup in a one-token
     /// window. Each row's expert walks and the fold are unchanged for any value;
     /// fewer rows per threadgroup means more threadgroups in flight (H / rows).
-    static let downRowsPerSimdgroup = 2
+    /// Activation rows staged per simdgroup in the decode down+combine.
+    ///
+    /// The crown ships 2; this candidate sets 1, which is the one constant
+    /// change the campaign found to be neutral-to-good rather than harmful.
+    /// Every other deviation tried on this artifact cost score: `asyncChunk`
+    /// moved off 3 (4, 2, 5, 6, 7, 8 all measured lower, and 0 is 13% worse),
+    /// `downCombineSimdgroups = 4` lost ~1.5%, and
+    /// `gateUpReuseRowsPerSimdgroup = 4` lost ~1.5% reproducibly. The value 1
+    /// is used in the decode branch only; the prefill branch keeps the crown's
+    /// hardcoded 4.
+    static let downRowsPerSimdgroup = 1
 
     static let downCombineSimdgroups =
         ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 5
