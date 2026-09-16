@@ -154,7 +154,7 @@ extension TrackFastKernels {
                         InT sp = out[row * H + d] * inj_t;
                         r = r + sp;
                     }
-                    stream[base + d] = r;
+                    if (EMIT_STREAM) { stream[base + d] = r; }
                     kept[si * N_READS + i] = r;
                     const float xf = static_cast<float>(r);
                     acc += xf * xf;
@@ -192,12 +192,17 @@ extension TrackFastKernels {
 
     static func injectNorm(
         residual: MLXArray, out: MLXArray?, inject: MLXArray?, scale: MLXArray,
-        hcCount: Int, hidden: Int, eps: Float, tile: Bool
+        hcCount: Int, hidden: Int, eps: Float, tile: Bool, emitStream: Bool = true
     ) -> (stream: MLXArray, normed: MLXArray) {
         let B = residual.dim(0), S = residual.dim(1)
         let W = hcCount * hidden
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024)
         let hasInject = out != nil
+        // MLXFAST-EMITSTREAM: the one caller that passes `out == nil` and
+        // `tile == false` gets a `stream` output that is a byte-for-byte copy
+        // of `residual`, so it keeps the array it passed in and the store is
+        // skipped. Only the wide (prefill) body carries the flag.
+        precondition(emitStream || S >= wideNormMinS)
         if S >= wideNormMinS {
             let sg = wideNormSimdgroups
             let outs = injectNormWideKernel(
@@ -205,10 +210,10 @@ extension TrackFastKernels {
                 template: [
                     ("InT", residual.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
                     ("HAS_INJECT", hasInject), ("TILE", tile), ("EPS_BITS", Int(eps.bitPattern)),
-                    ("SG", sg),
+                    ("SG", sg), ("EMIT_STREAM", emitStream),
                 ],
                 grid: (32 * sg, hcCount, B * S), threadGroup: (32 * sg, 1, 1),
-                outputShapes: [[B, S, W], [B, S, W]],
+                outputShapes: [emitStream ? [B, S, W] : [1, 1, 1], [B, S, W]],
                 outputDTypes: [residual.dtype, residual.dtype])
             return (outs[0], outs[1])
         }
