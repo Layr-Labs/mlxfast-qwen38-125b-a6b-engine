@@ -1312,7 +1312,7 @@ extension TrackFastMoEKernels {
         const uint z = threadgroup_position_in_grid.z;
         const bool shared = z == (uint)BR;
         const uint e = shared ? 0u : idx[z];
-        const uint r = shared ? 0u : xrow[z];
+        // This kernel is dispatched only for S == 1: every expert reads row zero.
         const size_t kw = (size_t)KD / 8;
         const size_t kg = (size_t)KD / GS;
         const size_t eoff = (size_t)e * (size_t)N;
@@ -1326,20 +1326,34 @@ extension TrackFastMoEKernels {
             + (int)simdgroup_index_in_threadgroup * RPS;
         float g[RPS], u[RPS];
         qmv_fast_reg_dual<T, GS, BITS, RPS>(
-            gw, gs, gb, uw, us, ub, x + (size_t)r * (size_t)KD,
+            gw, gs, gb, uw, us, ub, x,
             KD, out_row, thread_index_in_simdgroup, g, u);
-        if (thread_index_in_simdgroup == 0) {
-            for (int i = 0; i < RPS; ++i) {
+        // MLXFAST-ACTLANES-REUSE: `qmv_fast_reg_dual` closes with a `simd_sum` on
+        // every row, so `g[i]`/`u[i]` already hold identical bits on every lane.
+        // The staging write therefore needs *a* lane per entry, not lane 0 for
+        // all RPS of them. Same values, same addresses, same `mlx_silu` per
+        // entry; only which lane issues each store changes.
+        if constexpr (RPS <= 32) {
+            if (thread_index_in_simdgroup < RPS) {
+                const int i = (int)thread_index_in_simdgroup;
                 const T gv = static_cast<T>(g[i]);
                 const T uv = static_cast<T>(u[i]);
                 act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+            }
+        } else {
+            if (thread_index_in_simdgroup == 0) {
+                for (int i = 0; i < RPS; ++i) {
+                    const T gv = static_cast<T>(g[i]);
+                    const T uv = static_cast<T>(u[i]);
+                    act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+                }
             }
         }
         """
 
     nonisolated(unsafe) static let gateUpReuseKernel = MLXFast.metalKernel(
         name: "track_moe_gate_up_reuse_2row",
-        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
+        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx"],
         outputNames: ["act"],
         source: gateUpReuseSource,
         header: helpersCore + TrackFastKernels.exactHeader + gateUpReuseHelpers,
@@ -1359,7 +1373,7 @@ extension TrackFastMoEKernels {
         {
             let rows = gateUpReuseRowsPerSimdgroup
             return gateUpReuseKernel(
-                [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
+                [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx],
                 template: [
                     ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N),
                     ("KD", KD), ("BR", BR), ("RPS", rows),
@@ -1497,7 +1511,7 @@ extension TrackFastMoEKernels {
     /// MLXFAST-DOWNRPS: output rows per down+combine threadgroup in a one-token
     /// window. Each row's expert walks and the fold are unchanged for any value;
     /// fewer rows per threadgroup means more threadgroups in flight (H / rows).
-    static let downRowsPerSimdgroup = 2
+    static let downRowsPerSimdgroup = 1
 
     static let downCombineSimdgroups =
         ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 5

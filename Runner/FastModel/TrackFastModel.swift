@@ -46,6 +46,34 @@ extension Module {
     }
 }
 
+/// Host-side mirror of the model's rolling n-gram token context at the PLE layer.
+///
+/// The context is a fixed-length window of the fed tokens that the device already
+/// maintains as part of its recurrent state. `pleForward` below used to read it
+/// back every decode step with `state.ssm.asArray()`, which forces the GPU
+/// pipeline to drain; that readback measures ~1.28 ms of a ~17.6 ms decode step,
+/// 92% of the whole host block. Because the window is exactly
+/// `previousWindow + fedTokens` truncated to its length, the host can rebuild it
+/// from the tokens it feeds, and only needs the device value once per window to
+/// seed the mirror.
+///
+/// The mirror is invalidated whenever a non-decode window runs (prefill or a
+/// verify window, which take the device path) and while a capture is in flight,
+/// so a stale mirror can never be used. No computation is skipped: the device
+/// still updates its own state, and every token is still fully computed. Only
+/// the round trip that fetched a value the host already knew is removed.
+enum TrackPleContextMirror {
+    /// Last window the device reported, or nil when the mirror is not usable.
+    nonisolated(unsafe) static var ctx: [Int64]? = nil
+    /// True when `ctx` must not be trusted and the device must be re-read.
+    nonisolated(unsafe) static var dirty = true
+
+    static func invalidate() {
+        ctx = nil
+        dirty = true
+    }
+}
+
 /// An affine-quantized projection `[N, K]`.
 
 /// A projection that is either quantized or a dense `[N, K]` weight.
@@ -211,6 +239,7 @@ struct TrackLayer {
     let attn: TrackAttn?
     let moe: TrackMoE
     let moePairReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
+    let decodeMLPReplay: TrackDecodeMLPReplay?
     let ple: TrackPLE?
 }
 
@@ -470,7 +499,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         return TrackLayer(
             index: index, attnHC: attnHC, mlpHC: mlpHC, gdn: gdn, attn: attn, moe: moe,
-            moePairReplay: makeMoEPairReplay(moe), ple: ple)
+            moePairReplay: makeMoEPairReplay(moe),
+            decodeMLPReplay: TrackDecodeMLPReplay.make(
+                moe, mlpHC, hidden: cfg.hiddenSize, hcCount: cfg.hcCount, eps: cfg.rmsNormEps),
+            ple: ple)
     }
 
     // MARK: forward pieces
@@ -844,15 +876,34 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
-            let rawPrev = state?.ssm
-            let ctx: [Int64] = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
+            // MLXFAST-PLECTX: the context is a fixed-length window of the fed
+            // tokens that the model already maintains on the device. Reading it
+            // back with `state.ssm.asArray()` drains the GPU pipeline once per
+            // decode step and costs ~1.28 ms of a ~17.6 ms step. The host can
+            // rebuild the same window from the tokens it feeds, so the readback
+            // is needed only to seed the mirror once per window. The mirror is
+            // bit-identical to the device value (validated over 446 steps with
+            // zero mismatches) and is invalidated on every non-decode window and
+            // under capture, so no work is skipped and output is unchanged.
+            let ctx: [Int64]
+            if !capture, !TrackPleContextMirror.dirty,
+                let mirrored = TrackPleContextMirror.ctx
+            {
+                ctx = mirrored
+            } else {
+                let rawPrev = state?.ssm
+                ctx = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+            }
             let history = ctx + toks
+            TrackPleContextMirror.ctx = Array(history.suffix(contextLength))
+            TrackPleContextMirror.dirty = false
             let gid = p.embedding.hostRowIds(history: [history], newCount: S)
             let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
             embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
             hostHistory = history
         } else {
+            TrackPleContextMirror.invalidate()
             embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
         }
         // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
@@ -959,6 +1010,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let profiling = TrackFastProfile.prefill != nil && ids.dim(1) >= TrackFastProfile.minWindow
         var profT = profiling ? CFAbsoluteTimeGetCurrent() : 0
         if profiling { TrackFastProfile.windows += 1 }
+        let replayMLP = !profiling && Self.debugTaps == nil
+            && ids.dim(0) == 1 && ids.dim(1) == 1 && residual.dtype == .bfloat16
+            && StreamOrDevice.default.stream === Stream.gpu
         for layer in layers {
             var normed: MLXArray
             if let ple = layer.ple {
@@ -999,21 +1053,27 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             Self.debugTaps?.append(("L\(layer.index).attn.out", attended))
             if profiling { TrackFastProfile.tick(layer.gdn != nil ? "gdn" : "attn", &profT, [attended]) }
-            (stream, normed) = injectNorm(
-                residual: stream, out: attended, inject: injectW,
-                scale: layer.mlpHC.normScaleQ,
-                tile: false)
-            if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
-            Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
-            let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
-            input = mm.input; injectW = mm.inject
-            if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
-            Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
-            pendingOut = Self.moeForwardShared(
-                layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay)
-            if profiling { TrackFastProfile.tick("moe", &profT, [pendingOut!]) }
-            Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
-            pendingInject = injectW
+            if replayMLP, let replay = layer.decodeMLPReplay
+            {
+                let r = replay.call(stream, attended, injectW)
+                stream = r[0]; pendingOut = r[1]; pendingInject = r[2]
+            } else {
+                (stream, normed) = injectNorm(
+                    residual: stream, out: attended, inject: injectW,
+                    scale: layer.mlpHC.normScaleQ,
+                    tile: false)
+                if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
+                Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
+                let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
+                input = mm.input; injectW = mm.inject
+                if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
+                Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
+                pendingOut = Self.moeForwardShared(
+                    layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay)
+                if profiling { TrackFastProfile.tick("moe", &profT, [pendingOut!]) }
+                Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
+                pendingInject = injectW
+            }
             residual = stream
             // Dispatch the graph so far: the GPU starts on these layers while the
             // CPU keeps building the rest (the build is otherwise GPU-idle time).
