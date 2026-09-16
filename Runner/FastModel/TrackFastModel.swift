@@ -497,7 +497,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             if !hc.hasInject || injQ != nil {
                 let n2 = normed.reshaped(S, hcCount * hidden)
                 let d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
-                let packedUp = S == 1 ? hc.decodeUp : nil
+                let packedUp = (S == 1 || S == 2) ? hc.decodeUp : nil
                 let u = TrackFastMixerKernels.upMix(
                     act: d.act, normed: n2, up: packedUp ?? uq, inj: d.inj, hcCount: hcCount, hidden: hidden,
                     hasInject: hc.hasInject, emitF32: emitF32, packedRows: packedUp != nil)
@@ -855,11 +855,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } else {
             embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
         }
-        // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
-        // every other shape takes the three-launch PLE block below.
+        // Keep both projection dispatches; fuse PLE preparation/convolution
+        // for one-token decode and two-token verification windows.
         let full: MLXArray
         let output: MLXArray
-        if S == 1, TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
+        if (S == 1 || S == 2), TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
             convState.shape == [1, 9, wide], convState.dtype == stream.dtype,
             let fused = TrackPLEFusion.forward(
                 p, embedded: embedded, stream: stream, convState: convState, eps: eps)
