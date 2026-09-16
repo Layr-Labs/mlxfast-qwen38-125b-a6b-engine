@@ -1237,7 +1237,7 @@ extension TrackFastMoEKernels {
         source: gateUpActSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
 
-    static let gateUpReuseRowsPerSimdgroup = 2
+    static let gateUpReuseRowsPerSimdgroup = 4
 
     static let gateUpReuseHelpers = #"""
         template <typename T, int group_size, int bits, int rows>
@@ -1328,11 +1328,25 @@ extension TrackFastMoEKernels {
         qmv_fast_reg_dual<T, GS, BITS, RPS>(
             gw, gs, gb, uw, us, ub, x + (size_t)r * (size_t)KD,
             KD, out_row, thread_index_in_simdgroup, g, u);
-        if (thread_index_in_simdgroup == 0) {
-            for (int i = 0; i < RPS; ++i) {
+        // MLXFAST-ACTLANES-REUSE: `qmv_fast_reg_dual` closes with a `simd_sum` on
+        // every row, so `g[i]`/`u[i]` already hold identical bits on every lane.
+        // The staging write therefore needs *a* lane per entry, not lane 0 for
+        // all RPS of them. Same values, same addresses, same `mlx_silu` per
+        // entry; only which lane issues each store changes.
+        if constexpr (RPS <= 32) {
+            if (thread_index_in_simdgroup < RPS) {
+                const int i = (int)thread_index_in_simdgroup;
                 const T gv = static_cast<T>(g[i]);
                 const T uv = static_cast<T>(u[i]);
                 act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+            }
+        } else {
+            if (thread_index_in_simdgroup == 0) {
+                for (int i = 0; i < RPS; ++i) {
+                    const T gv = static_cast<T>(g[i]);
+                    const T uv = static_cast<T>(u[i]);
+                    act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+                }
             }
         }
         """
@@ -1497,7 +1511,7 @@ extension TrackFastMoEKernels {
     /// MLXFAST-DOWNRPS: output rows per down+combine threadgroup in a one-token
     /// window. Each row's expert walks and the fold are unchanged for any value;
     /// fewer rows per threadgroup means more threadgroups in flight (H / rows).
-    static let downRowsPerSimdgroup = 2
+    static let downRowsPerSimdgroup = 1
 
     static let downCombineSimdgroups =
         ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 5
