@@ -737,7 +737,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// (uploading it per step was one host copy per layer).
     nonisolated(unsafe) private static var xrowTables: [Int: MLXArray] = [:]
     private static let xrowLock = NSLock()
+    nonisolated(unsafe) private static let singleTokenTop10XRows: MLXArray = {
+        let t = MLXArray(Array(repeating: UInt32(0), count: 10))
+        eval(t)
+        return t
+    }()
     static func xrowTable(S: Int, K: Int) -> MLXArray {
+        if S == 1 && K == 10 { return singleTokenTop10XRows }
         xrowLock.lock(); defer { xrowLock.unlock() }
         if let t = xrowTables[S * 1024 + K] { return t }
         let t = MLXArray((0 ..< (S * K)).map { UInt32($0 / K) })
