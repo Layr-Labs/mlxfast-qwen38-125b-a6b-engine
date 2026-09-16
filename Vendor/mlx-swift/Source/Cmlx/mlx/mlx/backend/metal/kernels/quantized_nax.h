@@ -1715,28 +1715,15 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
       // not have one. 16 bf16 per thread, statically indexed, so it stays in
       // registers. The values published to `As` are byte for byte what the
       // in-place copy published, only fetched earlier.
-      // MLXFAST-AVEC: a_col is a multiple of 16 elements (32 bytes), K is
-      // 2560 or 640 elements and BK is 64, so both ends of the copy are
-      // 16-byte aligned and the 16 elements move as two whole vectors.
-      constexpr short A_VECS = 16 * sizeof(T) / sizeof(uint4);
-      uint4 a_buf[A_VECS];
+      T a_buf[16];
       PackedNAXGroup32 packed_w;
       if (K_it > 0) {
         packed_w.prefetch(loader_w);
         if (a_live) {
-          const device uint4* a0 =
-              (const device uint4*)(xb + size_t(a_row) * K + a_col);
+          const device T* a0 = xb + size_t(a_row) * K + a_col;
           STEEL_PRAGMA_UNROLL
-          for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a0[v]; }
+          for (short e = 0; e < 16; ++e) { a_buf[e] = a0[e]; }
         }
-      }
-      if (!a_live) {
-        // A dead row's slice of the activation stage is zero for every K step:
-        // `a_dst` never advances, so the fill is written once here instead of
-        // once per step by the else branch that used to sit in the loop.
-        threadgroup uint4* d0 = (threadgroup uint4*)a_dst;
-        STEEL_PRAGMA_UNROLL
-        for (short v = 0; v < A_VECS; ++v) { d0[v] = uint4(0); }
       }
       for (int k = 0; k < K_it; k++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1754,9 +1741,15 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
         // rows are excluded by `store_slice` either way. Same values, same
         // order, bit-identical output.
         if (a_live) {
-          threadgroup uint4* d4 = (threadgroup uint4*)a_dst;
           STEEL_PRAGMA_UNROLL
-          for (short v = 0; v < A_VECS; ++v) { d4[v] = a_buf[v]; }
+          for (short e = 0; e < 16; ++e) {
+            a_dst[e] = a_buf[e];
+          }
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short e = 0; e < 16; ++e) {
+            a_dst[e] = T(0);
+          }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1765,10 +1758,9 @@ METAL_FUNC void p17_affine_gather_qmm_rhs_nax(
           loader_w.next();
           packed_w.prefetch(loader_w);
           if (a_live) {
-            const device uint4* a_next =
-                (const device uint4*)(xb + BK + size_t(a_row) * K + a_col);
+            const device T* a_next = xb + BK + size_t(a_row) * K + a_col;
             STEEL_PRAGMA_UNROLL
-            for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a_next[v]; }
+            for (short e = 0; e < 16; ++e) { a_buf[e] = a_next[e]; }
           }
         }
 
