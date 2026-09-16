@@ -754,6 +754,58 @@ METAL_FUNC void qmv_quad_impl(
   }
 }
 
+// MLXFAST-QMVVEC: the 4-bit fast-path operand loads, vectorised.
+// `load_vector_v4` fetches the 16 activations as four 8-byte vector loads
+// instead of sixteen scalar ones, and `qdot_v4` fetches a row's four 16-bit
+// packs as one 8-byte load instead of four. Component order, operand types and
+// addition order are those of `load_vector<T,U,16,4>` and `qdot<U,16,4>`, so
+// `sum`, every `x_thread` entry and `accum` are bit-identical; only the number
+// of load instructions changes. Alignment holds on the fast path: `x` advances
+// by whole multiples of `values_per_thread` (16 elements = 32 bytes for bfloat)
+// and the weight pointer by whole multiples of `packs_per_thread *
+// bytes_per_pack` (8 bytes), from buffer bases MLX allocates at 16 bytes or
+// better, and `fast` already requires `K` to be aligned.
+template <typename T, typename U, int values_per_thread, int bits>
+inline U load_vector_v4(const device T* x, thread U* x_thread) {
+  static_assert(bits == 4, "v4 activation load is 4-bit only");
+  static_assert(values_per_thread % 4 == 0, "v4 activation load needs groups of four");
+  U sum = 0;
+  for (int i = 0; i < values_per_thread; i += 4) {
+    const metal::vec<T, 4> v = *(const device metal::vec<T, 4>*)(x + i);
+    sum += v.x + v.y + v.z + v.w;
+    x_thread[i] = v.x;
+    x_thread[i + 1] = v.y / 16.0f;
+    x_thread[i + 2] = v.z / 256.0f;
+    x_thread[i + 3] = v.w / 4096.0f;
+  }
+  return sum;
+}
+
+template <typename U, int values_per_thread, int bits>
+inline U qdot_v4(
+    const device uint8_t* w,
+    const thread U* x_thread,
+    U scale,
+    U bias,
+    U sum) {
+  static_assert(bits == 4 && values_per_thread == 16, "v4 dot is 4-bit x16 only");
+  const ushort4 wq = *(const device ushort4*)w;
+  U accum = 0;
+  accum +=
+      (x_thread[0] * (wq.x & 0x000f) + x_thread[1] * (wq.x & 0x00f0) +
+       x_thread[2] * (wq.x & 0x0f00) + x_thread[3] * (wq.x & 0xf000));
+  accum +=
+      (x_thread[4] * (wq.y & 0x000f) + x_thread[5] * (wq.y & 0x00f0) +
+       x_thread[6] * (wq.y & 0x0f00) + x_thread[7] * (wq.y & 0xf000));
+  accum +=
+      (x_thread[8] * (wq.z & 0x000f) + x_thread[9] * (wq.z & 0x00f0) +
+       x_thread[10] * (wq.z & 0x0f00) + x_thread[11] * (wq.z & 0xf000));
+  accum +=
+      (x_thread[12] * (wq.w & 0x000f) + x_thread[13] * (wq.w & 0x00f0) +
+       x_thread[14] * (wq.w & 0x0f00) + x_thread[15] * (wq.w & 0xf000));
+  return scale * accum + sum * bias;
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_fast_impl(
     const device uint32_t* w,
@@ -794,8 +846,17 @@ METAL_FUNC void qmv_fast_impl(
   x += tid.x * in_vec_size + simd_lid * values_per_thread;
   y += tid.x * out_vec_size + out_row;
 
+  // MLXFAST-QMVVEC: 4-bit takes the vectorised operand loads; every other bit
+  // width keeps the scalar helpers unchanged.
+  constexpr bool qmv_vec4 = (bits == 4) && (values_per_thread == 16);
+
   for (int k = 0; k < in_vec_size; k += block_size) {
-    U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+    U sum;
+    if constexpr (qmv_vec4) {
+      sum = load_vector_v4<T, U, values_per_thread, bits>(x, x_thread);
+    } else {
+      sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+    }
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
@@ -804,7 +865,11 @@ METAL_FUNC void qmv_fast_impl(
 
       U s = sl[0];
       U b = bl[0];
-      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+      if constexpr (qmv_vec4) {
+        result[row] += qdot_v4<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+      } else {
+        result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+      }
     }
 
     ws += block_size * bytes_per_pack / pack_factor;
