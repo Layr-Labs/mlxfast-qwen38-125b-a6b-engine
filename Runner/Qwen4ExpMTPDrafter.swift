@@ -18,9 +18,9 @@
 //  as `lastHidden`, and every draft round re-embeds it. The collapsed hidden
 //  the head-facing path uses would be the wrong tensor and the wrong width.
 //
-//  DEPTH 1...3. The head is one hybrid layer applied to its own output, so a
-//  deeper chain drifts further from the target with no measured acceptance to
-//  pay for it. Three is the ruled ceiling for this track.
+//  DEPTH 1...6 is supported. The submitted declaration selects the depth;
+//  larger depth must pay for its extra head and verification work through
+//  accepted tokens. This implementation does not override the engine policy.
 //
 //  ARGMAX TIE-BREAK is the lowest token id, which is what `argMax` returns.
 //  The target verifier uses the same rule, so a draft can never be rejected
@@ -71,6 +71,9 @@ public final class TrackQwen4ExpInlineMTPAssistant {
         let groupSize: Int, bits: Int
     }
     private let shortlist: Shortlist?
+    private let draftProjection: QuantizedLinear?
+    private static let useTargetShortlist =
+        ProcessInfo.processInfo.environment["TRACK_MTP_TARGET_SHORTLIST"] != "0"
     static let shortlistLowIds = 98304
     static let shortlistSpecialFrom = 248044
 
@@ -88,6 +91,10 @@ public final class TrackQwen4ExpInlineMTPAssistant {
         self.target = target
         self.mtp = mtp
         self.embedTokens = embedTokens
+        let projection = target.children()[unwrapping: "lm_head"] as? QuantizedLinear
+        self.draftProjection = projection.flatMap {
+            $0.mode == .affine && $0.bits == 4 && $0.biases != nil && $0.bias == nil ? $0 : nil
+        }
         var shortlist: Shortlist? = nil
         if let q = target.children()[unwrapping: "lm_head"] as? QuantizedLinear, let biases = q.biases,
             q.mode == .affine, q.bits == 4
@@ -120,13 +127,13 @@ public final class TrackQwen4ExpInlineMTPAssistant {
     /// head's key-value history in place, and projecting them would read the
     /// whole output head for tokens nothing consumes.
     private func headStep(
-        tokens: MLXArray, multiStream: MLXArray, cache: [KVCache], stepIndex: Int
+        tokens: MLXArray, multiStream: MLXArray, cache: [KVCache], stepIndex: Int, candidateIDs: MLXArray?
     ) -> (draft: MLXArray, multi: MLXArray) {
         let step: (sample: MLXArray, multi: MLXArray)
         if let fastHead, let attnCache = cache.first as? Qwen4ExpAttentionCache,
             let fast = fastHead.forward(
                 nextTokenIds: tokens, multiStream: multiStream, embedTokens: embedTokens,
-                cache: attnCache)
+                cache: attnCache, lastPositionOnly: true)
         {
             step = fast
         } else {
@@ -141,7 +148,18 @@ public final class TrackQwen4ExpInlineMTPAssistant {
         let lastSample = step.sample[0..., last..., 0...]
         let lastMulti = step.multi[0..., last..., 0...]
         let draft: MLXArray
-        if let sl = shortlist {
+        if let candidateIDs, let q = draftProjection {
+            // The trusted verifier supplies request-local top-K ids only when
+            // its probability-mass gate passes. Sort ids, not scores, to keep
+            // lowest-token-id ties even though argPartition ids are unordered.
+            let ids = sorted(candidateIDs.asType(.int32).reshaped([-1]))
+            let logits = quantizedMM(
+                lastSample[0..., -1, 0...], take(q.weight, ids, axis: 0),
+                scales: take(q.scales, ids, axis: 0),
+                biases: take(q.biases!, ids, axis: 0),
+                transpose: true, groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+            draft = take(ids, argMax(logits, axis: -1), axis: 0).asType(.int32)
+        } else if let sl = shortlist {
             let logits = quantizedMM(
                 lastSample[0..., -1, 0...], sl.weight, scales: sl.scales, biases: sl.biases,
                 transpose: true, groupSize: sl.groupSize, bits: sl.bits)  // [1, NS]
@@ -262,6 +280,13 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     public var maximumDraftTokens: Int? { Self.maximumDepth }
     public var maximumSpeculativeBatch: Int? { 1 }
 
+    /// Public opt-in seam: the engine supplies a top-256 list from the actual
+    /// preceding target carry, with its unchanged >=90% coverage gate. No
+    /// request identity, token history lookup, or extra host synchronization.
+    public var draftShortlistSize: Int? {
+        Self.useTargetShortlist && draftProjection != nil ? 256 : nil
+    }
+
     /// Head key-value rows, the retained indexer tape, one multi-stream row
     /// and one token id, per input token.
     public var requestStateBytesPerToken: Int {
@@ -353,7 +378,7 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
         let step = headStep(
             tokens: feed.tokens, multiStream: feed.multi, cache: state.caches,
-            stepIndex: state.roundDraftSteps)
+            stepIndex: state.roundDraftSteps, candidateIDs: shortlist)
         state.roundRoots.append(contentsOf: [step.multi, step.draft])
         state.roundDraftSteps += 1
 
