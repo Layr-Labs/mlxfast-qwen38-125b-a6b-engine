@@ -1054,7 +1054,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             tile = false
             if profiling { TrackFastProfile.tick(layer.ple != nil ? "norm+ple" : "norm", &profT, [stream, normed]) }
-            let am = hcMix(layer.attnHC, normed: normed, tag: "L\(layer.index).attn.hc")
+            let am = hcMix(layer.attnHC, normed: normed,
+                tag: Self.debugTaps == nil ? "" : "L\(layer.index).attn.hc")
             var input = am.input, injectW = am.inject
             if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
             Self.debugTaps?.append(("L\(layer.index).attn.stream_in", stream))
@@ -1083,7 +1084,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     tile: false)
                 if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
                 Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
-                let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
+                let mm = hcMix(layer.mlpHC, normed: normed,
+                    tag: Self.debugTaps == nil ? "" : "L\(layer.index).mlp.hc", emitF32: true)
                 input = mm.input; injectW = mm.inject
                 if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
                 Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
