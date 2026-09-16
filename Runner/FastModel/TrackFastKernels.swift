@@ -624,10 +624,13 @@ enum TrackFastKernels {
         return s
     }
 
-    /// Value rows per simdgroup in the prefill recurrence. Four is the measured
-    /// optimum; `0` falls back to the previous prefetching two-row kernel.
+    /// Value rows per simdgroup in the prefill recurrence; `0` falls back to the
+    /// previous prefetching two-row kernel. Eight halves the threadgroup count
+    /// of the recurrence (grid y is `Dv / rows`) while each value row keeps its
+    /// own scan, its own operands and its own reductions, so the outputs are
+    /// bit-identical for any legal value; only row ownership moves.
     private static let prefillRows =
-        Int(ProcessInfo.processInfo.environment["TRACK_GDN_PREFILL_ROWS"] ?? "") ?? 4
+        Int(ProcessInfo.processInfo.environment["TRACK_GDN_PREFILL_ROWS"] ?? "") ?? 8
 
     nonisolated(unsafe) private static let leanRowsKernel = MLXFast.metalKernel(
         name: "track_gdn_rows",
