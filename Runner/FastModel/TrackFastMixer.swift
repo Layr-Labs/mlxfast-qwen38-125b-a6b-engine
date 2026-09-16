@@ -41,12 +41,20 @@ enum TrackFastMixerKernels {
             if constexpr (VPT == 1) {
                 float r[RPS];
                 qmv_fast_reg<T, GS, BITS, RPS>(wd, sd, bd, normed, KD, tile * (2 * RPS) + (int)sg * RPS, lid, r);
-                if (lid == 0) {
-                    for (int i = 0; i < RPS; ++i) {
-                        const T l = static_cast<T>(r[i]);
-                        lo[tile * (2 * RPS) + (int)sg * RPS + i] = l;
-                        act[tile * (2 * RPS) + (int)sg * RPS + i] = mlx_silu(l);
-                    }
+                // MLXFAST-MIXLANES: `qmv_fast_reg` closes with a `simd_sum` on
+                // every row, so all RPS entries of `r` hold identical bits on
+                // every lane of the simdgroup. The staging write therefore only
+                // needs *a* lane per entry rather than lane 0 writing all of
+                // them. Same values, same addresses, same `mlx_silu` per entry;
+                // only which lane issues each store changes. At the shipped
+                // RPS = 1 this is identically the lane-0 write (the guard keeps
+                // the distributed form to RPS <= 32, the static_assert above
+                // pins RPS to 1, 2 or 4, and the wide path is untouched).
+                if (lid < RPS) {
+                    const int i = (int)lid;
+                    const T l = static_cast<T>(r[i]);
+                    lo[tile * (2 * RPS) + (int)sg * RPS + i] = l;
+                    act[tile * (2 * RPS) + (int)sg * RPS + i] = mlx_silu(l);
                 }
             } else {
                 float r[VPT];
