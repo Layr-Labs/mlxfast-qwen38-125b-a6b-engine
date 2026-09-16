@@ -239,6 +239,7 @@ METAL_FUNC void track_mixer_act_dense(
     const device T* x,
     device T* y,
     threadgroup T* Ws,
+    threadgroup T* As,
     int K,
     int N,
     int M,
@@ -308,7 +309,22 @@ METAL_FUNC void track_mixer_act_dense(
   NAXTile<AccumType, TM, TN> Dtile;
   Dtile.clear();
 
-  x += tm * K;
+  // MLXFAST-ASTAGE: each simdgroup used to walk A itself, and with WM = WN = 2
+  // the pairs (0,1) and (2,3) issue IDENTICAL reads, so every A row of the tile
+  // was fetched twice -- as SK-element pieces at a K-element stride (K = 10240
+  // here, a 20,480-byte stride), one short read per cache line. Staging it
+  // instead costs one cooperative, fully coalesced pass: 128 threads x 16
+  // contiguous elements covers the whole BM x BK block, four threads to a row.
+  // It rides the barrier pair Ws already needs, so it adds no synchronization.
+  constexpr short BKA_padded = BK_padded;
+  constexpr short A_PER_THREAD = (BM * BK) / (WM * WN * SIMD_SIZE);
+  constexpr short A_SPLIT = BK / A_PER_THREAD;
+  constexpr short A_VECS = A_PER_THREAD * sizeof(T) / sizeof(uint4);
+  const short a_row = short(lid) / A_SPLIT;
+  const short a_col = (short(lid) % A_SPLIT) * A_PER_THREAD;
+  threadgroup T* a_dst = As + a_row * BKA_padded + a_col;
+  const short tile_m = short(min(int(BM), M - y_row));
+  const bool a_live = a_row < tile_m;
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
@@ -318,6 +334,20 @@ METAL_FUNC void track_mixer_act_dense(
           if (K > 0) {
             packed_w.prefetch(loader_w);
           }
+        }
+        uint4 a_buf[A_VECS];
+        if (a_live) {
+          const device uint4* a0 =
+              (const device uint4*)(x + size_t(a_row) * K + a_col);
+          STEEL_PRAGMA_UNROLL
+          for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a0[v]; }
+        } else {
+          // Rows past `tile_m` are zeroed, which is what the `load_safe` path
+          // they replace produced for the same lanes. `a_dst` never advances,
+          // so the fill is written once here instead of every block.
+          threadgroup uint4* d0 = (threadgroup uint4*)a_dst;
+          STEEL_PRAGMA_UNROLL
+          for (short v = 0; v < A_VECS; ++v) { d0[v] = uint4(0); }
         }
         for (int k = 0; k < K; k += BK) {
           threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -329,6 +359,12 @@ METAL_FUNC void track_mixer_act_dense(
             loader_w.load_safe(short2(BK, tgp_bn));
           }
 
+          if (a_live) {
+            threadgroup uint4* d4 = (threadgroup uint4*)a_dst;
+            STEEL_PRAGMA_UNROLL
+            for (short v = 0; v < A_VECS; ++v) { d4[v] = a_buf[v]; }
+          }
+
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
           if constexpr (kPrefetch.value) {
@@ -336,6 +372,12 @@ METAL_FUNC void track_mixer_act_dense(
               loader_w.next();
               packed_w.prefetch(loader_w);
             }
+          }
+          if (k + BK < K && a_live) {
+            const device uint4* a_next =
+                (const device uint4*)(x + BK + size_t(a_row) * K + a_col);
+            STEEL_PRAGMA_UNROLL
+            for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a_next[v]; }
           }
 
           STEEL_PRAGMA_NO_UNROLL
@@ -345,11 +387,7 @@ METAL_FUNC void track_mixer_act_dense(
 
             volatile int compiler_barrier;
 
-            if constexpr (kAlignedM.value) {
-              Atile.load(x + kk1, K);
-            } else {
-              Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
-            }
+            Atile.template load<T, BKA_padded, 1>(As + tm * BKA_padded + kk1);
 
             Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
 

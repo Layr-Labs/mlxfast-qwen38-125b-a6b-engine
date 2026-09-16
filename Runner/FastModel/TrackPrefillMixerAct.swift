@@ -49,8 +49,9 @@ enum TrackPrefillMixerAct {
     /// `TM = SM / 16` becomes 1 instead of 2 and the register tile halves.
     static let source = #"""
         alignas(16) threadgroup T Ws[64 * 72];
+        alignas(16) threadgroup T As[32 * 72];
         track_mixer_act_dense<T, 32, 4, true, 32, 64, 64, 2, 2>(
-            w, scales, biases, x, y, Ws, 10240, 320, M,
+            w, scales, biases, x, y, Ws, As, 10240, 320, M,
             threadgroup_position_in_grid, thread_index_in_threadgroup,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
         """#
