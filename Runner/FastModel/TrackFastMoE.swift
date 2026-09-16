@@ -1237,7 +1237,15 @@ extension TrackFastMoEKernels {
         source: gateUpActSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
 
-    static let gateUpReuseRowsPerSimdgroup = 2
+    /// MLXFAST-GUR1: output rows per simdgroup in the fused gate/up +
+    /// shared-expert kernel on the one-token path. `RPS` is a template
+    /// parameter and the grid is `(32, N / rows, BR + 1)`, so 1 gives
+    /// N / 1 = 640 row groups where 2 gave 320: twice the threadgroups,
+    /// and each simdgroup carries one row's accumulator instead of two.
+    /// The K walk, the dequantisation and the fold are unchanged for any
+    /// value, so every output element accumulates its K blocks in the
+    /// same order.
+    static let gateUpReuseRowsPerSimdgroup = 1
 
     static let gateUpReuseHelpers = #"""
         template <typename T, int group_size, int bits, int rows>
