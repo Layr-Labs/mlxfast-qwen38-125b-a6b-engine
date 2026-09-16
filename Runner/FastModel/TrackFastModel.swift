@@ -891,6 +891,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
+            // The drain above is the step's one device wait, and the first
+            // loop dispatch lands only after this layer (asyncFirst = 2), so
+            // the GPU would idle through the host hash and row gather below.
+            // Dispatch the pre-PLE prefix now and let it run under the fetch.
+            if Self.asyncChunk > 0 { asyncEval(stream) }
             let ctx: [Int64]
             if !capture,
                 TrackPleContextMirror.matches(
@@ -942,7 +947,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
-            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
+            let divisor = TrackFastKernels.scalar(Foundation.sqrt(Float(hidden)), dtype: dot.dtype)
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
             let gn = TrackFastPLEKernels.gated(
                 g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
