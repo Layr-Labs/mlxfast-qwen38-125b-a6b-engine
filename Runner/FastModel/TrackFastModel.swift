@@ -69,6 +69,65 @@ enum TrackPleContextMirror {
     }
 }
 
+/// Overlapped host-side PLE row fetch.
+///
+/// The host row-source path in `pleForward` is pure CPU work — drain the fed
+/// tokens, drain the rolling context, hash the n-grams, fetch the rows from
+/// the SSD-backed table — but it runs on the calling thread between two GPU
+/// phases, so the GPU idles for the whole fetch.  Everything the fetch needs
+/// (`ids`, the recurrent-state evaluation, the offset) is already known when
+/// `fastStreams` is entered, layers before the PLE layer still have to be
+/// built and dispatched, so the fetch is issued on a helper thread at entry
+/// and `pleForward` joins it.  The helper computes exactly the values the
+/// inline path would compute; a join that finishes late costs the same serial
+/// time the inline fetch would have cost, so the mechanism cannot be slower
+/// than the path it replaces.
+final class TrackPlePrefetch: @unchecked Sendable {
+    /// `DispatchQueue.async` takes a `@Sendable` closure; the captured values
+    /// are only read by the helper thread before the semaphore signal, so the
+    /// unchecked box is sound.
+    private struct Input: @unchecked Sendable {
+        let ids: MLXArray
+        let ssm: MLXArray?
+        let p: TrackPLE
+        let host: Qwen4ExpNGramHostRowSource
+    }
+
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var result: (rows: MLXArray, history: [Int64])?
+
+    init(
+        ids: MLXArray, ssm: MLXArray?, p: TrackPLE,
+        host: Qwen4ExpNGramHostRowSource, eosTokenId: Int64, rowWidth: Int
+    ) {
+        let B = ids.dim(0), S = ids.dim(1)
+        let contextLength = max(1, p.dilation - 1)
+        let input = Input(ids: ids, ssm: ssm, p: p, host: host)
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            let toks: [Int64] =
+                input.ids.dtype == .int32
+                ? input.ids.asArray(Int32.self).map(Int64.init)
+                : input.ids.asType(.int64).asArray(Int64.self)
+            let ctx: [Int64] =
+                input.ssm.map {
+                    $0.dtype == .int32
+                        ? $0.asArray(Int32.self).map(Int64.init)
+                        : $0.asType(.int64).asArray(Int64.self)
+                } ?? Array(repeating: eosTokenId, count: contextLength)
+            let history = ctx + toks
+            let gid = input.p.embedding.hostRowIds(history: [history], newCount: S)
+            let rows = input.host.rows(globalIds: gid, shape: [B, S, rowWidth])
+            result = (rows, history)
+            semaphore.signal()
+        }
+    }
+
+    func wait() -> (rows: MLXArray, history: [Int64]) {
+        semaphore.wait()
+        return result!
+    }
+}
+
 // MARK: - Weight helpers
 
 extension Module {
@@ -866,7 +925,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
-        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool,
+        prefetch: TrackPlePrefetch?
     ) -> MLXArray {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
@@ -890,23 +950,37 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
-            let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
-            let ctx: [Int64]
-            if !capture,
-                TrackPleContextMirror.matches(
-                    offset: offset, layer: p.stateLayerIndex, length: contextLength),
-                let mirrored = TrackPleContextMirror.context
-            {
-                ctx = mirrored
+            let history: [Int64]
+            let rows: MLXArray
+            if let prefetch {
+                // The helper thread already drained the tokens and the rolling
+                // context, hashed the n-grams and fetched the rows while the
+                // earlier layers were being built and dispatched; joining it
+                // here is free when the overlap covered the fetch.
+                let r = prefetch.wait()
+                history = r.history
+                rows = r.rows
             } else {
-                let rawPrev = state?.ssm
-                ctx = rawPrev.map {
-                    $0.dtype == .int32
-                        ? $0.asArray(Int32.self).map(Int64.init)
-                        : $0.asType(.int64).asArray(Int64.self)
-                } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+                let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
+                let ctx: [Int64]
+                if !capture,
+                    TrackPleContextMirror.matches(
+                        offset: offset, layer: p.stateLayerIndex, length: contextLength),
+                    let mirrored = TrackPleContextMirror.context
+                {
+                    ctx = mirrored
+                } else {
+                    let rawPrev = state?.ssm
+                    ctx = rawPrev.map {
+                        $0.dtype == .int32
+                            ? $0.asArray(Int32.self).map(Int64.init)
+                            : $0.asType(.int64).asArray(Int64.self)
+                    } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+                }
+                history = ctx + toks
+                let gid = p.embedding.hostRowIds(history: [history], newCount: S)
+                rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
             }
-            let history = ctx + toks
             if capture {
                 TrackPleContextMirror.invalidate()
             } else {
@@ -914,8 +988,6 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     Array(history.suffix(contextLength)), nextOffset: offset + S,
                     stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
             }
-            let gid = p.embedding.hostRowIds(history: [history], newCount: S)
-            let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
             embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
             hostHistory = history
         } else {
@@ -1016,6 +1088,23 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     ) -> (mixed: MLXArray, multi: MLXArray) {
         precondition(recurrentState.count == 1)
         let evaluation = recurrentState[0]
+        // The PLE layer's host row fetch depends only on `ids`, the recurrent
+        // state and the offset — all known here — so it starts on a helper
+        // thread now and overlaps the build and dispatch of the layers that
+        // precede it.  `pleForward` joins the helper instead of running the
+        // fetch inline.
+        let plePrefetch: TrackPlePrefetch?
+        if let ple = layers.lazy.compactMap(\.ple).first,
+            let host = ple.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource,
+            ids.dim(1) <= 8
+        {
+            plePrefetch = TrackPlePrefetch(
+                ids: ids, ssm: evaluation.inputState(modelLayerIndex: ple.stateLayerIndex)?.ssm,
+                p: ple, host: host, eosTokenId: Int64(cfg.eosTokenId),
+                rowWidth: (cfg.ngramSize - 1) * cfg.headsPerNGram)
+        } else {
+            plePrefetch = nil
+        }
         var residual = inputEmbeddings ?? embedTokens(ids)  // [B,S,H] until tiled
         // A fully injected hyper-stream can continue through a layer block.
         // Normal token/embedding entry points retain the initial tiling.
@@ -1041,7 +1130,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     stream
                     + pleForward(
                         ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
+                        offset: offset, capture: capture, prefetch: plePrefetch)
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
