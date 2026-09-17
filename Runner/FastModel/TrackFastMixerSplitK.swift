@@ -4,8 +4,10 @@ import MLX
 // Partition HC input blocks across SIMD groups while retaining each lane's
 // ascending block fold and the final simd_sum. No target weight changes.
 enum TrackFastMixerSplitK {
-    // Four partitions in production; zero selects the original A/B control.
-    nonisolated(unsafe) static var split = 4
+    // Eight partitions in production (four was the prior production value,
+    // measured on the ranked box by submission 1411ea3); zero selects the
+    // original A/B control.
+    nonisolated(unsafe) static var split = 8
     static let helper = #"""
         template <typename T, int K, int V, int R, int SPLIT, bool ORDERED>
         METAL_FUNC void research_split_qmv(
