@@ -887,7 +887,14 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
             let ctx: [Int64]
-            if !capture,
+            if let chained = TrackPleHistoryCache.context(
+                offset: offset, layer: p.stateLayerIndex, length: contextLength)
+            {
+                // The previous window's host history covers this offset --
+                // chained verify rounds and the first window after a decode
+                // step take the context without touching the device.
+                ctx = chained
+            } else if !capture,
                 TrackPleContextMirror.matches(
                     offset: offset, layer: p.stateLayerIndex, length: contextLength),
                 let mirrored = TrackPleContextMirror.context
@@ -902,6 +909,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
             }
             let history = ctx + toks
+            TrackPleHistoryCache.store(
+                history, endOffset: offset + S, layer: p.stateLayerIndex)
             if capture {
                 TrackPleContextMirror.invalidate()
             } else {
@@ -915,6 +924,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             hostHistory = history
         } else {
             TrackPleContextMirror.invalidate()
+            TrackPleHistoryCache.invalidate()
             embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
         }
         // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
