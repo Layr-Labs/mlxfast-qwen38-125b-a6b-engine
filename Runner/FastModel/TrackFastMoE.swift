@@ -775,9 +775,12 @@ extension TrackFastMoEKernels {
                 if (valid) { gate[row] = static_cast<T>(r[0]); }
             }
         }
-        // MLXFAST-ROUTEREG: the walk's winners come from a simd_max/simd_min
-        // pair, so logit and index are already broadcast across the walk's own
-        // simdgroup. Normalize them there and skip the threadgroup round trip.
+        // MLXFAST-ROUTEREG: the walk's selected logits and indices are
+        // produced by a `simd_max`/`simd_min` pair, so they are already
+        // broadcast to every lane of the walk's own simdgroup. Keep them in
+        // this lane's registers and let that same simdgroup normalize them,
+        // instead of staging both arrays through threadgroup memory for the
+        // other simdgroup to re-read after a barrier.
         constexpr bool REGISTER_RESULTS = VPT != 1 || HAS_GATE;
         constexpr int N_READS = 4;
         float ld[N_READS];
@@ -817,7 +820,10 @@ extension TrackFastMoEKernels {
             const uint gidx = simd_min(cand);
             if constexpr (REGISTER_RESULTS) {
                 for (int i = 0; i < N_READS; ++i) {
-                    if (k == (int)lane * N_READS + i) { ld[i] = gmax; selected[i] = gidx; }
+                    if (k == (int)lane * N_READS + i) {
+                        ld[i] = gmax;
+                        selected[i] = gidx;
+                    }
                 }
             } else if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
             if (gidx == (uint)(lane + 32 * bj) && bj >= 0) { taken[bj] = true; }
@@ -1181,11 +1187,10 @@ extension TrackFastMoEKernels {
                 float g[4], u[4];
                 qmv_fast_reg<T, GS, BITS>(wsh, ssh, bsh, x, KD, out_row, thread_index_in_simdgroup, g);
                 qmv_fast_reg<T, GS, BITS>(wsh + (size_t)N * kw2, ssh + (size_t)N * kg2, bsh + (size_t)N * kg2, x, KD, out_row, thread_index_in_simdgroup, u);
-                // MLXFAST-ACTLANES: g/u are post-simd_sum, identical on every
-                // lane, so each of the four entries can be stored by its own lane.
-                if (thread_index_in_simdgroup < 4) {
-                    const int i = (int)thread_index_in_simdgroup;
-                    act[(size_t)BR * (size_t)N + (size_t)(out_row + i)] = mlx_silu(static_cast<T>(g[i])) * static_cast<T>(u[i]);
+                if (thread_index_in_simdgroup == 0) {
+                    for (int i = 0; i < 4; ++i) {
+                        act[(size_t)BR * (size_t)N + (size_t)(out_row + i)] = mlx_silu(static_cast<T>(g[i])) * static_cast<T>(u[i]);
+                    }
                 }
             } else {
                 const int row = tile * 8 + (int)simdgroup_index_in_threadgroup * 4 + (int)(thread_index_in_simdgroup / 8);
@@ -1215,12 +1220,12 @@ extension TrackFastMoEKernels {
             qmv_reg<T, GS, BITS, (KD % get_pack_factor<BITS, 32>()) == 0>(wg + eoff * kw, sg + eoff * kg, bg + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, g);
             qmv_reg<T, GS, BITS, (KD % get_pack_factor<BITS, 32>()) == 0>(wu + eoff * kw, su + eoff * kg, bu + eoff * kg, xb, KD, out_row, thread_index_in_simdgroup, u);
         }
-        // MLXFAST-ACTLANES: same argument as the shared-expert staging above.
-        if (thread_index_in_simdgroup < 4) {
-            const int i = (int)thread_index_in_simdgroup;
-            const T gv = static_cast<T>(g[i]);
-            const T uv = static_cast<T>(u[i]);
-            act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+        if (thread_index_in_simdgroup == 0) {
+            for (int i = 0; i < 4; ++i) {
+                const T gv = static_cast<T>(g[i]);
+                const T uv = static_cast<T>(u[i]);
+                act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+            }
         }
         """
 
@@ -1497,7 +1502,7 @@ extension TrackFastMoEKernels {
     /// MLXFAST-DOWNRPS: output rows per down+combine threadgroup in a one-token
     /// window. Each row's expert walks and the fold are unchanged for any value;
     /// fewer rows per threadgroup means more threadgroups in flight (H / rows).
-    static let downRowsPerSimdgroup = 2
+    static let downRowsPerSimdgroup = 4
 
     static let downCombineSimdgroups =
         ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 5
