@@ -83,7 +83,7 @@ enum TrackFastMixerSplitK {
         precondition(x.shape == [1, k] && k % 512 == 0 && n % rows == 0 && partitions > 0)
         return fusedKernel([x, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
             template: [("T", x.dtype), ("K", k), ("ND", n), ("RPS", rows), ("SPLIT", partitions),
-                       ("ORDERED", true), ("HAS_INJECT", inject != nil)],
+                       ("ORDERED", false), ("HAS_INJECT", inject != nil)],
             grid: (32, (n / rows + (inject != nil ? hc : 0)) * partitions, 1), threadGroup: (32, partitions, 1),
             outputShapes: [[1, n], [1, n], [1, hc]], outputDTypes: [x.dtype, x.dtype, x.dtype])
     }
