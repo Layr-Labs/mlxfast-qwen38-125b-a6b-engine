@@ -294,6 +294,31 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         (ProcessInfo.processInfo.environment["TRACK_FAST_FORWARD"] ?? "1") != "0"
     }()
 
+    /// Compact recurrent replay is deliberately bounded to the MTP widths
+    /// that the track serves. S=1/2 and wider/fallback windows keep their
+    /// established staging semantics.
+    private static func usesCompactRecurrentReplay(capture: Bool, positions: Int) -> Bool {
+        capture && positions >= 3 && positions <= 8
+    }
+
+    /// Account every retained array conservatively. Views are intentionally
+    /// counted alongside their backing roots so a captured tail cannot evade
+    /// the recurrent admission charge.
+    private static func checkedByteCount(_ arrays: [MLXArray], context: String) -> Int {
+        var total = 0
+        for array in arrays {
+            let (bytes, multiplyOverflow) =
+                array.size.multipliedReportingOverflow(by: array.dtype.size)
+            let (sum, addOverflow) = total.addingReportingOverflow(bytes)
+            guard !multiplyOverflow, !addOverflow else {
+                preconditionFailure(
+                    "TrackFastModel: \(context) recurrent replay byte accounting overflow")
+            }
+            total = sum
+        }
+        return total
+    }
+
     public init(base: Qwen4ExpModel) {
         self.base = base
         let cfg = base.configuration
@@ -615,13 +640,35 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             state?.conv ?? MLXArray.zeros([B, geo.convKernel - 1, geo.convDim], dtype: x.dtype)
         let ssm =
             state?.ssm ?? MLXArray.zeros([B, geo.hv, geo.dv, geo.dk], dtype: .float32)
+        let compactReplay = Self.usesCompactRecurrentReplay(capture: capture, positions: S)
         let gated: MLXArray, convOut: MLXArray, stateOut: MLXArray
-        if let fused = TrackFastGDNDecode.apply(
+        let deltaJournal: MLXArray?, preparedKey: MLXArray?, preparedDecay: MLXArray?
+        if compactReplay {
+            let r = TrackFastKernels.gdnJournal(
+                proj: proj, convState: convState, convW: g.convW,
+                negExpALog: g.negExpALog, dtBias: g.dtBias, stateIn: ssm,
+                T: S, geometry: geo)
+            gated = TrackFastKernels.gatedRMS(
+                y: r.y, proj: proj, w: g.normW, zOffset: g.zOffset, eps: 1e-6)
+            (convOut, stateOut) = (r.convOut, r.stateOut)
+            deltaJournal = r.deltaJournal
+            preparedKey = r.key
+            preparedDecay = r.decay
+            if prof {
+                TrackFastProfile.tick(
+                    "gdn.journal+lean", &pt,
+                    [r.y, r.stateOut, r.convOut, r.deltaJournal])
+            }
+            if prof { TrackFastProfile.tick("gdn.gatedRMS", &pt, [gated]) }
+        } else if let fused = TrackFastGDNDecode.apply(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
             dtBias: g.dtBias, stateIn: ssm, normW: g.normW, zOffset: g.zOffset,
             eps: 1e-6, capture: capture, geometry: geo)
         {
             (gated, convOut, stateOut) = (fused.gated, fused.convOut, fused.stateOut)
+            deltaJournal = nil
+            preparedKey = nil
+            preparedDecay = nil
             if prof { TrackFastProfile.tick("gdn.decodeFused", &pt, [gated, stateOut, convOut]) }
         } else {
             let r = TrackFastKernels.gdn(
@@ -633,10 +680,47 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 y: r.y, proj: split?[1] ?? proj, w: g.normW,
                 zOffset: separate ? 0 : g.zOffset, eps: 1e-6)
             (convOut, stateOut) = (r.convOut, r.stateOut)
+            deltaJournal = nil
+            preparedKey = nil
+            preparedDecay = nil
             if prof { TrackFastProfile.tick("gdn.gatedRMS", &pt, [gated]) }
         }
         do {
-            if capture {
+            if compactReplay {
+                guard let deltaJournal, let preparedKey, let preparedDecay else {
+                    preconditionFailure("TrackFastModel: compact GDN replay outputs missing")
+                }
+                let convStack = convOut
+                let finalConv = convStack[(S - 1) ..< S]
+                let finalSSM = stateOut
+                let replayRoots = [ssm, preparedKey, preparedDecay, deltaJournal, convStack]
+                let materializedInitial = state?.ssm == nil ? [ssm] : []
+                let materializedBytes = Self.checkedByteCount(
+                    materializedInitial + [preparedKey, preparedDecay, deltaJournal, convStack, finalSSM],
+                    context: "GDN")
+                let retainedBytes = Self.checkedByteCount(
+                    replayRoots, context: "GDN strict")
+                let fullRetainedBytes = Self.checkedByteCount(
+                    [convStack], context: "GDN full")
+                try evaluation.stagePrefixReplay(
+                    modelLayerIndex: layerIndex,
+                    positions: S,
+                    finalConv: finalConv,
+                    finalSSM: finalSSM,
+                    materializedByteCount: materializedBytes,
+                    evaluationRoots: replayRoots,
+                    strictReplayRetainedByteCount: retainedBytes,
+                    strictReplayRetainedRoots: replayRoots,
+                    fullAcceptanceRetainedByteCount: fullRetainedBytes,
+                    fullAcceptanceRetainedRoots: [convStack],
+                    replay: { keep in
+                        let restored = TrackFastKernels.gdnJournalRestore(
+                            initial: ssm, key: preparedKey, decay: preparedDecay,
+                            deltas: deltaJournal, T: S, keep: keep, geometry: geo)
+                        return CBv2RecurrentLayerState(
+                            conv: convStack[(keep - 1) ..< keep], ssm: restored)
+                    })
+            } else if capture {
                 try evaluation.stageCaptured(
                     modelLayerIndex: layerIndex, conv: convOut, ssm: stateOut, positions: S)
             } else {
@@ -872,6 +956,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         precondition(B == 1)
         let wide = hcCount * hidden
         let contextLength = max(1, p.dilation - 1)
+        let compactReplay = Self.usesCompactRecurrentReplay(capture: capture, positions: S)
         let state = evaluation.inputState(modelLayerIndex: p.stateLayerIndex)
         // Device-side context (prefill windows and the device row source).
         func devicePrevious() -> MLXArray {
@@ -957,20 +1042,55 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 let n = p.stateLength
                 let convStack = asStrided(full, [S, n, wide], strides: [wide, wide, 1], offset: wide)
                 let contextStack: MLXArray
+                let contextBacking: MLXArray
                 if let h = hostHistory {
                     // Row s = the context after consuming window token s.
                     var flat: [Int32] = []
                     flat.reserveCapacity(S * contextLength)
                     for s in 0 ..< S { flat.append(contentsOf: h[(s + 1) ..< (s + 1 + contextLength)].map(Int32.init)) }
-                    contextStack = MLXArray(flat).reshaped(S, contextLength)
+                    contextBacking = MLXArray(flat)
+                    contextStack = contextBacking.reshaped(S, contextLength)
                 } else {
                     let history = concatenated([devicePrevious(), ids], axis: 1)
+                    contextBacking = history.asType(.int32)
                     contextStack = asStrided(
-                        history.asType(.int32), [S, contextLength], strides: [1, 1], offset: 1)
+                        contextBacking, [S, contextLength], strides: [1, 1], offset: 1)
                 }
-                try evaluation.stageCaptured(
-                    modelLayerIndex: p.stateLayerIndex, conv: convStack, ssm: contextStack,
-                    positions: S)
+                if compactReplay {
+                    let finalConv = convStack[(S - 1) ..< S]
+                    let finalSSM = contextStack[(S - 1) ..< S]
+                    // `convStack` is a view into `full`; retain both names so
+                    // the exact tail views remain live through commit. The
+                    // context stack is similarly retained because PLE's
+                    // prefix state is an integer view (or host materialization).
+                    let replayRoots = [full, convStack, contextBacking, contextStack]
+                    let materializedBytes = Self.checkedByteCount(
+                        replayRoots + [finalConv, finalSSM], context: "PLE")
+                    let retainedBytes = Self.checkedByteCount(
+                        replayRoots, context: "PLE strict")
+                    let fullRetainedBytes = Self.checkedByteCount(
+                        [full, contextBacking, contextStack], context: "PLE full")
+                    try evaluation.stagePrefixReplay(
+                        modelLayerIndex: p.stateLayerIndex,
+                        positions: S,
+                        finalConv: finalConv,
+                        finalSSM: finalSSM,
+                        materializedByteCount: materializedBytes,
+                        evaluationRoots: replayRoots,
+                        strictReplayRetainedByteCount: retainedBytes,
+                        strictReplayRetainedRoots: replayRoots,
+                        fullAcceptanceRetainedByteCount: fullRetainedBytes,
+                        fullAcceptanceRetainedRoots: [full, contextBacking, contextStack],
+                        replay: { keep in
+                            CBv2RecurrentLayerState(
+                                conv: convStack[(keep - 1) ..< keep],
+                                ssm: contextStack[(keep - 1) ..< keep])
+                        })
+                } else {
+                    try evaluation.stageCaptured(
+                        modelLayerIndex: p.stateLayerIndex, conv: convStack, ssm: contextStack,
+                        positions: S)
+                }
             } else {
                 let ssm: MLXArray
                 if let h = hostHistory {
@@ -1193,7 +1313,9 @@ extension TrackQwen4ExpFastModel: CBv2KeepMaskRequiringModel {
 extension TrackQwen4ExpFastModel: CBv2PositionedRecurrentLanguageModelForwardable,
     CBv2PositionedRecurrentEmbeddingForwardable
 {
-    public var cbv2Capabilities: CBv2ModelCapabilities { base.cbv2Capabilities }
+    public var cbv2Capabilities: CBv2ModelCapabilities {
+        base.cbv2Capabilities
+    }
     public var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec { base.cbv2RecurrentStateSpec }
 
     public func cbv2Forward(

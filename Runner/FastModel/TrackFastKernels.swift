@@ -319,6 +319,122 @@ enum TrackFastKernels {
         outputNames: ["y", "state_out"],
         source: leanTwoRowSource, ensureRowContiguous: true)
 
+    // The compact capture path keeps the exact two-row recurrence above and
+    // only records the already-computed FP32 deltas.  Each SIMD group owns two
+    // adjacent value rows, so its lane zero can write both values after the
+    // delta calculation without a gather or an extra synchronization.
+    private static let leanTwoRowJournalSource: String = {
+        let marker = "float out0 = 0.0f, out1 = 0.0f;"
+        let replacement = """
+            if (dk_idx == 0) {
+                const uint base = ((b_idx * T_ + t) * Hv + hv_idx) * Dv + dv_idx;
+                delta_journal[base] = delta0;
+                delta_journal[base + 1] = delta1;
+            }
+            float out0 = 0.0f, out1 = 0.0f;
+            """
+        precondition(
+            leanTwoRowSource.contains(marker),
+            "TrackFastKernels: two-row journal marker is missing")
+        return leanTwoRowSource.replacingOccurrences(of: marker, with: replacement)
+    }()
+
+    nonisolated(unsafe) private static let leanTwoRowJournalKernel = MLXFast.metalKernel(
+        name: "track_gdn_lean_two_row_delta_journal",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in"],
+        outputNames: ["y", "state_out", "delta_journal"],
+        source: leanTwoRowJournalSource, ensureRowContiguous: true)
+
+    /// The capture preparation still writes one small convolution tail per
+    /// position.  The recurrence writes only its final FP32 SSM and a
+    /// Float32 delta journal for strict-prefix reconstruction.
+    static func gdnJournal(
+        proj: MLXArray, convState: MLXArray, convW: MLXArray,
+        negExpALog: MLXArray, dtBias: MLXArray, stateIn: MLXArray,
+        T: Int, geometry g: GDNGeometry
+    ) -> (
+        y: MLXArray, convOut: MLXArray, stateOut: MLXArray, deltaJournal: MLXArray,
+        key: MLXArray, decay: MLXArray
+    ) {
+        let B = proj.dim(0)
+        precondition(B == 1, "TrackFastKernels: compact GDN replay is single-row")
+        precondition(T >= 2 && T <= 8)
+        precondition(g.dk == 128 && g.dv == 128 && g.convDim % 128 == 0)
+        precondition(stateIn.dtype == .float32)
+
+        let prep = gdnPrep(
+            proj: proj, convState: convState, convW: convW,
+            negExpALog: negExpALog, dtBias: dtBias, T: T,
+            capture: true, geometry: g)
+        let rec = leanTwoRowJournalKernel(
+            [prep[0], prep[1], prep[2], prep[3], prep[4], stateIn],
+            template: [
+                ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk),
+                ("Dv", g.dv), ("Hk", g.hk), ("Hv", g.hv), ("CAPTURE", false),
+                ("T", T),
+            ],
+            grid: (32, g.dv / 2, B * g.hv), threadGroup: (32, 4, 1),
+            outputShapes: [
+                [B, T, g.hv, g.dv], [B, g.hv, g.dv, g.dk], [B, T, g.hv, g.dv],
+            ],
+            outputDTypes: [proj.dtype, stateIn.dtype, .float32])
+        return (rec[0], prep[5], rec[1], rec[2], prep[1], prep[3])
+    }
+
+    private static let journalRestoreSource = """
+        const uint i = thread_position_in_grid.x;
+        if (i >= B * Hv * Dv * Dk) { return; }
+        const uint dk = i % Dk;
+        const uint dv = (i / Dk) % Dv;
+        const uint hv = (i / (Dk * Dv)) % Hv;
+        const uint b = i / (Dk * Dv * Hv);
+        const uint hk = hv / (Hv / Hk);
+        float state = initial[i];
+        for (int t = 0; t < KEEP; ++t) {
+            const float decay = g[(b * T + t) * Hv + hv];
+            {
+                #pragma clang fp reassociate(off)
+                #pragma clang fp contract(off)
+                state = state * decay;
+            }
+            const float key = static_cast<float>(k[((b * T + t) * Hk + hk) * Dk + dk]);
+            const float delta = deltas[((b * T + t) * Hv + hv) * Dv + dv];
+            state = state + key * delta;
+        }
+        state_out[i] = state;
+        """
+
+    nonisolated(unsafe) private static let journalRestoreKernel = MLXFast.metalKernel(
+        name: "track_gdn_delta_journal_restore",
+        inputNames: ["initial", "k", "g", "deltas"],
+        outputNames: ["state_out"], source: journalRestoreSource,
+        ensureRowContiguous: true)
+
+    /// Restore one accepted prefix from the original Float32 state.  The
+    /// decay multiply retains the recurrence's explicit contraction boundary;
+    /// the recorded delta removes the need to repeat the compensated dot.
+    static func gdnJournalRestore(
+        initial: MLXArray, key: MLXArray, decay: MLXArray, deltas: MLXArray,
+        T: Int, keep: Int, geometry g: GDNGeometry
+    ) -> MLXArray {
+        precondition(T >= 2 && T <= 8 && (1 ... T).contains(keep))
+        precondition(
+            initial.shape == [1, g.hv, g.dv, g.dk],
+            "unexpected initial SSM shape \(initial.shape)")
+        precondition(initial.dtype == .float32)
+        precondition(key.shape == [1, T, g.hk, g.dk])
+        precondition(decay.shape == [1, T, g.hv] && decay.dtype == .float32)
+        precondition(deltas.shape == [1, T, g.hv, g.dv] && deltas.dtype == .float32)
+        return journalRestoreKernel(
+            [initial, key, decay, deltas],
+            template: [
+                ("B", initial.dim(0)), ("Dk", g.dk), ("Dv", g.dv),
+                ("Hk", g.hk), ("Hv", g.hv), ("T", T), ("KEEP", keep),
+            ],
+            grid: (initial.size, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [initial.shape], outputDTypes: [.float32])[0]
+    }
+
     private static let prefetchGDNInputs =
         ProcessInfo.processInfo.environment["TRACK_GDN_INPUT_PREFETCH"] != "0"
 
