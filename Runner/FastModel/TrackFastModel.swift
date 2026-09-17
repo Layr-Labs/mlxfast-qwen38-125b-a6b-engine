@@ -883,7 +883,6 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // host (bit-for-bit the device hash) and the context is staged as a
         // host-backed int32 array, so the only device sync of the step is the
         // one on the fed token itself.
-        var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
             let ctx: [Int64]
@@ -912,7 +911,6 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let gid = p.embedding.hostRowIds(history: [history], newCount: S)
             let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
             embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
-            hostHistory = history
         } else {
             TrackPleContextMirror.invalidate()
             embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
@@ -948,36 +946,23 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
         }
         do {
+            // The carried context is staged on device: the sliding window is
+            // state.ssm ++ ids sliced one position in, the same tokens the
+            // host path hashed, so no host array or upload is needed.
+            let history = concatenated([devicePrevious(), ids], axis: 1)
             if capture {
                 let n = p.stateLength
                 let convStack = asStrided(full, [S, n, wide], strides: [wide, wide, 1], offset: wide)
-                let contextStack: MLXArray
-                if let h = hostHistory {
-                    // Row s = the context after consuming window token s.
-                    var flat: [Int32] = []
-                    flat.reserveCapacity(S * contextLength)
-                    for s in 0 ..< S { flat.append(contentsOf: h[(s + 1) ..< (s + 1 + contextLength)].map(Int32.init)) }
-                    contextStack = MLXArray(flat).reshaped(S, contextLength)
-                } else {
-                    let history = concatenated([devicePrevious(), ids], axis: 1)
-                    contextStack = asStrided(
-                        history.asType(.int32), [S, contextLength], strides: [1, 1], offset: 1)
-                }
+                let contextStack = asStrided(
+                    history.asType(.int32), [S, contextLength], strides: [1, 1], offset: 1)
                 try evaluation.stageCaptured(
                     modelLayerIndex: p.stateLayerIndex, conv: convStack, ssm: contextStack,
                     positions: S)
             } else {
-                let ssm: MLXArray
-                if let h = hostHistory {
-                    ssm = MLXArray(h.suffix(contextLength).map(Int32.init)).reshaped(1, contextLength)
-                } else {
-                    let history = concatenated([devicePrevious(), ids], axis: 1)
-                    ssm = history[0..., (-contextLength)...].asType(.int32)
-                }
                 try evaluation.stage(
                     modelLayerIndex: p.stateLayerIndex,
                     conv: full[0..., (-p.stateLength)..., 0...],
-                    ssm: ssm)
+                    ssm: history[0..., (-contextLength)...].asType(.int32))
             }
         } catch {
             preconditionFailure("TrackFastModel: PLE stage failed: \(error)")
