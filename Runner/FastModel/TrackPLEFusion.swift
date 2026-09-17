@@ -102,6 +102,101 @@ enum TrackPLEFusion {
             }
         }
         """
+    /// S>1 verify-window variant of `prepareSource`: identical per-row math,
+    /// with the window position carried on grid.z. `key`/`query`/`value`/
+    /// `gated` gain a row offset; `full` writes the normed row at 9+s; the
+    /// shared nine carried rows are staged once by the s==0 threadgroups.
+    static let prepareWindowSource = """
+        // MLXFAST-PLEFUSE2: all three group norms, dot, gate, and concat,
+        // per window position. Row s reads window token s and writes full
+        // row 9+s; the carried convState rows are written once (row 0).
+        constexpr uint H = 2560;
+        constexpr uint W = 4 * H;
+        const uint hc = threadgroup_position_in_grid.y;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint row = threadgroup_position_in_grid.z;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint d = lid * 4;
+        const uint base = hc * H + d;
+        const uint kq = row * W + base;
+        const uint vrow = row * H + d;
+        const uint frow = (9u + row) * W + base;
+        threadgroup float partials[32];  // 128 B total, reused throughout.
+        const float eps = as_type<float>((uint)EPS_BITS);
+
+        // Reload the four key/query elements after their norms instead of
+        // keeping both rows live across the reductions.
+        float acc = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float k = float(key[kq + i]);
+            acc += k * k;
+        }
+        const float ik = metal::precise::rsqrt(
+            ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
+        acc = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float q = float(query[kq + i]);
+            acc += q * q;
+        }
+        const float iq = metal::precise::rsqrt(
+            ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
+
+        // Keep the original dtype boundaries: round RMS before scale, round
+        // product before sum, and use row_reduce_looped's four-element fold.
+        InT dot = InT(0);
+        for (uint i = 0; i < 4; ++i) {
+            InT k = InT(float(key[kq + i]) * ik);
+            k = k * keyScale[base + i];
+            InT q = InT(float(query[kq + i]) * iq);
+            q = q * queryScale[base + i];
+            InT product = k * q;
+            dot = product + dot;
+        }
+        dot = InT(0) + dot;
+        dot = simd_sum(dot);
+        if (sg == 0 && lane >= 20) { partials[lane] = 0.0f; }
+        if (lane == 0) { partials[sg] = float(dot); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dot = simd_sum(InT(partials[lane]));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        InT gate = dot / InT(as_type<float>((uint)DIVISOR_BITS));
+        InT magnitude = metal::abs(gate);
+        magnitude = metal::max(magnitude, InT(1e-6f));
+        magnitude = metal::sqrt(magnitude);
+        InT direction = InT((gate > InT(0)) - (gate < InT(0)));
+        gate = magnitude * direction;
+        const InT activation = mlx_sigmoid(gate);
+
+        // Only four gated values survive this last reduction (8 B/thread
+        // for bf16/f16, 16 B for f32); no private full-row scratch.
+        InT g[4];
+        acc = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            g[i] = activation * value[vrow + i];
+            gated[row * W + base + i] = g[i];
+            float v = float(g[i]);
+            acc += v * v;
+        }
+        const float iv = metal::precise::rsqrt(
+            ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
+        for (uint i = 0; i < 4; ++i) {
+            InT n = InT(float(g[i]) * iv);
+            full[frow + i] = n * convScale[base + i];
+        }
+        // Same [old nine rows, new rows] layout as concatenated. The carried
+        // rows are shared by every window position, so the s==0 threadgroups
+        // stage them once. State staging keeps its existing tail view,
+        // including capture/rollback behavior.
+        if (row == 0) {
+            for (uint t = 0; t < 9; ++t) {
+                for (uint i = 0; i < 4; ++i) {
+                    full[t * W + base + i] = convState[t * W + base + i];
+                }
+            }
+        }
+        """
+
 
     static let convolutionSource = """
         // MLXFAST-PLEFUSE2: preserve the S=1 dilated implicit-GEMM dispatch:
@@ -142,6 +237,13 @@ enum TrackPLEFusion {
         outputNames: ["out"], source: convolutionSource,
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
+    nonisolated(unsafe) static let prepareWindowKernel = MLXFast.metalKernel(
+        name: "track_ple_prepare_window",
+        inputNames: ["key", "query", "value", "keyScale", "queryScale", "convScale", "convState"],
+        outputNames: ["gated", "full"], source: prepareWindowSource,
+        header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
+
+
     static func supports(_ p: TrackPLE, stream: MLXArray, hidden: Int, hcCount: Int) -> Bool {
         // Guard the exact geometry; every other path builds the original chain.
         hidden == 2560 && hcCount == 4 && stream.shape == [1, 1, 10240]
@@ -152,6 +254,48 @@ enum TrackPLEFusion {
             && [p.normKeyScale, p.normQueryScale, p.normConvScale].allSatisfy {
                 $0.shape == [10240] && $0.dtype == stream.dtype
             }
+    }
+
+    /// Same geometry guard as `supports`, for verify windows 2...8 tokens
+    /// wide. `convW2` ([wide, K]) backs the multi-row conv launch.
+    static func supportsWindow(
+        _ p: TrackPLE, stream: MLXArray, hidden: Int, hcCount: Int, S: Int
+    ) -> Bool {
+        hidden == 2560 && hcCount == 4 && S >= 2 && S <= 8
+            && stream.shape == [1, S, 10240]
+            && [.bfloat16, .float16, .float32].contains(stream.dtype)
+            && p.dilation == 3 && p.stateLength == 9
+            && p.keyProj.rows == 10240 && p.valueProj.rows == 2560
+            && p.convW2.shape == [10240, 4] && p.convW2.dtype == stream.dtype
+            && [p.normKeyScale, p.normQueryScale, p.normConvScale].allSatisfy {
+                $0.shape == [10240] && $0.dtype == stream.dtype
+            }
+    }
+
+    /// The S>1 window path: one prepare launch replaces prod + reduce +
+    /// gated + concat, then the existing multi-row conv. Returns the same
+    /// (full, output) pair as `forward`.
+    static func forwardWindow(
+        _ p: TrackPLE, embedded: MLXArray, stream: MLXArray, convState: MLXArray, eps: Float
+    ) -> (full: MLXArray, output: MLXArray)? {
+        let S = stream.dim(1)
+        // The original two projections stay separate, with unchanged kernels,
+        // quantization, tiling, and weight-loading lane ownership.
+        let key = p.keyProj.apply(embedded)
+        let value = p.valueProj.apply(embedded)
+        guard key.shape == [1, S, 10240], value.shape == [1, S, 2560],
+            key.dtype == stream.dtype, value.dtype == stream.dtype
+        else { return nil }
+        let r = prepareWindowKernel(
+            [key, stream, value, p.normKeyScale, p.normQueryScale, p.normConvScale, convState],
+            template: [("InT", stream.dtype), ("EPS_BITS", Int(eps.bitPattern)),
+                       ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern))],
+            grid: (640, 4, S), threadGroup: (640, 1, 1),
+            outputShapes: [[1, S, 10240], [1, 9 + S, 10240]],
+            outputDTypes: [stream.dtype, stream.dtype])
+        let output = TrackFastPLEKernels.conv(
+            full: r[1], convW: p.convW2, gated: r[0], dilation: p.dilation)
+        return (r[1], output)
     }
 
     static func forward(
