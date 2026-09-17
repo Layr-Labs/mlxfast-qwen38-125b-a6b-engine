@@ -64,6 +64,82 @@ enum TrackPleContextMirror {
     }
 }
 
+/// Sendable box for values handed to the PLE prefetch worker. The worker only
+/// reads them; every mutation of the result lands behind `done.signal()`.
+private final class TrackSendableBox<T>: @unchecked Sendable {
+    let value: T
+    init(_ value: T) { self.value = value }
+}
+
+/// The PLE n-gram row gather, started on a worker queue at the top of a
+/// forward and joined at the PLE layer.
+///
+/// The gather is the one host sync of a small decode step: `host.rows` reads
+/// the SSD-backed table behind the LRU, and it used to run inline at layer 1
+/// while the GPU pipeline was still empty. Everything it needs -- the fed
+/// tokens, the attention offset, the capture flag, and the staged context --
+/// is fixed before the layer loop starts, so the read can overlap the layer-0
+/// graph build and the previous step's GPU tail instead of serializing in
+/// front of the first dispatch.
+///
+/// The context mirror is snapshotted on the caller's thread before the worker
+/// starts; the worker never touches the mirror or the recurrent-state
+/// evaluation. `Qwen4ExpNGramTable.gather` is serialized by its own lock, and
+/// the MLXArray it returns is a lazy node evaluated later on the caller's
+/// stream, so the worker performs host IO only.
+final class TrackPlePrefetch: @unchecked Sendable {
+    let stateLayerIndex: Int
+    private let done = DispatchSemaphore(value: 0)
+    private var result: (history: [Int64], rows: MLXArray)?
+
+    /// Spawn the gather. `mirrored` is the mirror's context snapshot (nil when
+    /// the mirror does not match this call); `stateSsm` is the staged context
+    /// array the mirror replaces. Returns nil when the host path does not
+    /// apply, so the caller keeps the device path.
+    static func start(
+        ple: TrackPLE, ids: MLXArray, stateSsm: MLXArray?, offset: Int,
+        capture: Bool, mirrored: [Int64]?, eosTokenId: Int64, contextLength: Int,
+        rowShape: [Int]
+    ) -> TrackPlePrefetch? {
+        guard let host = ple.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource
+        else { return nil }
+        let job = TrackPlePrefetch(stateLayerIndex: ple.stateLayerIndex)
+        let box = TrackSendableBox((ple, ids, stateSsm, host))
+        DispatchQueue.global(qos: .userInitiated).async {
+            let (p, ids, stateSsm, host) = box.value
+            let toks: [Int64] =
+                ids.dtype == .int32
+                ? ids.asArray(Int32.self).map(Int64.init)
+                : ids.asType(.int64).asArray(Int64.self)
+            let ctx: [Int64]
+            if let mirrored {
+                ctx = mirrored
+            } else {
+                ctx = stateSsm.map {
+                    $0.dtype == .int32
+                        ? $0.asArray(Int32.self).map(Int64.init)
+                        : $0.asType(.int64).asArray(Int64.self)
+                } ?? Array(repeating: eosTokenId, count: contextLength)
+            }
+            let history = ctx + toks
+            let gid = p.embedding.hostRowIds(history: [history], newCount: ids.dim(1))
+            let rows = host.rows(globalIds: gid, shape: rowShape)
+            job.result = (history, rows)
+            job.done.signal()
+        }
+        return job
+    }
+
+    /// The gathered rows, or nil when this job belongs to a different PLE
+    /// layer. A non-matching job is left to finish on its own; its result is
+    /// simply never read.
+    func join(stateLayerIndex: Int) -> (history: [Int64], rows: MLXArray)? {
+        guard stateLayerIndex == self.stateLayerIndex else { return nil }
+        done.wait()
+        return result
+    }
+}
+
 // MARK: - Weight helpers
 
 extension Module {
@@ -861,7 +937,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
-        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool,
+        prefetch: TrackPlePrefetch? = nil
     ) -> MLXArray {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
@@ -885,23 +962,36 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
-            let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
-            let ctx: [Int64]
-            if !capture,
-                TrackPleContextMirror.matches(
-                    offset: offset, layer: p.stateLayerIndex, length: contextLength),
-                let mirrored = TrackPleContextMirror.context
-            {
-                ctx = mirrored
+            // The prefetch worker started this gather at the top of the
+            // forward; joining it here hides the SSD/LRU read behind the
+            // layer-0 graph build. A job for a different PLE layer, or none,
+            // falls back to the inline gather below.
+            let gathered = prefetch?.join(stateLayerIndex: p.stateLayerIndex)
+            let history: [Int64]
+            let rows: MLXArray
+            if let gathered {
+                (history, rows) = gathered
             } else {
-                let rawPrev = state?.ssm
-                ctx = rawPrev.map {
-                    $0.dtype == .int32
-                        ? $0.asArray(Int32.self).map(Int64.init)
-                        : $0.asType(.int64).asArray(Int64.self)
-                } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+                let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
+                let ctx: [Int64]
+                if !capture,
+                    TrackPleContextMirror.matches(
+                        offset: offset, layer: p.stateLayerIndex, length: contextLength),
+                    let mirrored = TrackPleContextMirror.context
+                {
+                    ctx = mirrored
+                } else {
+                    let rawPrev = state?.ssm
+                    ctx = rawPrev.map {
+                        $0.dtype == .int32
+                            ? $0.asArray(Int32.self).map(Int64.init)
+                            : $0.asType(.int64).asArray(Int64.self)
+                    } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+                }
+                history = ctx + toks
+                let gid = p.embedding.hostRowIds(history: [history], newCount: S)
+                rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
             }
-            let history = ctx + toks
             if capture {
                 TrackPleContextMirror.invalidate()
             } else {
@@ -909,8 +999,6 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     Array(history.suffix(contextLength)), nextOffset: offset + S,
                     stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
             }
-            let gid = p.embedding.hostRowIds(history: [history], newCount: S)
-            let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
             embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
             hostHistory = history
         } else {
@@ -1024,6 +1112,27 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let profiling = TrackFastProfile.prefill != nil && ids.dim(1) >= TrackFastProfile.minWindow
         var profT = profiling ? CFAbsoluteTimeGetCurrent() : 0
         if profiling { TrackFastProfile.windows += 1 }
+        // Start the PLE row gather now: it is the step's one host sync, and
+        // everything it reads is fixed before the layer loop. The worker's
+        // SSD/LRU read overlaps the layer-0 graph build; `pleForward` joins it.
+        let plePrefetch: TrackPlePrefetch? = {
+            guard let ple = layers.first(where: { $0.ple != nil })?.ple,
+                ids.dim(1) <= 8
+            else { return nil }
+            let contextLength = max(1, ple.dilation - 1)
+            let mirrored: [Int64]? =
+                (!capture
+                    && TrackPleContextMirror.matches(
+                        offset: offset, layer: ple.stateLayerIndex, length: contextLength))
+                ? TrackPleContextMirror.context : nil
+            return TrackPlePrefetch.start(
+                ple: ple, ids: ids,
+                stateSsm: evaluation.inputState(modelLayerIndex: ple.stateLayerIndex)?.ssm,
+                offset: offset, capture: capture, mirrored: mirrored,
+                eosTokenId: Int64(cfg.eosTokenId), contextLength: contextLength,
+                rowShape: [ids.dim(0), ids.dim(1), (cfg.ngramSize - 1) * cfg.headsPerNGram])
+        }()
+
         for layer in layers {
             var normed: MLXArray
             if let ple = layer.ple {
@@ -1036,7 +1145,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     stream
                     + pleForward(
                         ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
+                        offset: offset, capture: capture, prefetch: plePrefetch)
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
