@@ -34,6 +34,48 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 
   U sum = 0;
 
+  // MLXFAST-XVEC: the activation slice is contiguous, so when its byte width
+  // is a whole number of vectors and the pointer is aligned to match, fetch
+  // it with vector loads instead of values_per_thread scalar loads. The
+  // values and the accumulation order below are unchanged -- only the load
+  // instruction widens. The lane offset is a multiple of the slice width, so
+  // the alignment test is uniform across the simdgroup.
+  constexpr int x_bytes = values_per_thread * (int)sizeof(T);
+  alignas(16) T xv[values_per_thread];
+  if constexpr (x_bytes % 16 == 0) {
+    if ((size_t)x % 16 == 0) {
+      const device uint4* xp = (const device uint4*)x;
+#pragma unroll
+      for (int v = 0; v < x_bytes / 16; ++v) {
+        ((thread uint4*)xv)[v] = xp[v];
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < values_per_thread; ++i) {
+        xv[i] = x[i];
+      }
+    }
+  } else if constexpr (x_bytes % 8 == 0) {
+    if ((size_t)x % 8 == 0) {
+      const device uint2* xp = (const device uint2*)x;
+#pragma unroll
+      for (int v = 0; v < x_bytes / 8; ++v) {
+        ((thread uint2*)xv)[v] = xp[v];
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < values_per_thread; ++i) {
+        xv[i] = x[i];
+      }
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < values_per_thread; ++i) {
+      xv[i] = x[i];
+    }
+  }
+  const thread T* x = xv;
+
   if (bits == 2) {
     for (int i = 0; i < values_per_thread; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
