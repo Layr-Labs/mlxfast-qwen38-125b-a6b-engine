@@ -109,13 +109,20 @@ enum TrackFastGDNDecode {
                 }
             }
         }
-        if (sg == 0 && lane == 0) {
+        // The two gate scalars depend only on proj/dt_bias/neg_exp_alog, not on
+        // the staged q/k/v. Simdgroups 3+ are idle during staging, so sg3 lane 0
+        // and lane 1 compute them concurrently with it — the barrier still
+        // publishes gb_shared before any consumer reads it.
+        if (sg == 3 && lane == 0) {
             const device InT* row = proj + b_idx * PW;
-            const InT b_raw = row[B_OFF + hv_idx];
-            gb_shared[1] = static_cast<float>(mlx_sigmoid(b_raw));
             const InT ax = row[A_OFF + hv_idx] + dt_bias[hv_idx];
             const InT sp = mlx_logaddexp0(ax);
             gb_shared[0] = metal::precise::exp(neg_exp_alog[hv_idx] * sp);
+        }
+        if (sg == 3 && lane == 1) {
+            const device InT* row = proj + b_idx * PW;
+            const InT b_raw = row[B_OFF + hv_idx];
+            gb_shared[1] = static_cast<float>(mlx_sigmoid(b_raw));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const threadgroup InT* q_ = q_shared;
