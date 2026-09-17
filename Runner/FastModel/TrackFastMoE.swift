@@ -1411,7 +1411,7 @@ extension TrackFastMoEKernels {
             // holds the identical `res[RPS]`. The staging write therefore only
             // needs *a* lane per entry, not lane 0 for all of them; each k slot
             // is written by the simdgroup that owns it (`k = sgi + kk * KSG`).
-            if constexpr (VPT == 1 && RPS <= 32) {
+            if constexpr (RPS <= 32) {
                 if (lid < RPS) {
                     prod[k][lid] = static_cast<float>(static_cast<T>(res[lid])) * wk;
                 }
@@ -1452,7 +1452,7 @@ extension TrackFastMoEKernels {
         // on lane 0. `mlx_colsum_small_f32` is thread-local (no collectives, no
         // threadgroup memory), so each column keeps its own K iteration order
         // and its own fold; only which lane performs it changes.
-        if constexpr (VPT == 1 && RPS <= 32) {
+        if constexpr (RPS <= 32) {
             if (sgi == 0 && lid < RPS) {
                 const int i = (int)lid;
                 const T sg = mlx_sigmoid(gate[t]);
