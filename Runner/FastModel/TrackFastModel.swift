@@ -747,6 +747,19 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     ) -> MLXArray {
         let prof = TrackFastProfile.prefill != nil && x.dim(1) >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
+        // Dedicated no-gate prefill route: partial GEMM + fused sum/top-k/
+        // softmax in two launches, logits never materialized. Same gates as
+        // the wide router plus the eligible-route shape contract.
+        let fusedRoute: (idx: MLXArray, weights: MLXArray)? =
+            (inputF32 == nil && TrackP12Prefill.eligible(x) && x.dim(2) == 2560
+                && m.topK == 10 && StreamOrDevice.default.stream === Stream.gpu)
+            ? TrackPrefillRouter.applyRouted(x: x, w: m.routerW16, topK: m.topK)
+            : nil
+        let idx: MLXArray, weights: MLXArray
+        if let r = fusedRoute {
+            (idx, weights) = r
+            if prof { TrackFastProfile.tick("moe.router", &pt, [weights]) }
+        } else {
         let logits: MLXArray
         if x.dim(0) == 1, x.dim(1) == 1, m.routerW16.dtype == .bfloat16, x.dim(2) % 128 == 0,
             m.routerW16.dim(0) % 16 == 0, x.dim(2) < 16 * m.routerW16.dim(0), m.routerW16.dim(0) < 4096
@@ -803,7 +816,6 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 groupSize: m.expertGroupSize, bits: m.expertBits
             ).reshaped(1, S, H)
         }
-        let idx: MLXArray, weights: MLXArray
         if TrackP12Prefill.eligible(x), x.dim(2) == 2560,
             logits.dtype == .float32, logits.dim(-1) == 512, m.topK == 10,
             StreamOrDevice.default.stream === Stream.gpu
@@ -817,6 +829,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             weights = softmax(takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
         }
         if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights]) }
+        }
         let sharedAct: MLXArray
         if x.dim(1) > 8, let fusedGU = m.sharedGateUp.fused {
             // MLXFAST-SHAREDFUSE: wide windows run gate|up as ONE N = 1280 GEMM.

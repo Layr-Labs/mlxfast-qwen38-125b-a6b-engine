@@ -45,6 +45,105 @@ enum TrackPrefillRouter {
             outputShapes: [[1, rows, 512]], outputDTypes: [.float32])[0]
     }
 
+    /// Dedicated no-gate prefill route: the split-K partial sum folded into
+    /// the top-K + softmax walk, one simdgroup per row, four rows per
+    /// threadgroup. `logits` never materializes — the walk reads
+    /// `partials[row] + partials[R + row]` in the same order `sumKernel`
+    /// adds them, so the selected values are bit-identical. No gate GEMV,
+    /// no threadgroup arrays, no barrier: the simd_max/simd_min pair already
+    /// broadcasts each winner across the walk's own simdgroup.
+    private static let fusedRouteKernel = MLXFast.metalKernel(
+        name: "track_router_prefill_route",
+        inputNames: ["partials"], outputNames: ["idx", "w"],
+        source: fusedRouteSource, header: TrackFastKernels.exactHeader,
+        ensureRowContiguous: true)
+
+    /// partialKernel + fusedRouteKernel: `(idx [1,S,K] uint32, w [1,S,K] f32)`,
+    /// or nil outside the supported window. Same gates as `apply`.
+    static func applyRouted(x: MLXArray, w weight: MLXArray, topK: Int)
+        -> (idx: MLXArray, weights: MLXArray)?
+    {
+        guard enabled, supportsNAX, StreamOrDevice.default.stream == Stream.gpu,
+            x.ndim == 3, x.dim(0) == 1, x.dim(1) >= 32, x.dim(1) <= 1024,
+            x.dim(2) == 2560, x.dtype == .bfloat16,
+            weight.shape == [512, 2560], weight.dtype == .bfloat16,
+            topK >= 1 && topK <= 32
+        else { return nil }
+        let rows = x.dim(1), tilesM = (rows + 63) / 64
+        let swizzle = tilesM <= 3 ? 1 : 2
+        let groups = 8 * swizzle * ((tilesM + swizzle - 1) / swizzle) * 2
+        let partials = partialKernel(
+            [x, weight], template: [("M", rows)],
+            grid: (groups * 32, 2, 2), threadGroup: (32, 2, 2),
+            outputShapes: [[2, rows, 512]], outputDTypes: [.float32])[0]
+        let outs = fusedRouteKernel(
+            [partials], template: [("E", 512), ("K", topK), ("ROWS", rows)],
+            grid: (32, ((rows + 3) / 4) * 4, 1), threadGroup: (32, 4, 1),
+            outputShapes: [[rows, topK], [rows, topK]],
+            outputDTypes: [.uint32, .float32])
+        return (outs[0].reshaped(1, rows, topK), outs[1].reshaped(1, rows, topK))
+    }
+
+    static let fusedRouteSource = """
+        constexpr int E_PER = (E + 31) / 32;
+        const uint row = threadgroup_position_in_grid.y * 4
+            + simdgroup_index_in_threadgroup;
+        if (row >= (uint)ROWS) { return; }
+        const uint lane = thread_index_in_simdgroup;
+        constexpr int N_READS = 4;
+        float ld[N_READS];
+        uint selected[N_READS];
+        for (int i = 0; i < N_READS; ++i) {
+            ld[i] = -INFINITY;
+            selected[i] = 0xffffffffu;
+        }
+        const device float* pr = partials + (size_t)row * (size_t)E;
+        // Each lane owns E_PER experts: e = lane + 32 * j (strided so a tie at
+        // the same value resolves to the lowest index across lanes too). The
+        // two split-K halves are added in sumKernel's order.
+        float v[E_PER];
+        bool taken[E_PER];
+        for (int j = 0; j < E_PER; ++j) {
+            const int e = (int)lane + 32 * j;
+            v[j] = (e < E) ? (pr[e] + pr[(size_t)ROWS * (size_t)E + e]) : -INFINITY;
+            taken[j] = (e >= E);
+        }
+        for (int k = 0; k < K; ++k) {
+            // lane-local best: largest value, then lowest index
+            float bv = -INFINITY; int bj = -1;
+            for (int j = 0; j < E_PER; ++j) {
+                if (!taken[j] && (v[j] > bv)) { bv = v[j]; bj = j; }
+            }
+            const float gmax = simd_max(bv);
+            const uint cand = (bv == gmax && bj >= 0)
+                ? (uint)(lane + 32 * bj) : 0xffffffffu;
+            const uint gidx = simd_min(cand);
+            for (int i = 0; i < N_READS; ++i) {
+                if (k == (int)lane * N_READS + i) { ld[i] = gmax; selected[i] = gidx; }
+            }
+            if (gidx == (uint)(lane + 32 * bj) && bj >= 0) { taken[bj] = true; }
+        }
+        // softmax_single_row over the K selected logits (AccT = float)
+        float maxval = -FLT_MAX;
+        for (int i = 0; i < N_READS; i++) { maxval = (maxval < ld[i]) ? ld[i] : maxval; }
+        maxval = simd_max(maxval);
+        float normalizer = 0;
+        for (int i = 0; i < N_READS; i++) {
+            float exp_x = fast::exp(ld[i] - maxval);
+            ld[i] = exp_x;
+            normalizer += exp_x;
+        }
+        normalizer = simd_sum(normalizer);
+        normalizer = 1 / normalizer;
+        for (int i = 0; i < N_READS; i++) {
+            const int p = (int)lane * N_READS + i;
+            if (p < K) {
+                w[(size_t)row * K + p] = ld[i] * normalizer;
+                idx[(size_t)row * K + p] = selected[i];
+            }
+        }
+        """
+
     static let source = #"""
         constexpr int tiles_m = (M + 63) / 64;
         constexpr int swizzle_log = tiles_m <= 3 ? 0 : 1;
