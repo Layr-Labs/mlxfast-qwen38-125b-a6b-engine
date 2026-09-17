@@ -42,7 +42,12 @@ enum TrackPleContextMirror {
     nonisolated(unsafe) private(set) static var dirty = true
 
     static func matches(offset: Int, layer: Int, length: Int) -> Bool {
-        !dirty && nextOffset == offset && stateLayerIndex == layer && contextLength == length
+        guard !dirty else { return false }
+        return hasSameWindow(offset: offset, layer: layer, length: length)
+    }
+
+    private static func hasSameWindow(offset: Int, layer: Int, length: Int) -> Bool {
+        nextOffset == offset && stateLayerIndex == layer && contextLength == length
     }
 
     static func store(
@@ -937,7 +942,14 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
-            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
+            // MLXFAST-DIVCACHE: `sqrt(hidden)` is a constant and both spellings
+            // round identically into the activation dtype (checked at hidden =
+            // 2560/1024/4096/640/320: bit-for-bit equal), so the cached scalar
+            // serves it. `TrackFastKernels.scalar` exists for exactly this --
+            // building one per call is a host allocation and a cast launch --
+            // and the `floor` on the next line already uses it.
+            let divisor = TrackFastKernels.scalar(
+                Foundation.sqrt(Float(hidden)), dtype: dot.dtype)
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
             let gn = TrackFastPLEKernels.gated(
                 g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
