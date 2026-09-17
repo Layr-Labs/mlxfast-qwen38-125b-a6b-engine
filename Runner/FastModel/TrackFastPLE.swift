@@ -23,7 +23,9 @@
 //   `track_ple_prod`  norm_key(key_proj) * norm_query(stream)
 //   <MLX's own sum over the last axis, untouched>
 //   `track_ple_gated` the gate transform, the gated value, norm_conv
-//   `track_ple_conv`  the dilated conv, silu, and the residual add
+//   `track_ple_conv`  the dilated conv, silu, and the residual add;
+//                     at 4 <= S <= 16 `track_ple_conv_rows` runs instead --
+//                     one thread per channel, each `full` row loaded once
 //
 // EXACTNESS. The two norms are `rms_single_row`'s layout at axis 2560 -- four
 // consecutive elements per thread, a simd sum, a simd sum over the
@@ -222,12 +224,62 @@ enum TrackFastPLEKernels {
         outputNames: ["out"],
         source: convSource, header: header, ensureRowContiguous: true)
 
+    /// Same convolution, one thread per (b, c): every row of `full` is loaded
+    /// once into registers instead of once per tap. At S >= 4 the tap sets of
+    /// the S outputs overlap, so the per-tap kernel reads `full` 4*S times per
+    /// channel where only NIN = 9+S distinct rows exist. The accumulation for
+    /// each output keeps ascending tap order with the same FP32 products, so
+    /// the result is bit-identical to `track_ple_conv`.
+    /// grid (W, 1, B), threadgroup (256, 1, 1)
+    static let convRowsSource = """
+        const uint c = thread_position_in_grid.x;
+        const uint b = thread_position_in_grid.z;
+        if (c >= (uint)W) return;
+        const device InT* fb = full + (size_t)b * (size_t)(NIN) * (size_t)W;
+        float rows[NIN];
+        for (int r = 0; r < NIN; ++r) {
+            rows[r] = static_cast<float>(fb[(size_t)r * (size_t)W + c]);
+        }
+        float w[KC];
+        for (int j = 0; j < KC; ++j) {
+            w[j] = static_cast<float>(convw[c * KC + j]);
+        }
+        const device InT* gb = gated + (size_t)b * (size_t)S * (size_t)W + c;
+        device InT* ob = out + (size_t)b * (size_t)S * (size_t)W + c;
+        for (int t = 0; t < S; ++t) {
+            float acc = 0.0f;
+            for (int j = 0; j < KC; ++j) {
+                acc += rows[t + j * DIL] * w[j];
+            }
+            ob[(size_t)t * (size_t)W] = gb[(size_t)t * (size_t)W]
+                + mlx_silu(static_cast<InT>(acc));
+        }
+        """
+
+    nonisolated(unsafe) static let convRowsKernel = MLXFast.metalKernel(
+        name: "track_ple_conv_rows",
+        inputNames: ["full", "convw", "gated"],
+        outputNames: ["out"],
+        source: convRowsSource, header: header, ensureRowContiguous: true)
+
     static func conv(
         full: MLXArray, convW: MLXArray, gated: MLXArray, dilation: Int
     ) -> MLXArray {
         let B = gated.dim(0), S = gated.dim(1), W = gated.dim(2)
         let kc = convW.dim(1)
         precondition(full.dim(2) == W && full.dim(1) == S + (kc - 1) * dilation)
+        // Row reuse pays once the tap sets overlap (S >= 4) and stays
+        // register-resident while the carried frame is small (S <= 16).
+        if S >= 4 && S <= 16 {
+            return convRowsKernel(
+                [full, convW, gated],
+                template: [
+                    ("InT", gated.dtype), ("W", W), ("S", S), ("KC", kc),
+                    ("DIL", dilation), ("NIN", full.dim(1)),
+                ],
+                grid: (W, 1, B), threadGroup: (256, 1, 1),
+                outputShapes: [[B, S, W]], outputDTypes: [gated.dtype])[0]
+        }
         return convKernel(
             [full, convW, gated],
             template: [
