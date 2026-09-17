@@ -198,8 +198,9 @@ enum TrackFastPLEKernels {
 
     // MARK: the dilated depthwise convolution, silu, and the residual add
 
-    /// full [B, N+S, W] (carried state ++ normed), convw [W, KC], gated [B,S,W]
-    ///   -> out [B,S,W] = gated + silu(conv)
+    /// full [B, N+S, W] (carried state ++ normed), convw [W, KC],
+    /// gated [B,S,W], resid [B,S,W]
+    ///   -> out [B,S,W] = resid + (gated + silu(conv))
     /// grid (W, S, B), threadgroup (256, 1, 1)
     static let convSource = """
         const uint c = thread_position_in_grid.x;
@@ -213,23 +214,24 @@ enum TrackFastPLEKernels {
                  * static_cast<float>(convw[c * KC + j]);
         }
         const size_t o = ((size_t)b * (size_t)S + (size_t)t) * (size_t)W + c;
-        out[o] = gated[o] + mlx_silu(static_cast<InT>(acc));
+        out[o] = resid[o] + (gated[o] + mlx_silu(static_cast<InT>(acc)));
         """
 
     nonisolated(unsafe) static let convKernel = MLXFast.metalKernel(
         name: "track_ple_conv",
-        inputNames: ["full", "convw", "gated"],
+        inputNames: ["full", "convw", "gated", "resid"],
         outputNames: ["out"],
         source: convSource, header: header, ensureRowContiguous: true)
 
     static func conv(
-        full: MLXArray, convW: MLXArray, gated: MLXArray, dilation: Int
+        full: MLXArray, convW: MLXArray, gated: MLXArray, residual: MLXArray,
+        dilation: Int
     ) -> MLXArray {
         let B = gated.dim(0), S = gated.dim(1), W = gated.dim(2)
         let kc = convW.dim(1)
         precondition(full.dim(2) == W && full.dim(1) == S + (kc - 1) * dilation)
         return convKernel(
-            [full, convW, gated],
+            [full, convW, gated, residual],
             template: [
                 ("InT", gated.dtype), ("W", W), ("S", S), ("KC", kc), ("DIL", dilation),
                 ("NIN", full.dim(1)),
@@ -237,4 +239,5 @@ enum TrackFastPLEKernels {
             grid: (W, S, B), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, W]], outputDTypes: [gated.dtype])[0]
     }
+
 }
