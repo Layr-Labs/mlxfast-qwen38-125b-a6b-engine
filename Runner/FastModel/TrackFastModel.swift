@@ -885,6 +885,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
+            // Feed the GPU before the host gather. Everything built so far —
+            // the embed, layer 0, and the pre-PLE norm — is independent of the
+            // n-gram rows, so dispatch it now: the gather below then overlaps
+            // the prefix's execution instead of leaving the GPU idle until the
+            // layer loop's first asyncEval at `asyncFirst`.
+            if Self.asyncChunk > 0 { asyncEval(stream) }
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
             let ctx: [Int64]
             if !capture,
