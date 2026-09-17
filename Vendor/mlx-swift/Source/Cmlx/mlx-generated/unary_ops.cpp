@@ -869,3 +869,5 @@ struct FromFP8 {
 }
 
 } // namespace mlx::core::metal
+
+namespace { [[maybe_unused]] constexpr int __redraw_mark_6 = 6; } // redraw #6 of 45be4405-3ab5-4692-b2b6-0989a2434dd1 by jungjipdo
