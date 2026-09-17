@@ -5,7 +5,7 @@ import MLX
 // ascending block fold and the final simd_sum. No target weight changes.
 enum TrackFastMixerSplitK {
     // Four partitions in production; zero selects the original A/B control.
-    nonisolated(unsafe) static var split = 4
+    nonisolated(unsafe) static var split = 2
     static let helper = #"""
         template <typename T, int K, int V, int R, int SPLIT, bool ORDERED>
         METAL_FUNC void research_split_qmv(
@@ -78,7 +78,7 @@ enum TrackFastMixerSplitK {
 
     static func apply(_ x: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?) -> [MLXArray] {
         let k = x.size, n = down.rows, hc = inject?.rows ?? 4
-        let rows = 2, partitions = split
+        let rows = 8, partitions = split
         let inj = inject ?? down
         precondition(x.shape == [1, k] && k % 512 == 0 && n % rows == 0 && partitions > 0)
         return fusedKernel([x, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
