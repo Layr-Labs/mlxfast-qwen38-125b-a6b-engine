@@ -931,7 +931,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let fused = TrackPLEFusion.forward(
                 p, embedded: embedded, stream: stream, convState: convState, eps: eps)
         {
-            (full, output) = fused
+            // Same add as before, relocated so every path returns the summed
+            // stream (the S>=2 conv folds it into its epilogue instead).
+            (full, output) = (fused.0, fused.1 + stream)
         } else {
             let keyFlat = p.keyProj.apply(embedded)
             let value = p.valueProj.apply(embedded)
@@ -950,7 +952,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let gated = gn.gated
             full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
             output = TrackFastPLEKernels.conv(
-                full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
+                full: full, convW: p.convW2, gated: gated, dilation: p.dilation,
+                residual: stream)
         }
         do {
             if capture {
@@ -1038,8 +1041,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     scale: layer.attnHC.normScaleQ,
                     tile: tile)
                 stream =
-                    stream
-                    + pleForward(
+                    pleForward(
                         ple, stream: stream, ids: ids, evaluation: evaluation,
                         offset: offset, capture: capture)
                 (stream, normed) = injectNorm(
