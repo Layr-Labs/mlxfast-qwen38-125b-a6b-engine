@@ -100,11 +100,6 @@ enum TrackFastMixerKernels {
         let S = normed.dim(0), KD = normed.dim(1), ND = down.rows
         let HC = inject?.rows ?? 4
         precondition(S >= 1 && S <= 8 && ND % 8 == 0 && KD % 512 == 0 && down.bits == 4)
-        if S == 1 && down.groupSize == 32 && (inject == nil || inject!.groupSize == 32)
-            && TrackFastMixerSplitK.split > 0 {
-            let o = TrackFastMixerSplitK.apply(normed, down: down, inject: inject)
-            return (o[0], o[1], o[2])
-        }
         let inj = inject ?? down
         // MLXFAST-MIX2ROW: match the source-time row count; launch size stays 64.
         let rowsPerSimdgroup = S == 1 ? downRowsPerSimdgroup : 4
