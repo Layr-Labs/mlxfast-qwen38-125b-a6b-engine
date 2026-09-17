@@ -890,6 +890,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
+            // The host row gather below is the one host sync of the step, and
+            // the chunked dispatch schedule lands its first eval only after
+            // this layer (asyncFirst = 2), so without an explicit dispatch the
+            // GPU idles through the ids readback and the n-gram row fetch.
+            // Dispatch the graph built so far -- embedding, the layers before
+            // PLE, and the pre-PLE norm that produced `stream` -- so the GPU
+            // runs it while the host hashes and gathers. The eval is
+            // asynchronous: the ids readback then waits only on the sampler
+            // event, not on an undispatched queue.
+            if Self.asyncChunk > 0 { asyncEval(stream) }
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
             let ctx: [Int64]
             if !capture,
