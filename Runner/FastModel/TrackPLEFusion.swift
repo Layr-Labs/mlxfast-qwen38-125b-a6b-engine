@@ -127,7 +127,9 @@ enum TrackPLEFusion {
         if (lane == 0) {
             InT convolved = InT(acc);
             InT activated = mlx_silu(convolved);
-            out[c] = gated[c] + activated;
+            // The caller's `stream + ple` add folds into this epilogue with
+            // the same operand order as track_ple_conv's HAS_RES path.
+            out[c] = residual[c] + (gated[c] + activated);
         }
         """
 
@@ -138,7 +140,7 @@ enum TrackPLEFusion {
         header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
 
     static let convolutionKernel = MLXFast.metalKernel(
-        name: "track_ple_convolution_fuse2", inputNames: ["full", "weight", "gated"],
+        name: "track_ple_convolution_fuse2", inputNames: ["full", "weight", "gated", "residual"],
         outputNames: ["out"], source: convolutionSource,
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
@@ -172,7 +174,7 @@ enum TrackPLEFusion {
             outputShapes: [[1, 1, 10240], [1, 10, 10240]],
             outputDTypes: [stream.dtype, stream.dtype])
         let output = convolutionKernel(
-            [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
+            [r[1], p.convW, r[0], stream], template: [("InT", stream.dtype)],
             grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
             outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
         return (r[1], output)

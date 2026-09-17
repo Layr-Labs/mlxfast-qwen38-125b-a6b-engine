@@ -950,7 +950,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let gated = gn.gated
             full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
             output = TrackFastPLEKernels.conv(
-                full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
+                full: full, convW: p.convW2, gated: gated, dilation: p.dilation,
+                residual: stream)
         }
         do {
             if capture {
@@ -1037,11 +1038,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     residual: residual, out: pendingOut, inject: pendingInject,
                     scale: layer.attnHC.normScaleQ,
                     tile: tile)
-                stream =
-                    stream
-                    + pleForward(
-                        ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
+                stream = pleForward(
+                    ple, stream: stream, ids: ids, evaluation: evaluation,
+                    offset: offset, capture: capture)
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
