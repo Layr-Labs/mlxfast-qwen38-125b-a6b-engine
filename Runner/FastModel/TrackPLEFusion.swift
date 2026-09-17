@@ -137,6 +137,18 @@ enum TrackPLEFusion {
         outputNames: ["gated", "full"], source: prepareSource,
         header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
 
+    /// Same body reading the fused [key|value] buffer: `key` becomes `kv`,
+    /// and the value row lives at offset W inside it.
+    static let prepareKVSource = prepareSource
+        .replacingOccurrences(of: "key[base + i]", with: "kv[base + i]")
+        .replacingOccurrences(of: "value[d + i]", with: "kv[W + d + i]")
+
+    static let prepareKVKernel = MLXFast.metalKernel(
+        name: "track_ple_prepare_fuse2_kv",
+        inputNames: ["kv", "query", "keyScale", "queryScale", "convScale", "convState"],
+        outputNames: ["gated", "full"], source: prepareKVSource,
+        header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
+
     static let convolutionKernel = MLXFast.metalKernel(
         name: "track_ple_convolution_fuse2", inputNames: ["full", "weight", "gated"],
         outputNames: ["out"], source: convolutionSource,
@@ -157,20 +169,37 @@ enum TrackPLEFusion {
     static func forward(
         _ p: TrackPLE, embedded: MLXArray, stream: MLXArray, convState: MLXArray, eps: Float
     ) -> (full: MLXArray, output: MLXArray)? {
-        // The original two projections stay separate, with unchanged kernels,
-        // quantization, tiling, and weight-loading lane ownership.
-        let key = p.keyProj.apply(embedded)
-        let value = p.valueProj.apply(embedded)
-        guard key.shape == [1, 1, 10240], value.shape == [1, 1, 2560],
-            key.dtype == stream.dtype, value.dtype == stream.dtype
-        else { return nil }
-        let r = prepareKernel(
-            [key, stream, value, p.normKeyScale, p.normQueryScale, p.normConvScale, convState],
-            template: [("InT", stream.dtype), ("EPS_BITS", Int(eps.bitPattern)),
-                       ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern))],
-            grid: (640, 4, 1), threadGroup: (640, 1, 1),
-            outputShapes: [[1, 1, 10240], [1, 10, 10240]],
-            outputDTypes: [stream.dtype, stream.dtype])
+        let r: [MLXArray]
+        if let kvq = TrackPleFusedKV.keyValue(p) {
+            // One quantizedMM over the [key|value] rows: each output column is
+            // an independent dot over the same K, so the fused columns are the
+            // separate GEMVs' outputs. The prepare variant reads the value
+            // region in place at offset W — no slice, no copy.
+            let kv = kvq.apply(embedded)
+            guard kv.shape == [1, 1, 12800], kv.dtype == stream.dtype else { return nil }
+            r = prepareKVKernel(
+                [kv, stream, p.normKeyScale, p.normQueryScale, p.normConvScale, convState],
+                template: [("InT", stream.dtype), ("EPS_BITS", Int(eps.bitPattern)),
+                           ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern))],
+                grid: (640, 4, 1), threadGroup: (640, 1, 1),
+                outputShapes: [[1, 1, 10240], [1, 10, 10240]],
+                outputDTypes: [stream.dtype, stream.dtype])
+        } else {
+            // The original two projections stay separate, with unchanged kernels,
+            // quantization, tiling, and weight-loading lane ownership.
+            let key = p.keyProj.apply(embedded)
+            let value = p.valueProj.apply(embedded)
+            guard key.shape == [1, 1, 10240], value.shape == [1, 1, 2560],
+                key.dtype == stream.dtype, value.dtype == stream.dtype
+            else { return nil }
+            r = prepareKernel(
+                [key, stream, value, p.normKeyScale, p.normQueryScale, p.normConvScale, convState],
+                template: [("InT", stream.dtype), ("EPS_BITS", Int(eps.bitPattern)),
+                           ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern))],
+                grid: (640, 4, 1), threadGroup: (640, 1, 1),
+                outputShapes: [[1, 1, 10240], [1, 10, 10240]],
+                outputDTypes: [stream.dtype, stream.dtype])
+        }
         let output = convolutionKernel(
             [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
             grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),

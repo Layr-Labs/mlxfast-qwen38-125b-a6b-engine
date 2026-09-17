@@ -928,12 +928,26 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         {
             (full, output) = fused
         } else {
-            let keyFlat = p.keyProj.apply(embedded)
-            let value = p.valueProj.apply(embedded)
+            let keyFlat: MLXArray, value: MLXArray
+            let keyStride: Int?, valueStride: Int?, valueOffset: Int
+            if let kvq = TrackPleFusedKV.keyValue(p) {
+                // One [key|value] GEMM; the kernels read each region in place.
+                keyFlat = kvq.apply(embedded)
+                value = keyFlat
+                keyStride = keyFlat.dim(2)
+                valueStride = keyFlat.dim(2)
+                valueOffset = p.keyProj.rows
+            } else {
+                keyFlat = p.keyProj.apply(embedded)
+                value = p.valueProj.apply(embedded)
+                keyStride = nil
+                valueStride = nil
+                valueOffset = 0
+            }
             // norm_key * norm_query, then MLX's own reduction over the last axis.
             let prod = TrackFastPLEKernels.prod(
                 keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
-                hcCount: hcCount, hidden: hidden, eps: eps)
+                hcCount: hcCount, hidden: hidden, eps: eps, keyStride: keyStride)
             let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
@@ -941,7 +955,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
             let gn = TrackFastPLEKernels.gated(
                 g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
-                hcCount: hcCount, hidden: hidden, eps: eps)
+                hcCount: hcCount, hidden: hidden, eps: eps,
+                valueStride: valueStride, valueOffset: valueOffset)
             let gated = gn.gated
             full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
             output = TrackFastPLEKernels.conv(
