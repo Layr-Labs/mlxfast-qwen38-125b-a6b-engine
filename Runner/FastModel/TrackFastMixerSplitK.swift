@@ -5,7 +5,17 @@ import MLX
 // ascending block fold and the final simd_sum. No target weight changes.
 enum TrackFastMixerSplitK {
     // Four partitions in production; zero selects the original A/B control.
-    nonisolated(unsafe) static var split = 4
+    // MLXFAST-SPLITROWS: the K range is cut into `split` partitions and each
+    // simdgroup owns `rows` output rows. Under ORDERED the threadgroup scratch
+    // is (K / 512) * rows * 32 for the down branch and (K / 256) * split * 32
+    // for the inject branch, so raising `split` alone buys finer partitioning
+    // of the K loop while leaving the down scratch and the ORDERED tail loop
+    // (which runs over NB = K / 512, not over SPLIT) exactly as they were.
+    // Halving `rows` alongside it halves the down term, but the allocation is
+    // max(down, inject) and the inject term dominates at rows = 1, so the
+    // threadgroup memory reserved is unchanged; what halves is the number of
+    // rows one simdgroup folds and the qdot calls it issues per block.
+    nonisolated(unsafe) static var split = 8
     static let helper = #"""
         template <typename T, int K, int V, int R, int SPLIT, bool ORDERED>
         METAL_FUNC void research_split_qmv(
@@ -78,7 +88,7 @@ enum TrackFastMixerSplitK {
 
     static func apply(_ x: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?) -> [MLXArray] {
         let k = x.size, n = down.rows, hc = inject?.rows ?? 4
-        let rows = 2, partitions = split
+        let rows = 1, partitions = split
         let inj = inject ?? down
         precondition(x.shape == [1, k] && k % 512 == 0 && n % rows == 0 && partitions > 0)
         return fusedKernel([x, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
