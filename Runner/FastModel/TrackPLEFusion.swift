@@ -1,4 +1,4 @@
-// MLXFAST-PLEFUSE2: S=1 PLE fusion. No projection or weight-layout changes.
+// MLXFAST-PLEFUSE2: S=1 PLE fusion. key|value run as one fused GEMV read by offset.
 // Scratch: ONE reused float[32] (128 B) in prepare, ZERO in convolution.
 // This retains the RMS/reduction lane layout and the dilated convolution's
 // channel-per-threadgroup layout; token tolerance, not bit equality, applies.
@@ -83,7 +83,7 @@ enum TrackPLEFusion {
         InT g[4];
         acc = 0.0f;
         for (uint i = 0; i < 4; ++i) {
-            g[i] = activation * value[d + i];
+            g[i] = activation * value[V_OFF + d + i];
             gated[base + i] = g[i];
             float v = float(g[i]);
             acc += v * v;
@@ -157,17 +157,29 @@ enum TrackPLEFusion {
     static func forward(
         _ p: TrackPLE, embedded: MLXArray, stream: MLXArray, convState: MLXArray, eps: Float
     ) -> (full: MLXArray, output: MLXArray)? {
-        // The original two projections stay separate, with unchanged kernels,
-        // quantization, tiling, and weight-loading lane ownership.
-        let key = p.keyProj.apply(embedded)
-        let value = p.valueProj.apply(embedded)
-        guard key.shape == [1, 1, 10240], value.shape == [1, 1, 2560],
+        // key|value arrive as one GEMV output when the fused weight exists;
+        // the kernels read the value half at V_OFF. Without it the parts stay
+        // separate and V_OFF is zero.
+        let key: MLXArray
+        let value: MLXArray
+        let vOff: Int
+        if let fusedKV = p.kvProj.fused {
+            key = fusedKV.apply(embedded)
+            value = key
+            vOff = p.keyProj.rows
+        } else {
+            key = p.keyProj.apply(embedded)
+            value = p.valueProj.apply(embedded)
+            vOff = 0
+        }
+        guard key.dim(2) >= 10240, value.dim(2) - vOff == 2560,
             key.dtype == stream.dtype, value.dtype == stream.dtype
         else { return nil }
         let r = prepareKernel(
             [key, stream, value, p.normKeyScale, p.normQueryScale, p.normConvScale, convState],
             template: [("InT", stream.dtype), ("EPS_BITS", Int(eps.bitPattern)),
-                       ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern))],
+                       ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern)),
+                       ("V_OFF", vOff)],
             grid: (640, 4, 1), threadGroup: (640, 1, 1),
             outputShapes: [[1, 1, 10240], [1, 10, 10240]],
             outputDTypes: [stream.dtype, stream.dtype])
