@@ -146,7 +146,10 @@ struct TrackMultiProj {
         self.offsets = offs
     }
 
-    var width: Int { offsets.last! }
+    var width: Int {
+        let width = offsets.last!
+        return width
+    }
 
     /// The concatenated output `[..., width]`.
     ///
