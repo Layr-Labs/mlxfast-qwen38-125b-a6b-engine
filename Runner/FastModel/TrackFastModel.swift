@@ -34,27 +34,61 @@ import MLXNN
 /// the tokens fed to the same call.  It is fenced by the attention offset,
 /// state-layer identity and window length so a reset or a different model
 /// state cannot reuse an old host window.
+///
+/// Capture calls (MTP verify) commit a PREFIX of the fed window chosen by the
+/// engine afterwards, so a capture cannot name one next offset.  Instead it
+/// records the post-context for EVERY reachable acceptance count, keyed by the
+/// absolute offset that count commits to.  The context at an absolute offset
+/// is a pure function of the committed token prefix, so a candidate stays
+/// correct no matter which prefix the engine keeps or rolls back to; a later
+/// committed step simply replaces the pending candidate set.
 enum TrackPleContextMirror {
     nonisolated(unsafe) private(set) static var context: [Int64]? = nil
     nonisolated(unsafe) private(set) static var nextOffset: Int? = nil
+    nonisolated(unsafe) private(set) static var candidates: [Int: [Int64]] = [:]
     nonisolated(unsafe) private(set) static var stateLayerIndex: Int? = nil
     nonisolated(unsafe) private(set) static var contextLength: Int? = nil
     nonisolated(unsafe) private(set) static var dirty = true
 
-    static func matches(offset: Int, layer: Int, length: Int) -> Bool {
-        guard !dirty else { return false }
-        return hasSameWindow(offset: offset, layer: layer, length: length)
+    /// The context in force at `offset`, when the mirror can prove it.
+    static func context(at offset: Int, layer: Int, length: Int) -> [Int64]? {
+        guard !dirty, stateLayerIndex == layer, contextLength == length else {
+            return nil
+        }
+        if nextOffset == offset, let context { return context }
+        return candidates[offset]
     }
 
-    private static func hasSameWindow(offset: Int, layer: Int, length: Int) -> Bool {
-        nextOffset == offset && stateLayerIndex == layer && contextLength == length
-    }
-
+    /// A committed step: all `S` fed tokens are kept, so the context at
+    /// `nextOffset` is single-valued and supersedes any pending candidates.
     static func store(
         _ context: [Int64], nextOffset: Int, stateLayerIndex: Int, contextLength: Int
     ) {
         self.context = context
         self.nextOffset = nextOffset
+        self.stateLayerIndex = stateLayerIndex
+        self.contextLength = contextLength
+        candidates.removeAll(keepingCapacity: true)
+        dirty = false
+    }
+
+    /// A capture step: the engine will keep `k` of the `S` fed tokens for some
+    /// `k` in `0...S`, landing at `baseOffset + k`.  Record every reachable
+    /// post-context under the offset it commits to.  The single committed
+    /// context is superseded: a capture re-derives the future, so an offset
+    /// the old `nextOffset` still names may now commit different tokens.
+    static func storeCandidates(
+        history: [Int64], baseOffset: Int, count: Int,
+        stateLayerIndex: Int, contextLength: Int
+    ) {
+        var next: [Int: [Int64]] = [:]
+        next.reserveCapacity(count + 1)
+        for k in 0 ... count {
+            next[baseOffset + k] = Array(history[k ..< k + contextLength])
+        }
+        candidates = next
+        context = nil
+        nextOffset = nil
         self.stateLayerIndex = stateLayerIndex
         self.contextLength = contextLength
         dirty = false
@@ -63,6 +97,7 @@ enum TrackPleContextMirror {
     static func invalidate() {
         context = nil
         nextOffset = nil
+        candidates.removeAll(keepingCapacity: true)
         stateLayerIndex = nil
         contextLength = nil
         dirty = true
@@ -892,10 +927,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
             let ctx: [Int64]
-            if !capture,
-                TrackPleContextMirror.matches(
-                    offset: offset, layer: p.stateLayerIndex, length: contextLength),
-                let mirrored = TrackPleContextMirror.context
+            if let mirrored = TrackPleContextMirror.context(
+                at: offset, layer: p.stateLayerIndex, length: contextLength)
             {
                 ctx = mirrored
             } else {
@@ -908,7 +941,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             let history = ctx + toks
             if capture {
-                TrackPleContextMirror.invalidate()
+                TrackPleContextMirror.storeCandidates(
+                    history: history, baseOffset: offset, count: S,
+                    stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
             } else {
                 TrackPleContextMirror.store(
                     Array(history.suffix(contextLength)), nextOffset: offset + S,
@@ -1144,7 +1179,6 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         _ tokens: MLXArray, inputEmbeddings: MLXArray?, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, capture: Bool
     ) -> (mixed: MLXArray, multi: MLXArray)? {
-        if capture { TrackPleContextMirror.invalidate() }
         guard let plan = fastPlan(
             tokens: tokens, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds)
