@@ -939,11 +939,25 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // same way so they carry the same rounding into the activation dtype.
             let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
-            let gn = TrackFastPLEKernels.gated(
-                g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
-                hcCount: hcCount, hidden: hidden, eps: eps)
-            let gated = gn.gated
-            full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
+            let gated: MLXArray
+            if convState.dtype == stream.dtype {
+                // The gated kernel's (row, hc) threadgroups already cover
+                // every channel, so they stage the carried-state rows and the
+                // normed row into `full` themselves -- one launch instead of
+                // gated + concatenated.
+                let gf = TrackFastPLEKernels.gatedFull(
+                    g0: dot, value: value, cScale: p.normConvScale, divisor: divisor,
+                    floor: floor, convState: convState, stateLength: p.stateLength,
+                    hcCount: hcCount, hidden: hidden, eps: eps)
+                gated = gf.gated
+                full = gf.full
+            } else {
+                let gn = TrackFastPLEKernels.gated(
+                    g0: dot, value: value, cScale: p.normConvScale, divisor: divisor,
+                    floor: floor, hcCount: hcCount, hidden: hidden, eps: eps)
+                gated = gn.gated
+                full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
+            }
             output = TrackFastPLEKernels.conv(
                 full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
         }

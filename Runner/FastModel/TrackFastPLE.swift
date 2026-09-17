@@ -196,6 +196,88 @@ enum TrackFastPLEKernels {
         return (outs[0], outs[1])
     }
 
+    // MARK: gated + norm_conv + the carried-state concat in one launch
+
+    /// `gated` with the `concatenated([convState, normed], axis: 1)` folded in:
+    /// outputs gated [B,S,W] and full [B,ST+S,W] directly. Each (row, hc)
+    /// threadgroup already covers its four channels, so it copies the
+    /// convState slice for those channels and writes its normed values into
+    /// row ST+row -- the same layout the S=1 prepare kernel stages. The copy
+    /// is a pure relocation: identical bytes, identical dtype, no arithmetic.
+    static let gatedFullSource = """
+        constexpr int N_READS = 4;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint hc = thread_position_in_grid.y;
+        const uint row = thread_position_in_grid.z;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        threadgroup float sums[32];
+        const uint base = row * W + hc * H;
+        const uint ch = hc * H + lid * N_READS;
+
+        InT g = g0[row * HC + hc] / divisor;
+        g = mlx_sqrt_t(mlx_maximum(mlx_abs_t(g), floorv)) * mlx_sign(g);
+        const InT sgm = mlx_sigmoid(g);
+
+        float gx[N_READS];
+        float acc = 0.0f;
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            const InT v = sgm * value[row * H + d];
+            gated[base + d] = v;
+            gx[i] = static_cast<float>(v);
+            acc += gx[i] * gx[i];
+        }
+        acc = simd_sum(acc);
+        constexpr uint simd_groups = (H + 32 * N_READS - 1) / (32 * N_READS);
+        if (sg == 0 && lane >= simd_groups) { sums[lane] = 0; }
+        if (lane == 0) { sums[sg] = acc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        acc = simd_sum(sums[lane]);
+        const float inv = metal::precise::rsqrt(acc / (float)H + eps);
+        for (int i = 0; i < N_READS; ++i) {
+            full[(ST + row) * W + ch + i] =
+                static_cast<InT>(gx[i] * inv) * cscale[ch + i];
+        }
+        // Same [old ST rows, new S rows] layout as concatenated.
+        for (uint t = 0; t < ST; ++t) {
+            for (int i = 0; i < N_READS; ++i) {
+                full[t * W + ch + i] = convState[t * W + ch + i];
+            }
+        }
+        """
+
+    nonisolated(unsafe) static let gatedFullKernel = MLXFast.metalKernel(
+        name: "track_ple_gated_full",
+        inputNames: ["g0", "value", "cscale", "divisor", "floorv", "eps", "convState"],
+        outputNames: ["gated", "full"],
+        source: gatedFullSource,
+        header: header + """
+            template <typename T> METAL_FUNC T mlx_abs_t(T x) { return metal::abs(x); }
+            template <typename T> METAL_FUNC T mlx_sqrt_t(T x) { return metal::precise::sqrt(x); }
+            """,
+        ensureRowContiguous: true)
+
+    static func gatedFull(
+        g0: MLXArray, value: MLXArray, cScale: MLXArray, divisor: MLXArray, floor: MLXArray,
+        convState: MLXArray, stateLength: Int, hcCount: Int, hidden: Int, eps: Float
+    ) -> (gated: MLXArray, full: MLXArray) {
+        let B = value.dim(0), S = value.dim(1), W = hcCount * hidden
+        precondition(
+            B == 1 && hidden % 4 == 0 && hidden / 4 <= 1024 && value.dim(2) == hidden
+                && convState.shape == [B, stateLength, W])
+        let outs = gatedFullKernel(
+            [g0, value, cScale, divisor, floor, MLXArray(eps), convState],
+            template: [
+                ("InT", value.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+                ("ST", stateLength),
+            ],
+            grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
+            outputShapes: [[B, S, W], [B, stateLength + S, W]],
+            outputDTypes: [value.dtype, value.dtype])
+        return (outs[0], outs[1])
+    }
+
     // MARK: the dilated depthwise convolution, silu, and the residual add
 
     /// full [B, N+S, W] (carried state ++ normed), convw [W, KC], gated [B,S,W]
