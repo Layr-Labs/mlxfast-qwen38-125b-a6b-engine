@@ -100,11 +100,6 @@ enum TrackFastMixerKernels {
         let S = normed.dim(0), KD = normed.dim(1), ND = down.rows
         let HC = inject?.rows ?? 4
         precondition(S >= 1 && S <= 8 && ND % 8 == 0 && KD % 512 == 0 && down.bits == 4)
-        if S == 1 && down.groupSize == 32 && (inject == nil || inject!.groupSize == 32)
-            && TrackFastMixerSplitK.split > 0 {
-            let o = TrackFastMixerSplitK.apply(normed, down: down, inject: inject)
-            return (o[0], o[1], o[2])
-        }
         let inj = inject ?? down
         // MLXFAST-MIX2ROW: match the source-time row count; launch size stays 64.
         let rowsPerSimdgroup = S == 1 ? downRowsPerSimdgroup : 4
@@ -125,46 +120,23 @@ enum TrackFastMixerKernels {
     /// Tile t owns columns 2t, 2t+1 across the HC streams (8 rows); slot s ->
     /// row (2t + (s & 1)) + H * (s >> 1). grid threads (32, 2 * H/2, 1), tg (32, 2, 1).
     static let upMixSource = """
-        auto sigmoid = [&](T value) -> T {
-            if constexpr (metal::is_same_v<T, bfloat16_t>) {
-                return sigmoid_lut[as_type<ushort>(static_cast<bfloat16_t>(value))];
-            } else {
-                return mlx_sigmoid(value);
-            }
-        };
         const int tile = (int)threadgroup_position_in_grid.y;
         const int d0 = 2 * tile;
         const uint sg = simdgroup_index_in_threadgroup;
         const uint lid = thread_index_in_simdgroup;
-        threadgroup T products[8][VPT];
+        threadgroup float res[8][VPT];
         if constexpr (VPT == 1) {
+            int rows[4];
+            for (int i = 0; i < 4; ++i) { const int s = (int)sg * 4 + i; rows[i] = d0 + (s & 1) + H * (s >> 1); }
             float r[4];
-            if constexpr (PACKED_ROWS) {
-                qmv_reg<T, GS, BITS, (LW % get_pack_factor<BITS, 32>()) == 0>(wu, su, bu, act, LW, tile * 8 + (int)sg * 4, lid, r);
-            } else {
-                int rows[4];
-                for (int i = 0; i < 4; ++i) { const int s = (int)sg * 4 + i; rows[i] = d0 + (s & 1) + H * (s >> 1); }
-                qmv_reg_rows<T, GS, BITS, false, (LW % get_pack_factor<BITS, 32>()) == 0>(wu, su, bu, act, LW, rows, lid, r);
-            }
-            if (lid < 4 && (int)(sg * 2 + lid / 2) < HC) {
-                const int slot = (int)sg * 4 + (int)lid;
-                const float low = metal::select(r[0], r[1], (lid & 1u) != 0);
-                const float high = metal::select(r[2], r[3], (lid & 1u) != 0);
-                const T weight = static_cast<T>(metal::select(low, high, (lid & 2u) != 0));
-                const int row = d0 + (slot & 1) + H * (slot >> 1);
-                products[slot][0] = sigmoid(weight) * normed[row];
-            }
+            qmv_reg_rows<T, GS, BITS, false, (LW % get_pack_factor<BITS, 32>()) == 0>(wu, su, bu, act, LW, rows, lid, r);
+            if (lid == 0) { for (int i = 0; i < 4; ++i) { res[(int)sg * 4 + i][0] = r[i]; } }
         } else {
             const int s = (int)sg * 4 + (int)(lid / 8);
             const int row = d0 + (s & 1) + H * (s >> 1);
             float r[VPT];
             qmv_wide_reg_full<T, GS, BITS, VPT, 8, false>(wu, su, bu, act, LW, VPT, row, lid, r);
-            if ((lid % 8) == 0 && (s >> 1) < HC) {
-                for (int v = 0; v < VPT; ++v) {
-                    const T weight = static_cast<T>(r[v]);
-                    products[s][v] = sigmoid(weight) * normed[(size_t)v * (size_t)(HC * H) + (size_t)row];
-                }
-            }
+            if ((lid % 8) == 0) { for (int v = 0; v < VPT; ++v) { res[s][v] = r[v]; } }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const uint t = sg * 32 + lid;
@@ -173,7 +145,9 @@ enum TrackFastMixerKernels {
             for (int v = 0; v < VPT; ++v) {
                 T acc = T(0);
                 for (int s = 0; s < HC; ++s) {
-                    const T p = products[s * 2 + (int)t][v];
+                    const T w = static_cast<T>(res[s * 2 + (int)t][v]);
+                    const T sgm = mlx_sigmoid(w);
+                    const T p = sgm * normed[(size_t)v * (size_t)(HC * H) + (size_t)(s * H + d)];
                     acc = acc + p;
                 }
                 input[(size_t)v * (size_t)H + (size_t)d] = acc;
@@ -182,36 +156,33 @@ enum TrackFastMixerKernels {
         }
         if (HAS_INJECT && tile == 0 && t < (uint)(HC * VPT)) {
             const T x = inj[t];
-            inject[t] = T(2) * sigmoid(x);
+            inject[t] = T(2) * mlx_sigmoid(x);
         }
         """
 
     nonisolated(unsafe) static let upMixKernel = MLXFast.metalKernel(
         name: "track_mixer_up_mix",
-        inputNames: ["act", "normed", "wu", "su", "bu", "inj", "sigmoid_lut"],
+        inputNames: ["act", "normed", "wu", "su", "bu", "inj"],
         outputNames: ["input", "inject", "inputF"],
         source: upMixSource, header: header, ensureRowContiguous: true)
     nonisolated(unsafe) static let upMixKernel1 = MLXFast.metalKernel(
         name: "track_mixer_up_mix_1",
-        inputNames: ["act", "normed", "wu", "su", "bu", "inj", "sigmoid_lut"],
+        inputNames: ["act", "normed", "wu", "su", "bu", "inj"],
         outputNames: ["input", "inject", "inputF"],
         source: upMixSource, header: header1, ensureRowContiguous: true)
 
     static func upMix(
         act: MLXArray, normed: MLXArray, up: TrackQuantWeight, inj: MLXArray, hcCount: Int, hidden: Int,
-        hasInject: Bool, emitF32: Bool = false, packedRows: Bool = false
+        hasInject: Bool, emitF32: Bool = false
     ) -> (input: MLXArray, inject: MLXArray, inputF32: MLXArray) {
         let S = act.dim(0), LW = act.dim(1)
         precondition(S >= 1 && S <= 8 && hidden % 2 == 0 && up.rows == hcCount * hidden && up.bits == 4)
         precondition(LW % 32 == 0 && LW < 512 + 256)  // K = 320: one full block + a tail, the `qmv` normal branch
-        let sigmoidTable = act.dtype == .bfloat16 ? TrackBF16Functions.sigmoid : normed
-        precondition(!packedRows || (S == 1 && hcCount == 4))
         let outs = (S == 1 ? upMixKernel1 : upMixKernel)(
-            [act, normed, up.weight, up.scales, up.biases!, inj, sigmoidTable],
+            [act, normed, up.weight, up.scales, up.biases!, inj],
             template: [
                 ("T", act.dtype), ("GS", up.groupSize), ("BITS", up.bits), ("H", hidden), ("HC", hcCount),
                 ("LW", LW), ("VPT", S), ("HAS_INJECT", hasInject), ("EMIT_F32", emitF32),
-                ("PACKED_ROWS", packedRows),
             ],
             grid: (32, (hidden / 2) * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [[S, hidden], [S, hcCount], [emitF32 ? S : 1, emitF32 ? hidden : 1]],
