@@ -25,6 +25,7 @@ import MLX
 import MLXLLM
 import MLXLMCommon
 import MLXNN
+import Dispatch
 
 /// Host-side mirror of the rolling n-gram context used by the PLE layer.
 ///
@@ -64,9 +65,38 @@ enum TrackPleContextMirror {
     }
 }
 
+
+/// A PLE host row gather running on a side thread.
+///
+/// The gather -- token read, n-gram hash, LRU/SSD row fetch -- is pure host
+/// work that depends only on `ids`, the mirrored context, and the row source.
+/// Starting it when `fastStreams` begins lets it run while the calling thread
+/// builds the layer-0 graph; `pleForward` joins it where the gather used to
+/// run inline. The mirror is touched only on the gather thread, in the same
+/// order the inline path used; the `wait()` join before any later mirror
+/// access keeps every access serialized.
+final class TrackPleRowGather {
+    private let done = DispatchSemaphore(value: 0)
+    private var result: (embedded: MLXArray, history: [Int64])? = nil
+
+    init(_ body: @escaping () -> (MLXArray, [Int64])) {
+        DispatchQueue.global(qos: .userInitiated).async { [done] in
+            let r = body()
+            self.result = (r.0, r.1)
+            done.signal()
+        }
+    }
+
+    func wait() -> (embedded: MLXArray, history: [Int64]) {
+        done.wait()
+        return result!
+    }
+}
+
 // MARK: - Weight helpers
 
 extension Module {
+
     func trackChild(_ key: String) -> Module {
         guard let child = children()[unwrapping: key] else {
             preconditionFailure("TrackFastModel: module has no child \(key)")
@@ -861,7 +891,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
-        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool,
+        gather: TrackPleRowGather?
     ) -> MLXArray {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
@@ -885,33 +916,43 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
-            let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
-            let ctx: [Int64]
-            if !capture,
-                TrackPleContextMirror.matches(
-                    offset: offset, layer: p.stateLayerIndex, length: contextLength),
-                let mirrored = TrackPleContextMirror.context
-            {
-                ctx = mirrored
+            let history: [Int64]
+            if let gather {
+                // The gather ran on a side thread from `fastStreams` entry;
+                // join it here. The mirror was already stored/invalidated by
+                // that thread in the same order the inline path used.
+                let r = gather.wait()
+                embedded = r.embedded
+                history = r.history
             } else {
-                let rawPrev = state?.ssm
-                ctx = rawPrev.map {
-                    $0.dtype == .int32
-                        ? $0.asArray(Int32.self).map(Int64.init)
-                        : $0.asType(.int64).asArray(Int64.self)
-                } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+                let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
+                let ctx: [Int64]
+                if !capture,
+                    TrackPleContextMirror.matches(
+                        offset: offset, layer: p.stateLayerIndex, length: contextLength),
+                    let mirrored = TrackPleContextMirror.context
+                {
+                    ctx = mirrored
+                } else {
+                    let rawPrev = state?.ssm
+                    ctx = rawPrev.map {
+                        $0.dtype == .int32
+                            ? $0.asArray(Int32.self).map(Int64.init)
+                            : $0.asType(.int64).asArray(Int64.self)
+                    } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+                }
+                history = ctx + toks
+                if capture {
+                    TrackPleContextMirror.invalidate()
+                } else {
+                    TrackPleContextMirror.store(
+                        Array(history.suffix(contextLength)), nextOffset: offset + S,
+                        stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
+                }
+                let gid = p.embedding.hostRowIds(history: [history], newCount: S)
+                let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
+                embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
             }
-            let history = ctx + toks
-            if capture {
-                TrackPleContextMirror.invalidate()
-            } else {
-                TrackPleContextMirror.store(
-                    Array(history.suffix(contextLength)), nextOffset: offset + S,
-                    stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
-            }
-            let gid = p.embedding.hostRowIds(history: [history], newCount: S)
-            let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
-            embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
             hostHistory = history
         } else {
             TrackPleContextMirror.invalidate()
@@ -1012,6 +1053,55 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         precondition(recurrentState.count == 1)
         let evaluation = recurrentState[0]
         var residual = inputEmbeddings ?? embedTokens(ids)  // [B,S,H] until tiled
+        // Start the PLE host row gather on a side thread. It needs only `ids`,
+        // the mirrored context, and the row source -- none of the stream graph
+        // -- so it runs while this thread builds the layer-0 graph, and
+        // `pleForward` joins it where the gather used to run inline. The
+        // mirror store/invalidate happens inside the closure in the same
+        // order the inline path used; the join before any later mirror access
+        // keeps the access serialized.
+        var pleGather: TrackPleRowGather? = nil
+        if let ple = layers.first(where: { $0.ple != nil })?.ple,
+            let host = ple.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource,
+            ids.dim(1) <= 8
+        {
+            let streamDtype = residual.dtype
+            let contextLength = max(1, ple.dilation - 1)
+            let state = evaluation.inputState(modelLayerIndex: ple.stateLayerIndex)
+            pleGather = TrackPleRowGather { [self] in
+                let toks: [Int64] = ids.dtype == .int32
+                    ? ids.asArray(Int32.self).map(Int64.init)
+                    : ids.asType(.int64).asArray(Int64.self)
+                let ctx: [Int64]
+                if !capture,
+                    TrackPleContextMirror.matches(
+                        offset: offset, layer: ple.stateLayerIndex, length: contextLength),
+                    let mirrored = TrackPleContextMirror.context
+                {
+                    ctx = mirrored
+                } else {
+                    let rawPrev = state?.ssm
+                    ctx = rawPrev.map {
+                        $0.dtype == .int32
+                            ? $0.asArray(Int32.self).map(Int64.init)
+                            : $0.asType(.int64).asArray(Int64.self)
+                    } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+                }
+                let history = ctx + toks
+                if capture {
+                    TrackPleContextMirror.invalidate()
+                } else {
+                    TrackPleContextMirror.store(
+                        Array(history.suffix(contextLength)), nextOffset: offset + ids.dim(1),
+                        stateLayerIndex: ple.stateLayerIndex, contextLength: contextLength)
+                }
+                let gid = ple.embedding.hostRowIds(history: [history], newCount: ids.dim(1))
+                let rows = host.rows(
+                    globalIds: gid,
+                    shape: [1, ids.dim(1), (cfg.ngramSize - 1) * cfg.headsPerNGram])
+                return (rows.reshaped(1, ids.dim(1), -1).asType(streamDtype), history)
+            }
+        }
         // A fully injected hyper-stream can continue through a layer block.
         // Normal token/embedding entry points retain the initial tiling.
         var tile = !inputIsMultiStream
@@ -1036,7 +1126,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     stream
                     + pleForward(
                         ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
+                        offset: offset, capture: capture, gather: pleGather)
+                pleGather = nil  // consumed; a second PLE layer would gather inline
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
