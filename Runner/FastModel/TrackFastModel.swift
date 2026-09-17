@@ -155,7 +155,7 @@ struct TrackMultiProj {
     /// shapes dispatch chooses its split from N, so wide inputs run the parts
     /// separately and stay exact with the reference.
     func apply(_ x: MLXArray) -> MLXArray {
-        if let fused, x.dim(-2) <= 8 { return fused.apply(x) }
+        if let fused = fused, x.dim(-2) <= 8 { return fused.apply(x) }
         return concatenated(parts.map { $0.apply(x) }, axis: -1)
     }
 }
