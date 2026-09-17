@@ -748,6 +748,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let prof = TrackFastProfile.prefill != nil && x.dim(1) >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
         let logits: MLXArray
+        var routerPartials: MLXArray? = nil
         if x.dim(0) == 1, x.dim(1) == 1, m.routerW16.dtype == .bfloat16, x.dim(2) % 128 == 0,
             m.routerW16.dim(0) % 16 == 0, x.dim(2) < 16 * m.routerW16.dim(0), m.routerW16.dim(0) < 4096
         {
@@ -755,7 +756,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // reference upcasts it to float32 and reads twice the bytes).
             let xf = (inputF32 ?? x.asType(.float32)).reshaped(x.dim(2))
             logits = TrackFastMoEKernels.routerGemv(x: xf, w: m.routerW16).reshaped(1, 1, -1)
-        } else if inputF32 == nil, let wide = TrackPrefillRouter.apply(x: x, w: m.routerW16) {
+        } else if inputF32 == nil, let wide = TrackPrefillRouter.partials(x: x, w: m.routerW16) {
+            // The fused no-gate route folds the split-K partitions inside its
+            // top-k walk; `logits` keeps the partials for the profile tick.
+            routerPartials = wide
             logits = wide
         } else {
             logits = matmul(inputF32 ?? x.asType(.float32), m.routerW32.transposed())
@@ -804,7 +808,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             ).reshaped(1, S, H)
         }
         let idx: MLXArray, weights: MLXArray
-        if TrackP12Prefill.eligible(x), x.dim(2) == 2560,
+        if let partials = routerPartials, TrackP12Prefill.eligible(x), x.dim(2) == 2560,
+            partials.dim(-1) == 512, m.topK == 10,
+            let fused = TrackPrefillRouteTopK.route(partials: partials, x: x, topK: m.topK)
+        {
+            idx = fused.idx
+            weights = fused.w
+        } else if TrackP12Prefill.eligible(x), x.dim(2) == 2560,
             logits.dtype == .float32, logits.dim(-1) == 512, m.topK == 10,
             StreamOrDevice.default.stream === Stream.gpu
         {
@@ -813,8 +823,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             idx = routed.idx
             weights = routed.w
         } else {
-            idx = argPartition(-logits, kth: m.topK - 1, axis: -1)[.ellipsis, ..<m.topK]
-            weights = softmax(takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
+            let materialized = routerPartials.map(TrackPrefillRouter.sum) ?? logits
+            idx = argPartition(-materialized, kth: m.topK - 1, axis: -1)[.ellipsis, ..<m.topK]
+            weights = softmax(takeAlong(materialized, idx, axis: -1), axis: -1, precise: true)
         }
         if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights]) }
         let sharedAct: MLXArray

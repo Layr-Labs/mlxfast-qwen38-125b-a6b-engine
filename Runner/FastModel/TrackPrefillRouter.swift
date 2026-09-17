@@ -26,7 +26,10 @@ enum TrackPrefillRouter {
         name: "track_router_split_sum", inputNames: ["partials"], outputNames: ["y"],
         source: sumSource, ensureRowContiguous: true)
 
-    static func apply(x: MLXArray, w: MLXArray) -> MLXArray? {
+    /// The split-K partials `[2, S, 512]` f32, or nil outside the supported
+    /// window. The fused route kernel consumes these directly; `sum` folds
+    /// them into the logits matrix the fallback paths still read.
+    static func partials(x: MLXArray, w: MLXArray) -> MLXArray? {
         guard enabled, supportsNAX, StreamOrDevice.default.stream == Stream.gpu,
             x.ndim == 3, x.dim(0) == 1, x.dim(1) >= 32, x.dim(1) <= 1024,
             x.dim(2) == 2560, x.dtype == .bfloat16,
@@ -35,10 +38,16 @@ enum TrackPrefillRouter {
         let rows = x.dim(1), tilesM = (rows + 63) / 64
         let swizzle = tilesM <= 3 ? 1 : 2
         let groups = 8 * swizzle * ((tilesM + swizzle - 1) / swizzle) * 2
-        let partials = partialKernel(
+        return partialKernel(
             [x, w], template: [("M", rows)],
             grid: (groups * 32, 2, 2), threadGroup: (32, 2, 2),
             outputShapes: [[2, rows, 512]], outputDTypes: [.float32])[0]
+    }
+
+    /// `partials` folded into `[1, S, 512]` f32 logits: the same two-operand
+    /// add the fused route performs inside its walk.
+    static func sum(_ partials: MLXArray) -> MLXArray {
+        let rows = partials.dim(1)
         return sumKernel(
             [partials], template: [("M", rows)],
             grid: (512, rows, 1), threadGroup: (256, 1, 1),
