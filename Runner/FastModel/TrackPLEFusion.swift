@@ -104,31 +104,25 @@ enum TrackPLEFusion {
         """
 
     static let convolutionSource = """
-        // MLXFAST-PLEFUSE2: preserve the S=1 dilated implicit-GEMM dispatch:
-        // group=(32,1,4), grid of groups=(1,1,W), channel=group.z.
-        // Its small-channel loaders assign taps 0..3 to SIMD 0 lanes 0..3;
-        // lane 0 owns the single valid output. Keep those owners, discard
-        // the padded matrix work, and require no threadgroup storage.
+        // MLXFAST-PLEFUSE2: one thread per channel, the same layout
+        // `track_ple_conv` uses for S >= 2. The previous dispatch staged
+        // each channel's four taps across lanes 0..3 of simdgroup 0 of a
+        // 128-thread threadgroup, reconstructed the sum with four serial
+        // simd_broadcasts, and wrote from lane 0 alone -- 128 threads
+        // launched per channel for 4 loads and 1 store.
         constexpr uint W = 10240;
-        const uint c = threadgroup_position_in_grid.z;
-        const uint lane = thread_index_in_simdgroup;
-        if (simdgroup_index_in_threadgroup != 0) { return; }
-        float product = 0.0f;
-        if (lane < 4) {
-            product = float(full[(lane * 3) * W + c]) * float(weight[c * 4 + lane]);
-        }
-        // FP32 products and chronological FP32 additions, taps 0,1,2,3.
-        // Shuffle broadcasts retain the weight-loading lanes. Unlike a
-        // padded simdgroup MMA, this has no matrix accumulator or spill array.
-        float acc = simd_broadcast(product, 0);
-        acc += simd_broadcast(product, 1);
-        acc += simd_broadcast(product, 2);
-        acc += simd_broadcast(product, 3);
-        if (lane == 0) {
-            InT convolved = InT(acc);
-            InT activated = mlx_silu(convolved);
-            out[c] = gated[c] + activated;
-        }
+        const uint c = thread_position_in_grid.x;
+        if (c >= W) { return; }
+        // FP32 products and chronological FP32 additions, taps 0,1,2,3 --
+        // the same operand order and single rounding the broadcast version
+        // produced, so the result is bit-identical.
+        float acc = float(full[0 * W + c]) * float(weight[c * 4 + 0]);
+        acc += float(full[3 * W + c]) * float(weight[c * 4 + 1]);
+        acc += float(full[6 * W + c]) * float(weight[c * 4 + 2]);
+        acc += float(full[9 * W + c]) * float(weight[c * 4 + 3]);
+        InT convolved = InT(acc);
+        InT activated = mlx_silu(convolved);
+        out[c] = gated[c] + activated;
         """
 
     static let prepareKernel = MLXFast.metalKernel(
@@ -173,7 +167,7 @@ enum TrackPLEFusion {
             outputDTypes: [stream.dtype, stream.dtype])
         let output = convolutionKernel(
             [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
-            grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
+            grid: (10240, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
         return (r[1], output)
     }
