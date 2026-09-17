@@ -97,13 +97,13 @@ final class TrackFastHead {
 
     /// One head application over `[1, S]` inputs; returns `sample` `[1,S,H]`
     /// and the next multi stream `[1,S,hc*H]`. Nil when the fast path does
-    /// not serve the call (context past the indexer budget).
+    /// not serve the call (wider batches).
     func forward(
         nextTokenIds ids: MLXArray, multiStream multi: MLXArray, embedTokens: Embedding,
         cache: Qwen4ExpAttentionCache
     ) -> (sample: MLXArray, multi: MLXArray)? {
         let B = ids.dim(0), S = ids.dim(1)
-        guard Self.enabled, B == 1, cache.offset + S <= indexerBudget else { return nil }
+        guard Self.enabled, B == 1 else { return nil }
         let offset = cache.offset
 
         // embed -> pre-norm -> fc ; multi -> pre-norm (one statistic) -> per-stream fc ; add
@@ -138,16 +138,28 @@ final class TrackFastHead {
         let heads = cfg.attentionHeads, kvHeads = cfg.kvHeads, d = cfg.headDim
         let qkv = attn.qkv.apply(x)
         let idxStart = 2 * attn.qWidth + 2 * attn.kvWidth
-        _ = cache.updateIndexer(keys: qkv[.ellipsis, idxStart ..< (idxStart + cfg.indexerHeadDim)])
+        let idxKeys = qkv[.ellipsis, idxStart ..< (idxStart + cfg.indexerHeadDim)]
+        // The indexer tape first: its truncation reads the pre-update offset.
+        // Past the budget the indexer also needs its queries, which only the
+        // full projection carries.
+        let selection: Qwen4ExpQSASelection
+        if offset + S > indexerBudget {
+            selection = attn.indexer.legacySelection(
+                q: attn.indexerFull.apply(x)[.ellipsis, ..<attn.indexerQWidth], keys: idxKeys,
+                rope: rotary, cache: cache, offset: offset)
+        } else {
+            _ = cache.updateIndexer(keys: idxKeys)
+            selection = .all
+        }
         let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: S))
         let prep = TrackFastKernels.attnPrep(
             qkv: qkv, qNorm: attn.qNormW, kNorm: attn.kNormW,
             cos: c.asType(x.dtype).reshaped(S, rotaryDims), sin: s.asType(x.dtype).reshaped(S, rotaryDims),
             heads: heads, kvHeads: kvHeads, headDim: d, rotaryDims: rotaryDims, eps: eps)
         let mask = makeAttentionMask(n: S, cache: cache)
-        let att = attentionWithCacheUpdate(
-            queries: prep.q, keys: prep.k, values: prep.v, cache: cache,
-            scale: attentionScale, mask: mask)
+        let att = cache.updateAndAttend(
+            queries: prep.q, keys: prep.k, values: prep.v,
+            scale: attentionScale, mask: mask, selection: selection)
         let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: attn.qWidth)
         return attn.out.apply(out)
     }
