@@ -128,6 +128,129 @@ enum TrackFastPLEKernels {
             outputShapes: [[B, S, W]], outputDTypes: [keyFlat.dtype])[0]
     }
 
+    // MARK: prod + dot + gate + gated value + norm_conv in one launch
+
+    /// keyFlat [B,S,W], stream [B,S,W], value [B,S,H], scales, scalars
+    ///   -> gated [B,S,W], normed [B,S,W]
+    /// grid (H/4, HC, B*S), threadgroup (H/4, 1, 1)
+    ///
+    /// The dot reduction is folded in with row_reduce_looped's four-element
+    /// fold -- the same sequence the S=1 fused kernel carries. That is only
+    /// the kernel MLX picks while B*S*HC < 32; at 32 rows and above it
+    /// switches to row_reduce_simple, whose order this does not reproduce,
+    /// so `prodGated` refuses and the caller keeps the three-launch path.
+    static let prodGatedSource = """
+        constexpr int N_READS = 4;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint hc = thread_position_in_grid.y;
+        const uint row = thread_position_in_grid.z;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        threadgroup float ksums[32];
+        threadgroup float qsums[32];
+        threadgroup float dsums[32];
+        threadgroup float vsums[32];
+        const uint base = row * W + hc * H;
+        float kx[N_READS];
+        float qx[N_READS];
+        float kacc = 0.0f;
+        float qacc = 0.0f;
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            kx[i] = static_cast<float>(keyFlat[base + d]);
+            qx[i] = static_cast<float>(stream[base + d]);
+            kacc += kx[i] * kx[i];
+            qacc += qx[i] * qx[i];
+        }
+        kacc = simd_sum(kacc);
+        qacc = simd_sum(qacc);
+        constexpr uint simd_groups = (H + 32 * N_READS - 1) / (32 * N_READS);
+        if (sg == 0 && lane >= simd_groups) { ksums[lane] = 0; qsums[lane] = 0; }
+        if (lane == 0) { ksums[sg] = kacc; qsums[sg] = qacc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        kacc = simd_sum(ksums[lane]);
+        qacc = simd_sum(qsums[lane]);
+        const float kinv = metal::precise::rsqrt(kacc / (float)H + eps);
+        const float qinv = metal::precise::rsqrt(qacc / (float)H + eps);
+
+        // The dot: the products stay in registers and fold in InT ascending,
+        // then the same simd + partials tree row_reduce_looped uses.
+        InT dot = InT(0);
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            const InT kn = static_cast<InT>(kx[i] * kinv) * kscale[hc * H + d];
+            const InT qn = static_cast<InT>(qx[i] * qinv) * qscale[hc * H + d];
+            const InT product = kn * qn;
+            dot = product + dot;
+        }
+        dot = InT(0) + dot;
+        dot = simd_sum(dot);
+        if (sg == 0 && lane >= simd_groups) { dsums[lane] = 0; }
+        if (lane == 0) { dsums[sg] = float(dot); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dot = simd_sum(InT(dsums[lane]));
+
+        InT g = dot / divisor;
+        g = mlx_sqrt_t(mlx_maximum(mlx_abs_t(g), floorv)) * mlx_sign(g);
+        const InT sgm = mlx_sigmoid(g);
+
+        float gx[N_READS];
+        float acc = 0.0f;
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            const InT v = sgm * value[row * H + d];
+            gated[base + d] = v;
+            gx[i] = static_cast<float>(v);
+            acc += gx[i] * gx[i];
+        }
+        acc = simd_sum(acc);
+        if (sg == 0 && lane >= simd_groups) { vsums[lane] = 0; }
+        if (lane == 0) { vsums[sg] = acc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        acc = simd_sum(vsums[lane]);
+        const float inv = metal::precise::rsqrt(acc / (float)H + eps);
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            normed[base + d] = static_cast<InT>(gx[i] * inv) * cscale[hc * H + d];
+        }
+        """
+
+    nonisolated(unsafe) static let prodGatedKernel = MLXFast.metalKernel(
+        name: "track_ple_prod_gated",
+        inputNames: [
+            "keyFlat", "stream", "value", "kscale", "qscale", "cscale",
+            "divisor", "floorv", "eps",
+        ],
+        outputNames: ["gated", "normed"],
+        source: prodGatedSource,
+        header: header + """
+            template <typename T> METAL_FUNC T mlx_abs_t(T x) { return metal::abs(x); }
+            template <typename T> METAL_FUNC T mlx_sqrt_t(T x) { return metal::precise::sqrt(x); }
+            """,
+        ensureRowContiguous: true)
+
+    static func prodGated(
+        keyFlat: MLXArray, stream: MLXArray, value: MLXArray,
+        kScale: MLXArray, qScale: MLXArray, cScale: MLXArray,
+        divisor: MLXArray, floor: MLXArray,
+        hcCount: Int, hidden: Int, eps: Float
+    ) -> (gated: MLXArray, normed: MLXArray)? {
+        let B = keyFlat.dim(0), S = keyFlat.dim(1), W = hcCount * hidden
+        // row_reduce_looped only below 32 rows; above it the reference sum
+        // switches kernel and this fold would not be bit-exact.
+        guard B * S * hcCount < 32,
+            hidden % 4 == 0 && hidden / 4 <= 1024,
+            keyFlat.dim(2) == W && value.dim(2) == hidden
+        else { return nil }
+        let outs = prodGatedKernel(
+            [keyFlat, stream, value, kScale, qScale, cScale, divisor, floor, MLXArray(eps)],
+            template: [("InT", keyFlat.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+            grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
+            outputShapes: [[B, S, W], [B, S, W]],
+            outputDTypes: [keyFlat.dtype, keyFlat.dtype])
+        return (outs[0], outs[1])
+    }
+
     // MARK: the gate scalar chain, the gated value, and norm_conv
 
     /// g0 [B,S,HC,1] (the reduced dot), value [B,S,H], cscale [W], divisor and
