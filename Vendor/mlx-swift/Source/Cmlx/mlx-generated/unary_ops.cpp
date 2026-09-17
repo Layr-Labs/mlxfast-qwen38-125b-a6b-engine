@@ -869,3 +869,5 @@ struct FromFP8 {
 }
 
 } // namespace mlx::core::metal
+
+// redraw #3 of submission 525e4333-f5ef-49c3-8f6b-6b82150f274e by Meganpark980320
