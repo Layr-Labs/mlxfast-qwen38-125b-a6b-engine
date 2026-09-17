@@ -24,6 +24,15 @@ namespace steel {
 // NAX Steel with new tiles
 ///////////////////////////////////////////////////////////////////////////////
 
+template <typename V>
+METAL_FUNC metal::vec<V, 4> steel_nax_load4(const device V* p) {
+  return *reinterpret_cast<const device metal::vec<V, 4>*>(p);
+}
+template <typename V>
+METAL_FUNC metal::vec<V, 4> steel_nax_load4(const threadgroup V* p) {
+  return *reinterpret_cast<const threadgroup metal::vec<V, 4>*>(p);
+}
+
 struct BaseNAXFrag {
   STEEL_CONST short kFragRows = 16;
   STEEL_CONST short kFragCols = 16;
@@ -81,9 +90,25 @@ struct BaseNAXFrag {
       const auto c = off_y;
 
       if constexpr (metal::is_same_v<StrY, Int<1>>) {
-        STEEL_PRAGMA_UNROLL
-        for (short j = 0; j < kElemCols; j++) {
-          dst[i * kElemCols + j] = static_cast<T>(src[r * str_x + c + j]);
+        // MLXFAST-AVECLOAD: with StrY == 1 these kElemCols reads are
+        // contiguous, and kElemCols is 4, so they are one vec<U,4>. The
+        // address is src + sc.y*str_x + sc.x + r*str_x + c, where `c` is
+        // `off_y` = idx_col * kFragCols (a compile-time multiple of 16) and
+        // `sc.x` = ((qid & 2) | (lane & 1)) * 4 (a compile-time-shaped
+        // multiple of 4). The only runtime unknown is `str_x`, so one
+        // threadgroup-uniform test outside the unrolled loop covers it; the
+        // scalar path is kept verbatim for every other case.
+        if (kElemCols == 4 && (str_x & 3) == 0) {
+          const auto v = steel_nax_load4(&src[r * str_x + c]);
+          dst[i * kElemCols + 0] = static_cast<T>(v[0]);
+          dst[i * kElemCols + 1] = static_cast<T>(v[1]);
+          dst[i * kElemCols + 2] = static_cast<T>(v[2]);
+          dst[i * kElemCols + 3] = static_cast<T>(v[3]);
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < kElemCols; j++) {
+            dst[i * kElemCols + j] = static_cast<T>(src[r * str_x + c + j]);
+          }
         }
       } else {
         STEEL_PRAGMA_UNROLL
