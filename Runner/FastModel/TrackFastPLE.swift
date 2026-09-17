@@ -200,20 +200,34 @@ enum TrackFastPLEKernels {
 
     /// full [B, N+S, W] (carried state ++ normed), convw [W, KC], gated [B,S,W]
     ///   -> out [B,S,W] = gated + silu(conv)
-    /// grid (W, S, B), threadgroup (256, 1, 1)
+    /// grid (W, min(DIL,S), B), threadgroup (256, 1, 1). Each thread owns the
+    /// outputs t, t+DIL, t+2*DIL, ... of one residue class and streams the tap
+    /// rows through a KC-entry ring, so every `full` row loads once instead of
+    /// once per output that taps it. Per-output arithmetic is the original
+    /// ascending-tap FP32 accumulation, unchanged.
     static let convSource = """
         const uint c = thread_position_in_grid.x;
         const uint t = thread_position_in_grid.y;
         const uint b = thread_position_in_grid.z;
         if (c >= (uint)W) return;
         const device InT* fb = full + (size_t)b * (size_t)(NIN) * (size_t)W;
-        float acc = 0.0f;
-        for (int j = 0; j < KC; ++j) {
-            acc += static_cast<float>(fb[(size_t)(t + (uint)(j * DIL)) * (size_t)W + c])
-                 * static_cast<float>(convw[c * KC + j]);
+        const uint nOut = ((uint)S - t + (uint)DIL - 1) / (uint)DIL;
+        float v[KC];
+        uint loaded = 0;
+        for (uint k = 0; k < nOut; ++k) {
+            const uint need = k + KC;
+            for (; loaded < need; ++loaded) {
+                v[loaded % KC] = static_cast<float>(
+                    fb[(size_t)(t + loaded * (uint)DIL) * (size_t)W + c]);
+            }
+            float acc = 0.0f;
+            for (int j = 0; j < KC; ++j) {
+                acc += v[(k + j) % KC] * static_cast<float>(convw[c * KC + j]);
+            }
+            const uint tt = t + k * (uint)DIL;
+            const size_t o = ((size_t)b * (size_t)S + (size_t)tt) * (size_t)W + c;
+            out[o] = gated[o] + mlx_silu(static_cast<InT>(acc));
         }
-        const size_t o = ((size_t)b * (size_t)S + (size_t)t) * (size_t)W + c;
-        out[o] = gated[o] + mlx_silu(static_cast<InT>(acc));
         """
 
     nonisolated(unsafe) static let convKernel = MLXFast.metalKernel(
@@ -234,7 +248,7 @@ enum TrackFastPLEKernels {
                 ("InT", gated.dtype), ("W", W), ("S", S), ("KC", kc), ("DIL", dilation),
                 ("NIN", full.dim(1)),
             ],
-            grid: (W, S, B), threadGroup: (256, 1, 1),
+            grid: (W, min(dilation, S), B), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, W]], outputDTypes: [gated.dtype])[0]
     }
 }
