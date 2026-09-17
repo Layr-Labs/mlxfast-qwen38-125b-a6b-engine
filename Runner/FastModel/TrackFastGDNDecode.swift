@@ -1,4 +1,3 @@
-// Each threadgroup owns one value head; each SIMD group owns four value rows.
 // Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
 // TrackFastKernels.prepSource, leanSource and gatedRMSSource.
 
