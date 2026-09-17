@@ -241,13 +241,44 @@ inline U qdot(
   }
 
   else if (bits == 4) {
-    const device uint16_t* ws = (const device uint16_t*)w;
-    for (int i = 0; i < (values_per_thread / 4); i++) {
-      accum +=
-          (x_thread[4 * i] * (ws[i] & 0x000f) +
-           x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-           x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-           x_thread[4 * i + 3] * (ws[i] & 0xf000));
+    if constexpr (values_per_thread % 16 == 0) {
+      // One 8-byte vector load per four packs. The compiler cannot prove the
+      // row pointer's 8-byte alignment (base + row * K/2 + lane * 8, K % 16
+      // == 0 for every caller), so the scalar form issues four u16 loads.
+      // Same words, same masks, same accumulation order: bit-identical.
+      const device vec<ushort, 4>* wv = (const device vec<ushort, 4>*)w;
+      for (int i = 0; i < (values_per_thread / 16); i++) {
+        const vec<ushort, 4> p = wv[i];
+        accum +=
+            (x_thread[16 * i] * (p.x & 0x000f) +
+             x_thread[16 * i + 1] * (p.x & 0x00f0) +
+             x_thread[16 * i + 2] * (p.x & 0x0f00) +
+             x_thread[16 * i + 3] * (p.x & 0xf000));
+        accum +=
+            (x_thread[16 * i + 4] * (p.y & 0x000f) +
+             x_thread[16 * i + 5] * (p.y & 0x00f0) +
+             x_thread[16 * i + 6] * (p.y & 0x0f00) +
+             x_thread[16 * i + 7] * (p.y & 0xf000));
+        accum +=
+            (x_thread[16 * i + 8] * (p.z & 0x000f) +
+             x_thread[16 * i + 9] * (p.z & 0x00f0) +
+             x_thread[16 * i + 10] * (p.z & 0x0f00) +
+             x_thread[16 * i + 11] * (p.z & 0xf000));
+        accum +=
+            (x_thread[16 * i + 12] * (p.w & 0x000f) +
+             x_thread[16 * i + 13] * (p.w & 0x00f0) +
+             x_thread[16 * i + 14] * (p.w & 0x0f00) +
+             x_thread[16 * i + 15] * (p.w & 0xf000));
+      }
+    } else {
+      const device uint16_t* ws = (const device uint16_t*)w;
+      for (int i = 0; i < (values_per_thread / 4); i++) {
+        accum +=
+            (x_thread[4 * i] * (ws[i] & 0x000f) +
+             x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+             x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+             x_thread[4 * i + 3] * (ws[i] & 0xf000));
+      }
     }
   }
 
