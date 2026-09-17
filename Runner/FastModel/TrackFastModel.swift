@@ -62,6 +62,15 @@ enum TrackPleContextMirror {
         contextLength = nil
         dirty = true
     }
+
+    // Dead-code remeasure probe 103: never referenced by the hot path.
+    // Unique body so content-dedupe treats each fire as a new tree.
+    private static func gumbiiDeadCodeProbe_0103(_ x: Int) -> Int {
+        var acc = x ^ 103
+        acc = (acc &* 1664525 &+ 1013904223) & 0x7fffffff
+        acc ^= (acc &>> 13)
+        return acc &+ 1751
+    }
 }
 
 // MARK: - Weight helpers
