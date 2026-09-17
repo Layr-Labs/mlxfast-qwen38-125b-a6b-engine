@@ -1,4 +1,4 @@
-// MLXFAST-PLEFUSE2: S=1 PLE fusion. No projection or weight-layout changes.
+// MLXFAST-PLEFUSE2: S<=7 PLE fusion. No projection or weight-layout changes.
 // Scratch: ONE reused float[32] (128 B) in prepare, ZERO in convolution.
 // This retains the RMS/reduction lane layout and the dilated convolution's
 // channel-per-threadgroup layout; token tolerance, not bit equality, applies.
@@ -27,11 +27,13 @@ enum TrackPLEFusion {
         constexpr uint H = 2560;
         constexpr uint W = 4 * H;
         const uint hc = threadgroup_position_in_grid.y;
+        const uint row = threadgroup_position_in_grid.z;
         const uint lid = thread_position_in_threadgroup.x;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
         const uint d = lid * 4;
-        const uint base = hc * H + d;
+        const uint cbase = hc * H + d;
+        const uint base = row * W + cbase;
         threadgroup float partials[32];  // 128 B total, reused throughout.
         const float eps = as_type<float>((uint)EPS_BITS);
 
@@ -57,9 +59,9 @@ enum TrackPLEFusion {
         InT dot = InT(0);
         for (uint i = 0; i < 4; ++i) {
             InT k = InT(float(key[base + i]) * ik);
-            k = k * keyScale[base + i];
+            k = k * keyScale[cbase + i];
             InT q = InT(float(query[base + i]) * iq);
-            q = q * queryScale[base + i];
+            q = q * queryScale[cbase + i];
             InT product = k * q;
             dot = product + dot;
         }
@@ -83,7 +85,7 @@ enum TrackPLEFusion {
         InT g[4];
         acc = 0.0f;
         for (uint i = 0; i < 4; ++i) {
-            g[i] = activation * value[d + i];
+            g[i] = activation * value[row * H + d + i];
             gated[base + i] = g[i];
             float v = float(g[i]);
             acc += v * v;
@@ -92,13 +94,18 @@ enum TrackPLEFusion {
             ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
         for (uint i = 0; i < 4; ++i) {
             InT n = InT(float(g[i]) * iv);
-            full[9 * W + base + i] = n * convScale[base + i];
+            full[9 * W + base + i] = n * convScale[cbase + i];
         }
-        // Same [old nine rows, new row] layout as concatenated. State staging
-        // keeps its existing tail view, including capture/rollback behavior.
-        for (uint t = 0; t < 9; ++t) {
-            for (uint i = 0; i < 4; ++i) {
-                full[t * W + base + i] = convState[t * W + base + i];
+        // Same [old nine rows, new rows] layout as concatenated: rows 0..8
+        // carry the state, rows 9.. carry this window's normed rows. Only the
+        // first window row's threadgroups stage the carried state; the rest
+        // write their own normed row. State staging keeps its existing tail
+        // view, including capture/rollback behavior.
+        if (row == 0) {
+            for (uint t = 0; t < 9; ++t) {
+                for (uint i = 0; i < 4; ++i) {
+                    full[t * W + cbase + i] = convState[t * W + cbase + i];
+                }
             }
         }
         """
@@ -144,7 +151,8 @@ enum TrackPLEFusion {
 
     static func supports(_ p: TrackPLE, stream: MLXArray, hidden: Int, hcCount: Int) -> Bool {
         // Guard the exact geometry; every other path builds the original chain.
-        hidden == 2560 && hcCount == 4 && stream.shape == [1, 1, 10240]
+        hidden == 2560 && hcCount == 4 && stream.dim(0) == 1 && stream.dim(1) <= 7
+            && stream.dim(2) == 10240
             && [.bfloat16, .float16, .float32].contains(stream.dtype)
             && p.dilation == 3 && p.stateLength == 9
             && p.keyProj.rows == 10240 && p.valueProj.rows == 2560
@@ -161,20 +169,29 @@ enum TrackPLEFusion {
         // quantization, tiling, and weight-loading lane ownership.
         let key = p.keyProj.apply(embedded)
         let value = p.valueProj.apply(embedded)
-        guard key.shape == [1, 1, 10240], value.shape == [1, 1, 2560],
+        let S = stream.dim(1)
+        guard key.shape == [1, S, 10240], value.shape == [1, S, 2560],
             key.dtype == stream.dtype, value.dtype == stream.dtype
         else { return nil }
         let r = prepareKernel(
             [key, stream, value, p.normKeyScale, p.normQueryScale, p.normConvScale, convState],
             template: [("InT", stream.dtype), ("EPS_BITS", Int(eps.bitPattern)),
                        ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern))],
-            grid: (640, 4, 1), threadGroup: (640, 1, 1),
-            outputShapes: [[1, 1, 10240], [1, 10, 10240]],
+            grid: (640, 4, S), threadGroup: (640, 1, 1),
+            outputShapes: [[1, S, 10240], [1, 9 + S, 10240]],
             outputDTypes: [stream.dtype, stream.dtype])
-        let output = convolutionKernel(
-            [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
-            grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
-            outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
+        // S=1 keeps the implicit-GEMM-shaped conv; wider windows take the
+        // three-launch block's S-aware conv kernel over the same `full`.
+        let output: MLXArray
+        if S == 1 {
+            output = convolutionKernel(
+                [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
+                grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
+                outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
+        } else {
+            output = TrackFastPLEKernels.conv(
+                full: r[1], convW: p.convW2, gated: r[0], dilation: p.dilation)
+        }
         return (r[1], output)
     }
 }
