@@ -1,4 +1,3 @@
-// Each threadgroup owns one value head; each SIMD group owns four value rows.
 // Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
 // TrackFastKernels.prepSource, leanSource and gatedRMSSource.
 
@@ -54,6 +53,8 @@ enum TrackFastGDNDecode {
         const uint sg = simdgroup_index_in_threadgroup;
         const uint lane = thread_index_in_simdgroup;
         constexpr int KM1 = KC - 1;
+        threadgroup float qx_shared[Dk];
+        threadgroup float kx_shared[Dk];
         threadgroup InT q_shared[Dk];
         threadgroup InT k_shared[Dk];
         threadgroup InT v_shared[Dv];
@@ -63,49 +64,32 @@ enum TrackFastGDNDecode {
             const device StT* first_state = state_in + (n * Dv + sg * RPS) * Dk;
             next_state = *reinterpret_cast<const device float4*>(first_state + 4 * lane);
         }
-        if (sg < 3) {
-            const uint vec = sg == 0 ? hk_idx : (sg == 1 ? Hk + hk_idx : 2 * Hk + hv_idx);
+        // The conv prologue is three independent 128-channel vectors (q, k, v).
+        // One simdgroup per vector leaves 29 of 32 simdgroups idle at the
+        // barrier; four simdgroups per vector give each lane one channel.
+        if (sg < 12) {
+            const uint vec_sg = sg / 4;
+            const uint sub = sg % 4;
+            const uint vec = vec_sg == 0 ? hk_idx : (vec_sg == 1 ? Hk + hk_idx : 2 * Hk + hv_idx);
             const device InT* proj_b = proj + b_idx * PW;
             const device InT* cst_b = conv_state + b_idx * KM1 * CONV_DIM;
             auto win = [&](int r, uint ch) -> float {
                 if (r < KM1) { return static_cast<float>(cst_b[(uint)(r * CONV_DIM) + ch]); }
                 return static_cast<float>(proj_b[(uint)((r - KM1) * PW) + ch]);
             };
-            float thread_x[4];
-            float acc = 0.0f;
-            for (int i = 0; i < 4; ++i) {
-                const uint ch = vec * 128 + lane * 4 + i;
-                float cacc = 0.0f;
-                for (int j = 0; j < KC; ++j) {
-                    cacc += win(j, ch) * conv_w[ch * KC + j];
-                }
-                const InT c0 = static_cast<InT>(cacc);
-                const InT c1 = mlx_silu(c0);
-                thread_x[i] = static_cast<float>(c1);
-                acc += thread_x[i] * thread_x[i];
+            const uint ch = vec * 128 + sub * 32 + lane;
+            float cacc = 0.0f;
+            for (int j = 0; j < KC; ++j) {
+                cacc += win(j, ch) * conv_w[ch * KC + j];
             }
-            if (sg < 2) {
-                acc = simd_sum(acc);
-                const float inv_mean = metal::precise::rsqrt(acc / 128.0f + 1e-6f);
-                const float inv_scale = metal::rsqrt(static_cast<float>(Dk));
-                const InT q_mul = static_cast<InT>(inv_scale * inv_scale);
-                const InT k_mul = static_cast<InT>(inv_scale);
-                for (int i = 0; i < 4; ++i) {
-                    const InT normalized = static_cast<InT>(thread_x[i] * inv_mean);
-                    const uint d = lane * 4 + i;
-                    if (sg == 0) { q_shared[d] = q_mul * normalized; }
-                    else { k_shared[d] = k_mul * normalized; }
-                }
-            } else {
-                for (int i = 0; i < 4; ++i) { v_shared[lane * 4 + i] = static_cast<InT>(thread_x[i]); }
-            }
-            if (sg == 2 || hv_idx % (Hv / Hk) == 0) {
+            const float conv_x = static_cast<float>(mlx_silu(static_cast<InT>(cacc)));
+            if (vec_sg == 0) { qx_shared[sub * 32 + lane] = conv_x; }
+            else if (vec_sg == 1) { kx_shared[sub * 32 + lane] = conv_x; }
+            else { v_shared[sub * 32 + lane] = static_cast<InT>(conv_x); }
+            if (vec_sg == 2 || hv_idx % (Hv / Hk) == 0) {
                 device InT* o_conv = conv_out + b_idx * KM1 * CONV_DIM;
-                for (int i = 0; i < 4; ++i) {
-                    const uint ch = vec * 128 + lane * 4 + i;
-                    for (int j = 0; j < KM1; ++j) {
-                        o_conv[(uint)(j * CONV_DIM) + ch] = static_cast<InT>(win(1 + j, ch));
-                    }
+                for (int j = 0; j < KM1; ++j) {
+                    o_conv[(uint)(j * CONV_DIM) + ch] = static_cast<InT>(win(1 + j, ch));
                 }
             }
         }
@@ -116,6 +100,28 @@ enum TrackFastGDNDecode {
             const InT ax = row[A_OFF + hv_idx] + dt_bias[hv_idx];
             const InT sp = mlx_logaddexp0(ax);
             gb_shared[0] = metal::precise::exp(neg_exp_alog[hv_idx] * sp);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // q/k RMS norm, one simdgroup per vector (sg 0 -> q, sg 4 -> k). Lane i
+        // sums the squares of channels 4i..4i+3 in the original order, so the
+        // simd_sum tree and every rounding are unchanged.
+        if (sg == 0 || sg == 4) {
+            const threadgroup float* xs = sg == 0 ? qx_shared : kx_shared;
+            threadgroup InT* dst = sg == 0 ? q_shared : k_shared;
+            const float inv_scale = metal::rsqrt(static_cast<float>(Dk));
+            const InT mul = static_cast<InT>(sg == 0 ? inv_scale * inv_scale : inv_scale);
+            float thread_x[4];
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                thread_x[i] = xs[lane * 4 + i];
+                acc += thread_x[i] * thread_x[i];
+            }
+            acc = simd_sum(acc);
+            const float inv_mean = metal::precise::rsqrt(acc / 128.0f + 1e-6f);
+            for (int i = 0; i < 4; ++i) {
+                const InT normalized = static_cast<InT>(thread_x[i] * inv_mean);
+                dst[lane * 4 + i] = mul * normalized;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const threadgroup InT* q_ = q_shared;
