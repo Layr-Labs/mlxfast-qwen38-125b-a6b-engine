@@ -40,6 +40,16 @@ enum TrackPleContextMirror {
     nonisolated(unsafe) private(set) static var stateLayerIndex: Int? = nil
     nonisolated(unsafe) private(set) static var contextLength: Int? = nil
     nonisolated(unsafe) private(set) static var dirty = true
+    /// Speculative window: the full token history a capture forward consumed,
+    /// keyed by the offset its first drafted token was evaluated at. A commit
+    /// that accepts k of S drafted tokens resumes at offset base+k, whose
+    /// context is the slice history[k ..< k+contextLength] — already on the
+    /// host, so the post-commit step skips the `state.ssm` readback. The slice
+    /// only ever reaches tokens at absolute offsets below the caller's offset,
+    /// so rejected draft suffixes are never served.
+    nonisolated(unsafe) private(set) static var windowHistory: [Int64]? = nil
+    nonisolated(unsafe) private(set) static var windowBase: Int? = nil
+    nonisolated(unsafe) private(set) static var windowLayer: Int? = nil
 
     static func matches(offset: Int, layer: Int, length: Int) -> Bool {
         !dirty && nextOffset == offset && stateLayerIndex == layer && contextLength == length
@@ -53,6 +63,23 @@ enum TrackPleContextMirror {
         self.stateLayerIndex = stateLayerIndex
         self.contextLength = contextLength
         dirty = false
+        windowHistory = nil
+        windowBase = nil
+        windowLayer = nil
+    }
+
+    static func storeWindow(history: [Int64], baseOffset: Int, stateLayerIndex: Int) {
+        windowHistory = history
+        windowBase = baseOffset
+        windowLayer = stateLayerIndex
+    }
+
+    static func windowContext(offset: Int, layer: Int, length: Int) -> [Int64]? {
+        guard let history = windowHistory, let base = windowBase, windowLayer == layer
+        else { return nil }
+        let d = offset - base
+        guard d >= 0, d + length <= history.count else { return nil }
+        return Array(history[d ..< (d + length)])
     }
 
     static func invalidate() {
@@ -61,6 +88,9 @@ enum TrackPleContextMirror {
         stateLayerIndex = nil
         contextLength = nil
         dirty = true
+        windowHistory = nil
+        windowBase = nil
+        windowLayer = nil
     }
 }
 
@@ -887,12 +917,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
             let ctx: [Int64]
-            if !capture,
-                TrackPleContextMirror.matches(
-                    offset: offset, layer: p.stateLayerIndex, length: contextLength),
+            if TrackPleContextMirror.matches(
+                offset: offset, layer: p.stateLayerIndex, length: contextLength),
                 let mirrored = TrackPleContextMirror.context
             {
                 ctx = mirrored
+            } else if let windowed = TrackPleContextMirror.windowContext(
+                offset: offset, layer: p.stateLayerIndex, length: contextLength)
+            {
+                ctx = windowed
             } else {
                 let rawPrev = state?.ssm
                 ctx = rawPrev.map {
@@ -903,7 +936,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             let history = ctx + toks
             if capture {
-                TrackPleContextMirror.invalidate()
+                // A capture forward commits nothing: keep the committed mirror
+                // and record the speculative window so the post-commit step
+                // slices its context on the host instead of reading `state.ssm`.
+                TrackPleContextMirror.storeWindow(
+                    history: history, baseOffset: offset,
+                    stateLayerIndex: p.stateLayerIndex)
             } else {
                 TrackPleContextMirror.store(
                     Array(history.suffix(contextLength)), nextOffset: offset + S,
@@ -1139,7 +1177,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         _ tokens: MLXArray, inputEmbeddings: MLXArray?, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, capture: Bool
     ) -> (mixed: MLXArray, multi: MLXArray)? {
-        if capture { TrackPleContextMirror.invalidate() }
+        // Capture forwards keep the committed mirror and the speculative
+        // window alive; only a plan miss or a non-host PLE path invalidates.
         guard let plan = fastPlan(
             tokens: tokens, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds)
