@@ -926,7 +926,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let fused = TrackPLEFusion.forward(
                 p, embedded: embedded, stream: stream, convState: convState, eps: eps)
         {
-            (full, output) = fused
+            // Same add as before, relocated so every path returns the summed
+            // stream (the S>=2 conv folds it into its epilogue instead).
+            (full, output) = (fused.0, fused.1 + stream)
         } else {
             let keyFlat = p.keyProj.apply(embedded)
             let value = p.valueProj.apply(embedded)
@@ -937,7 +939,14 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
-            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
+            // MLXFAST-DIVCACHE: `sqrt(hidden)` is a constant and both spellings
+            // round identically into the activation dtype (checked at hidden =
+            // 2560/1024/4096/640/320: bit-for-bit equal), so the cached scalar
+            // serves it. `TrackFastKernels.scalar` exists for exactly this --
+            // building one per call is a host allocation and a cast launch --
+            // and the `floor` on the next line already uses it.
+            let divisor = TrackFastKernels.scalar(
+                Foundation.sqrt(Float(hidden)), dtype: dot.dtype)
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
             let gn = TrackFastPLEKernels.gated(
                 g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
@@ -945,7 +954,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let gated = gn.gated
             full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
             output = TrackFastPLEKernels.conv(
-                full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
+                full: full, convW: p.convW2, gated: gated, dilation: p.dilation,
+                residual: stream)
         }
         do {
             if capture {
@@ -1033,8 +1043,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     scale: layer.attnHC.normScaleQ,
                     tile: tile)
                 stream =
-                    stream
-                    + pleForward(
+                    pleForward(
                         ple, stream: stream, ids: ids, evaluation: evaluation,
                         offset: offset, capture: capture)
                 (stream, normed) = injectNorm(
@@ -1103,6 +1112,19 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             scale: finalMixer.normScaleQ,
             tile: false)
         let mixed = hcMix(finalMixer, normed: finalNormed).input
+        // MLXFAST-TAILFLUSH: the loop's dispatch schedule lands its last flush
+        // on layer 47 -- with `asyncChunk` 3 and `asyncFirst` 2 the hits are
+        // ... 41, 44, 47 -- so layer 48, the final `injectNorm` above and this
+        // final `hcMix`, plus the head and the sampler the caller builds on top
+        // of `mixed`, are all still unenqueued at this return. On the pure
+        // decode path the engine launches the NEXT step feeding this step's
+        // still-lazy sampled token and only finalizes afterwards, so nothing
+        // enqueues that tail until something reads the token -- and the read
+        // then waits on all of it. Enqueue it here instead.
+        //
+        // `asyncEval` does not block and computes nothing new: the same arrays
+        // are returned, with the same contents, in the same order.
+        asyncEval(mixed, multi)
         return (mixed, multi)
     }
 
