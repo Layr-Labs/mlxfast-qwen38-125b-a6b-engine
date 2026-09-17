@@ -26,44 +26,6 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 
-/// Host-side mirror of the rolling n-gram context used by the PLE layer.
-///
-/// The device already carries this fixed-length token window in `state.ssm`,
-/// but reading it with `asArray()` drains the GPU once per small decode call.
-/// The mirror is seeded from that authoritative state and then advanced from
-/// the tokens fed to the same call.  It is fenced by the attention offset,
-/// state-layer identity and window length so a reset or a different model
-/// state cannot reuse an old host window.
-enum TrackPleContextMirror {
-    nonisolated(unsafe) private(set) static var context: [Int64]? = nil
-    nonisolated(unsafe) private(set) static var nextOffset: Int? = nil
-    nonisolated(unsafe) private(set) static var stateLayerIndex: Int? = nil
-    nonisolated(unsafe) private(set) static var contextLength: Int? = nil
-    nonisolated(unsafe) private(set) static var dirty = true
-
-    static func matches(offset: Int, layer: Int, length: Int) -> Bool {
-        !dirty && nextOffset == offset && stateLayerIndex == layer && contextLength == length
-    }
-
-    static func store(
-        _ context: [Int64], nextOffset: Int, stateLayerIndex: Int, contextLength: Int
-    ) {
-        self.context = context
-        self.nextOffset = nextOffset
-        self.stateLayerIndex = stateLayerIndex
-        self.contextLength = contextLength
-        dirty = false
-    }
-
-    static func invalidate() {
-        context = nil
-        nextOffset = nil
-        stateLayerIndex = nil
-        contextLength = nil
-        dirty = true
-    }
-}
-
 // MARK: - Weight helpers
 
 extension Module {
@@ -249,7 +211,6 @@ struct TrackLayer {
     let attn: TrackAttn?
     let moe: TrackMoE
     let moePairReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
-    let mlpReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let ple: TrackPLE?
 }
 
@@ -509,9 +470,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         return TrackLayer(
             index: index, attnHC: attnHC, mlpHC: mlpHC, gdn: gdn, attn: attn, moe: moe,
-            moePairReplay: makeMoEPairReplay(moe),
-            mlpReplay: TrackFastMLPReplay.make(hc: mlpHC, moe: moe,
-                hcCount: cfg.hcCount, hidden: cfg.hiddenSize, eps: cfg.rmsNormEps), ple: ple)
+            moePairReplay: makeMoEPairReplay(moe), ple: ple)
     }
 
     // MARK: forward pieces
@@ -861,7 +820,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
-        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, capture: Bool
     ) -> MLXArray {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
@@ -885,36 +844,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
+            let rawPrev = state?.ssm
+            let ctx: [Int64] = rawPrev.map { $0.dtype == .int32 ? $0.asArray(Int32.self).map(Int64.init) : $0.asType(.int64).asArray(Int64.self) } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
-            let ctx: [Int64]
-            if !capture,
-                TrackPleContextMirror.matches(
-                    offset: offset, layer: p.stateLayerIndex, length: contextLength),
-                let mirrored = TrackPleContextMirror.context
-            {
-                ctx = mirrored
-            } else {
-                let rawPrev = state?.ssm
-                ctx = rawPrev.map {
-                    $0.dtype == .int32
-                        ? $0.asArray(Int32.self).map(Int64.init)
-                        : $0.asType(.int64).asArray(Int64.self)
-                } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
-            }
             let history = ctx + toks
-            if capture {
-                TrackPleContextMirror.invalidate()
-            } else {
-                TrackPleContextMirror.store(
-                    Array(history.suffix(contextLength)), nextOffset: offset + S,
-                    stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
-            }
             let gid = p.embedding.hostRowIds(history: [history], newCount: S)
             let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
             embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
             hostHistory = history
         } else {
-            TrackPleContextMirror.invalidate()
             embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
         }
         // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
@@ -1006,15 +944,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// next mixer consumes it.
     func fastStreams(
         _ ids: MLXArray, inputEmbeddings: MLXArray?, caches: [Qwen4ExpCBv2LayerCache],
-        recurrentState: [CBv2RecurrentStateEvaluation], offset: Int, capture: Bool,
-        inputIsMultiStream: Bool = false
+        recurrentState: [CBv2RecurrentStateEvaluation], offset: Int, capture: Bool
     ) -> (mixed: MLXArray, multi: MLXArray) {
         precondition(recurrentState.count == 1)
         let evaluation = recurrentState[0]
         var residual = inputEmbeddings ?? embedTokens(ids)  // [B,S,H] until tiled
-        // A fully injected hyper-stream can continue through a layer block.
-        // Normal token/embedding entry points retain the initial tiling.
-        var tile = !inputIsMultiStream
+        var tile = true
         var pendingOut: MLXArray? = nil
         var pendingInject: MLXArray? = nil
         var attentionIndex = 0
@@ -1035,8 +970,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 stream =
                     stream
                     + pleForward(
-                        ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
+                        ple, stream: stream, ids: ids, evaluation: evaluation, capture: capture)
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
@@ -1065,28 +999,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             Self.debugTaps?.append(("L\(layer.index).attn.out", attended))
             if profiling { TrackFastProfile.tick(layer.gdn != nil ? "gdn" : "attn", &profT, [attended]) }
-            if TrackFastMLPReplay.enabled, ids.shape == [1, 1], stream.dtype == .bfloat16,
-                !profiling, Self.debugTaps == nil, StreamOrDevice.default.stream === Stream.gpu,
-                let replay = layer.mlpReplay
-            {
-                let r = replay([stream, attended, injectW])
-                stream = r[0]; pendingOut = r[1]; injectW = r[2]
-            } else {
-                (stream, normed) = injectNorm(
-                    residual: stream, out: attended, inject: injectW,
-                    scale: layer.mlpHC.normScaleQ,
-                    tile: false)
-                if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
-                Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
-                let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
-                input = mm.input; injectW = mm.inject
-                if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
-                Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
-                pendingOut = Self.moeForwardShared(
-                    layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay)
-                if profiling { TrackFastProfile.tick("moe", &profT, [pendingOut!]) }
-                Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
-            }
+            (stream, normed) = injectNorm(
+                residual: stream, out: attended, inject: injectW,
+                scale: layer.mlpHC.normScaleQ,
+                tile: false)
+            if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
+            Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
+            let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
+            input = mm.input; injectW = mm.inject
+            if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
+            Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
+            pendingOut = Self.moeForwardShared(
+                layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay)
+            if profiling { TrackFastProfile.tick("moe", &profT, [pendingOut!]) }
+            Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
             pendingInject = injectW
             residual = stream
             // Dispatch the graph so far: the GPU starts on these layers while the
@@ -1139,14 +1065,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         _ tokens: MLXArray, inputEmbeddings: MLXArray?, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, capture: Bool
     ) -> (mixed: MLXArray, multi: MLXArray)? {
-        if capture { TrackPleContextMirror.invalidate() }
         guard let plan = fastPlan(
             tokens: tokens, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds)
-        else {
-            TrackPleContextMirror.invalidate()
-            return nil
-        }
+        else { return nil }
         return fastStreams(
             tokens, inputEmbeddings: inputEmbeddings, caches: plan.caches,
             recurrentState: recurrentState, offset: plan.offset, capture: capture)

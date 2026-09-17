@@ -1328,11 +1328,24 @@ extension TrackFastMoEKernels {
         qmv_fast_reg_dual<T, GS, BITS, RPS>(
             gw, gs, gb, uw, us, ub, x + (size_t)r * (size_t)KD,
             KD, out_row, thread_index_in_simdgroup, g, u);
-        if (thread_index_in_simdgroup == 0) {
-            for (int i = 0; i < RPS; ++i) {
+        // qmv_fast_reg_dual finishes each output row with simd_sum, so every
+        // lane has the same g/u bits. Give each staged row to one lane for
+        // RPS <= SIMD_SIZE; addresses remain disjoint and the fallback
+        // preserves the original lane-0 path.
+        if constexpr (RPS <= 32) {
+            if (thread_index_in_simdgroup < RPS) {
+                const int i = (int)thread_index_in_simdgroup;
                 const T gv = static_cast<T>(g[i]);
                 const T uv = static_cast<T>(u[i]);
                 act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+            }
+        } else {
+            if (thread_index_in_simdgroup == 0) {
+                for (int i = 0; i < RPS; ++i) {
+                    const T gv = static_cast<T>(g[i]);
+                    const T uv = static_cast<T>(u[i]);
+                    act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+                }
             }
         }
         """
