@@ -1328,12 +1328,14 @@ extension TrackFastMoEKernels {
         qmv_fast_reg_dual<T, GS, BITS, RPS>(
             gw, gs, gb, uw, us, ub, x + (size_t)r * (size_t)KD,
             KD, out_row, thread_index_in_simdgroup, g, u);
-        if (thread_index_in_simdgroup == 0) {
-            for (int i = 0; i < RPS; ++i) {
-                const T gv = static_cast<T>(g[i]);
-                const T uv = static_cast<T>(u[i]);
-                act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
-            }
+        // MLXFAST-ACTLANES: g/u are post-simd_sum, identical on every lane, so
+        // each of the RPS entries is stored by its own lane instead of lane 0
+        // serialising the silu + store loop.
+        if (thread_index_in_simdgroup < RPS) {
+            const int i = (int)thread_index_in_simdgroup;
+            const T gv = static_cast<T>(g[i]);
+            const T uv = static_cast<T>(u[i]);
+            act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
         }
         """
 
@@ -1353,7 +1355,14 @@ extension TrackFastMoEKernels {
         let BR = idx.dim(0), S = x.dim(0), KD = x.dim(1), N = wg.dim(1)
         precondition(N % 8 == 0 && bits == 4 && idx.dtype == .uint32 && xrow.dtype == .uint32)
         precondition(shared.rows == 2 * N && shared.groupSize == groupSize && shared.bits == bits && S >= 1 && S <= 8)
-        precondition(isFast(k: KD, n: N), "shared expert one-token path assumes qmv_fast")
+        // MLXFAST-FASTCSE: `isFast(k:n:)` is a pure function of KD and N and was
+        // evaluated twice on this path -- once for the precondition and once
+        // for the `FAST` template value -- with neither rebound in between.
+        // Host-side only: the template receives the same Bool, so both kernel
+        // selections, every template constant, both grids, both threadgroup
+        // shapes and every byte moved are unchanged.
+        let fast = isFast(k: KD, n: N)
+        precondition(fast, "shared expert one-token path assumes qmv_fast")
         if x.dtype == .bfloat16 && S == 1 && KD == 2560 && N == 640
             && groupSize == 32 && bits == 4 && shared.mode == .affine
         {
@@ -1369,7 +1378,7 @@ extension TrackFastMoEKernels {
         }
         return (S == 1 ? gateUpActKernel1 : gateUpActKernel)(
             [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
-            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("BR", BR), ("VPT", S)],
+            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", fast), ("BR", BR), ("VPT", S)],
             grid: (32, (N / 8) * 2, BR + 1), threadGroup: (32, 2, 1),
             outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
     }
@@ -1510,12 +1519,20 @@ extension TrackFastMoEKernels {
         let BR = idx.dim(0), F = act.dim(1), H = wd.dim(1)
         let S = BR / topK
         precondition(BR % topK == 0 && H % 4 == 0 && bits == 4 && w.dtype == .float32 && S >= 1 && S <= 8)
-        precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
+        // MLXFAST-DCFAST: `isFast(k:n:)` is a pure function of F and H, both
+        // `let` bindings from `act.dim(1)` / `wd.dim(1)` that are never rebound
+        // here, and it was evaluated twice -- once for the precondition below
+        // and once as the `FAST` template value. Bind it once. Host-side only:
+        // the template receives the same Bool (the precondition asserts it is
+        // false), so the kernel selection, every template constant, the grid,
+        // the threadgroup shape and every byte moved are unchanged.
+        let fast = isFast(k: F, n: H)
+        precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !fast)
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
         let rps = S == 1 ? downRowsPerSimdgroup : 4
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
-            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
+            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", fast), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
             grid: (32, (H / rps) * ksg, S), threadGroup: (32, ksg, 1),
             outputShapes: [[S, H]], outputDTypes: [act.dtype])[0]
     }
