@@ -235,6 +235,8 @@ struct TrackPLE {
     let embedding: Qwen4ExpNGramEmbedding
     let keyProj: TrackProj
     let valueProj: TrackProj
+    /// key|value rows in one weight: one GEMV at S<=8, separate applies wider.
+    let kvProj: TrackMultiProj
     let normKeyScale: MLXArray
     let normQueryScale: MLXArray
     let normConvScale: MLXArray
@@ -485,6 +487,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             embedding: ple.pleEmbedding,
             keyProj: TrackProj(ple.trackChild("key_proj")),
             valueProj: TrackProj(ple.trackChild("value_proj")),
+            kvProj: TrackMultiProj([
+                TrackProj(ple.trackChild("key_proj")),
+                TrackProj(ple.trackChild("value_proj")),
+            ]),
             normKeyScale: ple.trackChild("norm_key").trackArray("weight"),
             normQueryScale: ple.trackChild("norm_query").trackArray("weight"),
             normConvScale: ple.trackChild("norm_conv").trackArray("weight"),
@@ -933,24 +939,47 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         {
             (full, output) = fused
         } else {
-            let keyFlat = p.keyProj.apply(embedded)
-            let value = p.valueProj.apply(embedded)
+            // One GEMV for key|value when the fused weight exists and the
+            // window is small; the kernels read the parts by stride/offset.
+            // Wide windows keep the two separate applies: the split-K GEMM
+            // they dispatch is exact per part, and no concat is needed.
+            let keyBuf: MLXArray
+            let valueBuf: MLXArray
+            let keyWidth: Int
+            let valueWidth: Int
+            let valueOffset: Int
+            if let fusedKV = p.kvProj.fused, S <= 8 {
+                keyBuf = fusedKV.apply(embedded)
+                valueBuf = keyBuf
+                keyWidth = p.kvProj.width
+                valueWidth = p.kvProj.width
+                valueOffset = p.keyProj.rows
+            } else {
+                keyBuf = p.keyProj.apply(embedded)
+                valueBuf = p.valueProj.apply(embedded)
+                keyWidth = p.keyProj.rows
+                valueWidth = p.valueProj.rows
+                valueOffset = 0
+            }
             // norm_key * norm_query, then MLX's own reduction over the last axis.
             let prod = TrackFastPLEKernels.prod(
-                keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
-                hcCount: hcCount, hidden: hidden, eps: eps)
+                keyFlat: keyBuf, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
+                hcCount: hcCount, hidden: hidden, eps: eps, kvWidth: keyWidth)
             let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
             let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
+            // gated also emits `full` = convState rows ++ normed rows, so the
+            // standalone concat launch is gone at every window size.
             let gn = TrackFastPLEKernels.gated(
-                g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
-                hcCount: hcCount, hidden: hidden, eps: eps)
-            let gated = gn.gated
-            full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
+                g0: dot, value: valueBuf, convState: convState, cScale: p.normConvScale,
+                divisor: divisor, floor: floor,
+                hcCount: hcCount, hidden: hidden, eps: eps,
+                kvWidth: valueWidth, valueOffset: valueOffset)
+            full = gn.full  // [1, n+S, wide]
             output = TrackFastPLEKernels.conv(
-                full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
+                full: full, convW: p.convW2, gated: gn.gated, dilation: p.dilation)
         }
         do {
             if capture {

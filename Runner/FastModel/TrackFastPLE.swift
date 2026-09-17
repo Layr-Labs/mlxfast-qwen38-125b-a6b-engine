@@ -17,12 +17,14 @@
 // wanted. Measured on this box, concat + conv + silu alone is ~80 us of a
 // ~180-300 us block.
 //
-// Three kernels replace all of it except the two projections and the one
-// reduction:
+// Three kernels replace all of it except the projections and the one
+// reduction. At S <= 8 the key and value projections run as ONE fused GEMV
+// (TrackMultiProj); the kernels read the halves by row stride and offset.
 //
 //   `track_ple_prod`  norm_key(key_proj) * norm_query(stream)
 //   <MLX's own sum over the last axis, untouched>
-//   `track_ple_gated` the gate transform, the gated value, norm_conv
+//   `track_ple_gated` the gate transform, the gated value, norm_conv, and the
+//                     convState++normed `full` buffer (the concat is gone)
 //   `track_ple_conv`  the dilated conv, silu, and the residual add
 //
 // EXACTNESS. The two norms are `rms_single_row`'s layout at axis 2560 -- four
@@ -67,9 +69,9 @@ enum TrackFastPLEKernels {
 
     // MARK: norm_key(key_proj(e)) * norm_query(stream)
 
-    /// keyFlat [B,S,W], stream [B,S,W], kscale [W], qscale [W], eps
+    /// keyFlat [B,S,KVW] (standalone key GEMV or the fused key|value output),
+    /// stream [B,S,W], kscale [W], qscale [W], eps
     ///   -> prod [B,S,W]
-    /// grid (H/4, HC, B*S), threadgroup (H/4, 1, 1)
     static let prodSource = """
         constexpr int N_READS = 4;
         const uint lid = thread_position_in_threadgroup.x;
@@ -80,13 +82,16 @@ enum TrackFastPLEKernels {
         threadgroup float ksums[32];
         threadgroup float qsums[32];
         const uint base = row * W + hc * H;
+        // KVW is the row stride of the key buffer: W for a standalone key
+        // projection, wider when key|value arrive fused in one GEMV output.
+        const uint kbase = row * KVW + hc * H;
         float kx[N_READS];
         float qx[N_READS];
         float kacc = 0.0f;
         float qacc = 0.0f;
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
-            kx[i] = static_cast<float>(keyFlat[base + d]);
+            kx[i] = static_cast<float>(keyFlat[kbase + d]);
             qx[i] = static_cast<float>(stream[base + d]);
             kacc += kx[i] * kx[i];
             qacc += qx[i] * qx[i];
@@ -117,23 +122,28 @@ enum TrackFastPLEKernels {
 
     static func prod(
         keyFlat: MLXArray, stream: MLXArray, kScale: MLXArray, qScale: MLXArray,
-        hcCount: Int, hidden: Int, eps: Float
+        hcCount: Int, hidden: Int, eps: Float, kvWidth: Int
     ) -> MLXArray {
         let B = keyFlat.dim(0), S = keyFlat.dim(1), W = hcCount * hidden
-        precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && keyFlat.dim(2) == W)
+        precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && keyFlat.dim(2) == kvWidth && kvWidth >= W)
         return prodKernel(
             [keyFlat, stream, kScale, qScale, MLXArray(eps)],
-            template: [("InT", keyFlat.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+            template: [
+                ("InT", keyFlat.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+                ("KVW", kvWidth),
+            ],
             grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
             outputShapes: [[B, S, W]], outputDTypes: [keyFlat.dtype])[0]
     }
 
     // MARK: the gate scalar chain, the gated value, and norm_conv
 
-    /// g0 [B,S,HC,1] (the reduced dot), value [B,S,H], cscale [W], divisor and
-    /// floor as 0-dim arrays in the activation dtype, eps
-    ///   -> gated [B,S,W], normed [B,S,W]
-    /// grid (H/4, HC, B*S), threadgroup (H/4, 1, 1)
+    /// g0 [B,S,HC,1] (the reduced dot), value [B,S,KVW] (standalone or the
+    /// fused key|value GEMV output, read at V_OFF), convState [B,NST,W],
+    /// cscale [W], divisor and floor as 0-dim arrays in the activation dtype,
+    /// eps
+    ///   -> gated [B,S,W], full [B,NST+S,W] = convState rows ++ normed rows
+    /// grid (H/4, HC, B*(NST+S)), threadgroup (H/4, 1, 1)
     static let gatedSource = """
         constexpr int N_READS = 4;
         const uint lid = thread_position_in_threadgroup.x;
@@ -143,8 +153,23 @@ enum TrackFastPLEKernels {
         const uint sg = simdgroup_index_in_threadgroup;
         threadgroup float sums[32];
         const uint base = row * W + hc * H;
+        const uint b = row / (uint)(NST + S);
+        const uint r = row % (uint)(NST + S);
 
-        InT g = g0[row * HC + hc] / divisor;
+        // The carried conv state occupies the first NST rows of `full`: a
+        // straight elementwise copy, the same bytes `concatenated` moved.
+        if (r < (uint)NST) {
+            const uint csbase = (b * (uint)NST + r) * W + hc * H;
+            for (int i = 0; i < N_READS; ++i) {
+                const uint d = lid * N_READS + i;
+                full[base + d] = convState[csbase + d];
+            }
+            return;
+        }
+        const uint srow = b * (uint)S + (r - (uint)NST);
+        const uint sbase = srow * W + hc * H;
+
+        InT g = g0[srow * HC + hc] / divisor;
         g = mlx_sqrt_t(mlx_maximum(mlx_abs_t(g), floorv)) * mlx_sign(g);
         const InT sgm = mlx_sigmoid(g);
 
@@ -152,8 +177,8 @@ enum TrackFastPLEKernels {
         float acc = 0.0f;
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
-            const InT v = sgm * value[row * H + d];
-            gated[base + d] = v;
+            const InT v = sgm * value[srow * KVW + V_OFF + d];
+            gated[sbase + d] = v;
             gx[i] = static_cast<float>(v);
             acc += gx[i] * gx[i];
         }
@@ -166,14 +191,14 @@ enum TrackFastPLEKernels {
         const float inv = metal::precise::rsqrt(acc / (float)H + eps);
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
-            normed[base + d] = static_cast<InT>(gx[i] * inv) * cscale[hc * H + d];
+            full[base + d] = static_cast<InT>(gx[i] * inv) * cscale[hc * H + d];
         }
         """
 
     nonisolated(unsafe) static let gatedKernel = MLXFast.metalKernel(
         name: "track_ple_gated",
-        inputNames: ["g0", "value", "cscale", "divisor", "floorv", "eps"],
-        outputNames: ["gated", "normed"],
+        inputNames: ["g0", "value", "convState", "cscale", "divisor", "floorv", "eps"],
+        outputNames: ["gated", "full"],
         source: gatedSource,
         header: header + """
             template <typename T> METAL_FUNC T mlx_abs_t(T x) { return metal::abs(x); }
@@ -182,16 +207,24 @@ enum TrackFastPLEKernels {
         ensureRowContiguous: true)
 
     static func gated(
-        g0: MLXArray, value: MLXArray, cScale: MLXArray, divisor: MLXArray, floor: MLXArray,
-        hcCount: Int, hidden: Int, eps: Float
-    ) -> (gated: MLXArray, normed: MLXArray) {
+        g0: MLXArray, value: MLXArray, convState: MLXArray, cScale: MLXArray,
+        divisor: MLXArray, floor: MLXArray,
+        hcCount: Int, hidden: Int, eps: Float, kvWidth: Int, valueOffset: Int
+    ) -> (gated: MLXArray, full: MLXArray) {
         let B = value.dim(0), S = value.dim(1), W = hcCount * hidden
-        precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && value.dim(2) == hidden)
+        let nst = convState.dim(1)
+        precondition(
+            hidden % 4 == 0 && hidden / 4 <= 1024 && value.dim(2) == kvWidth
+                && kvWidth >= valueOffset + hidden && convState.dim(2) == W
+                && convState.dtype == value.dtype)
         let outs = gatedKernel(
-            [g0, value, cScale, divisor, floor, MLXArray(eps)],
-            template: [("InT", value.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
-            grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
-            outputShapes: [[B, S, W], [B, S, W]],
+            [g0, value, convState, cScale, divisor, floor, MLXArray(eps)],
+            template: [
+                ("InT", value.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+                ("S", S), ("NST", nst), ("KVW", kvWidth), ("V_OFF", valueOffset),
+            ],
+            grid: (hidden / 4, hcCount, B * (nst + S)), threadGroup: (hidden / 4, 1, 1),
+            outputShapes: [[B, S, W], [B, nst + S, W]],
             outputDTypes: [value.dtype, value.dtype])
         return (outs[0], outs[1])
     }
