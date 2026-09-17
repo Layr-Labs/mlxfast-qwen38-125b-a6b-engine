@@ -879,12 +879,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             state?.conv ?? MLXArray.zeros([1, p.stateLength, wide], dtype: stream.dtype)
 
         let embedded: MLXArray
-        // Host history for the decode/verify windows: the ids are hashed on the
+        // Host history for every window shape: the ids are hashed on the
         // host (bit-for-bit the device hash) and the context is staged as a
         // host-backed int32 array, so the only device sync of the step is the
-        // one on the fed token itself.
+        // one on the fed token itself. The mirror also carries the context
+        // across prefill windows: without it each window would read
+        // `state.ssm` back, which drains the in-flight window's graph before
+        // the row gather can start.
         var hostHistory: [Int64]? = nil
-        if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
+        if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource {
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
             let ctx: [Int64]
             if !capture,
