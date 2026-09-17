@@ -916,7 +916,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             let gid = p.embedding.hostRowIds(history: [history], newCount: S)
             let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
-            embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
+            embedded = rows.asType(stream.dtype)
             hostHistory = history
         } else {
             TrackPleContextMirror.invalidate()
@@ -961,7 +961,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     // Row s = the context after consuming window token s.
                     var flat: [Int32] = []
                     flat.reserveCapacity(S * contextLength)
-                    for s in 0 ..< S { flat.append(contentsOf: h[(s + 1) ..< (s + 1 + contextLength)].map(Int32.init)) }
+                    for s in 0 ..< S { flat.append(contentsOf: h[(s + 1) ..< (s + 1 + contextLength)].lazy.map(Int32.init)) }
                     contextStack = MLXArray(flat).reshaped(S, contextLength)
                 } else {
                     let history = concatenated([devicePrevious(), ids], axis: 1)
