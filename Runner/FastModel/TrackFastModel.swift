@@ -30,34 +30,48 @@ import MLXNN
 ///
 /// The device already carries this fixed-length token window in `state.ssm`,
 /// but reading it with `asArray()` drains the GPU once per small decode call.
-/// The mirror is seeded from that authoritative state and then advanced from
-/// the tokens fed to the same call.  It is fenced by the attention offset,
-/// state-layer identity and window length so a reset or a different model
-/// state cannot reuse an old host window.
+/// The mirror holds the host-built `context ++ window tokens` history of the
+/// last window that took the host row path, keyed by the absolute offset of
+/// its first element. A later window whose context lands inside that history
+/// -- a full advance, a partially accepted capture-verify prefix, or a
+/// rollback to the same offset -- is served by slicing, so the only device
+/// read left is the one on the fed tokens themselves. The mirror is fenced
+/// by the state-layer identity and window length so a reset or a different
+/// model state cannot reuse an old host window.
 enum TrackPleContextMirror {
-    nonisolated(unsafe) private(set) static var context: [Int64]? = nil
-    nonisolated(unsafe) private(set) static var nextOffset: Int? = nil
+    nonisolated(unsafe) private(set) static var history: [Int64]? = nil
+    nonisolated(unsafe) private(set) static var baseOffset: Int = 0
     nonisolated(unsafe) private(set) static var stateLayerIndex: Int? = nil
     nonisolated(unsafe) private(set) static var contextLength: Int? = nil
     nonisolated(unsafe) private(set) static var dirty = true
 
-    static func matches(offset: Int, layer: Int, length: Int) -> Bool {
-        !dirty && nextOffset == offset && stateLayerIndex == layer && contextLength == length
+    /// The `length` tokens ending at `offset - 1`, when the stored history
+    /// covers them. `offset` is the absolute position of the window's first
+    /// token, so the context occupies `[offset - length, offset)`.
+    static func context(offset: Int, layer: Int, length: Int) -> [Int64]? {
+        guard !dirty, stateLayerIndex == layer, contextLength == length,
+            let history
+        else { return nil }
+        let start = offset - length - baseOffset
+        guard start >= 0, start + length <= history.count else { return nil }
+        return Array(history[start ..< start + length])
     }
 
+    /// `history` is `context ++ window tokens`; its first element sits at
+    /// absolute position `offset - contextLength`.
     static func store(
-        _ context: [Int64], nextOffset: Int, stateLayerIndex: Int, contextLength: Int
+        history: [Int64], offset: Int, stateLayerIndex: Int, contextLength: Int
     ) {
-        self.context = context
-        self.nextOffset = nextOffset
+        self.history = history
+        self.baseOffset = offset - contextLength
         self.stateLayerIndex = stateLayerIndex
         self.contextLength = contextLength
         dirty = false
     }
 
     static func invalidate() {
-        context = nil
-        nextOffset = nil
+        history = nil
+        baseOffset = 0
         stateLayerIndex = nil
         contextLength = nil
         dirty = true
@@ -859,6 +873,26 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return TrackFastKernels.moeCombine(routed: routed, w: weights, shared: shared, gate: gate)
     }
 
+    /// The rolling n-gram context for a window starting at `offset`: the
+    /// mirror when it covers the range, else one read of the committed state.
+    private func pleContext(
+        evaluation: CBv2RecurrentStateEvaluation, stateLayerIndex: Int,
+        contextLength: Int, offset: Int
+    ) -> [Int64] {
+        if let mirrored = TrackPleContextMirror.context(
+            offset: offset, layer: stateLayerIndex, length: contextLength)
+        {
+            return mirrored
+        }
+        guard let rawPrev = evaluation.inputState(modelLayerIndex: stateLayerIndex)?.ssm
+        else {
+            return Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+        }
+        return rawPrev.dtype == .int32
+            ? rawPrev.asArray(Int32.self).map(Int64.init)
+            : rawPrev.asType(.int64).asArray(Int64.self)
+    }
+
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
         evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
@@ -882,36 +916,30 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // Host history for the decode/verify windows: the ids are hashed on the
         // host (bit-for-bit the device hash) and the context is staged as a
         // host-backed int32 array, so the only device sync of the step is the
-        // one on the fed token itself.
+        // one on the fed token itself. When the window was staged at open,
+        // even that readback and the row gather are already done.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
-            let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
-            let ctx: [Int64]
-            if !capture,
-                TrackPleContextMirror.matches(
-                    offset: offset, layer: p.stateLayerIndex, length: contextLength),
-                let mirrored = TrackPleContextMirror.context
-            {
-                ctx = mirrored
+            let history: [Int64]
+            if let staged = TrackPLEWindowPump.join() {
+                embedded = staged.embedded
+                history = staged.history
             } else {
-                let rawPrev = state?.ssm
-                ctx = rawPrev.map {
-                    $0.dtype == .int32
-                        ? $0.asArray(Int32.self).map(Int64.init)
-                        : $0.asType(.int64).asArray(Int64.self)
-                } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+                let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
+                let ctx = pleContext(
+                    evaluation: evaluation, stateLayerIndex: p.stateLayerIndex,
+                    contextLength: contextLength, offset: offset)
+                history = ctx + toks
+                let gid = p.embedding.hostRowIds(history: [history], newCount: S)
+                let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
+                embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
             }
-            let history = ctx + toks
-            if capture {
-                TrackPleContextMirror.invalidate()
-            } else {
-                TrackPleContextMirror.store(
-                    Array(history.suffix(contextLength)), nextOffset: offset + S,
-                    stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
-            }
-            let gid = p.embedding.hostRowIds(history: [history], newCount: S)
-            let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
-            embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
+            // The committed context of the next window is a slice of this
+            // history for every accepted prefix, so the mirror serves
+            // capture-verify rounds too.
+            TrackPleContextMirror.store(
+                history: history, offset: offset,
+                stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
             hostHistory = history
         } else {
             TrackPleContextMirror.invalidate()
@@ -1012,6 +1040,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         precondition(recurrentState.count == 1)
         let evaluation = recurrentState[0]
         var residual = inputEmbeddings ?? embedTokens(ids)  // [B,S,H] until tiled
+        // Stage the PLE window's host inputs while the layer loop dispatches:
+        // the id readback, the n-gram hash and the row gather all depend only
+        // on the ids and the committed context, both known at window open.
+        if let ple = layers.first(where: { $0.ple != nil })?.ple, ids.dim(1) <= 8,
+            let host = ple.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource
+        {
+            let contextLength = max(1, ple.dilation - 1)
+            let ctx = pleContext(
+                evaluation: evaluation, stateLayerIndex: ple.stateLayerIndex,
+                contextLength: contextLength, offset: offset)
+            TrackPLEWindowPump.stage(
+                ids: ids, ple: ple, host: host, ctx: ctx, S: ids.dim(1), B: ids.dim(0),
+                rowCount: (cfg.ngramSize - 1) * cfg.headsPerNGram, dtype: residual.dtype)
+        }
         // A fully injected hyper-stream can continue through a layer block.
         // Normal token/embedding entry points retain the initial tiling.
         var tile = !inputIsMultiStream
@@ -1139,7 +1181,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         _ tokens: MLXArray, inputEmbeddings: MLXArray?, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, capture: Bool
     ) -> (mixed: MLXArray, multi: MLXArray)? {
-        if capture { TrackPleContextMirror.invalidate() }
+        // The mirror survives capture: the committed context of the next
+        // verify window is a slice of the history this one stores.
         guard let plan = fastPlan(
             tokens: tokens, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds)
