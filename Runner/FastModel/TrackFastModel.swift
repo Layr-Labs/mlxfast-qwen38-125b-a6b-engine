@@ -882,6 +882,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         let convState =
             state?.conv ?? MLXArray.zeros([1, p.stateLength, wide], dtype: stream.dtype)
+        // Commit the graph built so far -- the embedding, layer 0 and the
+        // pre-PLE injectNorm -- before the host work below. The row gather
+        // (token read, n-gram hash, LRU/SSD row fetch) is the one host sync
+        // of the step; without this commit the GPU holds no work for the
+        // step until the n == asyncFirst dispatch after this call returns,
+        // and idles through the whole gather. asyncEval only materializes
+        // the pre-PLE stream; every array built below still schedules after
+        // it in dependency order.
+        asyncEval(stream)
 
         let embedded: MLXArray
         // Host history for the decode/verify windows: the ids are hashed on the
