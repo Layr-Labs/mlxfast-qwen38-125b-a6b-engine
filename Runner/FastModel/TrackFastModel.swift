@@ -40,6 +40,16 @@ enum TrackPleContextMirror {
     nonisolated(unsafe) private(set) static var stateLayerIndex: Int? = nil
     nonisolated(unsafe) private(set) static var contextLength: Int? = nil
     nonisolated(unsafe) private(set) static var dirty = true
+    /// The last host-path `history` (context ++ fed tokens), indexed by
+    /// absolute position: `remembered[i]` is the token at
+    /// `rememberedBase + i`. The staged `state.ssm` row at any covered
+    /// offset is bit-identical to a slice of this array — both are built
+    /// from the same `history` — so a covered offset can serve `ctx`
+    /// without the `state.ssm` readback.
+    nonisolated(unsafe) private(set) static var remembered: [Int64]? = nil
+    nonisolated(unsafe) private(set) static var rememberedBase: Int = 0
+    nonisolated(unsafe) private(set) static var rememberedLayer: Int = -1
+    nonisolated(unsafe) private(set) static var rememberedLength: Int = 0
 
     static func matches(offset: Int, layer: Int, length: Int) -> Bool {
         guard !dirty else { return false }
@@ -60,11 +70,31 @@ enum TrackPleContextMirror {
         dirty = false
     }
 
+    static func remember(_ history: [Int64], base: Int, layer: Int, length: Int) {
+        remembered = history
+        rememberedBase = base
+        rememberedLayer = layer
+        rememberedLength = length
+    }
+
+    /// The `length`-token context ending at `offset`, sliced from the
+    /// remembered history. Returns nil when the offset is not covered.
+    static func rememberedContext(offset: Int, layer: Int, length: Int) -> [Int64]? {
+        guard let h = remembered, rememberedLayer == layer, rememberedLength == length
+        else { return nil }
+        let i = offset - rememberedBase - length
+        guard i >= 0, i + length <= h.count else { return nil }
+        return Array(h[i ..< (i + length)])
+    }
+
     static func invalidate() {
         context = nil
         nextOffset = nil
         stateLayerIndex = nil
         contextLength = nil
+        remembered = nil
+        rememberedLayer = -1
+        rememberedLength = 0
         dirty = true
     }
 }
@@ -898,6 +928,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 let mirrored = TrackPleContextMirror.context
             {
                 ctx = mirrored
+            } else if let remembered = TrackPleContextMirror.rememberedContext(
+                offset: offset, layer: p.stateLayerIndex, length: contextLength)
+            {
+                // The staged ssm row at this offset is a slice of the last
+                // host history; serve it without the device readback. This
+                // covers capture calls and the first call after one.
+                ctx = remembered
             } else {
                 let rawPrev = state?.ssm
                 ctx = rawPrev.map {
@@ -914,6 +951,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     Array(history.suffix(contextLength)), nextOffset: offset + S,
                     stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
             }
+            TrackPleContextMirror.remember(
+                history, base: offset - contextLength, layer: p.stateLayerIndex,
+                length: contextLength)
             let gid = p.embedding.hostRowIds(history: [history], newCount: S)
             let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
             embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
