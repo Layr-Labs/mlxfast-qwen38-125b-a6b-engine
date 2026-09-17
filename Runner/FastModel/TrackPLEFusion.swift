@@ -83,7 +83,7 @@ enum TrackPLEFusion {
         InT g[4];
         acc = 0.0f;
         for (uint i = 0; i < 4; ++i) {
-            g[i] = activation * value[d + i];
+            g[i] = activation * value[VOFF + d + i];
             gated[base + i] = g[i];
             float v = float(g[i]);
             acc += v * v;
@@ -157,17 +157,30 @@ enum TrackPLEFusion {
     static func forward(
         _ p: TrackPLE, embedded: MLXArray, stream: MLXArray, convState: MLXArray, eps: Float
     ) -> (full: MLXArray, output: MLXArray)? {
-        // The original two projections stay separate, with unchanged kernels,
-        // quantization, tiling, and weight-loading lane ownership.
-        let key = p.keyProj.apply(embedded)
-        let value = p.valueProj.apply(embedded)
-        guard key.shape == [1, 1, 10240], value.shape == [1, 1, 2560],
+        // key_proj ++ value_proj share one GEMV when the fused weight exists;
+        // the value half is read through the VOFF template offset so no slice
+        // copy is needed. Separate projections remain the fallback.
+        let key: MLXArray
+        let value: MLXArray
+        let valueOffset: Int
+        if let kvProj = p.kvProj.fused {
+            let kv = kvProj.apply(embedded)
+            key = kv
+            value = kv
+            valueOffset = p.kvProj.offsets[1]
+        } else {
+            key = p.keyProj.apply(embedded)
+            value = p.valueProj.apply(embedded)
+            valueOffset = 0
+        }
+        guard key.dim(2) >= 10240, value.dim(2) >= valueOffset + 2560,
             key.dtype == stream.dtype, value.dtype == stream.dtype
         else { return nil }
         let r = prepareKernel(
             [key, stream, value, p.normKeyScale, p.normQueryScale, p.normConvScale, convState],
             template: [("InT", stream.dtype), ("EPS_BITS", Int(eps.bitPattern)),
-                       ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern))],
+                       ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern)),
+                       ("VOFF", valueOffset)],
             grid: (640, 4, 1), threadGroup: (640, 1, 1),
             outputShapes: [[1, 1, 10240], [1, 10, 10240]],
             outputDTypes: [stream.dtype, stream.dtype])

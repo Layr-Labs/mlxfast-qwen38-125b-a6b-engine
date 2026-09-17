@@ -230,6 +230,8 @@ struct TrackPLE {
     let embedding: Qwen4ExpNGramEmbedding
     let keyProj: TrackProj
     let valueProj: TrackProj
+    /// key_proj ++ value_proj rows, fused for windows of eight or fewer.
+    let kvProj: TrackMultiProj
     let normKeyScale: MLXArray
     let normQueryScale: MLXArray
     let normConvScale: MLXArray
@@ -476,10 +478,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         -> TrackPLE
     {
         let convW = ple.trackChild("conv1d").trackArray("weight")
+        let keyProj = TrackProj(ple.trackChild("key_proj"))
+        let valueProj = TrackProj(ple.trackChild("value_proj"))
         return TrackPLE(
             embedding: ple.pleEmbedding,
-            keyProj: TrackProj(ple.trackChild("key_proj")),
-            valueProj: TrackProj(ple.trackChild("value_proj")),
+            keyProj: keyProj,
+            valueProj: valueProj,
+            kvProj: TrackMultiProj([keyProj, valueProj]),
             normKeyScale: ple.trackChild("norm_key").trackArray("weight"),
             normQueryScale: ple.trackChild("norm_query").trackArray("weight"),
             normConvScale: ple.trackChild("norm_conv").trackArray("weight"),
@@ -917,7 +922,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             TrackPleContextMirror.invalidate()
             embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
         }
-        // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
+        // MLXFAST-PLEFUSE2: one fused KV GEMV + prepare + convolution at S=1;
         // every other shape takes the three-launch PLE block below.
         let full: MLXArray
         let output: MLXArray
@@ -928,8 +933,21 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         {
             (full, output) = fused
         } else {
-            let keyFlat = p.keyProj.apply(embedded)
-            let value = p.valueProj.apply(embedded)
+            // key_proj ++ value_proj in one GEMV for narrow windows (bit-exact
+            // per TrackMultiProj); wide windows keep the separate GEMMs.
+            let keyFlat: MLXArray
+            let value: MLXArray
+            let valueOffset: Int
+            if S <= 8, let kvProj = p.kvProj.fused {
+                let kv = kvProj.apply(embedded)
+                keyFlat = kv
+                value = kv
+                valueOffset = p.kvProj.offsets[1]
+            } else {
+                keyFlat = p.keyProj.apply(embedded)
+                value = p.valueProj.apply(embedded)
+                valueOffset = 0
+            }
             // norm_key * norm_query, then MLX's own reduction over the last axis.
             let prod = TrackFastPLEKernels.prod(
                 keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
@@ -940,7 +958,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
             let gn = TrackFastPLEKernels.gated(
-                g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
+                g0: dot, value: value, valueOffset: valueOffset, cScale: p.normConvScale,
+                divisor: divisor, floor: floor,
                 hcCount: hcCount, hidden: hidden, eps: eps)
             let gated = gn.gated
             full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
