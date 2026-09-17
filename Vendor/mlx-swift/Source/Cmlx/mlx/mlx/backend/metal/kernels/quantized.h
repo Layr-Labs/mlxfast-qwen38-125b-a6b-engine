@@ -766,7 +766,15 @@ METAL_FUNC void qmv_fast_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+  // MLXFAST-QMVPK1: one 32-bit pack per thread per k-block instead of two.
+  // `values_per_thread = pack_factor * packs_per_thread` sizes the activation
+  // window each thread holds in registers -- `thread U x_thread[16]` at two
+  // packs, `x_thread[8]` at one -- which is the kernel's largest register
+  // allocation, four times `result[]`. The k loop then steps
+  // `block_size = values_per_thread * SIMD_SIZE` = 256 instead of 512, so the
+  // same contraction is walked in twice as many, half-sized iterations: the
+  // same bytes, the same `qdot` calls, the same accumulation order.
+  constexpr int packs_per_thread = 1;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
