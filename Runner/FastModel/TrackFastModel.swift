@@ -917,11 +917,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             TrackPleContextMirror.invalidate()
             embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
         }
-        // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
-        // every other shape takes the three-launch PLE block below.
+        // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at
+        // S <= 8; every larger window takes the three-launch PLE block below.
         let full: MLXArray
         let output: MLXArray
-        if S == 1, TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
+        if S <= 8, TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
             convState.shape == [1, 9, wide], convState.dtype == stream.dtype,
             let fused = TrackPLEFusion.forward(
                 p, embedded: embedded, stream: stream, convState: convState, eps: eps)
