@@ -869,3 +869,5 @@ struct FromFP8 {
 }
 
 } // namespace mlx::core::metal
+
+#define YUKON_REDRAW_1 1
