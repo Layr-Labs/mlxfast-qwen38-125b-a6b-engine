@@ -265,6 +265,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let hcCount: Int
     let hidden: Int
     let eps: Float
+    /// Runs the PLE layer's host block (ids readback, context, hash, row
+    /// gather) on a helper queue from window entry; see TrackPlePrefetch.
+    private let plePrefetch = TrackPlePrefetch()
     private let injectNormReplay: @Sendable ([MLXArray]) -> [MLXArray]
     let rotaryDims: Int
     let rotary: Qwen4ExpRotary
@@ -884,7 +887,21 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // host-backed int32 array, so the only device sync of the step is the
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
-        if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
+        if let prefetched = plePrefetch.awaitResult() {
+            // The helper ran the same ids readback, context resolution, hash
+            // and row gather from window entry; only the mirror bookkeeping
+            // stays here so it is ordered after the await.
+            let history = prefetched.history
+            if capture {
+                TrackPleContextMirror.invalidate()
+            } else {
+                TrackPleContextMirror.store(
+                    Array(history.suffix(contextLength)), nextOffset: offset + S,
+                    stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
+            }
+            embedded = prefetched.rows.reshaped(B, S, -1).asType(stream.dtype)
+            hostHistory = history
+        } else if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
             let ctx: [Int64]
             if !capture,
@@ -1011,6 +1028,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     ) -> (mixed: MLXArray, multi: MLXArray) {
         precondition(recurrentState.count == 1)
         let evaluation = recurrentState[0]
+        // Kick the PLE host block before any of this window's graph is built:
+        // its ids readback overlaps the previous window's GPU tail and the
+        // hash + row gather overlap the embed/layer-0 construction below.
+        if let pleLayer = layers.first(where: { $0.ple != nil })?.ple {
+            _ = plePrefetch.start(
+                ple: pleLayer, ids: ids, evaluation: evaluation, offset: offset,
+                capture: capture, eosTokenId: Int32(cfg.eosTokenId),
+                ngramHeads: (cfg.ngramSize - 1) * cfg.headsPerNGram)
+        }
         var residual = inputEmbeddings ?? embedTokens(ids)  // [B,S,H] until tiled
         // A fully injected hyper-stream can continue through a layer block.
         // Normal token/embedding entry points retain the initial tiling.
