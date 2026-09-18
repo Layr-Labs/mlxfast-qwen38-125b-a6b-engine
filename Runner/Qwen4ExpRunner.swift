@@ -370,16 +370,33 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
             return source
         }
         if let url = resource as? URL {
-            return try Qwen4ExpNGramRowSourceLoader.rowSource(at: url, for: model)
+            return try Self.cachedRowSource(
+                Qwen4ExpNGramRowSourceLoader.rowSource(at: url, for: model))
         }
         if let path = resource as? String {
-            return try Qwen4ExpNGramRowSourceLoader.rowSource(
-                at: URL(fileURLWithPath: path), for: model)
+            return try Self.cachedRowSource(
+                Qwen4ExpNGramRowSourceLoader.rowSource(
+                    at: URL(fileURLWithPath: path), for: model))
         }
         throw RunnerError.resourceMissing(
             "\(ngramRowSourceResource): this checkpoint has "
                 + "\(model.pleEmbeddings.count) PLE layers and the n-gram table "
                 + "is never model parameters; pass the n-gram shard directory")
+    }
+
+    /// Wrap a loader-built source in the dequantized-row cache. A caller that
+    /// hands in an already built source keeps it unwrapped -- its identity is
+    /// part of the caller's contract. A source without the host-id form keeps
+    /// its shape too: the fast model's host path keys on the protocol, so
+    /// wrapping a device-only source in a host conformer would change which
+    /// branch `pleForward` takes.
+    private static func cachedRowSource(
+        _ source: any Qwen4ExpNGramRowSource
+    ) -> any Qwen4ExpNGramRowSource {
+        guard let host = source as? any Qwen4ExpNGramHostRowSource else {
+            return source
+        }
+        return TrackPleRowCacheSource(host: host)
     }
 
     /// The family's own caches. `newCacheV2` still runs the vending closure
