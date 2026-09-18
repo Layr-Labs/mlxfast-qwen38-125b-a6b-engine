@@ -885,6 +885,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
+            // Dispatch the stream prefix (embedding, layer 0, the pre-PLE norm)
+            // BEFORE the host n-gram fetch: the token/context readbacks and the
+            // hash + LRU + SSD row fetch below stall the CPU, and an
+            // undispatched graph leaves the GPU idle for the whole stall.
+            asyncEval(stream)
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
             let ctx: [Int64]
             if !capture,
@@ -910,8 +915,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
             }
             let gid = p.embedding.hostRowIds(history: [history], newCount: S)
-            let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
             embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
+            // Kick the host-to-device upload of the fetched rows now; the CPU
+            // spends the next stretch building the key/value GEMV graph.
+            asyncEval(embedded)
             hostHistory = history
         } else {
             TrackPleContextMirror.invalidate()
