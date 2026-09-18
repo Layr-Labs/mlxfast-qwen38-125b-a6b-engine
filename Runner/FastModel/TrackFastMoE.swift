@@ -1237,7 +1237,10 @@ extension TrackFastMoEKernels {
         source: gateUpActSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
 
-    static let gateUpReuseRowsPerSimdgroup = 2
+    static let gateUpReuseRowsPerSimdgroup: Int = {
+        let requested = ProcessInfo.processInfo.environment["MLXFAST_MOE_GATEUP_RPS"].flatMap(Int.init) ?? 4
+        return requested > 0 && requested <= 8 && 640 % (2 * requested) == 0 ? requested : 4
+    }()
 
     static let gateUpReuseHelpers = #"""
         template <typename T, int group_size, int bits, int rows>
@@ -1500,7 +1503,7 @@ extension TrackFastMoEKernels {
     static let downRowsPerSimdgroup = 2
 
     static let downCombineSimdgroups =
-        ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 5
+        ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 2
 
     /// act [BR + S, F] (routed slots, then the shared expert per token), gate [S] pre-sigmoid.
     static func downCombine(
@@ -1511,7 +1514,11 @@ extension TrackFastMoEKernels {
         let S = BR / topK
         precondition(BR % topK == 0 && H % 4 == 0 && bits == 4 && w.dtype == .float32 && S >= 1 && S <= 8)
         precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
-        let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
+        // The two-group geometry is a one-row specialization.  MTP target
+        // verification sends a short multi-row window through this entry point;
+        // retain the established five-group geometry for that distinct shape.
+        let requestedKsg = S == 1 ? downCombineSimdgroups : 5
+        let ksg = topK % requestedKsg == 0 ? requestedKsg : 1
         let rps = S == 1 ? downRowsPerSimdgroup : 4
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
