@@ -32,6 +32,12 @@ final class TrackFastHead {
     let attn: TrackAttn
     let moe: TrackMoE
     let finalMixer: TrackHC
+    /// Rotary cos/sin rows for every position the indexer can serve,
+    /// computed once per dtype. `cosSin` is elementwise in the position, so
+    /// a slice of the full table is bit-identical to a per-step call.
+    private var ropeCos: MLXArray?
+    private var ropeSin: MLXArray?
+    private var ropeDtype: DType?
 
     static let enabled: Bool = {
         (ProcessInfo.processInfo.environment["TRACK_FAST_HEAD"] ?? "1") != "0"
@@ -139,10 +145,10 @@ final class TrackFastHead {
         let qkv = attn.qkv.apply(x)
         let idxStart = 2 * attn.qWidth + 2 * attn.kvWidth
         _ = cache.updateIndexer(keys: qkv[.ellipsis, idxStart ..< (idxStart + cfg.indexerHeadDim)])
-        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: S))
+        let rope = ropeTables(dtype: x.dtype)
         let prep = TrackFastKernels.attnPrep(
             qkv: qkv, qNorm: attn.qNormW, kNorm: attn.kNormW,
-            cos: c.asType(x.dtype).reshaped(S, rotaryDims), sin: s.asType(x.dtype).reshaped(S, rotaryDims),
+            cos: rope.cos[offset ..< offset + S], sin: rope.sin[offset ..< offset + S],
             heads: heads, kvHeads: kvHeads, headDim: d, rotaryDims: rotaryDims, eps: eps)
         let mask = makeAttentionMask(n: S, cache: cache)
         let att = attentionWithCacheUpdate(
@@ -150,5 +156,15 @@ final class TrackFastHead {
             scale: attentionScale, mask: mask)
         let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: attn.qWidth)
         return attn.out.apply(out)
+    }
+
+    private func ropeTables(dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
+        if ropeCos == nil || ropeDtype != dtype {
+            let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: 0, count: indexerBudget))
+            ropeCos = c.asType(dtype).reshaped(indexerBudget, rotaryDims)
+            ropeSin = s.asType(dtype).reshaped(indexerBudget, rotaryDims)
+            ropeDtype = dtype
+        }
+        return (ropeCos!, ropeSin!)
     }
 }
