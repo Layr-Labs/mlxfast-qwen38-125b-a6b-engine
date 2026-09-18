@@ -910,6 +910,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
             }
             let gid = p.embedding.hostRowIds(history: [history], newCount: S)
+            // The draft phase warms this gather's rows on a serial side
+            // queue; drain it so the LRU lookup below observes every warmed
+            // row and never races an in-flight warm.
+            TrackPleWarmer.shared.drain()
             let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
             embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
             hostHistory = history

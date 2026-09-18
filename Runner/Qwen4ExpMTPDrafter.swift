@@ -56,6 +56,10 @@ public final class TrackQwen4ExpInlineMTPAssistant {
     private let embedTokens: Embedding
     // ADDED: the head's forward over the fast kernels (nil when disabled).
     private let fastHead: TrackFastHead?
+    // ADDED: the PLE embedding and its host row source, for warming the
+    // verify window's n-gram rows during the draft phase.
+    private let pleEmbedding: Qwen4ExpNGramEmbedding?
+    private let pleHost: Qwen4ExpNGramHostRowSource?
 
     /// The draft argmax over a shortlist of the vocabulary: the lowest ids
     /// (this tokenizer assigns ids in BPE merge order, i.e. by corpus
@@ -105,6 +109,9 @@ public final class TrackQwen4ExpInlineMTPAssistant {
                 shortlist = Shortlist(ids: idx, weight: w, scales: s, biases: b, groupSize: q.groupSize, bits: q.bits)
             }
         }
+        let ple = target.pleEmbeddings.first
+        self.pleEmbedding = ple
+        self.pleHost = ple?.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource
         self.shortlist = shortlist
         self.fastHead = TrackFastHead.enabled
             ? TrackFastHead(mtp, configuration: target.configuration) : nil
@@ -362,7 +369,37 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             // it builds a deeper draft step, so the trusted flush ends here.
             state.roundValidHistoryOffset = state.cacheOffset
         }
+
+        // Warm the verify window's n-gram rows while the engine is still in
+        // the draft phase. The trusted carry seeds the round's history and
+        // covers the window's first position; each drafted token covers the
+        // position it closes. Every drafted token sits in the verify window
+        // whether or not it is accepted, so no warm is wasted.
+        if isFirstStep {
+            TrackPleWarmer.shared.startRound(seedTokens: feed.tokens) { [weak self] history in
+                self?.pleWarm(history)
+            }
+        }
+        TrackPleWarmer.shared.appendDraft(step.draft) { [weak self] history in
+            self?.pleWarm(history)
+        }
+
         return (step.draft, step.multi)
+    }
+
+    /// Queue the n-gram row fetch of one verify-window position on the PLE
+    /// warm queue.
+    ///
+    /// `history` ends at the token the position consumes, so the last
+    /// position's ids are exactly the rows `pleForward` will gather for it.
+    /// The fetch is advisory: a wrong id warms a row nothing reads, never a
+    /// wrong value — the verify gather recomputes its own ids.
+    private func pleWarm(_ history: [Int64]) {
+        guard let embedding = pleEmbedding, let host = pleHost else { return }
+        let gid = embedding.hostRowIds(history: [history], newCount: 1)
+        let heads = (target.configuration.ngramSize - 1)
+            * target.configuration.headsPerNGram
+        _ = host.rows(globalIds: gid, shape: [1, 1, heads])
     }
 
     private func beginRound(
