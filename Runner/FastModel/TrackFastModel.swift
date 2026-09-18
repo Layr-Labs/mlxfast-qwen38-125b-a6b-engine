@@ -1103,6 +1103,19 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             scale: finalMixer.normScaleQ,
             tile: false)
         let mixed = hcMix(finalMixer, normed: finalNormed).input
+        // The loop's dispatch schedule lands its last flush on layer 47 -- with
+        // `asyncChunk` 3 and `asyncFirst` 2 the hits are ... 41, 44, 47 -- so
+        // layer 48, the final `injectNorm` above and this final `hcMix`, plus
+        // the head and the sampler the caller builds on top of `mixed`, are all
+        // still unenqueued at this return. On the pure decode path the engine
+        // launches the NEXT step feeding this step's still-lazy sampled token
+        // and only finalizes afterwards, so nothing enqueues that tail until
+        // something reads the token -- and the read then waits on all of it.
+        // Enqueue it here instead.
+        //
+        // `asyncEval` does not block and computes nothing new: the same arrays
+        // are returned, with the same contents, in the same order.
+        asyncEval(mixed, multi)
         return (mixed, multi)
     }
 
