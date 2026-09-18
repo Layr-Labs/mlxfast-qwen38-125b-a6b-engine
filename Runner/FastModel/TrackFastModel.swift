@@ -26,6 +26,116 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 
+final class TrackPendingIndexerTapes {
+    private struct Entry {
+        let startOffset: Int
+        let keys: MLXArray
+    }
+
+    private final class Pending {
+        weak var row: (any CBv2SequenceKV)?
+        weak var cache: Qwen4ExpCBv2LayerCache?
+        var entries: [Entry] = []
+
+        init(row: any CBv2SequenceKV, cache: Qwen4ExpCBv2LayerCache) {
+            self.row = row
+            self.cache = cache
+        }
+
+        // Mirror updateIndexerTape's prefix truncation at the pre-KV-update
+        // absoluteOffset, including rollback into an S > 1 pending slice.
+        func truncate(to offset: Int) {
+            while let last = entries.last, last.startOffset >= offset {
+                entries.removeLast()
+            }
+            if let last = entries.last, last.startOffset + last.keys.dim(1) > offset {
+                entries[entries.count - 1] = Entry(
+                    startOffset: last.startOffset,
+                    keys: last.keys[0..., ..<(offset - last.startOffset), 0...])
+            }
+        }
+
+        var isBound: Bool {
+            guard let row, let cache, cache.rows.count == 1 else { return false }
+            return cache.rows[0] === row
+        }
+    }
+
+    private var pending: [ObjectIdentifier: Pending] = [:]
+    private let flushInterval = 4096
+
+    // The engine can rebind layer caches between calls. Match the real
+    // cache's setRows lifetime; weak references also prevent identity reuse
+    // from attaching an old request's keys to a new row or cache.
+    func prune() {
+        pending = pending.filter { $0.value.isBound }
+    }
+
+    func flush() {
+        prune()
+        for value in pending.values {
+            guard let row = value.row, let cache = value.cache else { continue }
+            flush(value, row: row, cache: cache)
+        }
+        pending.removeAll(keepingCapacity: true)
+    }
+
+    private func flush(
+        _ value: Pending, row: any CBv2SequenceKV, cache: Qwen4ExpCBv2LayerCache
+    ) {
+        value.truncate(to: row.absoluteOffset)
+        guard !value.entries.isEmpty else { return }
+        let keys = value.entries.map(\.keys)
+        // One cache append, rather than a growing full-tape copy per step.
+        _ = cache.updateIndexerTape(
+            keys: keys.count == 1 ? keys[0] : concatenated(keys, axis: 1))
+    }
+
+    // Call before updateAndAttend, just like the original eager append.
+    func append(keys: MLXArray, cache: Qwen4ExpCBv2LayerCache, deferred: Bool) {
+        precondition(cache.rows.count == 1)
+        let row = cache.rows[0]
+        let identity = ObjectIdentifier(row)
+        let existing = pending[identity]
+        let value: Pending
+        if let existing, existing.cache === cache, existing.row === row {
+            value = existing
+        } else {
+            if let existing, let oldRow = existing.row, let oldCache = existing.cache {
+                flush(existing, row: oldRow, cache: oldCache)
+            }
+            value = Pending(row: row, cache: cache)
+        }
+        value.truncate(to: row.absoluteOffset)
+
+        let tapeEnd = value.entries.last.map { $0.startOffset + $0.keys.dim(1) }
+            ?? cache.indexerTapeLength
+        if !deferred || tapeEnd != row.absoluteOffset {
+            // Capture and wide windows retain the original eager behavior.
+            // Rollback into materialized history must also truncate NOW:
+            // after KV advances, updateIndexerTape would see a later offset.
+            // A rebound cache with missing history stays eager as well; do
+            // not invent absolute positions for its shorter physical tape.
+            flush(value, row: row, cache: cache)
+            pending.removeValue(forKey: identity)
+            _ = cache.updateIndexerTape(keys: keys)
+            return
+        }
+
+        value.entries.append(Entry(startOffset: row.absoluteOffset, keys: keys))
+        if value.entries.count >= flushInterval {
+            // The current entry is at absoluteOffset and must survive this
+            // flush, so do not run the pre-append truncation a second time.
+            let chunks = value.entries.map(\.keys)
+            _ = cache.updateIndexerTape(keys: concatenated(chunks, axis: 1))
+            pending.removeValue(forKey: identity)
+        } else {
+            pending[identity] = value
+        }
+    }
+}
+
+
 /// Host-side mirror of the rolling n-gram context used by the PLE layer.
 ///
 /// The device already carries this fixed-length token window in `state.ssm`,
@@ -270,6 +380,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let rotary: Qwen4ExpRotary
     let indexerBudget: Int
     let attentionScale: Float
+
+    // MLXFAST-NOTAPE: keep deferred QSA copies out of cache.innerState().
+    // KV buffers, device offsets and recurrent evaluation roots are unchanged.
+    private let pendingIndexerTapes = TrackPendingIndexerTapes()
 
     /// Debug taps (tests): when set, every layer's output stream and the block
     /// inputs/outputs are appended here.
@@ -654,7 +768,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func attnForward(
         _ a: TrackAttn, _ x: MLXArray, cache: Qwen4ExpCBv2LayerCache,
-        rope: (cos: MLXArray, sin: MLXArray)
+        rope: (cos: MLXArray, sin: MLXArray), capture: Bool
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let heads = cfg.attentionHeads, kvHeads = cfg.kvHeads, d = cfg.headDim
@@ -682,7 +796,14 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } else {
             idxKeys = a.indexerFull.apply(x)[.ellipsis, a.indexerQWidth...]
         }
-        _ = cache.updateIndexerTape(keys: idxKeys)
+        // MLXFAST-NOTAPE: keepMask is nil throughout the eligible decode path.
+        // Wide/captured calls can be consumed immediately and avoid entering
+        // the pending manager at all.
+        if capture || S > 8 {
+            _ = cache.updateIndexerTape(keys: idxKeys)
+        } else {
+            pendingIndexerTapes.append(keys: idxKeys, cache: cache, deferred: true)
+        }
 
         let prep: (q: MLXArray, k: MLXArray, v: MLXArray)
         if let parts = splitInputs {
@@ -1061,7 +1182,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             } else {
                 let cache = caches[attentionIndex]
                 attentionIndex += 1
-                attended = attnForward(layer.attn!, input, cache: cache, rope: ropeTab)
+                attended = attnForward(
+                    layer.attn!, input, cache: cache, rope: ropeTab, capture: capture)
             }
             Self.debugTaps?.append(("L\(layer.index).attn.out", attended))
             if profiling { TrackFastProfile.tick(layer.gdn != nil ? "gdn" : "attn", &profT, [attended]) }
@@ -1140,13 +1262,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, capture: Bool
     ) -> (mixed: MLXArray, multi: MLXArray)? {
         if capture { TrackPleContextMirror.invalidate() }
+        // The wrapped model may read the tape after a failed plan.
+        pendingIndexerTapes.prune()
         guard let plan = fastPlan(
             tokens: tokens, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds)
         else {
             TrackPleContextMirror.invalidate()
+            pendingIndexerTapes.flush()
             return nil
         }
+        if capture { pendingIndexerTapes.flush() }
         return fastStreams(
             tokens, inputEmbeddings: inputEmbeddings, caches: plan.caches,
             recurrentState: recurrentState, offset: plan.offset, capture: capture)
@@ -1165,10 +1291,12 @@ extension TrackQwen4ExpFastModel: LanguageModel, KVCacheDimensionProvider {
         base.sanitize(weights: weights, metadata: metadata)
     }
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
-        try base.prepare(input, cache: cache, windowSize: windowSize)
+        pendingIndexerTapes.flush()
+        return try base.prepare(input, cache: cache, windowSize: windowSize)
     }
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        base(inputs, cache: cache)
+        pendingIndexerTapes.flush()
+        return base(inputs, cache: cache)
     }
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         base.newCache(parameters: parameters)
@@ -1222,7 +1350,8 @@ extension TrackQwen4ExpFastModel: CBv2PositionedRecurrentLanguageModelForwardabl
     public func embeddingForward(
         _ inputs: MLXArray, inputEmbedding: MLXArray, cache: [KVCache]?
     ) -> MLXArray {
-        base.embeddingForward(inputs, inputEmbedding: inputEmbedding, cache: cache)
+        pendingIndexerTapes.flush()
+        return base.embeddingForward(inputs, inputEmbedding: inputEmbedding, cache: cache)
     }
 
     public func embeddingForward(
