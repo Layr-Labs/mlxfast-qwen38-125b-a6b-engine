@@ -25,23 +25,31 @@ enum TrackFastGDNDecode {
             g.aOffset >= 0, g.aOffset + g.hv <= g.projWidth
         else { return nil }
         let B = proj.dim(0)
+        // `proj.dtype` is a pure metadata read of a `let` parameter that was
+        // evaluated five times on this path: the guard above, the
+        // `convState.dtype` comparison below, the `InT` template value, and
+        // both `proj` entries of `outputDTypes`. Bind it once. Host-side only:
+        // the same `DType` reaches the same template slot and the same output
+        // descriptors, so the kernel, the grid and every byte moved are
+        // unchanged.
+        let projDType = proj.dtype
         guard convState.shape == [B, g.convKernel - 1, g.convDim],
             stateIn.shape == [B, g.hv, g.dv, g.dk],
             convW.shape == [g.convDim, g.convKernel],
             negExpALog.shape == [g.hv], dtBias.shape == [g.hv], normW.shape == [g.dv],
-            convState.dtype == proj.dtype
+            convState.dtype == projDType
         else { return nil }
         let result = kernel(
             [proj, convState, convW, negExpALog, dtBias, stateIn, normW],
             template: [
-                ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
+                ("InT", projDType), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
                 ("Hk", g.hk), ("Hv", g.hv), ("KC", g.convKernel), ("CONV_DIM", g.convDim),
                 ("PW", g.projWidth), ("B_OFF", g.bOffset), ("A_OFF", g.aOffset),
                 ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)), ("RPS", 4),
             ],
             grid: (32, g.dv / 4, B * g.hv), threadGroup: (32, g.dv / 4, 1),
             outputShapes: [[B, g.hv, g.dv, g.dk], [B, 1, g.hv * g.dv], [B, g.convKernel - 1, g.convDim]],
-            outputDTypes: [stateIn.dtype, proj.dtype, proj.dtype])
+            outputDTypes: [stateIn.dtype, projDType, projDType])
         return (result[1], result[0], result[2])
     }
 
