@@ -42,7 +42,8 @@ enum TrackPleContextMirror {
     nonisolated(unsafe) private(set) static var dirty = true
 
     static func matches(offset: Int, layer: Int, length: Int) -> Bool {
-        !dirty && nextOffset == offset && stateLayerIndex == layer && contextLength == length
+        guard !dirty else { return false }
+        return nextOffset == offset && stateLayerIndex == layer && contextLength == length
     }
 
     static func store(
