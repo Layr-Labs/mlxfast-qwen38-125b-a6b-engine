@@ -268,6 +268,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     private let injectNormReplay: @Sendable ([MLXArray]) -> [MLXArray]
     let rotaryDims: Int
     let rotary: Qwen4ExpRotary
+    private var ropeDecodeCache: (
+        start: Int, rows: Int, dtype: DType, cos: MLXArray, sin: MLXArray
+    )?
     let indexerBudget: Int
     let attentionScale: Float
 
@@ -648,6 +651,30 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
+        if count == 1 {
+            if let cache = ropeDecodeCache,
+               cache.dtype == dtype,
+               offset >= cache.start,
+               offset < cache.start + cache.rows {
+                let row = offset - cache.start
+                return (
+                    cache.cos[row ..< row + 1, 0 ..< rotaryDims].reshaped(1, rotaryDims),
+                    cache.sin[row ..< row + 1, 0 ..< rotaryDims].reshaped(1, rotaryDims)
+                )
+            }
+
+            let rows = max(1, min(64, indexerBudget - offset))
+            let (cosAll, sinAll) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: rows))
+            let cachedCos = cosAll.asType(dtype).reshaped(rows, rotaryDims)
+            let cachedSin = sinAll.asType(dtype).reshaped(rows, rotaryDims)
+            asyncEval(cachedCos, cachedSin)
+            ropeDecodeCache = (offset, rows, dtype, cachedCos, cachedSin)
+            return (
+                cachedCos[0 ..< 1, 0 ..< rotaryDims].reshaped(1, rotaryDims),
+                cachedSin[0 ..< 1, 0 ..< rotaryDims].reshaped(1, rotaryDims)
+            )
+        }
+
         let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
         return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
     }
