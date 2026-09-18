@@ -1237,7 +1237,18 @@ extension TrackFastMoEKernels {
         source: gateUpActSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
 
-    static let gateUpReuseRowsPerSimdgroup = 2
+    // MLXFAST-GUREUSE4: output rows per simdgroup in the one-token gate/up
+    // reuse kernel. The kernel reads the activation row once per threadgroup
+    // and spends it over `2 * RPS` output columns
+    // (`out_row = tgy * (2 * RPS) + sgi * RPS`), so RPS sets how far each
+    // loaded row is reused before it is dropped. At 2 a threadgroup covers 4
+    // of the N = 640 columns; at 4 it covers 8, which halves the number of
+    // times the same row is re-read for the same output work. The grid is
+    // expressed in threads and divides exactly either way (640 % 8 == 0), the
+    // per-thread accumulators `g[RPS]`/`u[RPS]` and the `qmv_fast_reg_dual`
+    // template follow RPS, and no byte of weight traffic, no template constant
+    // besides RPS and no threadgroup shape changes.
+    static let gateUpReuseRowsPerSimdgroup = 4
 
     static let gateUpReuseHelpers = #"""
         template <typename T, int group_size, int bits, int rows>
@@ -1353,7 +1364,14 @@ extension TrackFastMoEKernels {
         let BR = idx.dim(0), S = x.dim(0), KD = x.dim(1), N = wg.dim(1)
         precondition(N % 8 == 0 && bits == 4 && idx.dtype == .uint32 && xrow.dtype == .uint32)
         precondition(shared.rows == 2 * N && shared.groupSize == groupSize && shared.bits == bits && S >= 1 && S <= 8)
-        precondition(isFast(k: KD, n: N), "shared expert one-token path assumes qmv_fast")
+        // MLXFAST-FASTCSE: `isFast(k:n:)` is a pure function of KD and N and was
+        // evaluated twice on this path -- once for the precondition and once
+        // for the `FAST` template value -- with neither rebound in between.
+        // Host-side only: the template receives the same Bool, so both kernel
+        // selections, every template constant, both grids, both threadgroup
+        // shapes and every byte moved are unchanged.
+        let fast = isFast(k: KD, n: N)
+        precondition(fast, "shared expert one-token path assumes qmv_fast")
         if x.dtype == .bfloat16 && S == 1 && KD == 2560 && N == 640
             && groupSize == 32 && bits == 4 && shared.mode == .affine
         {
@@ -1369,7 +1387,7 @@ extension TrackFastMoEKernels {
         }
         return (S == 1 ? gateUpActKernel1 : gateUpActKernel)(
             [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
-            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("BR", BR), ("VPT", S)],
+            template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", fast), ("BR", BR), ("VPT", S)],
             grid: (32, (N / 8) * 2, BR + 1), threadGroup: (32, 2, 1),
             outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
     }
