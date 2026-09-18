@@ -1651,9 +1651,10 @@ METAL_FUNC void track_prefill_indirect_gu(
     uint simd_group_id,
     uint simd_lane_id) {
   static_assert(
-      transpose && BM == 32 && WM == 2 && WN == 2 &&
+      transpose && ((BM == 32 && WM == 2 && WN == 2) ||
+                    (BM == 16 && WM == 1 && WN == 4)) &&
           ((BN == 64 && BK == 64) || (BN == 128 && BK == 32)),
-      "P17 tile: 32 rows, 2x2 SIMD layout, 64x64 or 128x32 weight block");
+      "P17 tile: 32-row 2x2 or 16-row 1x4 SIMD layout");
   static_assert(
       metal::is_same_v<T, bfloat16_t> && group_size == 32 && bits == 4,
       "P17 requires unchanged bf16 / affine group-32 / 4-bit operands");
