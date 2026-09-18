@@ -909,9 +909,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     Array(history.suffix(contextLength)), nextOffset: offset + S,
                     stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
             }
-            let gid = p.embedding.hostRowIds(history: [history], newCount: S)
-            let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
-            embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
+            if let memoized = TrackPleHostRows.embed(
+                embedding: p.embedding, host: host, history: history, newCount: S,
+                ngramSize: cfg.ngramSize, headsPerNGram: cfg.headsPerNGram,
+                eosTokenId: cfg.eosTokenId, dtype: stream.dtype)
+            {
+                embedded = memoized
+            } else {
+                let gid = p.embedding.hostRowIds(history: [history], newCount: S)
+                let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
+                embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
+            }
             hostHistory = history
         } else {
             TrackPleContextMirror.invalidate()
