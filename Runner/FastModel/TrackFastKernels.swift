@@ -228,96 +228,19 @@ enum TrackFastKernels {
     // Keep the original grid/threadgroup; surplus SIMD groups return uniformly.
     // Per lane: four extra FP32 state values, plus a second sum/compensation or
     // delta/output pair. Actual register allocation and spills require profiling.
-    static let leanTwoRowSource = """
-        // MLXFAST-GDNTILE: Each row retains four consecutive key elements per lane.
-        const uint dv_idx = 2 * thread_position_in_grid.y;
-        if (dv_idx >= Dv) { return; }
-        const uint n = thread_position_in_grid.z;
-        const uint b_idx = n / Hv;
-        const uint hv_idx = n % Hv;
-        const uint hk_idx = hv_idx / (Hv / Hk);
-        constexpr int n_per_t = Dk / 32;
-        const int T_ = T;
-        const device InT* q_ = q + b_idx * T_ * Hk * Dk + hk_idx * Dk;
-        const device InT* k_ = k + b_idx * T_ * Hk * Dk + hk_idx * Dk;
-        const device InT* v_ = v + b_idx * T_ * Hv * Dv + hv_idx * Dv;
-        device InT* y_ = y + b_idx * T_ * Hv * Dv + hv_idx * Dv;
-        const uint dk_idx = thread_position_in_threadgroup.x;
-        const device float* g_ = g + b_idx * T_ * Hv;
-        const device float* beta_ = beta + b_idx * T_ * Hv;
-        const device StT* i_state = state_in + (n * Dv + dv_idx) * Dk;
-        float state0[n_per_t], state1[n_per_t];
-        for (int i = 0; i < n_per_t; ++i) {
-            state0[i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);
-            state1[i] = static_cast<float>(i_state[Dk + n_per_t * dk_idx + i]);
-        }
-        for (int t = 0; t < T_; ++t) {
-            const float decay = g_[hv_idx];
-            float kv_mem0 = 0.0f, kv_mem1 = 0.0f;
-            {
-                #pragma clang fp reassociate(off)
-                #pragma clang fp contract(off)
-                float kv_compensation0 = 0.0f, kv_compensation1 = 0.0f;
-                for (int i = 0; i < n_per_t; ++i) {
-                    const int s_idx = n_per_t * dk_idx + i;
-                    const float key = static_cast<float>(k_[s_idx]);
-                    {
-                        state0[i] = state0[i] * decay;
-                        auto product = state0[i] * key;
-                        auto corrected = product - kv_compensation0;
-                        auto next_sum = kv_mem0 + corrected;
-                        kv_compensation0 = (next_sum - kv_mem0) - corrected;
-                        kv_mem0 = next_sum;
-                    }
-                    {
-                        state1[i] = state1[i] * decay;
-                        auto product = state1[i] * key;
-                        auto corrected = product - kv_compensation1;
-                        auto next_sum = kv_mem1 + corrected;
-                        kv_compensation1 = (next_sum - kv_mem1) - corrected;
-                        kv_mem1 = next_sum;
-                    }
-                }
-            }
-            kv_mem0 = simd_sum(kv_mem0);
-            kv_mem1 = simd_sum(kv_mem1);
-            const float gate_beta = beta_[hv_idx];
-            const float delta0 = (static_cast<float>(v_[dv_idx]) - kv_mem0) * gate_beta;
-            const float delta1 = (static_cast<float>(v_[dv_idx + 1]) - kv_mem1) * gate_beta;
-            float out0 = 0.0f, out1 = 0.0f;
-            for (int i = 0; i < n_per_t; ++i) {
-                const int s_idx = n_per_t * dk_idx + i;
-                const float key = static_cast<float>(k_[s_idx]);
-                state0[i] = state0[i] + key * delta0;
-                state1[i] = state1[i] + key * delta1;
-                const float query = static_cast<float>(q_[s_idx]);
-                out0 += state0[i] * query;
-                out1 += state1[i] * query;
-            }
-            out0 = simd_sum(out0);
-            out1 = simd_sum(out1);
-            if (dk_idx == 0) {
-                y_[dv_idx] = static_cast<InT>(out0);
-                y_[dv_idx + 1] = static_cast<InT>(out1);
-            }
-            if (CAPTURE || t == T_ - 1) {
-                const uint slot = CAPTURE ? (b_idx * T_ + t) : b_idx;
-                device StT* o_state = state_out + ((slot * Hv + hv_idx) * Dv + dv_idx) * Dk;
-                for (int i = 0; i < n_per_t; ++i) {
-                    o_state[n_per_t * dk_idx + i] = static_cast<StT>(state0[i]);
-                    o_state[Dk + n_per_t * dk_idx + i] = static_cast<StT>(state1[i]);
-                }
-            }
-            q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; g_ += Hv; beta_ += Hv;
-        }
-        """
 
-    // MLXFAST-GDNTILE: Keep the one-row kernel intact for decode and comparison.
+    // MLXFAST-GDNROWS2: the two-row kernel now comes from the same generator as
+    // the four-row one, so the T in 2..8 window (MTP verification, prefill
+    // tail chunks) gets the measured reductions too -- peeled Kahan ends,
+    // vector q/k/v/state loads, three running offsets in place of six pointer
+    // increments. `leanRowsSource(2)` emits each row's operations in the same
+    // order as the hand-written body did, so every output element's arithmetic
+    // sequence is unchanged. Bit-identical by construction.
     nonisolated(unsafe) static let leanTwoRowKernel = MLXFast.metalKernel(
         name: "track_gdn_lean_two_row",
         inputNames: ["q", "k", "v", "g", "beta", "state_in"],
         outputNames: ["y", "state_out"],
-        source: leanTwoRowSource, ensureRowContiguous: true)
+        source: leanRowsSource(2), ensureRowContiguous: true)
 
     private static let prefetchGDNInputs =
         ProcessInfo.processInfo.environment["TRACK_GDN_INPUT_PREFETCH"] != "0"
