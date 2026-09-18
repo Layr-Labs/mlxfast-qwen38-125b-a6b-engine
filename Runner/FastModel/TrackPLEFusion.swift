@@ -1,7 +1,8 @@
 // MLXFAST-PLEFUSE2: S=1 PLE fusion. No projection or weight-layout changes.
 // Scratch: ONE reused float[32] (128 B) in prepare, ZERO in convolution.
-// This retains the RMS/reduction lane layout and the dilated convolution's
-// channel-per-threadgroup layout; token tolerance, not bit equality, applies.
+// Prepare retains the RMS/reduction lane layout; convolution runs one thread
+// per channel with the implicit-GEMM dispatch's own float products and
+// ascending-tap additions. Token tolerance, not bit equality, applies.
 import Foundation
 import MLX
 
@@ -104,31 +105,19 @@ enum TrackPLEFusion {
         """
 
     static let convolutionSource = """
-        // MLXFAST-PLEFUSE2: preserve the S=1 dilated implicit-GEMM dispatch:
-        // group=(32,1,4), grid of groups=(1,1,W), channel=group.z.
-        // Its small-channel loaders assign taps 0..3 to SIMD 0 lanes 0..3;
-        // lane 0 owns the single valid output. Keep those owners, discard
-        // the padded matrix work, and require no threadgroup storage.
+        // MLXFAST-PLEFUSE2: one thread per channel. The float products and
+        // chronological additions are the implicit-GEMM dispatch's own --
+        // taps 0,1,2,3 accumulated in ascending order -- without its
+        // 128-thread groups where three SIMD groups and 28 lanes idled.
         constexpr uint W = 10240;
-        const uint c = threadgroup_position_in_grid.z;
-        const uint lane = thread_index_in_simdgroup;
-        if (simdgroup_index_in_threadgroup != 0) { return; }
-        float product = 0.0f;
-        if (lane < 4) {
-            product = float(full[(lane * 3) * W + c]) * float(weight[c * 4 + lane]);
+        const uint c = thread_position_in_grid.x;
+        if (c >= (uint)W) { return; }
+        float acc = float(full[c]) * float(weight[c * 4]);
+        for (uint j = 1; j < 4; ++j) {
+            acc += float(full[(j * 3) * W + c]) * float(weight[c * 4 + j]);
         }
-        // FP32 products and chronological FP32 additions, taps 0,1,2,3.
-        // Shuffle broadcasts retain the weight-loading lanes. Unlike a
-        // padded simdgroup MMA, this has no matrix accumulator or spill array.
-        float acc = simd_broadcast(product, 0);
-        acc += simd_broadcast(product, 1);
-        acc += simd_broadcast(product, 2);
-        acc += simd_broadcast(product, 3);
-        if (lane == 0) {
-            InT convolved = InT(acc);
-            InT activated = mlx_silu(convolved);
-            out[c] = gated[c] + activated;
-        }
+        const InT convolved = InT(acc);
+        out[c] = gated[c] + mlx_silu(convolved);
         """
 
     static let prepareKernel = MLXFast.metalKernel(
@@ -173,7 +162,7 @@ enum TrackPLEFusion {
             outputDTypes: [stream.dtype, stream.dtype])
         let output = convolutionKernel(
             [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
-            grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
+            grid: (10240, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
         return (r[1], output)
     }
