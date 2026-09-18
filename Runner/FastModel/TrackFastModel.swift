@@ -26,6 +26,11 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 
+enum TrackFastTailFlush {
+    /// Local A/B switch for enqueueing the final graph before returning.
+    static let enabled = ProcessInfo.processInfo.environment["MLXFAST_TAIL_FLUSH"] != "0"
+}
+
 /// Host-side mirror of the rolling n-gram context used by the PLE layer.
 ///
 /// The device already carries this fixed-length token window in `state.ssm`,
@@ -1103,6 +1108,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             scale: finalMixer.normScaleQ,
             tile: false)
         let mixed = hcMix(finalMixer, normed: finalNormed).input
+        if TrackFastTailFlush.enabled {
+            asyncEval(mixed, multi)
+        }
         return (mixed, multi)
     }
 

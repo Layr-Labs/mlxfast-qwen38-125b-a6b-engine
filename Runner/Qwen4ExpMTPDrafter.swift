@@ -233,6 +233,8 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         }
 
         func clearAll() {
+            // Join asynchronous head/cache work before releasing request roots.
+            MLX.Stream.gpu.synchronize()
             caches.removeAll(keepingCapacity: false)
             backlogMulti.removeAll(keepingCapacity: false)
             backlogTokens.removeAll(keepingCapacity: false)

@@ -406,11 +406,11 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
     }
 
     public func makeStepper() throws -> any TeacherForcedStepper {
-        CBv2SingleRowStepper(
+        TrackSynchronizedStepper(CBv2SingleRowStepper(
             model: servingModel,
             layerKinds: layerKinds,
             newCaches: newCaches,
             kvBytesCapacity: kvBytesCapacity,
-            maxLength: maxSequenceLength)
+            maxLength: maxSequenceLength), stream: StreamOrDevice.default.stream)
     }
 }
