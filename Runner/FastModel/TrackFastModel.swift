@@ -230,6 +230,9 @@ struct TrackPLE {
     let embedding: Qwen4ExpNGramEmbedding
     let keyProj: TrackProj
     let valueProj: TrackProj
+    /// Row-concatenated key|value weight for the one-launch small-window GEMV;
+    /// nil when the two projections cannot share a quantized geometry.
+    let keyValueFused: TrackProj?
     let normKeyScale: MLXArray
     let normQueryScale: MLXArray
     let normConvScale: MLXArray
@@ -476,10 +479,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         -> TrackPLE
     {
         let convW = ple.trackChild("conv1d").trackArray("weight")
+        let keyProj = TrackProj(ple.trackChild("key_proj"))
+        let valueProj = TrackProj(ple.trackChild("value_proj"))
         return TrackPLE(
             embedding: ple.pleEmbedding,
-            keyProj: TrackProj(ple.trackChild("key_proj")),
-            valueProj: TrackProj(ple.trackChild("value_proj")),
+            keyProj: keyProj,
+            valueProj: valueProj,
+            keyValueFused: TrackProj.fused([keyProj, valueProj]),
             normKeyScale: ple.trackChild("norm_key").trackArray("weight"),
             normQueryScale: ple.trackChild("norm_query").trackArray("weight"),
             normConvScale: ple.trackChild("norm_conv").trackArray("weight"),
@@ -928,20 +934,41 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         {
             (full, output) = fused
         } else {
-            let keyFlat = p.keyProj.apply(embedded)
-            let value = p.valueProj.apply(embedded)
-            // norm_key * norm_query, then MLX's own reduction over the last axis.
-            let prod = TrackFastPLEKernels.prod(
-                keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
-                hcCount: hcCount, hidden: hidden, eps: eps)
-            let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
-            // The two scalars the reference's `/` and `maximum` build, built the
-            // same way so they carry the same rounding into the activation dtype.
-            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
-            let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
-            let gn = TrackFastPLEKernels.gated(
-                g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
-                hcCount: hcCount, hidden: hidden, eps: eps)
+            let dot: MLXArray
+            let gn: (gated: MLXArray, normed: MLXArray)
+            if let fusedKV = p.keyValueFused, fusedKV.rows == wide + hidden,
+                B * S * hcCount < 32
+            {
+                // One GEMV over the row-concatenated key|value weight, then the
+                // dot folded into the product kernel. qmv_wide accumulates each
+                // output row independently of N, and the fold is the
+                // row_reduce_looped sequence the fused S=1 path already proves,
+                // so both are bit-exact with the launches they replace.
+                let kv = fusedKV.apply(embedded)
+                dot = TrackFastPLEKernels.prodDot(
+                    kv: kv, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
+                    hcCount: hcCount, hidden: hidden, eps: eps)
+                let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
+                let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
+                gn = TrackFastPLEKernels.gatedKV(
+                    g0: dot, kv: kv, cScale: p.normConvScale, divisor: divisor, floor: floor,
+                    hcCount: hcCount, hidden: hidden, eps: eps)
+            } else {
+                let keyFlat = p.keyProj.apply(embedded)
+                let value = p.valueProj.apply(embedded)
+                // norm_key * norm_query, then MLX's own reduction over the last axis.
+                let prod = TrackFastPLEKernels.prod(
+                    keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
+                    hcCount: hcCount, hidden: hidden, eps: eps)
+                dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
+                // The two scalars the reference's `/` and `maximum` build, built the
+                // same way so they carry the same rounding into the activation dtype.
+                let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
+                let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
+                gn = TrackFastPLEKernels.gated(
+                    g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
+                    hcCount: hcCount, hidden: hidden, eps: eps)
+            }
             let gated = gn.gated
             full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
             output = TrackFastPLEKernels.conv(

@@ -196,6 +196,148 @@ enum TrackFastPLEKernels {
         return (outs[0], outs[1])
     }
 
+    // MARK: verify-window fusion: fused key|value GEMV + folded dot reduction
+
+    /// kv [B,S,W+H] (fused key|value GEMV output), stream [B,S,W], kscale [W],
+    /// qscale [W], eps -> dot [B,S,HC,1]
+    /// Same norms and product as `prod`, then row_reduce_looped's fold — the
+    /// exact sequence `track_ple_prepare_fuse2` already proves at S = 1 —
+    /// so the separate `sum` launch and the [B,S,W] prod buffer are skipped.
+    /// Only for windows where MLX's reduce is row_reduce_looped (B*S*HC < 32).
+    /// grid (H/4, HC, B*S), threadgroup (H/4, 1, 1)
+    static let prodDotSource = """
+        constexpr int N_READS = 4;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint hc = thread_position_in_grid.y;
+        const uint row = thread_position_in_grid.z;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        threadgroup float ksums[32];
+        threadgroup float qsums[32];
+        threadgroup float dsums[32];
+        const uint base = row * W + hc * H;
+        float kx[N_READS];
+        float qx[N_READS];
+        float kacc = 0.0f;
+        float qacc = 0.0f;
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            kx[i] = static_cast<float>(kv[base + d]);
+            qx[i] = static_cast<float>(stream[base + d]);
+            kacc += kx[i] * kx[i];
+            qacc += qx[i] * qx[i];
+        }
+        kacc = simd_sum(kacc);
+        qacc = simd_sum(qacc);
+        constexpr uint simd_groups = (H + 32 * N_READS - 1) / (32 * N_READS);
+        if (sg == 0 && lane >= simd_groups) { ksums[lane] = 0; qsums[lane] = 0; }
+        if (lane == 0) { ksums[sg] = kacc; qsums[sg] = qacc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        kacc = simd_sum(ksums[lane]);
+        qacc = simd_sum(qsums[lane]);
+        const float kinv = metal::precise::rsqrt(kacc / (float)H + eps);
+        const float qinv = metal::precise::rsqrt(qacc / (float)H + eps);
+        InT dsum = InT(0);
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            const InT kn = static_cast<InT>(kx[i] * kinv) * kscale[hc * H + d];
+            const InT qn = static_cast<InT>(qx[i] * qinv) * qscale[hc * H + d];
+            dsum = (kn * qn) + dsum;
+        }
+        dsum = InT(0) + dsum;
+        dsum = simd_sum(dsum);
+        if (sg == 0 && lane >= simd_groups) { dsums[lane] = 0; }
+        if (lane == 0) { dsums[sg] = float(dsum); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dsum = simd_sum(InT(dsums[lane]));
+        if (sg == 0 && lane == 0) { dot[row * HC + hc] = dsum; }
+        """
+
+    nonisolated(unsafe) static let prodDotKernel = MLXFast.metalKernel(
+        name: "track_ple_prod_dot",
+        inputNames: ["kv", "stream", "kscale", "qscale", "eps"],
+        outputNames: ["dot"],
+        source: prodDotSource, header: header, ensureRowContiguous: true)
+
+    static func prodDot(
+        kv: MLXArray, stream: MLXArray, kScale: MLXArray, qScale: MLXArray,
+        hcCount: Int, hidden: Int, eps: Float
+    ) -> MLXArray {
+        let B = kv.dim(0), S = kv.dim(1), W = hcCount * hidden
+        precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && kv.dim(2) == W + hidden)
+        return prodDotKernel(
+            [kv, stream, kScale, qScale, MLXArray(eps)],
+            template: [("InT", kv.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+            grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
+            outputShapes: [[B, S, hcCount, 1]], outputDTypes: [kv.dtype])[0]
+    }
+
+    /// g0 [B,S,HC,1] (the folded dot), kv [B,S,W+H] (value rows at offset W),
+    /// cscale [W], divisor and floor as 0-dim arrays in the activation dtype,
+    /// eps -> gated [B,S,W], normed [B,S,W]
+    /// Identical arithmetic to `gated`; only the value read is offset.
+    /// grid (H/4, HC, B*S), threadgroup (H/4, 1, 1)
+    static let gatedKVSource = """
+        constexpr int N_READS = 4;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint hc = thread_position_in_grid.y;
+        const uint row = thread_position_in_grid.z;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        threadgroup float sums[32];
+        const uint base = row * W + hc * H;
+
+        InT g = g0[row * HC + hc] / divisor;
+        g = mlx_sqrt_t(mlx_maximum(mlx_abs_t(g), floorv)) * mlx_sign(g);
+        const InT sgm = mlx_sigmoid(g);
+
+        float gx[N_READS];
+        float acc = 0.0f;
+        for (int i = 0; i < N_READS; ++i) {
+            const InT v = sgm * kv[row * (W + H) + W + d];
+            gated[base + d] = v;
+            gx[i] = static_cast<float>(v);
+            acc += gx[i] * gx[i];
+        }
+        acc = simd_sum(acc);
+        constexpr uint simd_groups = (H + 32 * N_READS - 1) / (32 * N_READS);
+        if (sg == 0 && lane >= simd_groups) { sums[lane] = 0; }
+        if (lane == 0) { sums[sg] = acc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        acc = simd_sum(sums[lane]);
+        const float inv = metal::precise::rsqrt(acc / (float)H + eps);
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            normed[base + d] = static_cast<InT>(gx[i] * inv) * cscale[hc * H + d];
+        }
+        """
+
+    nonisolated(unsafe) static let gatedKVKernel = MLXFast.metalKernel(
+        name: "track_ple_gated_kv",
+        inputNames: ["g0", "kv", "cscale", "divisor", "floorv", "eps"],
+        outputNames: ["gated", "normed"],
+        source: gatedKVSource,
+        header: header + """
+            template <typename T> METAL_FUNC T mlx_abs_t(T x) { return metal::abs(x); }
+            template <typename T> METAL_FUNC T mlx_sqrt_t(T x) { return metal::precise::sqrt(x); }
+            """,
+        ensureRowContiguous: true)
+
+    static func gatedKV(
+        g0: MLXArray, kv: MLXArray, cScale: MLXArray, divisor: MLXArray, floor: MLXArray,
+        hcCount: Int, hidden: Int, eps: Float
+    ) -> (gated: MLXArray, normed: MLXArray) {
+        let B = kv.dim(0), S = kv.dim(1), W = hcCount * hidden
+        precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && kv.dim(2) == W + hidden)
+        let outs = gatedKVKernel(
+            [g0, kv, cScale, divisor, floor, MLXArray(eps)],
+            template: [("InT", kv.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+            grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
+            outputShapes: [[B, S, W], [B, S, W]],
+            outputDTypes: [kv.dtype, kv.dtype])
+        return (outs[0], outs[1])
+    }
+
     // MARK: the dilated depthwise convolution, silu, and the residual add
 
     /// full [B, N+S, W] (carried state ++ normed), convw [W, KC], gated [B,S,W]
