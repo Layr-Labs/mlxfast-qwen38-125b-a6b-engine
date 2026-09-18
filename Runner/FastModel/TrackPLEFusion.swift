@@ -103,6 +103,97 @@ enum TrackPLEFusion {
         }
         """
 
+    /// The S=1 fusion's per-row math with the row carried on `grid.z`: one
+    /// threadgroup per (row, hc) pair, identical norms, dot, gate, and normed
+    /// row layout. `full` keeps the `[old nine rows, new S rows]` shape the
+    /// unfused concat builds, so the shared conv kernel and the capture
+    /// staging see byte-identical inputs.
+    static let prepareMultiSource = """
+        constexpr uint H = 2560;
+        constexpr uint W = 4 * H;
+        const uint hc = threadgroup_position_in_grid.y;
+        const uint row = threadgroup_position_in_grid.z;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint d = lid * 4;
+        const uint base = row * W + hc * H + d;
+        const uint sb = hc * H + d;
+        threadgroup float partials[32];  // 128 B total, reused throughout.
+        const float eps = as_type<float>((uint)EPS_BITS);
+
+        float acc = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float k = float(key[base + i]);
+            acc += k * k;
+        }
+        const float ik = metal::precise::rsqrt(
+            ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
+        acc = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float q = float(query[base + i]);
+            acc += q * q;
+        }
+        const float iq = metal::precise::rsqrt(
+            ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
+
+        // Same dtype boundaries as the unfused prod + row reduce: round RMS
+        // before scale, round product before the four-element fold.
+        InT dot = InT(0);
+        for (uint i = 0; i < 4; ++i) {
+            InT k = InT(float(key[base + i]) * ik);
+            k = k * keyScale[sb + i];
+            InT q = InT(float(query[base + i]) * iq);
+            q = q * queryScale[sb + i];
+            InT product = k * q;
+            dot = product + dot;
+        }
+        dot = InT(0) + dot;
+        dot = simd_sum(dot);
+        if (sg == 0 && lane >= 20) { partials[lane] = 0.0f; }
+        if (lane == 0) { partials[sg] = float(dot); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dot = simd_sum(InT(partials[lane]));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        InT gate = dot / InT(as_type<float>((uint)DIVISOR_BITS));
+        InT magnitude = metal::abs(gate);
+        magnitude = metal::max(magnitude, InT(1e-6f));
+        magnitude = metal::sqrt(magnitude);
+        InT direction = InT((gate > InT(0)) - (gate < InT(0)));
+        gate = magnitude * direction;
+        const InT activation = mlx_sigmoid(gate);
+
+        InT g[4];
+        acc = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            g[i] = activation * value[row * H + d + i];
+            gated[base + i] = g[i];
+            float v = float(g[i]);
+            acc += v * v;
+        }
+        const float iv = metal::precise::rsqrt(
+            ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
+        for (uint i = 0; i < 4; ++i) {
+            InT n = InT(float(g[i]) * iv);
+            full[(9 + row) * W + sb + i] = n * convScale[sb + i];
+        }
+        // Row 0's threadgroups also carry the old conv state into `full`,
+        // replacing the unfused concatenated([convState, normed]).
+        if (row == 0) {
+            for (uint t = 0; t < 9; ++t) {
+                for (uint i = 0; i < 4; ++i) {
+                    full[t * W + sb + i] = convState[t * W + sb + i];
+                }
+            }
+        }
+        """
+
+    static let prepareMultiKernel = MLXFast.metalKernel(
+        name: "track_ple_prepare_fuse3",
+        inputNames: ["key", "query", "value", "keyScale", "queryScale", "convScale", "convState"],
+        outputNames: ["gated", "full"], source: prepareMultiSource,
+        header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
+
     static let convolutionSource = """
         // MLXFAST-PLEFUSE2: preserve the S=1 dilated implicit-GEMM dispatch:
         // group=(32,1,4), grid of groups=(1,1,W), channel=group.z.
@@ -175,6 +266,50 @@ enum TrackPLEFusion {
             [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
             grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
             outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
+        return (r[1], output)
+    }
+
+    /// The multi-row fusion serves exactly the windows the unfused S >= 2
+    /// block serves: same projections, same conv weight layout, same scales.
+    /// Capped at the host-path window size so the fused path stays on the
+    /// decode/verify geometry it was built for.
+    static func supportsMulti(
+        _ p: TrackPLE, stream: MLXArray, hidden: Int, hcCount: Int
+    ) -> Bool {
+        hidden == 2560 && hcCount == 4
+            && stream.dim(0) == 1 && stream.dim(1) >= 2 && stream.dim(1) <= 8
+            && stream.dim(2) == 10240
+            && [.bfloat16, .float16, .float32].contains(stream.dtype)
+            && p.dilation == 3 && p.stateLength == 9
+            && p.keyProj.rows == 10240 && p.valueProj.rows == 2560
+            && p.convW2.shape == [10240, 4] && p.convW2.dtype == stream.dtype
+            && [p.normKeyScale, p.normQueryScale, p.normConvScale].allSatisfy {
+                $0.shape == [10240] && $0.dtype == stream.dtype
+            }
+    }
+
+    /// Fused prepare + the shared conv for S in 2...8. Returns the same
+    /// `(full, output)` pair the unfused block produces: `full` is
+    /// `[1, 9 + S, W]` for the conv and the capture staging, `output` is the
+    /// PLE block result.
+    static func forwardMulti(
+        _ p: TrackPLE, embedded: MLXArray, stream: MLXArray, convState: MLXArray, eps: Float
+    ) -> (full: MLXArray, output: MLXArray)? {
+        let S = stream.dim(1)
+        let key = p.keyProj.apply(embedded)
+        let value = p.valueProj.apply(embedded)
+        guard key.shape == [1, S, 10240], value.shape == [1, S, 2560],
+            key.dtype == stream.dtype, value.dtype == stream.dtype
+        else { return nil }
+        let r = prepareMultiKernel(
+            [key, stream, value, p.normKeyScale, p.normQueryScale, p.normConvScale, convState],
+            template: [("InT", stream.dtype), ("EPS_BITS", Int(eps.bitPattern)),
+                       ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern))],
+            grid: (640, 4, S), threadGroup: (640, 1, 1),
+            outputShapes: [[1, S, 10240], [1, 9 + S, 10240]],
+            outputDTypes: [stream.dtype, stream.dtype])
+        let output = TrackFastPLEKernels.conv(
+            full: r[1], convW: p.convW2, gated: r[0], dilation: p.dilation)
         return (r[1], output)
     }
 }

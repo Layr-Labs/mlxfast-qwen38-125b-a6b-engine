@@ -927,6 +927,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 p, embedded: embedded, stream: stream, convState: convState, eps: eps)
         {
             (full, output) = fused
+        } else if S >= 2,
+            TrackPLEFusion.supportsMulti(p, stream: stream, hidden: hidden, hcCount: hcCount),
+            convState.shape == [1, 9, wide], convState.dtype == stream.dtype,
+            let fused = TrackPLEFusion.forwardMulti(
+                p, embedded: embedded, stream: stream, convState: convState, eps: eps)
+        {
+            (full, output) = fused
         } else {
             let keyFlat = p.keyProj.apply(embedded)
             let value = p.valueProj.apply(embedded)
