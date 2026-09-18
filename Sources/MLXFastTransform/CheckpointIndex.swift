@@ -97,3 +97,4 @@ public enum CheckpointIndexTools {
         return shards.sorted()
     }
 }
+// redraw marker 2026-09-18T16:15:52Z
