@@ -168,12 +168,23 @@ enum TrackFastMixerKernels {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const uint t = sg * 32 + lid;
-        if (t < 2) {
-            const int d = d0 + (int)t;
-            for (int v = 0; v < VPT; ++v) {
+        // MLXFAST-MIXFOLD: the (row, token) outputs of this tile used to be
+        // folded by two threads, each walking all VPT tokens while the other 62
+        // threads waited at the barrier below. The fold is independent per
+        // (row, token) pair -- its own accumulator, its own output address --
+        // so the tokens are handed out across the whole threadgroup instead.
+        // The sum over HC keeps its original order, so every output value is
+        // bit-identical; only which thread computes it changes. The threadgroup
+        // is (32, 2, 1), so `t` runs over 64 threads and the stride is 32.
+        // At VPT = 1 (decode) only threads 0 and 1 enter the loop with
+        // `t & 1u == t`, exactly as the original guard did, so the decode path
+        // is unchanged; this is a prefill win.
+        {
+            const int d = d0 + (int)(t & 1u);
+            for (int v = (int)(t >> 1); v < VPT; v += 32) {
                 T acc = T(0);
                 for (int s = 0; s < HC; ++s) {
-                    const T p = products[s * 2 + (int)t][v];
+                    const T p = products[s * 2 + (int)(t & 1u)][v];
                     acc = acc + p;
                 }
                 input[(size_t)v * (size_t)H + (size_t)d] = acc;
