@@ -751,10 +751,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         if x.dim(0) == 1, x.dim(1) == 1, m.routerW16.dtype == .bfloat16, x.dim(2) % 128 == 0,
             m.routerW16.dim(0) % 16 == 0, x.dim(2) < 16 * m.routerW16.dim(0), m.routerW16.dim(0) < 4096
         {
-            // One token: MLX's float gemv arithmetic over the bf16 weight (the
-            // reference upcasts it to float32 and reads twice the bytes).
-            let xf = (inputF32 ?? x.asType(.float32)).reshaped(x.dim(2))
-            logits = TrackFastMoEKernels.routerGemv(x: xf, w: m.routerW16).reshaped(1, 1, -1)
+            // One token: MLX's float GEMV arithmetic over BF16 model values.
+            // Promote the BF16 activation in the router kernel so the mixer
+            // does not materialize a second FP32 copy of every token row.
+            logits = TrackFastMoEKernels.routerGemv(
+                x: x.reshaped(x.dim(2)), w: m.routerW16
+            ).reshaped(1, 1, -1)
         } else if inputF32 == nil, let wide = TrackPrefillRouter.apply(x: x, w: m.routerW16) {
             logits = wide
         } else {
@@ -1078,7 +1080,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     tile: false)
                 if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
                 Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
-                let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
+                let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc")
                 input = mm.input; injectW = mm.inject
                 if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
                 Self.debugTaps?.append(("L\(layer.index).mlp.input", input))

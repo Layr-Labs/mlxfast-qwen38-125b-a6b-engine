@@ -42,10 +42,10 @@ enum TrackFastMLPReplay {
             let u = TrackFastMixerKernels.upMix(
                 act: d.act, normed: normed, up: packedUp ?? up, inj: d.inj,
                 hcCount: hcCount, hidden: hidden, hasInject: hc.hasInject,
-                emitF32: true, packedRows: packedUp != nil)
+                emitF32: false, packedRows: packedUp != nil)
             let out = TrackQwen4ExpFastModel.moeForwardShared(
                 moe, u.input.reshaped(1, 1, hidden),
-                inputF32: u.inputF32.reshaped(1, 1, hidden), replay: nil)
+                inputF32: nil, replay: nil)
             return [n.stream, out, u.inject.reshaped(1, 1, hcCount)]
         }
     }
