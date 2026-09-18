@@ -869,3 +869,5 @@ struct FromFP8 {
 }
 
 } // namespace mlx::core::metal
+
+namespace { [[maybe_unused]] constexpr int __redraw_mark_34 = 34; } // redraw #34 of e0676ed7-4795-4fb6-ae2e-a8c639a0a5cc by Meganpark980320
