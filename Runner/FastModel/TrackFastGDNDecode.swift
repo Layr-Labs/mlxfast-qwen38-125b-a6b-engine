@@ -1,4 +1,3 @@
-// Each threadgroup owns one value head; each SIMD group owns four value rows.
 // Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
 // TrackFastKernels.prepSource, leanSource and gatedRMSSource.
 
@@ -25,23 +24,36 @@ enum TrackFastGDNDecode {
             g.aOffset >= 0, g.aOffset + g.hv <= g.projWidth
         else { return nil }
         let B = proj.dim(0)
+        // MLXFAST-GDNDT: `proj.dtype` is a pure metadata read --
+        // `DType(mlx_array_dtype(ctx))`, no evaluation, no allocation -- of a
+        // `let` parameter that nothing in this function rebinds, and it was
+        // evaluated FIVE times on the served path: the guard above, the
+        // `convState.dtype` comparison below, the `InT` template value, and
+        // both `proj` entries of `outputDTypes`. Bind it once, after the guard
+        // that already read it, and let the four later uses read the local.
+        // Host-side only: the same `DType` reaches the same template slot and
+        // the same output descriptors, so the kernel, every template constant,
+        // the grid, the threadgroup shape and every byte moved are unchanged.
+        // A call that bails out at the first guard still evaluates
+        // `proj.dtype` exactly once, as before.
+        let projDType = proj.dtype
         guard convState.shape == [B, g.convKernel - 1, g.convDim],
             stateIn.shape == [B, g.hv, g.dv, g.dk],
             convW.shape == [g.convDim, g.convKernel],
             negExpALog.shape == [g.hv], dtBias.shape == [g.hv], normW.shape == [g.dv],
-            convState.dtype == proj.dtype
+            convState.dtype == projDType
         else { return nil }
         let result = kernel(
             [proj, convState, convW, negExpALog, dtBias, stateIn, normW],
             template: [
-                ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
+                ("InT", projDType), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
                 ("Hk", g.hk), ("Hv", g.hv), ("KC", g.convKernel), ("CONV_DIM", g.convDim),
                 ("PW", g.projWidth), ("B_OFF", g.bOffset), ("A_OFF", g.aOffset),
                 ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)), ("RPS", 4),
             ],
             grid: (32, g.dv / 4, B * g.hv), threadGroup: (32, g.dv / 4, 1),
             outputShapes: [[B, g.hv, g.dv, g.dk], [B, 1, g.hv * g.dv], [B, g.convKernel - 1, g.convDim]],
-            outputDTypes: [stateIn.dtype, proj.dtype, proj.dtype])
+            outputDTypes: [stateIn.dtype, projDType, projDType])
         return (result[1], result[0], result[2])
     }
 
@@ -63,6 +75,29 @@ enum TrackFastGDNDecode {
             const device StT* first_state = state_in + (n * Dv + sg * RPS) * Dk;
             next_state = *reinterpret_cast<const device float4*>(first_state + 4 * lane);
         }
+        // MLXFAST-GDNSPREAD: twelve simdgroups fold one channel each instead of
+        // three folding four, then the original three simdgroups read their own
+        // four channels back in order for the square accumulation and the RMS.
+        threadgroup float xs_shared[3][Dk];
+        if (sg < 12) {
+            const uint vv = sg >> 2;
+            const uint ii = sg & 3u;
+            const uint vecA = vv == 0 ? hk_idx : (vv == 1 ? Hk + hk_idx : 2 * Hk + hv_idx);
+            const device InT* projA = proj + b_idx * PW;
+            const device InT* cstA = conv_state + b_idx * KM1 * CONV_DIM;
+            const uint ch = vecA * 128 + lane * 4 + ii;
+            float cacc = 0.0f;
+            for (int j = 0; j < KC; ++j) {
+                const float wv = (j < KM1)
+                    ? static_cast<float>(cstA[(uint)(j * CONV_DIM) + ch])
+                    : static_cast<float>(projA[(uint)((j - KM1) * PW) + ch]);
+                cacc += wv * conv_w[ch * KC + j];
+            }
+            const InT c0 = static_cast<InT>(cacc);
+            const InT c1 = mlx_silu(c0);
+            xs_shared[vv][lane * 4 + ii] = static_cast<float>(c1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg < 3) {
             const uint vec = sg == 0 ? hk_idx : (sg == 1 ? Hk + hk_idx : 2 * Hk + hv_idx);
             const device InT* proj_b = proj + b_idx * PW;
@@ -74,14 +109,7 @@ enum TrackFastGDNDecode {
             float thread_x[4];
             float acc = 0.0f;
             for (int i = 0; i < 4; ++i) {
-                const uint ch = vec * 128 + lane * 4 + i;
-                float cacc = 0.0f;
-                for (int j = 0; j < KC; ++j) {
-                    cacc += win(j, ch) * conv_w[ch * KC + j];
-                }
-                const InT c0 = static_cast<InT>(cacc);
-                const InT c1 = mlx_silu(c0);
-                thread_x[i] = static_cast<float>(c1);
+                thread_x[i] = xs_shared[sg][lane * 4 + i];
                 acc += thread_x[i] * thread_x[i];
             }
             if (sg < 2) {
