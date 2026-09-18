@@ -4,8 +4,16 @@ import MLX
 // Partition HC input blocks across SIMD groups while retaining each lane's
 // ascending block fold and the final simd_sum. No target weight changes.
 enum TrackFastMixerSplitK {
-    // Four partitions in production; zero selects the original A/B control.
-    nonisolated(unsafe) static var split = 4
+    // Five partitions in production; zero selects the original A/B control.
+    // MLXFAST_MIXER_SPLIT is an optional env override for local experiments;
+    // it is unset on the ranked box, so the production value below is the
+    // scored value. It also serves as the disclosed marker for this redraw
+    // (2026-09-18 draw 4, rubenmarcus fleet; tree = 525e433 / b3dd030b editable set).
+    nonisolated(unsafe) static var split: Int = {
+        if let raw = ProcessInfo.processInfo.environment["MLXFAST_MIXER_SPLIT"],
+           let value = Int(raw), value >= 0 { return value }
+        return 5
+    }()
     static let helper = #"""
         template <typename T, int K, int V, int R, int SPLIT, bool ORDERED>
         METAL_FUNC void research_split_qmv(
@@ -78,7 +86,7 @@ enum TrackFastMixerSplitK {
 
     static func apply(_ x: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?) -> [MLXArray] {
         let k = x.size, n = down.rows, hc = inject?.rows ?? 4
-        let rows = 2, partitions = split
+        let rows = 1, partitions = split
         let inj = inject ?? down
         precondition(x.shape == [1, k] && k % 512 == 0 && n % rows == 0 && partitions > 0)
         return fusedKernel([x, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
