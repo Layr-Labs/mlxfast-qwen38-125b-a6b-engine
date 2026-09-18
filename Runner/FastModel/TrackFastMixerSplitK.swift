@@ -78,7 +78,17 @@ enum TrackFastMixerSplitK {
 
     static func apply(_ x: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?) -> [MLXArray] {
         let k = x.size, n = down.rows, hc = inject?.rows ?? 4
-        let rows = 2, partitions = split
+        // MLXFAST-SPLITKRPS: output rows per simdgroup in the split-K mixer
+        // down+inject kernel. `RPS` is a loop bound and an array extent only --
+        // `DN = ND / RPS`, `float r[RPS]`, the `research_split_qmv` template
+        // argument, and the `lo`/`act` stores at `tile * RPS + i` -- so it sets
+        // how many adjacent down rows one simdgroup owns and nothing else. The
+        // precondition `n % rows == 0` holds at 4 for this path's `n` (the
+        // mixer low rank, 320), the launch y extent `(n / rows + hc) *
+        // partitions` follows it, and the threadgroup stays `(32, partitions,
+        // 1)`. Threadgroup scratch is `(K / 512) * RPS * 32` floats under
+        // `ORDERED`, so it doubles with RPS and stays well inside the limit.
+        let rows = 4, partitions = split
         let inj = inject ?? down
         precondition(x.shape == [1, k] && k % 512 == 0 && n % rows == 0 && partitions > 0)
         return fusedKernel([x, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
