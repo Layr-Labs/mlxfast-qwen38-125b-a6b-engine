@@ -902,13 +902,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
             }
             let history = ctx + toks
-            if capture {
-                TrackPleContextMirror.invalidate()
-            } else {
-                TrackPleContextMirror.store(
-                    Array(history.suffix(contextLength)), nextOffset: offset + S,
-                    stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
-            }
+            // Capture calls store too. The mirror is fenced by the offset the
+            // context reaches: a later call only observes `offset + S` when
+            // every staged token of this call was committed, so the staged
+            // context IS the committed one. A partially rejected draft never
+            // reaches that offset, and the next call at the rewound offset
+            // overwrites the single slot before it can be served.
+            TrackPleContextMirror.store(
+                Array(history.suffix(contextLength)), nextOffset: offset + S,
+                stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
             let gid = p.embedding.hostRowIds(history: [history], newCount: S)
             let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
             embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
@@ -1139,7 +1141,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         _ tokens: MLXArray, inputEmbeddings: MLXArray?, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, capture: Bool
     ) -> (mixed: MLXArray, multi: MLXArray)? {
-        if capture { TrackPleContextMirror.invalidate() }
+        // Capture calls may serve and store the mirror like any other call:
+        // the offset fence only lets a staged context be observed at the
+        // offset it reaches, which implies every staged token committed.
         guard let plan = fastPlan(
             tokens: tokens, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds)
