@@ -42,7 +42,12 @@ enum TrackPleContextMirror {
     nonisolated(unsafe) private(set) static var dirty = true
 
     static func matches(offset: Int, layer: Int, length: Int) -> Bool {
-        !dirty && nextOffset == offset && stateLayerIndex == layer && contextLength == length
+        guard !dirty else { return false }
+        return hasSameWindow(offset: offset, layer: layer, length: length)
+    }
+
+    private static func hasSameWindow(offset: Int, layer: Int, length: Int) -> Bool {
+        nextOffset == offset && stateLayerIndex == layer && contextLength == length
     }
 
     static func store(
@@ -571,6 +576,23 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             } else {
                 act = TrackFastKernels.siluHead(lo: lo, width: hc.lowrank)
             }
+        }
+        // MLXFAST-MIXFUSE: the up projection and the mix in one launch. The pair
+        // below writes `w` [B,S,HC*H] out of the GEMM and reads every byte of it
+        // straight back; nothing else consumes it. Falls through whenever the
+        // packed rows are unavailable, the shape is not the prefill one, or a
+        // debug tap wants `w` itself.
+        if Self.debugTaps == nil, act.ndim == 3, act.dim(0) == 1, normed.ndim == 3,
+            inj.ndim == 3, let packed = hc.decodeUp,
+            let fused = TrackPrefillMixFuse.apply(
+                act: act.reshaped(act.dim(1), act.dim(2)), up: packed,
+                normed: normed.reshaped(normed.dim(1), normed.dim(2)),
+                inj: inj.reshaped(inj.dim(1), inj.dim(2)),
+                hidden: hidden, hcCount: hcCount, hasInject: hc.hasInject)
+        {
+            let S = act.dim(1)
+            return (fused.input.reshaped(1, S, hidden),
+                    fused.inject.reshaped(1, S, hcCount), nil)
         }
         let w = hc.up.apply(act)  // [B,S,W], pre-sigmoid
         if Self.debugTaps != nil, !tag.isEmpty {
