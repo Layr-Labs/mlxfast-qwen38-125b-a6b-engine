@@ -2206,7 +2206,12 @@ extension TrackFastMoEKernels {
         const device T* mat = w + (size_t)out_row * (size_t)K;
         const int n_iter = K / blockN;
         for (int i = 0; i < n_iter; ++i) {
-            for (int tn = 0; tn < TN; tn++) { v_coeff[tn] = x[bn + tn]; }
+            // The model input is BF16. The reference promotes that exact BF16
+            // value to float before the router product; do the promotion here
+            // instead of making the preceding mixer write a second FP32 copy.
+            for (int tn = 0; tn < TN; tn++) {
+                v_coeff[tn] = static_cast<float>(x[bn + tn]);
+            }
             int mat_offset = 0;
             for (int tm = 0; tm < TM; tm++) {
                 for (int tn = 0; tn < TN; tn++) { inter[tn] = static_cast<float>(mat[mat_offset + bn + tn]); }
@@ -2231,11 +2236,13 @@ extension TrackFastMoEKernels {
         outputNames: ["out"],
         source: routerGemvSource, ensureRowContiguous: true)
 
-    /// x float32 [K], w bf16 [N, K] -> logits float32 [N]. One-token windows only
+    /// x bf16 [K], w bf16 [N, K] -> logits float32 [N]. One-token windows only.
+    /// Each activation is promoted to float in-register, exactly where MLX's
+    /// float GEMV would consume the separately materialized FP32 copy.
     /// Retains MLX's per-row arithmetic for K in [65, 16N) with N < 4096.
     static func routerGemv(x: MLXArray, w: MLXArray) -> MLXArray {
         let K = w.dim(1), N = w.dim(0)
-        precondition(x.dtype == .float32 && x.size == K && w.dtype == .bfloat16)
+        precondition(x.dtype == .bfloat16 && x.size == K && w.dtype == .bfloat16)
         precondition(K % 128 == 0 && K > 64 && K < 16 * N && N % 16 == 0 && N < 4096)
         let rowsPerSimdgroup = K == 2560 && N == 512 ? 1 : 4  // MLXFAST-ROUTERRPS1
         return routerGemvKernel(
