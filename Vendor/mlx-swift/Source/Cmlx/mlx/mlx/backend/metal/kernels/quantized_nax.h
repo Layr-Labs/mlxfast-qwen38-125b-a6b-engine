@@ -986,6 +986,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
     const device T* x,
     device T* y,
     threadgroup T* Ws,
+    threadgroup T* As,
     const constant int& K,
     const constant int& N,
     const constant int& M,
@@ -1030,6 +1031,27 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   // Make the weight loader
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
 
+  // MLXFAST-NAXAS: the staged activation block gets the same padded leading
+  // dimension Ws uses, so every staged row starts on a 16-byte boundary.
+  constexpr int BKA_padded = BK_padded;
+  // Only bfloat16 stages. The float instantiation's Ws is already
+  // BN * BK_padded * 4 = 17,408 B and a second buffer of that size would take
+  // the threadgroup allocation past 32 KB; those shapes keep the device reads.
+  constexpr bool naxas_shape = metal::is_same_v<T, bfloat16_t> && BN == 64 &&
+      BK == 64 && WM == 2 && WN == 2 && (BM == 64 || BM == 32);
+  // BM * BK elements over WM * WN * SIMD_SIZE threads: 32 elements each at
+  // BM = 64 (A_SPLIT = 2 threads to a row), 16 at BM = 32 (A_SPLIT = 4).
+  constexpr short A_PER_THREAD =
+      naxas_shape ? short((BM * BK) / (WM * WN * SIMD_SIZE)) : short(1);
+  constexpr short A_SPLIT = naxas_shape ? short(BK / A_PER_THREAD) : short(1);
+  const short a_thread =
+      naxas_shape ? short(simd_gid * SIMD_SIZE + simd_lid) : short(0);
+  const short a_row = a_thread / A_SPLIT;
+  const short a_col = (a_thread % A_SPLIT) * A_PER_THREAD;
+  threadgroup T* a_dst = As + a_row * BKA_padded + a_col;
+  const short tile_m = short(min(int(BM), M - y_row));
+  const bool a_live = a_row < tile_m;
+
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
   constexpr short SK = 32;
@@ -1057,7 +1079,12 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   NAXTile<AccumType, TM, TN> Dtile;
   Dtile.clear();
 
-  x += tm * K;
+  // MLXFAST-NAXAS: `x` stays the threadgroup's row-block base, because the
+  // staging pass addresses every row of the block. The per-simdgroup row
+  // offset moves to the `As` read instead.
+  if constexpr (!naxas_shape) {
+    x += tm * K;
+  }
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
@@ -1068,6 +1095,19 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
             packed_w.prefetch(loader_w);
           }
         }
+        // MLXFAST-NAXAS: a row past `tile_m` holds zero for every K step --
+        // `a_dst` never advances -- so the fill is written once here rather
+        // than once per step. Zero is what the `load_safe` path being replaced
+        // produced for exactly those lanes, and those rows reach only their own
+        // Dtile rows, which `store_safe` discards either way.
+        if constexpr (naxas_shape) {
+          if (!a_live) {
+            STEEL_PRAGMA_UNROLL
+            for (short e = 0; e < A_PER_THREAD; ++e) {
+              a_dst[e] = T(0);
+            }
+          }
+        }
         for (int k = 0; k < K; k += BK) {
           threadgroup_barrier(mem_flags::mem_threadgroup);
           if constexpr (kPrefetch.value) {
@@ -1076,6 +1116,25 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
             loader_w.load_unsafe();
           } else {
             loader_w.load_safe(short2(BK, tgp_bn));
+          }
+
+          // MLXFAST-NAXAS. Each simdgroup used to walk A itself, out of device
+          // memory, inside the kk1 loop: SK elements per row at a stride of K
+          // elements, per simdgroup, per kk1 -- and with WM = WN = 2 the pairs
+          // (0, 1) and (2, 3) share `tm`, so they issue IDENTICAL reads and
+          // every A row of the tile was fetched twice. The block is staged once
+          // instead: WM * WN * SIMD_SIZE threads x A_PER_THREAD contiguous
+          // elements cover the whole BM x BK block, A_SPLIT threads to a row.
+          // It rides the barrier pair Ws already needs, so it adds no
+          // synchronization. Same elements, same per-simdgroup order.
+          if constexpr (naxas_shape) {
+            if (a_live) {
+              const device T* a_src = x + size_t(a_row) * K + a_col;
+              STEEL_PRAGMA_UNROLL
+              for (short e = 0; e < A_PER_THREAD; ++e) {
+                a_dst[e] = a_src[e];
+              }
+            }
           }
 
           threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1094,7 +1153,9 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
             volatile int compiler_barrier;
 
-            if constexpr (kAlignedM.value) {
+            if constexpr (naxas_shape) {
+              Atile.template load<T, BKA_padded, 1>(As + tm * BKA_padded + kk1);
+            } else if constexpr (kAlignedM.value) {
               Atile.load(x + kk1, K);
             } else {
               Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
@@ -1305,6 +1366,12 @@ template <
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
   threadgroup T Ws[BN * BK_padded];
+  // MLXFAST-NAXAS: BM x BK_padded bf16 -- 9,216 B at BM = 64, 4,608 B at
+  // BM = 32 -- and a one-element placeholder for every instantiation the
+  // staged path does not admit.
+  constexpr bool naxas_shape = metal::is_same_v<T, bfloat16_t> && BN == 64 &&
+      BK == 64 && WM == 2 && WN == 2 && (BM == 64 || BM == 32);
+  alignas(16) threadgroup T As[naxas_shape ? BM * BK_padded : 1];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1325,7 +1392,7 @@ template <
         tid);
   }
   qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
-      w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+      w, scales, biases, x, y, Ws, As, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
 template <
@@ -1430,6 +1497,12 @@ template <
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
   threadgroup T Ws[BN * BK_padded];
+  // MLXFAST-NAXAS: BM x BK_padded bf16 -- 9,216 B at BM = 64, 4,608 B at
+  // BM = 32 -- and a one-element placeholder for every instantiation the
+  // staged path does not admit.
+  constexpr bool naxas_shape = metal::is_same_v<T, bfloat16_t> && BN == 64 &&
+      BK == 64 && WM == 2 && WN == 2 && (BM == 64 || BM == 32);
+  alignas(16) threadgroup T As[naxas_shape ? BM * BK_padded : 1];
 
   adjust_matrix_offsets<T>(
       x,
@@ -1454,7 +1527,7 @@ template <
       b_strides,
       tid);
   qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
-      w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+      w, scales, biases, x, y, Ws, As, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
 template <
