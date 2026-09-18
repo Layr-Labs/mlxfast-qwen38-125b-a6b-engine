@@ -930,20 +930,37 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } else {
             let keyFlat = p.keyProj.apply(embedded)
             let value = p.valueProj.apply(embedded)
-            // norm_key * norm_query, then MLX's own reduction over the last axis.
-            let prod = TrackFastPLEKernels.prod(
-                keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
-                hcCount: hcCount, hidden: hidden, eps: eps)
-            let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
-            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
-            let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
-            let gn = TrackFastPLEKernels.gated(
-                g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
-                hcCount: hcCount, hidden: hidden, eps: eps)
-            let gated = gn.gated
-            full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
+            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: keyFlat.dtype)
+            let floor = TrackFastKernels.scalar(Float(1e-6), dtype: keyFlat.dtype)
+            let normed: MLXArray
+            let gated: MLXArray
+            if B * S * hcCount < 32 {
+                // Decode/verify windows: MLX's reduce is row_reduce_looped,
+                // whose fold the fused kernel reproduces exactly.
+                let pg = TrackFastPLEKernels.prodGated(
+                    keyFlat: keyFlat, stream: stream, value: value,
+                    kScale: p.normKeyScale, qScale: p.normQueryScale,
+                    cScale: p.normConvScale, divisor: divisor, floor: floor,
+                    hcCount: hcCount, hidden: hidden, eps: eps)
+                gated = pg.gated
+                normed = pg.normed
+            } else {
+                // norm_key * norm_query, then MLX's own reduction over the
+                // last axis (row_reduce_simple at this row count).
+                let prod = TrackFastPLEKernels.prod(
+                    keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale,
+                    qScale: p.normQueryScale, hcCount: hcCount, hidden: hidden,
+                    eps: eps)
+                let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
+                let gn = TrackFastPLEKernels.gated(
+                    g0: dot, value: value, cScale: p.normConvScale, divisor: divisor,
+                    floor: floor, hcCount: hcCount, hidden: hidden, eps: eps)
+                gated = gn.gated
+                normed = gn.normed
+            }
+            full = concatenated([convState, normed], axis: 1)  // [1, n+S, wide]
             output = TrackFastPLEKernels.conv(
                 full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
         }

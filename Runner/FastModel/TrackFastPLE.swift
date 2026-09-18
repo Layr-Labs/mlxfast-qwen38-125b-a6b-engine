@@ -25,6 +25,9 @@
 //   `track_ple_gated` the gate transform, the gated value, norm_conv
 //   `track_ple_conv`  the dilated conv, silu, and the residual add
 //
+// For decode/verify windows (B*S*HC < 32, where MLX's reduce is
+// row_reduce_looped) the first three collapse into `track_ple_prodgated`,
+// which reproduces row_reduce_looped's fold in-kernel.
 // EXACTNESS. The two norms are `rms_single_row`'s layout at axis 2560 -- four
 // consecutive elements per thread, a simd sum, a simd sum over the
 // per-simdgroup partials, `precise::rsqrt`, and the weight applied AFTER the
@@ -43,10 +46,10 @@
 // test checks element by element at S = 1..8.
 //
 // The reduction between `track_ple_prod` and `track_ple_gated` is left to
-// MLX. `sum` over a bf16 row accumulates in bf16 through `simd_sum`, and its
-// kernel changes with the window (`row_reduce_looped` below 32 rows,
-// `row_reduce_simple` at or above), so reproducing it would have to
-// reproduce both -- for one launch out of twenty.
+// MLX only at 32 or more rows, where `sum` picks `row_reduce_simple`.
+// Below that it picks `row_reduce_looped`, whose four-element in-dtype fold
+// `track_ple_prodgated` reproduces per row -- the same fold
+// TrackPLEFusion.prepare already runs at S=1.
 
 import Foundation
 import MLX
@@ -193,6 +196,133 @@ enum TrackFastPLEKernels {
             grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
             outputShapes: [[B, S, W], [B, S, W]],
             outputDTypes: [value.dtype, value.dtype])
+        return (outs[0], outs[1])
+    }
+
+    // MARK: prod + reduce + gated as one launch for decode/verify windows
+
+    /// keyFlat [B,S,W], stream [B,S,W], value [B,S,H], kscale/qscale/cscale
+    /// [W], divisor and floor as 0-dim arrays in the activation dtype, eps
+    ///   -> gated [B,S,W], normed [B,S,W]
+    /// grid (H/4, HC, B*S), threadgroup (H/4, 1, 1)
+    ///
+    /// The reduction between prod and gated is inlined with the same fold
+    /// TrackPLEFusion.prepare uses at S=1: a four-element in-dtype fold per
+    /// thread, an in-dtype simd_sum, then float partials summed in-dtype --
+    /// row_reduce_looped's association, which is the kernel MLX picks below
+    /// 32 rows (B*S*HC < 32, i.e. every decode/verify window). Larger windows
+    /// keep the separate prod + sum + gated launches, where MLX switches to
+    /// row_reduce_simple and this fold would not reproduce its rounding.
+    static let prodGatedSource = """
+        constexpr int N_READS = 4;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint hc = thread_position_in_grid.y;
+        const uint row = thread_position_in_grid.z;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        threadgroup float ksums[32];
+        threadgroup float qsums[32];
+        const uint base = row * W + hc * H;
+        constexpr uint simd_groups = (H + 32 * N_READS - 1) / (32 * N_READS);
+
+        // norm_key / norm_query sums, track_ple_prod's layout.
+        float kx[N_READS];
+        float qx[N_READS];
+        float kacc = 0.0f;
+        float qacc = 0.0f;
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            kx[i] = static_cast<float>(keyFlat[base + d]);
+            qx[i] = static_cast<float>(stream[base + d]);
+            kacc += kx[i] * kx[i];
+            qacc += qx[i] * qx[i];
+        }
+        kacc = simd_sum(kacc);
+        qacc = simd_sum(qacc);
+        if (sg == 0 && lane >= simd_groups) { ksums[lane] = 0; qsums[lane] = 0; }
+        if (lane == 0) { ksums[sg] = kacc; qsums[sg] = qacc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        kacc = simd_sum(ksums[lane]);
+        qacc = simd_sum(qsums[lane]);
+        const float kinv = metal::precise::rsqrt(kacc / (float)H + eps);
+        const float qinv = metal::precise::rsqrt(qacc / (float)H + eps);
+        // All phase-one partial reads are done; ksums is reused below.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // The dot MLX's row_reduce_looped runs on the prod row: per-thread
+        // four-element fold in the activation dtype, in-dtype simd_sum,
+        // float partials, in-dtype cross-simdgroup sum.
+        InT dot = InT(0);
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            const InT kn = static_cast<InT>(kx[i] * kinv) * kscale[hc * H + d];
+            const InT qn = static_cast<InT>(qx[i] * qinv) * qscale[hc * H + d];
+            const InT product = kn * qn;
+            dot = product + dot;
+        }
+        dot = InT(0) + dot;
+        dot = simd_sum(dot);
+        if (sg == 0 && lane >= simd_groups) { ksums[lane] = 0; }
+        if (lane == 0) { ksums[sg] = float(dot); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dot = simd_sum(InT(ksums[lane]));
+
+        // The gate chain and norm_conv, track_ple_gated's expressions.
+        InT g = dot / divisor;
+        g = mlx_sqrt_t(mlx_maximum(mlx_abs_t(g), floorv)) * mlx_sign(g);
+        const InT sgm = mlx_sigmoid(g);
+        float gx[N_READS];
+        float acc = 0.0f;
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            const InT v = sgm * value[row * H + d];
+            gated[base + d] = v;
+            gx[i] = static_cast<float>(v);
+            acc += gx[i] * gx[i];
+        }
+        acc = simd_sum(acc);
+        // qsums has not been read since phase one's post-read barrier.
+        if (sg == 0 && lane >= simd_groups) { qsums[lane] = 0; }
+        if (lane == 0) { qsums[sg] = acc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        acc = simd_sum(qsums[lane]);
+        const float inv = metal::precise::rsqrt(acc / (float)H + eps);
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            normed[base + d] = static_cast<InT>(gx[i] * inv) * cscale[hc * H + d];
+        }
+        """
+
+    nonisolated(unsafe) static let prodGatedKernel = MLXFast.metalKernel(
+        name: "track_ple_prodgated",
+        inputNames: [
+            "keyFlat", "stream", "value", "kscale", "qscale", "cscale",
+            "divisor", "floorv", "eps",
+        ],
+        outputNames: ["gated", "normed"],
+        source: prodGatedSource,
+        header: header + """
+            template <typename T> METAL_FUNC T mlx_abs_t(T x) { return metal::abs(x); }
+            template <typename T> METAL_FUNC T mlx_sqrt_t(T x) { return metal::precise::sqrt(x); }
+            """,
+        ensureRowContiguous: true)
+
+    static func prodGated(
+        keyFlat: MLXArray, stream: MLXArray, value: MLXArray,
+        kScale: MLXArray, qScale: MLXArray, cScale: MLXArray,
+        divisor: MLXArray, floor: MLXArray,
+        hcCount: Int, hidden: Int, eps: Float
+    ) -> (gated: MLXArray, normed: MLXArray) {
+        let B = keyFlat.dim(0), S = keyFlat.dim(1), W = hcCount * hidden
+        precondition(
+            hidden % 4 == 0 && hidden / 4 <= 1024 && keyFlat.dim(2) == W
+                && value.dim(2) == hidden)
+        let outs = prodGatedKernel(
+            [keyFlat, stream, value, kScale, qScale, cScale, divisor, floor, MLXArray(eps)],
+            template: [("InT", keyFlat.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+            grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
+            outputShapes: [[B, S, W], [B, S, W]],
+            outputDTypes: [keyFlat.dtype, keyFlat.dtype])
         return (outs[0], outs[1])
     }
 
