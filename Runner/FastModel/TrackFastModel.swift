@@ -767,9 +767,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             case .quant(let dq) = m.sharedDown, guq.biases != nil, dq.biases != nil
         {
             // The shared-expert gate is a bf16 Linear on this checkpoint (router gates
-            // are BF16): MLX's own GEMV keeps it; a quantized one rides in `route`.
+            // are BF16): its row rides in `route` as the dense gate; a quantized
+            // one takes the kernel's qmv path instead.
             var gateQ: TrackQuantWeight? = nil
-            if case .quant(let gq) = m.sharedGate, gq.biases != nil { gateQ = gq }
+            var gateD: MLXArray? = nil
+            switch m.sharedGate {
+            case .quant(let gq) where gq.biases != nil: gateQ = gq
+            case .dense(let gw) where gw.shape == [1, x.dim(2)] && gw.dtype == x.dtype: gateD = gw
+            default: break
+            }
             // Decode windows: three launches over MLX's own GEMV arithmetic for the
             // window size (per-row `qmv_fast` / `qmv` for the gathered experts, `qmv`
             // or `qmv_wide` for the shared expert): top-k + softmax + shared gate,
@@ -777,9 +783,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let S = x.dim(1), K = m.topK, H = x.dim(2)
             let x2 = x.reshaped(S, H)
             let r = TrackFastMoEKernels.route(
-                logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, topK: K)
+                logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, denseGate: gateD, topK: K)
             let (idx, weights) = (r.idx, r.w)
-            let gate = gateQ != nil ? r.gate : m.sharedGate.apply(x).reshaped(S)
+            let gate = (gateQ != nil || gateD != nil) ? r.gate : m.sharedGate.apply(x).reshaped(S)
             if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights, gate]) }
             let flatIdx = idx.reshaped(S * K)
             let xrow = Self.xrowTable(S: S, K: K)
@@ -804,14 +810,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             ).reshaped(1, S, H)
         }
         let idx: MLXArray, weights: MLXArray
+        var fusedGate: MLXArray? = nil
         if TrackP12Prefill.eligible(x), x.dim(2) == 2560,
             logits.dtype == .float32, logits.dim(-1) == 512, m.topK == 10,
             StreamOrDevice.default.stream === Stream.gpu
         {
+            var gateD: MLXArray? = nil
+            if case .dense(let gw) = m.sharedGate, gw.shape == [1, x.dim(2)], gw.dtype == x.dtype {
+                gateD = gw
+            }
             let routed = TrackFastMoEKernels.route(
-                logits: logits, x: x, sharedGate: nil, topK: m.topK)
+                logits: logits, x: x, sharedGate: nil, denseGate: gateD, topK: m.topK)
             idx = routed.idx
             weights = routed.w
+            fusedGate = routed.gate.reshaped(x.dim(0), x.dim(1), 1)
         } else {
             idx = argPartition(-logits, kth: m.topK - 1, axis: -1)[.ellipsis, ..<m.topK]
             weights = softmax(takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
@@ -842,7 +854,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             sharedAct = TrackFastKernels.swiglu(gu: m.sharedGateUp.apply(x))
         }
         let shared = m.sharedDown.apply(sharedAct)
-        let gate = m.sharedGate.apply(x)  // [B,S,1]
+        let gate = fusedGate ?? m.sharedGate.apply(x)  // [B,S,1]
         if prof { TrackFastProfile.tick("moe.shared", &pt, [shared, gate]) }
         // Read the routed rows through the permutation the sort already
         // produced instead of materialising a scattered copy of them.

@@ -763,10 +763,33 @@ extension TrackFastMoEKernels {
         const uint sg = simdgroup_index_in_threadgroup;
         // Shared-expert gate (1 row, K = KD): one token routes to `qmv`'s small-N
         // branch (simdgroup 0), two to eight to `qmv_wide`'s short tile, which
-        // folds K across the 8 slots of BOTH simdgroups.
+        // folds K across the 8 slots of BOTH simdgroups. A dense gate row —
+        // the bf16 Linear this checkpoint ships — takes the same lane-strided
+        // float dot and the same single rounding to the activation dtype.
         if constexpr (HAS_GATE) {
             const device T* xr = x + (size_t)row * (size_t)KD;
-            if constexpr (VPT == 1) {
+            if constexpr (GATE_DENSE) {
+                if constexpr (VPT == 1) {
+                    if (sg == 0) {
+                        float acc = 0.0f;
+                        for (uint k = lane; k < (uint)KD; k += 32) {
+                            acc += float(xr[k]) * float(wg[k]);
+                        }
+                        acc = simd_sum(acc);
+                        if (lane == 0) { gate[row] = static_cast<T>(acc); }
+                    }
+                } else {
+                    threadgroup float gp[2];
+                    float acc = 0.0f;
+                    for (uint k = lane; k < (uint)KD; k += 32) {
+                        acc += float(xr[k]) * float(wg[k]);
+                    }
+                    acc = simd_sum(acc);
+                    if (lane == 0) { gp[sg] = acc; }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (sg == 0 && lane == 0) { gate[row] = static_cast<T>(gp[0] + gp[1]); }
+                }
+            } else if constexpr (VPT == 1) {
                 track_inject_qmv<T, GS, BITS, KD, 1, 4>(wg, sgw, bgw, xr, gate + row, sg, lane);
             } else {
                 threadgroup float fp[8];
@@ -870,19 +893,25 @@ extension TrackFastMoEKernels {
 
     /// logits f32 [..., E] -> (idx uint32 [..., K], w f32 [..., K])
     /// Also the shared-expert gate logit per row: x [..., KD] x sharedGate [1, KD] -> gate [...] (pre-sigmoid).
-    static func route(logits: MLXArray, x: MLXArray, sharedGate: TrackQuantWeight?, topK: Int)
+    /// `sharedGate` is the quantized form; `denseGate` is the dense row this
+    /// checkpoint ships (same dtype as `x`), folded into the same launch.
+    static func route(logits: MLXArray, x: MLXArray, sharedGate: TrackQuantWeight?,
+        denseGate: MLXArray? = nil, topK: Int)
         -> (idx: MLXArray, w: MLXArray, gate: MLXArray)
     {
         precondition(logits.dtype == .float32 && (sharedGate == nil || (sharedGate!.rows == 1 && sharedGate!.bits == 4)))
+        precondition(sharedGate == nil || denseGate == nil)
+        precondition(denseGate == nil || (denseGate!.shape == [1, x.dim(-1)] && denseGate!.dtype == x.dtype))
         let g = sharedGate
         let E = logits.dim(-1), KD = x.dim(-1)
         let lead = Array(logits.shape.dropLast())
         let R = lead.reduce(1, *)
         precondition(topK <= 32 && topK <= E && R >= 1 && (g == nil || R <= 8) && KD % 256 == 0)
-        let simdgroups = g == nil ? 1 : 2
+        let hasGate = g != nil || denseGate != nil
+        let simdgroups = hasGate ? 2 : 1
         let outs = (R == 1 ? routeKernel1 : routeKernel)(
-            [logits.reshaped(R, E), x.reshaped(R, KD), g?.weight ?? x, g?.scales ?? x, g?.biases ?? x],
-            template: [("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32), ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R), ("HAS_GATE", g != nil)],
+            [logits.reshaped(R, E), x.reshaped(R, KD), denseGate ?? g?.weight ?? x, g?.scales ?? x, g?.biases ?? x],
+            template: [("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32), ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R), ("HAS_GATE", hasGate), ("GATE_DENSE", denseGate != nil)],
             grid: (32, R * simdgroups, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[R, topK], [R, topK], [R]], outputDTypes: [.uint32, .float32, x.dtype])
         return (outs[0].reshaped(lead + [topK]), outs[1].reshaped(lead + [topK]), outs[2].reshaped(lead))
