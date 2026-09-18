@@ -131,8 +131,9 @@ enum TrackFastPLEKernels {
     // MARK: the gate scalar chain, the gated value, and norm_conv
 
     /// g0 [B,S,HC,1] (the reduced dot), value [B,S,H], cscale [W], divisor and
-    /// floor as 0-dim arrays in the activation dtype, eps
-    ///   -> gated [B,S,W], normed [B,S,W]
+    /// floor as 0-dim arrays in the activation dtype, convState [1,NSTATE,W],
+    /// eps
+    ///   -> gated [B,S,W], full [B,NSTATE+S,W] (carried state ++ normed)
     /// grid (H/4, HC, B*S), threadgroup (H/4, 1, 1)
     static let gatedSource = """
         constexpr int N_READS = 4;
@@ -166,14 +167,27 @@ enum TrackFastPLEKernels {
         const float inv = metal::precise::rsqrt(acc / (float)H + eps);
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
-            normed[base + d] = static_cast<InT>(gx[i] * inv) * cscale[hc * H + d];
+            const InT n = static_cast<InT>(gx[i] * inv) * cscale[hc * H + d];
+            const uint b = row / S;
+            const uint t = row - b * S;
+            full[((size_t)b * (NSTATE + S) + NSTATE + t) * (size_t)W + hc * H + d] = n;
+        }
+        // The carried conv state occupies the first NSTATE rows of `full`;
+        // copy it here so no separate concat launch is needed. Each
+        // threadgroup owns the same four channels it normed.
+        for (uint j = 0; j < NSTATE; ++j) {
+            for (int i = 0; i < N_READS; ++i) {
+                const uint d = lid * N_READS + i;
+                full[((size_t)(row / S) * (NSTATE + S) + j) * (size_t)W + hc * H + d] =
+                    convState[j * W + hc * H + d];
+            }
         }
         """
 
     nonisolated(unsafe) static let gatedKernel = MLXFast.metalKernel(
         name: "track_ple_gated",
-        inputNames: ["g0", "value", "cscale", "divisor", "floorv", "eps"],
-        outputNames: ["gated", "normed"],
+        inputNames: ["g0", "value", "cscale", "divisor", "floorv", "convState", "eps"],
+        outputNames: ["gated", "full"],
         source: gatedSource,
         header: header + """
             template <typename T> METAL_FUNC T mlx_abs_t(T x) { return metal::abs(x); }
@@ -183,15 +197,21 @@ enum TrackFastPLEKernels {
 
     static func gated(
         g0: MLXArray, value: MLXArray, cScale: MLXArray, divisor: MLXArray, floor: MLXArray,
-        hcCount: Int, hidden: Int, eps: Float
-    ) -> (gated: MLXArray, normed: MLXArray) {
+        convState: MLXArray, hcCount: Int, hidden: Int, eps: Float
+    ) -> (gated: MLXArray, full: MLXArray) {
         let B = value.dim(0), S = value.dim(1), W = hcCount * hidden
-        precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && value.dim(2) == hidden)
+        let nstate = convState.dim(1)
+        precondition(
+            hidden % 4 == 0 && hidden / 4 <= 1024 && value.dim(2) == hidden
+                && convState.dim(2) == W)
         let outs = gatedKernel(
-            [g0, value, cScale, divisor, floor, MLXArray(eps)],
-            template: [("InT", value.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+            [g0, value, cScale, divisor, floor, convState, MLXArray(eps)],
+            template: [
+                ("InT", value.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+                ("S", S), ("NSTATE", nstate),
+            ],
             grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
-            outputShapes: [[B, S, W], [B, S, W]],
+            outputShapes: [[B, S, W], [B, nstate + S, W]],
             outputDTypes: [value.dtype, value.dtype])
         return (outs[0], outs[1])
     }

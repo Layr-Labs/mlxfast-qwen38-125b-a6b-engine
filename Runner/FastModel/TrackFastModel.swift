@@ -941,9 +941,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
             let gn = TrackFastPLEKernels.gated(
                 g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
-                hcCount: hcCount, hidden: hidden, eps: eps)
+                convState: convState, hcCount: hcCount, hidden: hidden, eps: eps)
             let gated = gn.gated
-            full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
+            full = gn.full  // [B, n+S, wide]: state rows copied in-kernel, no concat launch
             output = TrackFastPLEKernels.conv(
                 full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
         }
