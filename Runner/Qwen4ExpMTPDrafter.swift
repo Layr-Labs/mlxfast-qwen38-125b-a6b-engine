@@ -56,10 +56,6 @@ public final class TrackQwen4ExpInlineMTPAssistant {
     private let embedTokens: Embedding
     // ADDED: the head's forward over the fast kernels (nil when disabled).
     private let fastHead: TrackFastHead?
-
-    /// The draft argmax over a shortlist of the vocabulary: the lowest ids
-    /// (this tokenizer assigns ids in BPE merge order, i.e. by corpus
-    /// frequency; the public golden's tokens fall under 98,304 in 99.7% of
     /// cases) plus the added tokens at the top. The shortlist rows of `lm_head`
     /// are gathered once; their logits are the same per-row GEMV as the full
     /// head's, so the shortlist argmax IS the full argmax whenever the latter
@@ -187,6 +183,12 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         /// engine's finalize synchronization.
         var roundRoots: [MLXArray] = []
 
+        /// Rolling tail of the committed token stream, used to feed the PLE
+        /// context mirror. Extended by the trusted carry at each round's
+        /// first draft step; empty until enough tokens have committed to
+        /// fill the context window.
+        var committedTail: [Int64] = []
+
         var cacheOffset: Int {
             guard let first = caches.first else { return 0 }
             precondition(
@@ -239,6 +241,7 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             multiFrontier = nil
             roundTrustedMulti.removeAll(keepingCapacity: false)
             roundTrustedTokens.removeAll(keepingCapacity: false)
+            committedTail.removeAll(keepingCapacity: false)
             roundRoots.removeAll(keepingCapacity: false)
             roundBaseOffset = 0
             roundValidHistoryOffset = 0
@@ -362,6 +365,27 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             // it builds a deeper draft step, so the trusted flush ends here.
             state.roundValidHistoryOffset = state.cacheOffset
         }
+
+        // Feed the PLE context mirror from the committed tail so the verify
+        // forward's n-gram hash never reads the staged ssm state back. The
+        // trusted carry is exactly the newly committed tokens since the last
+        // round — accepted drafts plus the new carry — so the rolling tail
+        // here is the context the verify window hashes. The mirror's offset
+        // fence is the round anchor: the head runs one token ahead of the
+        // target's committed frontier, hence `committedInputCount - 1`.
+        if isFirstStep {
+            let contextLength = max(1, target.configuration.ngramSize - 1)
+            let fed = feed.tokens.asType(.int32).asArray(Int32.self).map(Int64.init)
+            state.committedTail = Array((state.committedTail + fed).suffix(contextLength))
+            if state.committedTail.count == contextLength, !target.pleEmbeddings.isEmpty {
+                TrackPleContextMirror.store(
+                    state.committedTail,
+                    nextOffset: state.committedInputCount - 1,
+                    stateLayerIndex: target.configuration.pleStateLayerIndex(ordinal: 0),
+                    contextLength: contextLength)
+            }
+        }
+
         return (step.draft, step.multi)
     }
 
