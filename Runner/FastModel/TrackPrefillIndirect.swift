@@ -34,18 +34,18 @@ enum TrackPrefillIndirect {
         outputNames: ["y"], source: sourceDown, header: metalHeader,
         ensureRowContiguous: true)
 
-    /// `[2 * maxTiles]` of `[begin, end)` row ranges, one 32-row tile per slot,
+    /// `[2 * maxTiles]` of `[begin, end)` row ranges, one 16-row tile per slot,
     /// each aligned to the start of its expert run; unused slots are `[0, 0)`.
     private static let tileKernel = MLXFast.metalKernel(
         name: "track_prefill_tile_table",
         inputNames: ["sorted_ids"], outputNames: ["tiles"],
         source: tileSource, header: "", ensureRowContiguous: true)
 
-    static let tileRows = 32
+    static let tileRows = 16
     static let tileThreads = 1024
 
-    /// Every expert run of `r` rows takes `ceil(r / 32)` tiles, so the count is
-    /// bounded by `rows / 32 + experts` for sorted ids over `experts` values.
+    /// Every expert run of `r` rows takes `ceil(r / 16)` tiles, so the count is
+    /// bounded by `rows / 16 + experts` for sorted ids over `experts` values.
     static func maxTiles(rows: Int, experts: Int) -> Int {
         (rows + tileRows - 1) / tileRows + experts
     }
@@ -101,8 +101,8 @@ enum TrackPrefillIndirect {
         let activated = gateUpKernel(
             [x, g.w, g.s, g.b, u.w, u.s, u.b, sortedIDs, tokenRows, tiles],
             template: [("T", x.dtype), ("N", 640), ("K", 2560), ("SILU", true)],
-            grid: (10 * 32, maxT * 2, 2),
-            threadGroup: (32, 2, 2),
+            grid: (10 * 32, maxT, 4),
+            threadGroup: (32, 1, 4),
             outputShapes: [[rows, 1, 640]], outputDTypes: [.bfloat16])[0]
         return (activated, sortedIDs, inverse, tiles)
     }
@@ -131,8 +131,8 @@ enum TrackPrefillIndirect {
     static let sourceGU = #"""
         alignas(16) threadgroup T Ws0[64 * 72];
         alignas(16) threadgroup T Ws1[64 * 72];
-        alignas(16) threadgroup T As[32 * 72];
-        track_prefill_indirect_gu<T, 32, 4, 32, 64, 64, 2, 2, true, SILU, N>(
+        alignas(16) threadgroup T As[16 * 72];
+        track_prefill_indirect_gu<T, 32, 4, 16, 64, 64, 1, 4, true, SILU, N>(
             x, w0, scales0, biases0, w1, scales1, biases1, indices, token_rows, tiles,
             y0, y1, N, K, Ws0, Ws1, As, threadgroup_position_in_grid,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
