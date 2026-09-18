@@ -435,17 +435,17 @@ extension TrackFastKernels {
         qkv: MLXArray, qNorm: MLXArray, kNorm: MLXArray, cos: MLXArray, sin: MLXArray,
         heads: Int, kvHeads: Int, headDim: Int, rotaryDims: Int, eps: Float
     ) -> (q: MLXArray, k: MLXArray, v: MLXArray) {
-        let B = qkv.dim(0), S = qkv.dim(1)
+        let B = qkv.dim(0), S = qkv.dim(1), inT = qkv.dtype
         precondition(headDim % 4 == 0 && rotaryDims % 8 == 0 && cos.dim(1) == rotaryDims)
         let outs = attnPrepKernel(
             [qkv, qNorm, kNorm, cos, sin],
             template: [
-                ("InT", qkv.dtype), ("D", headDim), ("HQ", heads), ("HK", kvHeads), ("S", S),
+                ("InT", inT), ("D", headDim), ("HQ", heads), ("HK", kvHeads), ("S", S),
                 ("QW", qkv.dim(2)), ("ROT", rotaryDims), ("EPS_BITS", Int(eps.bitPattern)),
             ],
             grid: (headDim / 4, heads + 2 * kvHeads, B * S), threadGroup: (headDim / 4, 1, 1),
             outputShapes: [[B, heads, S, headDim], [B, kvHeads, S, headDim], [B, kvHeads, S, headDim]],
-            outputDTypes: [qkv.dtype, qkv.dtype, qkv.dtype])
+            outputDTypes: [inT, inT, inT])
         return (outs[0], outs[1], outs[2])
     }
 
