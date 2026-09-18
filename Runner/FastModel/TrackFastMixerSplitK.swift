@@ -5,7 +5,15 @@ import MLX
 // ascending block fold and the final simd_sum. No target weight changes.
 enum TrackFastMixerSplitK {
     // Four partitions in production; zero selects the original A/B control.
-    nonisolated(unsafe) static var split = 4
+    // MLXFAST_MIXER_SPLIT is an optional env override for local experiments;
+    // it is unset on the ranked box, so the production value below is the
+    // scored value. It also serves as the disclosed marker for this redraw
+    // (2026-09-18 draw 1, rubenmarcus fleet; tree = e0676ed7's editable set).
+    nonisolated(unsafe) static var split: Int = {
+        if let raw = ProcessInfo.processInfo.environment["MLXFAST_MIXER_SPLIT"],
+           let value = Int(raw), value >= 0 { return value }
+        return 4
+    }()
     static let helper = #"""
         template <typename T, int K, int V, int R, int SPLIT, bool ORDERED>
         METAL_FUNC void research_split_qmv(
