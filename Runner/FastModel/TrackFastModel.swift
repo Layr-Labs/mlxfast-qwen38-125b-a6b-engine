@@ -277,9 +277,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// Layers per partial dispatch inside a forward (0 = one dispatch per step).
     nonisolated(unsafe) public static var asyncChunk: Int = 3
     /// Layers in the first partial-dispatch chunk (0 = same as asyncChunk):
-    /// the first dispatch lands right after the PLE layer, whose host row
-    /// gather is the one host sync of the step.
-    nonisolated(unsafe) public static var asyncFirst: Int = 2
+    /// the first dispatch lands right after layer 0, so the GPU executes the
+    /// first block while the PLE host row gather -- kicked off beside it on
+    /// the gather queue -- lands on its own thread.
+    nonisolated(unsafe) public static var asyncFirst: Int = 1
     /// Layer count at an optional second dispatch (0 = none).
     nonisolated(unsafe) public static var asyncSecond: Int = 0
 
@@ -861,7 +862,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
-        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool,
+        prefetched: TrackPleGatherBox?
     ) -> MLXArray {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
@@ -879,40 +881,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             state?.conv ?? MLXArray.zeros([1, p.stateLength, wide], dtype: stream.dtype)
 
         let embedded: MLXArray
-        // Host history for the decode/verify windows: the ids are hashed on the
-        // host (bit-for-bit the device hash) and the context is staged as a
-        // host-backed int32 array, so the only device sync of the step is the
-        // one on the fed token itself.
+        // Host history for the decode/verify windows: the ids are hashed on
+        // the host (bit-for-bit the device hash) and the context is staged as
+        // a host-backed int32 array. The whole chain -- token readback,
+        // context mirror, row-id hash, row gather -- was kicked off beside
+        // the layer-0 dispatch on the gather queue, so the join below is the
+        // only residue of what used to be the step's one host sync.
         var hostHistory: [Int64]? = nil
-        if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
-            let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
-            let ctx: [Int64]
-            if !capture,
-                TrackPleContextMirror.matches(
-                    offset: offset, layer: p.stateLayerIndex, length: contextLength),
-                let mirrored = TrackPleContextMirror.context
-            {
-                ctx = mirrored
-            } else {
-                let rawPrev = state?.ssm
-                ctx = rawPrev.map {
-                    $0.dtype == .int32
-                        ? $0.asArray(Int32.self).map(Int64.init)
-                        : $0.asType(.int64).asArray(Int64.self)
-                } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
-            }
-            let history = ctx + toks
-            if capture {
-                TrackPleContextMirror.invalidate()
-            } else {
-                TrackPleContextMirror.store(
-                    Array(history.suffix(contextLength)), nextOffset: offset + S,
-                    stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
-            }
-            let gid = p.embedding.hostRowIds(history: [history], newCount: S)
-            let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
-            embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
-            hostHistory = history
+        if let box = prefetched {
+            let gathered = box.join()
+            embedded = gathered.embedded.asType(stream.dtype)
+            hostHistory = gathered.history
         } else {
             TrackPleContextMirror.invalidate()
             embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
@@ -1011,6 +990,22 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     ) -> (mixed: MLXArray, multi: MLXArray) {
         precondition(recurrentState.count == 1)
         let evaluation = recurrentState[0]
+        // Kick off every PLE host gather beside the tower build. The gather
+        // needs only the fed tokens, the recurrent input state, the offset,
+        // and the context mirror -- all known here -- so the row reads and
+        // the token readback run on the gather queue while this thread keeps
+        // dispatching. `pleForward` joins on the box at the PLE layer.
+        var pleGathers: [Int: TrackPleGatherBox] = [:]
+        for layer in layers where layer.ple != nil {
+            if let box = TrackPleGather.start(
+                layer.ple!, ids: ids, evaluation: evaluation,
+                offset: offset, capture: capture,
+                eosTokenId: cfg.eosTokenId,
+                nHeads: (cfg.ngramSize - 1) * cfg.headsPerNGram)
+            {
+                pleGathers[layer.index] = box
+            }
+        }
         var residual = inputEmbeddings ?? embedTokens(ids)  // [B,S,H] until tiled
         // A fully injected hyper-stream can continue through a layer block.
         // Normal token/embedding entry points retain the initial tiling.
@@ -1036,7 +1031,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     stream
                     + pleForward(
                         ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
+                        offset: offset, capture: capture,
+                        prefetched: pleGathers[layer.index])
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
