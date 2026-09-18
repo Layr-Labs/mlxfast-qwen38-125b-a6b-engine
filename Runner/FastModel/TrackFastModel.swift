@@ -937,7 +937,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
-            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
+            let divisor = TrackFastKernels.scalar(
+                Foundation.sqrt(Float(hidden)), dtype: dot.dtype)
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
             let gn = TrackFastPLEKernels.gated(
                 g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
@@ -1024,6 +1025,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let profiling = TrackFastProfile.prefill != nil && ids.dim(1) >= TrackFastProfile.minWindow
         var profT = profiling ? CFAbsoluteTimeGetCurrent() : 0
         if profiling { TrackFastProfile.windows += 1 }
+        // Snapshot the async-dispatch configuration once per forward: the
+        // statics are `nonisolated(unsafe)` reads that nothing in the loop
+        // mutates, so the effective boundaries are loop-invariant.
+        let dispatchChunk = Self.asyncChunk
+        let dispatchFirst = Self.asyncFirst > 0 ? Self.asyncFirst : Self.asyncChunk
+        let dispatchSecond = Self.asyncSecond > dispatchFirst ? Self.asyncSecond : dispatchFirst
         for layer in layers {
             var normed: MLXArray
             if let ple = layer.ple {
@@ -1093,9 +1100,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // CPU keeps building the rest (the build is otherwise GPU-idle time).
             if Self.asyncChunk > 0 {
                 let n = layer.index + 1
-                let first = Self.asyncFirst > 0 ? Self.asyncFirst : Self.asyncChunk
-                let second = Self.asyncSecond > first ? Self.asyncSecond : first
-                if n == first || n == second || (n > second && (n - second) % Self.asyncChunk == 0) { asyncEval(stream) }
+                if n == dispatchFirst || n == dispatchSecond
+                    || (n > dispatchSecond && (n - dispatchSecond) % dispatchChunk == 0)
+                { asyncEval(stream) }
             }
         }
         let (multi, finalNormed) = injectNorm(
