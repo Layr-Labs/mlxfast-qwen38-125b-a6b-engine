@@ -31,33 +31,48 @@ import MLXNN
 /// The device already carries this fixed-length token window in `state.ssm`,
 /// but reading it with `asArray()` drains the GPU once per small decode call.
 /// The mirror is seeded from that authoritative state and then advanced from
-/// the tokens fed to the same call.  It is fenced by the attention offset,
+/// the tokens fed to the same call. It keeps the WHOLE served window — the
+/// context plus the fed ids — so it answers any offset inside that window,
+/// not only the first offset past it: a partially accepted verify window
+/// rolls the next offset back into the served range, and the fed tokens at
+/// those positions are fixed, so the slice it returns is the same token list
+/// the rolled-back `ssm` would have read back. It is fenced by the
 /// state-layer identity and window length so a reset or a different model
 /// state cannot reuse an old host window.
 enum TrackPleContextMirror {
-    nonisolated(unsafe) private(set) static var context: [Int64]? = nil
-    nonisolated(unsafe) private(set) static var nextOffset: Int? = nil
+    nonisolated(unsafe) private(set) static var history: [Int64]? = nil
+    nonisolated(unsafe) private(set) static var windowStart: Int? = nil
     nonisolated(unsafe) private(set) static var stateLayerIndex: Int? = nil
     nonisolated(unsafe) private(set) static var contextLength: Int? = nil
     nonisolated(unsafe) private(set) static var dirty = true
 
-    static func matches(offset: Int, layer: Int, length: Int) -> Bool {
-        !dirty && nextOffset == offset && stateLayerIndex == layer && contextLength == length
+    /// The `length` tokens ending at `offset`, when the stored window covers
+    /// them. `history` holds the context then the fed ids, so position
+    /// `windowStart + i` sits at index `contextLength + i`; the slice for
+    /// `offset` is the `length` entries ending at index
+    /// `offset - windowStart + length`.
+    static func context(offset: Int, layer: Int, length: Int) -> [Int64]? {
+        guard !dirty, stateLayerIndex == layer, contextLength == length,
+            let history, let windowStart,
+            offset >= windowStart,
+            offset - windowStart + length <= history.count
+        else { return nil }
+        return Array(history[(offset - windowStart) ..< (offset - windowStart + length)])
     }
 
     static func store(
-        _ context: [Int64], nextOffset: Int, stateLayerIndex: Int, contextLength: Int
+        history: [Int64], windowStart: Int, stateLayerIndex: Int, contextLength: Int
     ) {
-        self.context = context
-        self.nextOffset = nextOffset
+        self.history = history
+        self.windowStart = windowStart
         self.stateLayerIndex = stateLayerIndex
         self.contextLength = contextLength
         dirty = false
     }
 
     static func invalidate() {
-        context = nil
-        nextOffset = nil
+        history = nil
+        windowStart = nil
         stateLayerIndex = nil
         contextLength = nil
         dirty = true
@@ -888,9 +903,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
             let ctx: [Int64]
             if !capture,
-                TrackPleContextMirror.matches(
-                    offset: offset, layer: p.stateLayerIndex, length: contextLength),
-                let mirrored = TrackPleContextMirror.context
+                let mirrored = TrackPleContextMirror.context(
+                    offset: offset, layer: p.stateLayerIndex, length: contextLength)
             {
                 ctx = mirrored
             } else {
@@ -906,7 +920,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 TrackPleContextMirror.invalidate()
             } else {
                 TrackPleContextMirror.store(
-                    Array(history.suffix(contextLength)), nextOffset: offset + S,
+                    history: history, windowStart: offset,
                     stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
             }
             let gid = p.embedding.hostRowIds(history: [history], newCount: S)
