@@ -222,12 +222,64 @@ enum TrackFastPLEKernels {
         outputNames: ["out"],
         source: convSource, header: header, ensureRowContiguous: true)
 
+    /// Four channels per thread: the same taps and the same ascending
+    /// accumulation order as `convSource`, with both operand streams read as
+    /// `vec<InT,4>` -- eight vector loads per thread instead of thirty-two
+    /// scalar loads across four threads. `full` rows are W-aligned and
+    /// `convw` rows are KC-aligned, so every vector load is aligned whenever
+    /// W % 4 == 0 and KC == 4, which is the only shape this kernel takes.
+    static let convVecSource = """
+        const uint c4 = thread_position_in_grid.x * 4;
+        const uint t = thread_position_in_grid.y;
+        const uint b = thread_position_in_grid.z;
+        if (c4 >= (uint)W) return;
+        const device InT* fb = full + (size_t)b * (size_t)(NIN) * (size_t)W;
+        metal::vec<InT, 4> wv[4];
+        for (int i = 0; i < 4; ++i) {
+            wv[i] = *reinterpret_cast<const device metal::vec<InT, 4>*>(
+                convw + (size_t)(c4 + (uint)i) * (uint)KC);
+        }
+        float4 acc = float4(0.0f);
+        for (int j = 0; j < KC; ++j) {
+            const metal::vec<InT, 4> f =
+                *reinterpret_cast<const device metal::vec<InT, 4>*>(
+                    fb + (size_t)(t + (uint)(j * DIL)) * (size_t)W + c4);
+            for (int i = 0; i < 4; ++i) {
+                acc[i] += static_cast<float>(f[i]) * static_cast<float>(wv[i][j]);
+            }
+        }
+        const size_t o = ((size_t)b * (size_t)S + (size_t)t) * (size_t)W + c4;
+        const metal::vec<InT, 4> gv =
+            *reinterpret_cast<const device metal::vec<InT, 4>*>(gated + o);
+        metal::vec<InT, 4> ov;
+        for (int i = 0; i < 4; ++i) {
+            ov[i] = gv[i] + mlx_silu(static_cast<InT>(acc[i]));
+        }
+        *reinterpret_cast<device metal::vec<InT, 4>*>(out + o) = ov;
+        """
+
+    nonisolated(unsafe) static let convVecKernel = MLXFast.metalKernel(
+        name: "track_ple_conv_vec4",
+        inputNames: ["full", "convw", "gated"],
+        outputNames: ["out"],
+        source: convVecSource, header: header, ensureRowContiguous: true)
+
     static func conv(
         full: MLXArray, convW: MLXArray, gated: MLXArray, dilation: Int
     ) -> MLXArray {
         let B = gated.dim(0), S = gated.dim(1), W = gated.dim(2)
         let kc = convW.dim(1)
         precondition(full.dim(2) == W && full.dim(1) == S + (kc - 1) * dilation)
+        if kc == 4, W % 4 == 0 {
+            return convVecKernel(
+                [full, convW, gated],
+                template: [
+                    ("InT", gated.dtype), ("W", W), ("S", S), ("KC", kc), ("DIL", dilation),
+                    ("NIN", full.dim(1)),
+                ],
+                grid: (W / 4, S, B), threadGroup: (256, 1, 1),
+                outputShapes: [[B, S, W]], outputDTypes: [gated.dtype])[0]
+        }
         return convKernel(
             [full, convW, gated],
             template: [
