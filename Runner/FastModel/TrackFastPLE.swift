@@ -79,6 +79,7 @@ enum TrackFastPLEKernels {
         const uint sg = simdgroup_index_in_threadgroup;
         threadgroup float ksums[32];
         threadgroup float qsums[32];
+        const uint kbase = row * KS + hc * H;
         const uint base = row * W + hc * H;
         float kx[N_READS];
         float qx[N_READS];
@@ -86,7 +87,7 @@ enum TrackFastPLEKernels {
         float qacc = 0.0f;
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
-            kx[i] = static_cast<float>(keyFlat[base + d]);
+            kx[i] = static_cast<float>(keyFlat[kbase + d]);
             qx[i] = static_cast<float>(stream[base + d]);
             kacc += kx[i] * kx[i];
             qacc += qx[i] * qx[i];
@@ -117,13 +118,15 @@ enum TrackFastPLEKernels {
 
     static func prod(
         keyFlat: MLXArray, stream: MLXArray, kScale: MLXArray, qScale: MLXArray,
-        hcCount: Int, hidden: Int, eps: Float
+        hcCount: Int, hidden: Int, eps: Float, keyStride: Int? = nil
     ) -> MLXArray {
         let B = keyFlat.dim(0), S = keyFlat.dim(1), W = hcCount * hidden
-        precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && keyFlat.dim(2) == W)
+        let ks = keyStride ?? W
+        precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && keyFlat.dim(2) == ks)
         return prodKernel(
             [keyFlat, stream, kScale, qScale, MLXArray(eps)],
-            template: [("InT", keyFlat.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+            template: [("InT", keyFlat.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+                       ("KS", ks)],
             grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
             outputShapes: [[B, S, W]], outputDTypes: [keyFlat.dtype])[0]
     }
@@ -152,7 +155,7 @@ enum TrackFastPLEKernels {
         float acc = 0.0f;
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
-            const InT v = sgm * value[row * H + d];
+            const InT v = sgm * value[row * VS + VOFF + d];
             gated[base + d] = v;
             gx[i] = static_cast<float>(v);
             acc += gx[i] * gx[i];
@@ -183,13 +186,16 @@ enum TrackFastPLEKernels {
 
     static func gated(
         g0: MLXArray, value: MLXArray, cScale: MLXArray, divisor: MLXArray, floor: MLXArray,
-        hcCount: Int, hidden: Int, eps: Float
+        hcCount: Int, hidden: Int, eps: Float,
+        valueStride: Int? = nil, valueOffset: Int = 0
     ) -> (gated: MLXArray, normed: MLXArray) {
         let B = value.dim(0), S = value.dim(1), W = hcCount * hidden
-        precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && value.dim(2) == hidden)
+        let vs = valueStride ?? hidden
+        precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && value.dim(2) == vs)
         let outs = gatedKernel(
             [g0, value, cScale, divisor, floor, MLXArray(eps)],
-            template: [("InT", value.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+            template: [("InT", value.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+                       ("VS", vs), ("VOFF", valueOffset)],
             grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
             outputShapes: [[B, S, W], [B, S, W]],
             outputDTypes: [value.dtype, value.dtype])

@@ -230,6 +230,9 @@ struct TrackPLE {
     let embedding: Qwen4ExpNGramEmbedding
     let keyProj: TrackProj
     let valueProj: TrackProj
+    /// key|value row-concatenated for the S<=8 verify windows; bit-exact on
+    /// the GEMV paths (one output row is one accumulation regardless of N).
+    let kvProj: TrackMultiProj
     let normKeyScale: MLXArray
     let normQueryScale: MLXArray
     let normConvScale: MLXArray
@@ -475,11 +478,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     static func bindPLE(_ ple: Qwen4ExpPLELayer, ordinal: Int, cfg: Qwen4ExpTextConfiguration)
         -> TrackPLE
     {
-        let convW = ple.trackChild("conv1d").trackArray("weight")
+        let keyProj = TrackProj(ple.trackChild("key_proj"))
+        let valueProj = TrackProj(ple.trackChild("value_proj"))
         return TrackPLE(
             embedding: ple.pleEmbedding,
-            keyProj: TrackProj(ple.trackChild("key_proj")),
-            valueProj: TrackProj(ple.trackChild("value_proj")),
+            keyProj: keyProj,
+            valueProj: valueProj,
+            kvProj: TrackMultiProj([keyProj, valueProj]),
             normKeyScale: ple.trackChild("norm_key").trackArray("weight"),
             normQueryScale: ple.trackChild("norm_query").trackArray("weight"),
             normConvScale: ple.trackChild("norm_conv").trackArray("weight"),
@@ -928,12 +933,35 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         {
             (full, output) = fused
         } else {
-            let keyFlat = p.keyProj.apply(embedded)
-            let value = p.valueProj.apply(embedded)
+            // key|value as ONE row-concatenated GEMV on the verify windows
+            // (S<=8): the fused weight's rows are the two projections' rows,
+            // so each output element is the one the separate GEMVs produce.
+            // The consumers read the fused buffer in place through their
+            // stride parameters -- no slice, no copy. Wider windows keep the
+            // two separate GEMMs (the split-K choice depends on N).
+            let keyFlat: MLXArray
+            let value: MLXArray
+            let keyStride: Int
+            let valueStride: Int
+            let valueOffset: Int
+            if let fusedKV = p.kvProj.fused, S <= 8 {
+                let kv = fusedKV.apply(embedded)  // [B,S,W+H]
+                keyFlat = kv
+                value = kv
+                keyStride = p.kvProj.width
+                valueStride = p.kvProj.width
+                valueOffset = p.keyProj.rows
+            } else {
+                keyFlat = p.keyProj.apply(embedded)
+                value = p.valueProj.apply(embedded)
+                keyStride = hcCount * hidden
+                valueStride = hidden
+                valueOffset = 0
+            }
             // norm_key * norm_query, then MLX's own reduction over the last axis.
             let prod = TrackFastPLEKernels.prod(
                 keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
-                hcCount: hcCount, hidden: hidden, eps: eps)
+                hcCount: hcCount, hidden: hidden, eps: eps, keyStride: keyStride)
             let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
@@ -941,7 +969,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
             let gn = TrackFastPLEKernels.gated(
                 g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
-                hcCount: hcCount, hidden: hidden, eps: eps)
+                hcCount: hcCount, hidden: hidden, eps: eps,
+                valueStride: valueStride, valueOffset: valueOffset)
             let gated = gn.gated
             full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
             output = TrackFastPLEKernels.conv(
