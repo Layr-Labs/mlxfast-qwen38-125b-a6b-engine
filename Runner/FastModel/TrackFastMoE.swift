@@ -755,26 +755,10 @@ METAL_FUNC void qmv_impl(
 // `simd_sum`, multiply by the reciprocal).
 
 extension TrackFastMoEKernels {
-    /// logits f32 [R, E] -> idx uint32 [R, K], w f32 [R, K].
-    static let routeSource = """
-        constexpr int E_PER = (E + 31) / 32;
-        const uint row = threadgroup_position_in_grid.y;
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        // Shared-expert gate (1 row, K = KD): one token routes to `qmv`'s small-N
-        // branch (simdgroup 0), two to eight to `qmv_wide`'s short tile, which
-        // folds K across the 8 slots of BOTH simdgroups.
-        if constexpr (HAS_GATE) {
-            const device T* xr = x + (size_t)row * (size_t)KD;
-            if constexpr (VPT == 1) {
-                track_inject_qmv<T, GS, BITS, KD, 1, 4>(wg, sgw, bgw, xr, gate + row, sg, lane);
-            } else {
-                threadgroup float fp[8];
-                float r[1]; bool valid = false; int orow = 0;
-                qmv_wide_reg_partial<T, GS, BITS, 1, 8>(wg, sgw, bgw, xr, KD, 1, 1, fp, sg, lane, r, valid, orow);
-                if (valid) { gate[row] = static_cast<T>(r[0]); }
-            }
-        }
+    /// Top-k + softmax body shared by `routeSource` and `prefillRouteSource`.
+    /// Callers bind `row`, `lane`, `sg`, `E_PER` plus the VPT / HAS_GATE
+    /// template constants that steer REGISTER_RESULTS and SEL_SG.
+    static let routeSelectSource = """
         // MLXFAST-ROUTEREG: the walk's winners come from a simd_max/simd_min
         // pair, so logit and index are already broadcast across the walk's own
         // simdgroup. Normalize them there and skip the threadgroup round trip.
@@ -856,6 +840,40 @@ extension TrackFastMoEKernels {
         }
         """
 
+    /// logits f32 [R, E] -> idx uint32 [R, K], w f32 [R, K].
+    static let routeSource = """
+        constexpr int E_PER = (E + 31) / 32;
+        const uint row = threadgroup_position_in_grid.y;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        // Shared-expert gate (1 row, K = KD): one token routes to `qmv`'s small-N
+        // branch (simdgroup 0), two to eight to `qmv_wide`'s short tile, which
+        // folds K across the 8 slots of BOTH simdgroups.
+        if constexpr (HAS_GATE) {
+            const device T* xr = x + (size_t)row * (size_t)KD;
+            if constexpr (VPT == 1) {
+                track_inject_qmv<T, GS, BITS, KD, 1, 4>(wg, sgw, bgw, xr, gate + row, sg, lane);
+            } else {
+                threadgroup float fp[8];
+                float r[1]; bool valid = false; int orow = 0;
+                qmv_wide_reg_partial<T, GS, BITS, 1, 8>(wg, sgw, bgw, xr, KD, 1, 1, fp, sg, lane, r, valid, orow);
+                if (valid) { gate[row] = static_cast<T>(r[0]); }
+            }
+        }
+        """ + routeSelectSource
+
+    /// Prefill: the same select/softmax as `route`, with no shared-gate GEMV,
+    /// no dummy weight binds and no unused gate buffer. VPT is pinned to the
+    /// wide-window value so REGISTER_RESULTS and SEL_SG resolve exactly as the
+    /// R > 1 instantiation of `route` does, and one JIT variant serves every
+    /// window size.
+    static let prefillRouteSource = """
+        constexpr int E_PER = (E + 31) / 32;
+        const uint row = threadgroup_position_in_grid.y;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        """ + routeSelectSource
+
     nonisolated(unsafe) static let routeKernel = MLXFast.metalKernel(
         name: "track_moe_route",
         inputNames: ["logits", "x", "wg", "sgw", "bgw"],
@@ -886,6 +904,28 @@ extension TrackFastMoEKernels {
             grid: (32, R * simdgroups, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[R, topK], [R, topK], [R]], outputDTypes: [.uint32, .float32, x.dtype])
         return (outs[0].reshaped(lead + [topK]), outs[1].reshaped(lead + [topK]), outs[2].reshaped(lead))
+    }
+
+    nonisolated(unsafe) static let prefillRouteKernel = MLXFast.metalKernel(
+        name: "track_moe_route_prefill",
+        inputNames: ["logits"],
+        outputNames: ["idx", "w"],
+        source: prefillRouteSource, header: TrackFastKernels.mixerHeadHeader, ensureRowContiguous: true)
+
+    /// logits f32 [..., E] -> (idx uint32 [..., K], w f32 [..., K]). Prefill only:
+    /// identical top-k walk and softmax to `route` at HAS_GATE = false, VPT = 2.
+    static func routePrefill(logits: MLXArray, topK: Int) -> (idx: MLXArray, w: MLXArray) {
+        precondition(logits.dtype == .float32)
+        let E = logits.dim(-1)
+        let lead = Array(logits.shape.dropLast())
+        let R = lead.reduce(1, *)
+        precondition(topK <= 32 && topK <= E && R >= 1)
+        let outs = prefillRouteKernel(
+            [logits.reshaped(R, E)],
+            template: [("E", E), ("K", topK), ("VPT", 2), ("HAS_GATE", false)],
+            grid: (32, R, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[R, topK], [R, topK]], outputDTypes: [.uint32, .float32])
+        return (outs[0].reshaped(lead + [topK]), outs[1].reshaped(lead + [topK]))
     }
 }
 
