@@ -1087,7 +1087,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
             }
           }
 
-          STEEL_PRAGMA_NO_UNROLL
+          STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             NAXTile<T, TM, TK> Atile;
             NAXTile<T, TN, TK> Btile;
