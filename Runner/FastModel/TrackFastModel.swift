@@ -647,7 +647,28 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
+    ///
+    /// MLXFAST-ROPETAB: cos/sin rows are position-separable, so one table built
+    /// over the whole indexer budget serves every forward on the fast path
+    /// (`fastPlan` already bounds `offset + S <= indexerBudget`). Each call
+    /// then slices the rows it needs instead of rebuilding positions ->
+    /// `cosSin` -> two casts -> two reshapes. The cache is keyed on the
+    /// activation dtype; a request outside the budget takes the original
+    /// per-call build.
+    private var ropeTableCache: (dtype: DType, cos: MLXArray, sin: MLXArray)?
+
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
+        if offset + count <= indexerBudget {
+            if ropeTableCache?.dtype != dtype {
+                let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: 0, count: indexerBudget))
+                let cc = c.asType(dtype).reshaped(indexerBudget, rotaryDims)
+                let ss = s.asType(dtype).reshaped(indexerBudget, rotaryDims)
+                eval(cc, ss)
+                ropeTableCache = (dtype, cc, ss)
+            }
+            let table = ropeTableCache!
+            return (table.cos[offset ..< (offset + count)], table.sin[offset ..< (offset + count)])
+        }
         let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
         return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
     }
