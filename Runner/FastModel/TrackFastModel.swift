@@ -776,10 +776,23 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // gate|up + SwiGLU for the routed and the shared expert, down + combine.
             let S = x.dim(1), K = m.topK, H = x.dim(2)
             let x2 = x.reshaped(S, H)
-            let r = TrackFastMoEKernels.route(
-                logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, topK: K)
-            let (idx, weights) = (r.idx, r.w)
-            let gate = gateQ != nil ? r.gate : m.sharedGate.apply(x).reshaped(S)
+            let idx: MLXArray, weights: MLXArray, gate: MLXArray
+            if let gateQ {
+                let r = TrackFastMoEKernels.route(
+                    logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, topK: K)
+                idx = r.idx
+                weights = r.w
+                gate = r.gate
+            } else {
+                // Dense bf16 shared gate: it stays a separate GEMV, so the route
+                // dispatch runs the dedicated no-gate kernel -- four fewer
+                // buffer bindings and no dead `gate` output per launch.
+                let r = TrackFastMoEKernels.routeNoGate(
+                    logits: logits.reshaped(S, -1), topK: K)
+                idx = r.idx
+                weights = r.w
+                gate = m.sharedGate.apply(x).reshaped(S)
+            }
             if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights, gate]) }
             let flatIdx = idx.reshaped(S * K)
             let xrow = Self.xrowTable(S: S, K: K)
@@ -808,8 +821,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             logits.dtype == .float32, logits.dim(-1) == 512, m.topK == 10,
             StreamOrDevice.default.stream === Stream.gpu
         {
-            let routed = TrackFastMoEKernels.route(
-                logits: logits, x: x, sharedGate: nil, topK: m.topK)
+            let routed = TrackFastMoEKernels.routeNoGate(logits: logits, topK: m.topK)
             idx = routed.idx
             weights = routed.w
         } else {
