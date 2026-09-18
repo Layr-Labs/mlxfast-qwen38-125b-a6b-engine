@@ -861,7 +861,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
-        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool,
+        gather: TrackPleGather? = nil
     ) -> MLXArray {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
@@ -884,7 +885,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // host-backed int32 array, so the only device sync of the step is the
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
-        if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
+        if let gathered = gather?.join() {
+            // The side thread already ran the readback/hash/gather chain and
+            // the mirror bookkeeping; only the dtype cast stays here.
+            embedded = gathered.embedded.asType(stream.dtype)
+            hostHistory = gathered.history
+        } else if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
             let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
             let ctx: [Int64]
             if !capture,
@@ -1020,6 +1026,29 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         var attentionIndex = 0
         var stream = residual
         let ropeTab = ropeTables(offset: offset, count: ids.dim(1), dtype: residual.dtype)
+        // The PLE layer's host row gather (token readback, n-gram hash, table
+        // fetch) depends only on `ids` and the staged context, both known at
+        // this point. Run it on a side thread so it overlaps the graph
+        // construction of the layers ahead of PLE -- and any GPU tail the
+        // readback waits on -- instead of idling the decode loop inside
+        // `pleForward`. `inputState` is resolved on this thread; the gather
+        // never touches `evaluation`.
+        let pleGather: TrackPleGather? = {
+            guard let ple = layers.first(where: { $0.ple != nil })?.ple,
+                let host = ple.embedding.rowSourceHolder.source
+                    as? Qwen4ExpNGramHostRowSource,
+                ids.dim(1) <= 8
+            else { return nil }
+            return TrackPleGather.start(
+                embedding: ple.embedding, host: host, ids: ids,
+                state: evaluation.inputState(modelLayerIndex: ple.stateLayerIndex),
+                offset: offset, S: ids.dim(1), capture: capture,
+                contextLength: max(1, ple.dilation - 1),
+                stateLayerIndex: ple.stateLayerIndex,
+                eosTokenId: cfg.eosTokenId,
+                ngramHeads: (cfg.ngramSize - 1) * cfg.headsPerNGram)
+        }()
+
 
         let profiling = TrackFastProfile.prefill != nil && ids.dim(1) >= TrackFastProfile.minWindow
         var profT = profiling ? CFAbsoluteTimeGetCurrent() : 0
@@ -1036,7 +1065,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     stream
                     + pleForward(
                         ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
+                        offset: offset, capture: capture, gather: pleGather)
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
