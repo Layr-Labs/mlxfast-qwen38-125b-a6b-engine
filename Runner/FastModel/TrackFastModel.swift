@@ -230,6 +230,9 @@ struct TrackPLE {
     let embedding: Qwen4ExpNGramEmbedding
     let keyProj: TrackProj
     let valueProj: TrackProj
+    /// Row-concatenated key|value weight for the one-launch S=1 GEMV; nil when
+    /// the two projections cannot share a quantized geometry.
+    let keyValueFused: TrackProj?
     let normKeyScale: MLXArray
     let normQueryScale: MLXArray
     let normConvScale: MLXArray
@@ -476,10 +479,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         -> TrackPLE
     {
         let convW = ple.trackChild("conv1d").trackArray("weight")
+        let keyProj = TrackProj(ple.trackChild("key_proj"))
+        let valueProj = TrackProj(ple.trackChild("value_proj"))
         return TrackPLE(
             embedding: ple.pleEmbedding,
-            keyProj: TrackProj(ple.trackChild("key_proj")),
-            valueProj: TrackProj(ple.trackChild("value_proj")),
+            keyProj: keyProj,
+            valueProj: valueProj,
+            keyValueFused: TrackProj.fused([keyProj, valueProj]),
             normKeyScale: ple.trackChild("norm_key").trackArray("weight"),
             normQueryScale: ple.trackChild("norm_query").trackArray("weight"),
             normConvScale: ple.trackChild("norm_conv").trackArray("weight"),
@@ -917,8 +923,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             TrackPleContextMirror.invalidate()
             embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
         }
-        // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
-        // every other shape takes the three-launch PLE block below.
+        // MLXFAST-PLEFUSE2: one fused key|value GEMV + prepare + convolution at
+        // S=1; every other shape takes the three-launch PLE block below. Both
+        // convolutions fold the residual add, so `output` IS the new stream.
         let full: MLXArray
         let output: MLXArray
         if S == 1, TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
@@ -945,7 +952,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let gated = gn.gated
             full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
             output = TrackFastPLEKernels.conv(
-                full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
+                full: full, convW: p.convW2, gated: gated, stream: stream, dilation: p.dilation)
         }
         do {
             if capture {
@@ -1027,16 +1034,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         for layer in layers {
             var normed: MLXArray
             if let ple = layer.ple {
-                // Materialize the stream, add the PLE block, then norm.
+                // Materialize the stream, run the PLE block (its convolution
+                // folds the residual add), then norm.
                 (stream, _) = injectNorm(
                     residual: residual, out: pendingOut, inject: pendingInject,
                     scale: layer.attnHC.normScaleQ,
                     tile: tile)
-                stream =
-                    stream
-                    + pleForward(
-                        ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
+                stream = pleForward(
+                    ple, stream: stream, ids: ids, evaluation: evaluation,
+                    offset: offset, capture: capture)
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,

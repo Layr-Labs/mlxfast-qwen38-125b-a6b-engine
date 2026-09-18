@@ -1,4 +1,7 @@
-// MLXFAST-PLEFUSE2: S=1 PLE fusion. No projection or weight-layout changes.
+// MLXFAST-PLEFUSE2: S=1 PLE fusion. The key and value projections run as ONE
+// GEMV over their row-concatenated quantized weight (per-row accumulation is
+// N-independent in affine qmv_fast, so the fused launch is bit-exact), and the
+// convolution folds the residual add the caller used to launch separately.
 // Scratch: ONE reused float[32] (128 B) in prepare, ZERO in convolution.
 // This retains the RMS/reduction lane layout and the dilated convolution's
 // channel-per-threadgroup layout; token tolerance, not bit equality, applies.
@@ -24,6 +27,8 @@ enum TrackPLEFusion {
 
     static let prepareSource = """
         // MLXFAST-PLEFUSE2: all three group norms, dot, gate, and concat.
+        // `kv` is the row-concatenated key|value projection output: key rows
+        // [0, W), value rows [W, W + H) of the same buffer.
         constexpr uint H = 2560;
         constexpr uint W = 4 * H;
         const uint hc = threadgroup_position_in_grid.y;
@@ -39,7 +44,7 @@ enum TrackPLEFusion {
         // keeping both rows live across the reductions.
         float acc = 0.0f;
         for (uint i = 0; i < 4; ++i) {
-            float k = float(key[base + i]);
+            float k = float(kv[base + i]);
             acc += k * k;
         }
         const float ik = metal::precise::rsqrt(
@@ -56,7 +61,7 @@ enum TrackPLEFusion {
         // product before sum, and use row_reduce_looped's four-element fold.
         InT dot = InT(0);
         for (uint i = 0; i < 4; ++i) {
-            InT k = InT(float(key[base + i]) * ik);
+            InT k = InT(float(kv[base + i]) * ik);
             k = k * keyScale[base + i];
             InT q = InT(float(query[base + i]) * iq);
             q = q * queryScale[base + i];
@@ -83,7 +88,7 @@ enum TrackPLEFusion {
         InT g[4];
         acc = 0.0f;
         for (uint i = 0; i < 4; ++i) {
-            g[i] = activation * value[d + i];
+            g[i] = activation * kv[W + d + i];
             gated[base + i] = g[i];
             float v = float(g[i]);
             acc += v * v;
@@ -127,18 +132,20 @@ enum TrackPLEFusion {
         if (lane == 0) {
             InT convolved = InT(acc);
             InT activated = mlx_silu(convolved);
-            out[c] = gated[c] + activated;
+            // The residual add the caller used to launch separately:
+            // stream + (gated + silu(conv)), same operand order.
+            out[c] = stream[c] + (gated[c] + activated);
         }
         """
 
     static let prepareKernel = MLXFast.metalKernel(
         name: "track_ple_prepare_fuse2",
-        inputNames: ["key", "query", "value", "keyScale", "queryScale", "convScale", "convState"],
+        inputNames: ["kv", "query", "keyScale", "queryScale", "convScale", "convState"],
         outputNames: ["gated", "full"], source: prepareSource,
         header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
 
     static let convolutionKernel = MLXFast.metalKernel(
-        name: "track_ple_convolution_fuse2", inputNames: ["full", "weight", "gated"],
+        name: "track_ple_convolution_fuse2", inputNames: ["full", "weight", "gated", "stream"],
         outputNames: ["out"], source: convolutionSource,
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
@@ -148,6 +155,7 @@ enum TrackPLEFusion {
             && [.bfloat16, .float16, .float32].contains(stream.dtype)
             && p.dilation == 3 && p.stateLength == 9
             && p.keyProj.rows == 10240 && p.valueProj.rows == 2560
+            && p.keyValueFused != nil
             && p.convW.shape == [10240, 4, 1] && p.convW.dtype == stream.dtype
             && [p.normKeyScale, p.normQueryScale, p.normConvScale].allSatisfy {
                 $0.shape == [10240] && $0.dtype == stream.dtype
@@ -157,22 +165,22 @@ enum TrackPLEFusion {
     static func forward(
         _ p: TrackPLE, embedded: MLXArray, stream: MLXArray, convState: MLXArray, eps: Float
     ) -> (full: MLXArray, output: MLXArray)? {
-        // The original two projections stay separate, with unchanged kernels,
-        // quantization, tiling, and weight-loading lane ownership.
-        let key = p.keyProj.apply(embedded)
-        let value = p.valueProj.apply(embedded)
-        guard key.shape == [1, 1, 10240], value.shape == [1, 1, 2560],
-            key.dtype == stream.dtype, value.dtype == stream.dtype
+        // One GEMV over the row-concatenated key|value weight: at M = 1 the
+        // affine qmv_fast kernel accumulates each output row independently of
+        // N, so the fused launch is bit-exact with the two separate ones.
+        guard let fusedKV = p.keyValueFused else { return nil }
+        let kv = fusedKV.apply(embedded)
+        guard kv.shape == [1, 1, 12800], kv.dtype == stream.dtype
         else { return nil }
         let r = prepareKernel(
-            [key, stream, value, p.normKeyScale, p.normQueryScale, p.normConvScale, convState],
+            [kv, stream, p.normKeyScale, p.normQueryScale, p.normConvScale, convState],
             template: [("InT", stream.dtype), ("EPS_BITS", Int(eps.bitPattern)),
                        ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern))],
             grid: (640, 4, 1), threadGroup: (640, 1, 1),
             outputShapes: [[1, 1, 10240], [1, 10, 10240]],
             outputDTypes: [stream.dtype, stream.dtype])
         let output = convolutionKernel(
-            [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
+            [r[1], p.convW, r[0], stream], template: [("InT", stream.dtype)],
             grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
             outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
         return (r[1], output)
