@@ -610,6 +610,19 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             state?.conv ?? MLXArray.zeros([B, geo.convKernel - 1, geo.convDim], dtype: x.dtype)
         let ssm =
             state?.ssm ?? MLXArray.zeros([B, geo.hv, geo.dv, geo.dk], dtype: .float32)
+        if capture && S >= 2 {
+            do {
+                let y = try TrackCompactReplay.gdn(
+                    proj: proj, convState: convState, convW: g.convW,
+                    negExpALog: g.negExpALog, dtBias: g.dtBias, stateIn: ssm,
+                    geometry: geo, evaluation: evaluation, layerIndex: layerIndex)
+                let gated = TrackFastKernels.gatedRMS(
+                    y: y, proj: proj, w: g.normW, zOffset: g.zOffset, eps: 1e-6)
+                return g.out.apply(gated)
+            } catch {
+                preconditionFailure("TrackFastModel: compact GDN stage failed: \(error)")
+            }
+        }
         let gated: MLXArray, convOut: MLXArray, stateOut: MLXArray
         if let fused = TrackFastGDNDecode.apply(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
@@ -948,7 +961,18 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
         }
         do {
-            if capture {
+            if capture && S >= 2 {
+                let history: MLXArray
+                if let h = hostHistory {
+                    history = MLXArray(h.map(Int32.init)).reshaped(1, -1)
+                } else {
+                    history = concatenated([devicePrevious(), ids], axis: 1).asType(.int32)
+                }
+                try TrackCompactReplay.stagePLE(
+                    full: full, history: history, positions: S, stateLength: p.stateLength,
+                    contextLength: contextLength, wide: wide, layerIndex: p.stateLayerIndex,
+                    evaluation: evaluation)
+            } else if capture {
                 let n = p.stateLength
                 let convStack = asStrided(full, [S, n, wide], strides: [wide, wide, 1], offset: wide)
                 let contextStack: MLXArray
@@ -1188,7 +1212,11 @@ extension TrackQwen4ExpFastModel: CBv2KeepMaskRequiringModel {
 extension TrackQwen4ExpFastModel: CBv2PositionedRecurrentLanguageModelForwardable,
     CBv2PositionedRecurrentEmbeddingForwardable
 {
-    public var cbv2Capabilities: CBv2ModelCapabilities { base.cbv2Capabilities }
+    public var cbv2Capabilities: CBv2ModelCapabilities {
+        var capabilities = base.cbv2Capabilities
+        capabilities.supportsCompactRecurrentMTPReplay = true
+        return capabilities
+    }
     public var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec { base.cbv2RecurrentStateSpec }
 
     public func cbv2Forward(
