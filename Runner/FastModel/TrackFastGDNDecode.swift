@@ -1,4 +1,3 @@
-// Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
 // TrackFastKernels.prepSource, leanSource and gatedRMSSource.
 
 import MLX
@@ -73,6 +72,29 @@ enum TrackFastGDNDecode {
             const device StT* first_state = state_in + (n * Dv + sg * RPS) * Dk;
             next_state = *reinterpret_cast<const device float4*>(first_state + 4 * lane);
         }
+        // MLXFAST-GDNSPREAD: twelve simdgroups fold one channel each instead of
+        // three folding four, then the original three simdgroups read their own
+        // four channels back in order for the square accumulation and the RMS.
+        threadgroup float xs_shared[3][Dk];
+        if (sg < 12) {
+            const uint vv = sg >> 2;
+            const uint ii = sg & 3u;
+            const uint vecA = vv == 0 ? hk_idx : (vv == 1 ? Hk + hk_idx : 2 * Hk + hv_idx);
+            const device InT* projA = proj + b_idx * PW;
+            const device InT* cstA = conv_state + b_idx * KM1 * CONV_DIM;
+            const uint ch = vecA * 128 + lane * 4 + ii;
+            float cacc = 0.0f;
+            for (int j = 0; j < KC; ++j) {
+                const float wv = (j < KM1)
+                    ? static_cast<float>(cstA[(uint)(j * CONV_DIM) + ch])
+                    : static_cast<float>(projA[(uint)((j - KM1) * PW) + ch]);
+                cacc += wv * conv_w[ch * KC + j];
+            }
+            const InT c0 = static_cast<InT>(cacc);
+            const InT c1 = mlx_silu(c0);
+            xs_shared[vv][lane * 4 + ii] = static_cast<float>(c1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg < 3) {
             const uint vec = sg == 0 ? hk_idx : (sg == 1 ? Hk + hk_idx : 2 * Hk + hv_idx);
             const device InT* proj_b = proj + b_idx * PW;
@@ -84,14 +106,7 @@ enum TrackFastGDNDecode {
             float thread_x[4];
             float acc = 0.0f;
             for (int i = 0; i < 4; ++i) {
-                const uint ch = vec * 128 + lane * 4 + i;
-                float cacc = 0.0f;
-                for (int j = 0; j < KC; ++j) {
-                    cacc += win(j, ch) * conv_w[ch * KC + j];
-                }
-                const InT c0 = static_cast<InT>(cacc);
-                const InT c1 = mlx_silu(c0);
-                thread_x[i] = static_cast<float>(c1);
+                thread_x[i] = xs_shared[sg][lane * 4 + i];
                 acc += thread_x[i] * thread_x[i];
             }
             if (sg < 2) {
