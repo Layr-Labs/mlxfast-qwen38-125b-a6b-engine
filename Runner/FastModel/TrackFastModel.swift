@@ -64,6 +64,21 @@ enum TrackPleContextMirror {
     }
 }
 
+/// Private exact deferred GDN updates. Keeping this out of the public
+/// recurrent-state tuple avoids changing its allocation shape on alternating
+/// decode steps.
+private final class TrackGDNJournalEntry {
+    weak var state: MLXArray?
+    let nextOffset: Int
+    let array: MLXArray
+
+    init(state: MLXArray, nextOffset: Int, array: MLXArray) {
+        self.state = state
+        self.nextOffset = nextOffset
+        self.array = array
+    }
+}
+
 // MARK: - Weight helpers
 
 extension Module {
@@ -266,6 +281,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let hidden: Int
     let eps: Float
     private let injectNormReplay: @Sendable ([MLXArray]) -> [MLXArray]
+    private var gdnJournals: [ObjectIdentifier: TrackGDNJournalEntry] = [:]
     let rotaryDims: Int
     let rotary: Qwen4ExpRotary
     let indexerBudget: Int
@@ -588,7 +604,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func gdnForward(
         _ g: TrackGDN, _ x: MLXArray, layerIndex: Int,
-        evaluation: CBv2RecurrentStateEvaluation, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         // A wide window already runs the four input projections as four
@@ -611,12 +627,32 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let ssm =
             state?.ssm ?? MLXArray.zeros([B, geo.hv, geo.dv, geo.dk], dtype: .float32)
         let gated: MLXArray, convOut: MLXArray, stateOut: MLXArray
+        // A new evaluation object is bound for every token. The dense state
+        // object itself is stable across the deferred step because that step
+        // stages it by identity, so it is the lifecycle key for the private
+        // journal. The weak fence prevents object-identifier reuse.
+        let journalKey = ObjectIdentifier(ssm)
+        let entry = gdnJournals[journalKey]
+        let pendingJournal: MLXArray?
+        if !capture, let entry, entry.state === ssm, entry.nextOffset == offset {
+            pendingJournal = entry.array
+        } else {
+            gdnJournals.removeValue(forKey: journalKey)
+            pendingJournal = nil
+        }
         if let fused = TrackFastGDNDecode.apply(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
-            dtBias: g.dtBias, stateIn: ssm, normW: g.normW, zOffset: g.zOffset,
-            eps: 1e-6, capture: capture, geometry: geo)
+            dtBias: g.dtBias, stateIn: ssm, normW: g.normW,
+            pendingJournal: pendingJournal, zOffset: g.zOffset, eps: 1e-6,
+            capture: capture, geometry: geo)
         {
             (gated, convOut, stateOut) = (fused.gated, fused.convOut, fused.stateOut)
+            if let journal = fused.journal {
+                gdnJournals[journalKey] = TrackGDNJournalEntry(
+                    state: ssm, nextOffset: offset + S, array: journal)
+            } else {
+                gdnJournals.removeValue(forKey: journalKey)
+            }
             if prof { TrackFastProfile.tick("gdn.decodeFused", &pt, [gated, stateOut, convOut]) }
         } else {
             let r = TrackFastKernels.gdn(
@@ -1057,7 +1093,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let attended: MLXArray
             if let gdn = layer.gdn {
                 attended = gdnForward(
-                    gdn, input, layerIndex: layer.index, evaluation: evaluation, capture: capture)
+                    gdn, input, layerIndex: layer.index, evaluation: evaluation,
+                    offset: offset, capture: capture)
             } else {
                 let cache = caches[attentionIndex]
                 attentionIndex += 1
