@@ -1,7 +1,8 @@
 // MLXFAST-PLEFUSE2: S=1 PLE fusion. No projection or weight-layout changes.
 // Scratch: ONE reused float[32] (128 B) in prepare, ZERO in convolution.
-// This retains the RMS/reduction lane layout and the dilated convolution's
-// channel-per-threadgroup layout; token tolerance, not bit equality, applies.
+// This retains the RMS/reduction lane layout. The four-tap convolution assigns
+// independent channels to lanes and keeps ordered FP32 products/additions.
+// Official token tolerance remains the authority for full-model correctness.
 import Foundation
 import MLX
 
@@ -104,31 +105,31 @@ enum TrackPLEFusion {
         """
 
     static let convolutionSource = """
-        // MLXFAST-PLEFUSE2: preserve the S=1 dilated implicit-GEMM dispatch:
-        // group=(32,1,4), grid of groups=(1,1,W), channel=group.z.
-        // Its small-channel loaders assign taps 0..3 to SIMD 0 lanes 0..3;
-        // lane 0 owns the single valid output. Keep those owners, discard
-        // the padded matrix work, and require no threadgroup storage.
+        // Four-tap depthwise convolution: channels are independent. One lane
+        // owns one channel, so neighboring lanes read neighboring history
+        // elements. No inter-lane communication or padded groups are needed.
         constexpr uint W = 10240;
-        const uint c = threadgroup_position_in_grid.z;
-        const uint lane = thread_index_in_simdgroup;
-        if (simdgroup_index_in_threadgroup != 0) { return; }
-        float product = 0.0f;
-        if (lane < 4) {
-            product = float(full[(lane * 3) * W + c]) * float(weight[c * 4 + lane]);
+        const uint c = thread_position_in_grid.x;
+        if (c >= W) { return; }
+        float acc;
+        {
+            // In the old layout products crossed a SIMD broadcast before
+            // addition. Preserve those FP32 roundings when moving ownership
+            // into one lane: do not turn them into FMAs or regroup the sum.
+            #pragma clang fp contract(off)
+            #pragma clang fp reassociate(off)
+            const float p0 = float(full[c]) * float(weight[c * 4]);
+            const float p1 = float(full[3 * W + c]) * float(weight[c * 4 + 1]);
+            const float p2 = float(full[6 * W + c]) * float(weight[c * 4 + 2]);
+            const float p3 = float(full[9 * W + c]) * float(weight[c * 4 + 3]);
+            acc = p0;
+            acc += p1;
+            acc += p2;
+            acc += p3;
         }
-        // FP32 products and chronological FP32 additions, taps 0,1,2,3.
-        // Shuffle broadcasts retain the weight-loading lanes. Unlike a
-        // padded simdgroup MMA, this has no matrix accumulator or spill array.
-        float acc = simd_broadcast(product, 0);
-        acc += simd_broadcast(product, 1);
-        acc += simd_broadcast(product, 2);
-        acc += simd_broadcast(product, 3);
-        if (lane == 0) {
-            InT convolved = InT(acc);
-            InT activated = mlx_silu(convolved);
-            out[c] = gated[c] + activated;
-        }
+        InT convolved = InT(acc);
+        InT activated = mlx_silu(convolved);
+        out[c] = gated[c] + activated;
         """
 
     static let prepareKernel = MLXFast.metalKernel(
@@ -138,7 +139,7 @@ enum TrackPLEFusion {
         header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
 
     static let convolutionKernel = MLXFast.metalKernel(
-        name: "track_ple_convolution_fuse2", inputNames: ["full", "weight", "gated"],
+        name: "track_ple_convolution_channelwise", inputNames: ["full", "weight", "gated"],
         outputNames: ["out"], source: convolutionSource,
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
@@ -173,7 +174,7 @@ enum TrackPLEFusion {
             outputDTypes: [stream.dtype, stream.dtype])
         let output = convolutionKernel(
             [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
-            grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
+            grid: (10240, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
         return (r[1], output)
     }
