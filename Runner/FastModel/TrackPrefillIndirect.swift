@@ -41,6 +41,11 @@ enum TrackPrefillIndirect {
         inputNames: ["sorted_ids"], outputNames: ["tiles"],
         source: tileSource, header: "", ensureRowContiguous: true)
 
+    private static let lastPositionTileKernel = MLXFast.metalKernel(
+        name: "track_prefill_last_position_tile_table",
+        inputNames: ["sorted_ids", "inverse_order"], outputNames: ["tiles"],
+        source: lastPositionTileSource(tileSource), header: "", ensureRowContiguous: true)
+
     static let tileRows = 32
     static let tileThreads = 1024
 
@@ -59,7 +64,28 @@ enum TrackPrefillIndirect {
             outputShapes: [[2 * maxT]], outputDTypes: [.uint32])[0]
     }
 
-    static func apply(_ m: TrackMoE, x: MLXArray, indices: MLXArray)
+    static func lastPositionTileTable(
+        sortedIDs: MLXArray, inverse: MLXArray, rows: Int, experts: Int
+    ) -> MLXArray {
+        let maxT = maxTiles(rows: rows, experts: experts)
+        return lastPositionTileKernel(
+            [sortedIDs, inverse],
+            template: [("R", rows), ("E", experts), ("BM", tileRows),
+                       ("MAXT", maxT), ("TG", tileThreads), ("TOPK", 10)],
+            grid: (tileThreads, 1, 1), threadGroup: (tileThreads, 1, 1),
+            outputShapes: [[2 * maxT]], outputDTypes: [.uint32])[0]
+    }
+
+    private static func downWeightsEligible(_ m: TrackMoE) -> Bool {
+        let d = m.expertDown
+        return d.w.shape == [512, 2560, 80] && d.s.shape == [512, 2560, 20]
+            && d.b.shape == d.s.shape && d.w.dtype == .uint32
+            && d.s.dtype == .bfloat16 && d.b.dtype == .bfloat16
+    }
+
+    static func apply(
+        _ m: TrackMoE, x: MLXArray, indices: MLXArray, lastPositionOnly: Bool = false
+    )
         -> (activated: MLXArray, sortedIDs: MLXArray, inverse: MLXArray, tiles: MLXArray)?
     {
         guard enabled, supportsNAX, StreamOrDevice.default.stream == Stream.gpu,
@@ -69,6 +95,12 @@ enum TrackPrefillIndirect {
             indices.dim(2) > 0, indices.dtype == .uint32,
             indices.size >= 2048, indices.size < 512 * 64
         else { return nil }
+        // Sparse activations must never enter a generic down fallback. Check
+        // the down weights before producing them; all other down shapes below
+        // are fixed by this producer.
+        if lastPositionOnly {
+            guard indices.dim(2) == 10, downWeightsEligible(m) else { return nil }
+        }
         let g = m.expertGate
         let u = m.expertUp
         guard g.w.shape == [512, 640, 320], u.w.shape == g.w.shape,
@@ -96,7 +128,9 @@ enum TrackPrefillIndirect {
         }
         let rows = indices.size
         let experts = g.w.dim(0)
-        let tiles = tileTable(sortedIDs: sortedIDs, rows: rows, experts: experts)
+        let tiles = lastPositionOnly
+            ? lastPositionTileTable(sortedIDs: sortedIDs, inverse: inverse, rows: rows, experts: experts)
+            : tileTable(sortedIDs: sortedIDs, rows: rows, experts: experts)
         let maxT = maxTiles(rows: rows, experts: experts)
         let activated = gateUpKernel(
             [x, g.w, g.s, g.b, u.w, u.s, u.b, sortedIDs, tokenRows, tiles],
@@ -116,8 +150,7 @@ enum TrackPrefillIndirect {
         let rows = sortedIDs.size
         guard activated.ndim == 3, activated.dim(0) == rows, activated.dim(1) == 1,
             activated.dim(2) == 640, activated.dtype == .bfloat16,
-            d.w.shape == [512, 2560, 80], d.s.shape == [512, 2560, 20], d.b.shape == d.s.shape,
-            d.w.dtype == .uint32, d.s.dtype == .bfloat16, d.b.dtype == .bfloat16
+            downWeightsEligible(m)
         else { return nil }
         let maxT = maxTiles(rows: rows, experts: d.w.dim(0))
         return kernel(
@@ -218,4 +251,25 @@ enum TrackPrefillIndirect {
             tiles[2 * i + 1] = 0u;
         }
         """#
+
+    static func lastPositionTileSource(_ source: String) -> String {
+        let old = """
+                tiles[2 * (slot + j)] = b + j * (uint)BM;
+                tiles[2 * (slot + j) + 1] = b + min(len, (j + 1) * (uint)BM);
+        """
+        let new = """
+                const uint begin = b + j * (uint)BM;
+                const uint end = b + min(len, (j + 1) * (uint)BM);
+                bool keep = false;
+                for (uint k = 0; k < (uint)TOPK; ++k) {
+                    const uint p = (uint)inverse_order[R - TOPK + k];
+                    keep |= begin <= p && p < end;
+                }
+                tiles[2 * (slot + j)] = keep ? begin : 0u;
+                tiles[2 * (slot + j) + 1] = keep ? end : 0u;
+        """
+        precondition(source.components(separatedBy: old).count == 2,
+                     "TrackPrefillIndirect: tile store anchor is not unique")
+        return source.replacingOccurrences(of: old, with: new)
+    }
 }

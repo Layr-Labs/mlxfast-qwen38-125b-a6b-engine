@@ -779,7 +779,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     static func moeForwardShared(
         _ m: TrackMoE, _ x: MLXArray, inputF32: MLXArray? = nil,
-        replay: (@Sendable ([MLXArray]) -> [MLXArray])?
+        replay: (@Sendable ([MLXArray]) -> [MLXArray])?,
+        lastPositionOnly: Bool = false
     ) -> MLXArray {
         let prof = TrackFastProfile.prefill != nil && x.dim(1) >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
@@ -880,6 +881,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let shared = m.sharedDown.apply(sharedAct)
         let gate = m.sharedGate.apply(x)  // [B,S,1]
         if prof { TrackFastProfile.tick("moe.shared", &pt, [shared, gate]) }
+        if lastPositionOnly,
+            let combined = TrackP12Prefill.sortedMoELastPosition(
+                m, x, indices: idx, weights: weights, shared: shared, gate: gate)
+        {
+            return combined
+        }
         // Read the routed rows through the permutation the sort already
         // produced instead of materialising a scattered copy of them.
         if let combined = TrackP12Prefill.sortedMoE(
@@ -1043,7 +1050,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     func fastStreams(
         _ ids: MLXArray, inputEmbeddings: MLXArray?, caches: [Qwen4ExpCBv2LayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation], offset: Int, capture: Bool,
-        inputIsMultiStream: Bool = false
+        lastPositionOnly: Bool = false, inputIsMultiStream: Bool = false
     ) -> (mixed: MLXArray, multi: MLXArray) {
         precondition(recurrentState.count == 1)
         let evaluation = recurrentState[0]
@@ -1058,6 +1065,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let ropeTab = ropeTables(offset: offset, count: ids.dim(1), dtype: residual.dtype)
 
         let profiling = TrackFastProfile.prefill != nil && ids.dim(1) >= TrackFastProfile.minWindow
+        let allowLastPositionOnly = lastPositionOnly && inputEmbeddings == nil
+            && !capture && Self.debugTaps == nil
         var profT = profiling ? CFAbsoluteTimeGetCurrent() : 0
         if profiling { TrackFastProfile.windows += 1 }
         for layer in layers {
@@ -1120,7 +1129,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
                 Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
                 pendingOut = Self.moeForwardShared(
-                    layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay)
+                    layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay,
+                    lastPositionOnly: allowLastPositionOnly && !profiling
+                        && layer.index == layers.count - 1
+                        && layer.gdn == nil && layer.ple == nil)
                 if profiling { TrackFastProfile.tick("moe", &profT, [pendingOut!]) }
                 Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
             }
@@ -1174,7 +1186,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     func streamsOrDelegate(
         _ tokens: MLXArray, inputEmbeddings: MLXArray?, caches: [KVCache],
-        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, capture: Bool
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, capture: Bool,
+        lastPositionOnly: Bool = false
     ) -> (mixed: MLXArray, multi: MLXArray)? {
         if capture { TrackPleContextMirror.invalidate() }
         guard let plan = fastPlan(
@@ -1186,7 +1199,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         return fastStreams(
             tokens, inputEmbeddings: inputEmbeddings, caches: plan.caches,
-            recurrentState: recurrentState, offset: plan.offset, capture: capture)
+            recurrentState: recurrentState, offset: plan.offset, capture: capture,
+            lastPositionOnly: lastPositionOnly)
     }
 }
 
@@ -1290,9 +1304,12 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentLanguageModelPrefillForwardable {
             let plan = fastPlan(tokens: inputs, caches: cache ?? [], recurrentState: recurrentState, positionIds: positionIds)
             print("[profile] cbv2RecurrentPrefill S=\(inputs.dim(1)) posIds=\(positionIds != nil) caches=\(cache?.count ?? -1) fast=\(plan != nil) req=\(requirement)")
         }
+        let lastPositionOnly = requirement == .lastPositionLogits
+            && inputEmbedding == nil && positionIds == nil
         if let s = streamsOrDelegate(
             inputs, inputEmbeddings: inputEmbedding, caches: cache ?? [],
-            recurrentState: recurrentState, positionIds: positionIds, capture: false)
+            recurrentState: recurrentState, positionIds: positionIds, capture: false,
+            lastPositionOnly: lastPositionOnly)
         {
             switch requirement {
             case .evaluationOnly:
