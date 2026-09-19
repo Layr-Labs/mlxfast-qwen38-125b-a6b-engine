@@ -365,7 +365,6 @@ extension TrackFastKernels {
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
         threadgroup float local_sums[32];
-        threadgroup InT vec[D];
 
         const bool isQ = h < HQ;
         const bool isV = h >= HQ + HK;
@@ -393,6 +392,36 @@ extension TrackFastKernels {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         acc = simd_sum(local_sums[lane]);
         const float inv_mean = metal::precise::rsqrt(acc / (float)D + as_type<float>((uint)EPS_BITS));
+        // For the BF16 256/64 geometry, each rotary pair is eight lanes
+        // apart within SIMD group zero. Exchange its raw bits rather than
+        // staging the full normalized vector through threadgroup memory.
+        if constexpr (D == 256 && ROT == 64 && metal::is_same<InT, bfloat16_t>::value) {
+            InT normalized[N_READS];
+            for (int i = 0; i < N_READS; ++i) {
+                const uint d = lid * N_READS + i;
+                const InT wgt = isQ ? qnorm[d] : knorm[d];
+                normalized[i] = wgt * static_cast<InT>(thread_x[i] * inv_mean);
+            }
+            device InT* dst = isQ ? (qout + ((b * HQ + hh) * S + s) * D) : (kout + ((b * HK + hh) * S + s) * D);
+            for (int i = 0; i < N_READS; ++i) {
+                const uint d = lid * N_READS + i;
+                // All lanes participate, including those outside ROT.
+                const uint bits = (uint)as_type<ushort>(normalized[i]);
+                const InT partner = as_type<InT>((ushort)simd_shuffle(bits, lane ^ 8u));
+                InT o = normalized[i];
+                if (d < ROT) {
+                    const InT c = cosb[s * ROT + d];
+                    const InT sn = sinb[s * ROT + d];
+                    InT t1 = normalized[i] * c;
+                    InT t2;
+                    if (d < ROT / 2) { t2 = (-partner) * sn; }
+                    else { t2 = partner * sn; }
+                    o = t1 + t2;
+                }
+                dst[d] = o;
+            }
+        } else {
+        threadgroup InT vec[D];
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
             const InT wgt = isQ ? qnorm[d] : knorm[d];
@@ -422,6 +451,7 @@ extension TrackFastKernels {
                 }
             }
             dst[d] = o;
+        }
         }
         """
 
