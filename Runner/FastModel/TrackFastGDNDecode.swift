@@ -6,7 +6,7 @@ import MLX
 enum TrackFastGDNDecode {
     private static let kernel = MLXFast.metalKernel(
         name: "track_gdn_decode_complete",
-        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w", "journal_in"],
+        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w", "journal_in", "sigmoid_float"],
         outputNames: ["state_out", "gated", "conv_out", "journal_out"],
         source: source, header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
@@ -35,7 +35,7 @@ enum TrackFastGDNDecode {
         let hasJournal = pendingJournal?.shape == [B, journalStride]
         let journalIn = pendingJournal ?? convState
         let result = kernel(
-            [proj, convState, convW, negExpALog, dtBias, stateIn, normW, journalIn],
+            [proj, convState, convW, negExpALog, dtBias, stateIn, normW, journalIn, TrackBF16Functions.sigmoidFloat],
             template: [
                 ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
                 ("Hk", g.hk), ("Hv", g.hv), ("KC", g.convKernel), ("CONV_DIM", g.convDim),
@@ -243,7 +243,7 @@ enum TrackFastGDNDecode {
             vec<InT, 4> out4;
             for (int i = 0; i < 4; ++i) {
                 InT normalized = w4[i] * static_cast<InT>(thread_x[i] * inv_mean);
-                const float zg = mlx_sigmoid(static_cast<float>(z4[i]));
+                const float zg = sigmoid_float[(uint)as_type<ushort>(z4[i])];
                 out4[i] = static_cast<InT>(zg * static_cast<float>(normalized));
             }
             *reinterpret_cast<device vec<InT, 4>*>(gated + (n * Dv + lane * 4)) = out4;
