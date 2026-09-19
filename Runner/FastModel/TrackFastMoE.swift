@@ -1518,13 +1518,21 @@ extension TrackFastMoEKernels {
         let BR = idx.dim(0), F = act.dim(1), H = wd.dim(1)
         let S = BR / topK
         precondition(BR % topK == 0 && H % 4 == 0 && bits == 4 && w.dtype == .float32 && S >= 1 && S <= 8)
-        precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
+        // MLXFAST-DCFAST: `isFast(k:n:)` is a pure function of F and H, both
+        // `let` bindings from `act.dim(1)` / `wd.dim(1)` that are never rebound
+        // here, and it was evaluated twice -- once for the precondition below
+        // and once as the `FAST` template value. Bind it once. Host-side only:
+        // the template receives the same Bool (the precondition asserts it is
+        // false), so the kernel selection, every template constant, the grid,
+        // the threadgroup shape and every byte moved are unchanged.
+        let fast = isFast(k: F, n: H)
+        precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !fast)
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
         let rps = S == 1 ? downRowsPerSimdgroup : 4
         let groups = ksg + (S == 1 && topK == 10 && ksg >= 5 ? 1 : 0)
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
-            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
+            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", fast), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
             grid: (32, (H / rps) * groups, S), threadGroup: (32, groups, 1),
             outputShapes: [[S, H]], outputDTypes: [act.dtype])[0]
     }
@@ -2421,3 +2429,4 @@ extension TrackFastMoEKernels {
         """#
 
 }
+// redraw ea4cae6c 20260919T225926Z
