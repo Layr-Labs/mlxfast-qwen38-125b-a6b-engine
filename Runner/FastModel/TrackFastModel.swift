@@ -681,11 +681,29 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return o
     }
 
+    /// MLXFAST-ROPETAB: the table depends only on the position index, so it is
+    /// built once over `[0, indexerBudget)` and sliced. `cosSin` forms
+    /// `freqs = position * invFreq` and then concatenates, cosines and sines
+    /// elementwise, so row `p` of the whole-range table is exactly what a build
+    /// over `[p, p+1)` returns. The fast path is bounded by
+    /// `offset + S <= indexerBudget` (see `fastPlan`), so the cache is built
+    /// once and every later call is a contiguous row slice of it.
+    private var ropeTableCache: (dtype: DType, rows: Int, cos: MLXArray, sin: MLXArray)?
+
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
-        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
-        return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
+        let need = offset + count
+        if let cached = ropeTableCache, cached.dtype == dtype, cached.rows >= need {
+            return (cached.cos[offset ..< need, 0...], cached.sin[offset ..< need, 0...])
+        }
+        let rows = Swift.max(need, indexerBudget)
+        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: 0, count: rows))
+        let cosAll = c.asType(dtype).reshaped(rows, rotaryDims)
+        let sinAll = s.asType(dtype).reshaped(rows, rotaryDims)
+        eval(cosAll, sinAll)
+        ropeTableCache = (dtype, rows, cosAll, sinAll)
+        return (cosAll[offset ..< need, 0...], sinAll[offset ..< need, 0...])
     }
 
     private func attnForward(
@@ -973,7 +991,14 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
-            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
+            // MLXFAST-DIVCACHE: `sqrt(hidden)` is a constant and both spellings
+            // round identically into the activation dtype (checked at hidden =
+            // 2560/1024/4096/640/320: bit-for-bit equal), so the cached scalar
+            // serves it. `TrackFastKernels.scalar` exists for exactly this --
+            // building one per call is a host allocation and a cast launch --
+            // and the `floor` on the next line already uses it.
+            let divisor = TrackFastKernels.scalar(
+                Foundation.sqrt(Float(hidden)), dtype: dot.dtype)
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
             let gn = TrackFastPLEKernels.gated(
                 g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
