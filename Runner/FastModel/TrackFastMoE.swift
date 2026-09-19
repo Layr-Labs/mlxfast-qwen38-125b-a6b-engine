@@ -1426,7 +1426,7 @@ extension TrackFastMoEKernels {
         // Shared expert down rows d0..d0+3 for token t: one token routes to `qmv`'s
         // normal branch (K = 640), two to eight to `qmv_wide` (full tiles; a row's
         // walk does not depend on how many vectors share its tile).
-        constexpr uint shared_sg = VPT == 1 && K == 10 && KSG == 5
+        constexpr uint shared_sg = VPT == 1 && K == 10 && KSG >= 5
             ? (uint)KSG : (KSG > K ? (uint)K : 0u);
         if (sgi == shared_sg) {
             const device T* xs = act + (size_t)(BR + t) * (size_t)F;
@@ -1503,8 +1503,12 @@ extension TrackFastMoEKernels {
     /// fewer rows per threadgroup means more threadgroups in flight (H / rows).
     static let downRowsPerSimdgroup = 2
 
+    // MLXFAST-ONESG: one simdgroup per routed expert. With K = 10 and KSG = 10
+    // each group runs exactly one expert walk (kk loop trip count 1) instead of
+    // two serial walks; the per-row fold order over k is unchanged, so the
+    // output is bit-identical for any value.
     static let downCombineSimdgroups =
-        ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 5
+        ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 10
 
     /// act [BR + S, F] (routed slots, then the shared expert per token), gate [S] pre-sigmoid.
     static func downCombine(
@@ -1517,7 +1521,7 @@ extension TrackFastMoEKernels {
         precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
         let rps = S == 1 ? downRowsPerSimdgroup : 4
-        let groups = ksg + (S == 1 && topK == 10 && ksg == 5 ? 1 : 0)
+        let groups = ksg + (S == 1 && topK == 10 && ksg >= 5 ? 1 : 0)
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
             template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
