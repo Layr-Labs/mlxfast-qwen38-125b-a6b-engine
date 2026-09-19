@@ -184,19 +184,64 @@ enum TrackP12Prefill {
     /// inverse permutation the expert sort already produced. The float32
     /// products stay in original (token, slot) order and the K reduction is
     /// still the same small-column tree -- only the load address changes.
-    nonisolated(unsafe) private static let sortedCombineKernel = MLXFast.metalKernel(
-        name: "track_p12_moe_sorted_combine",
-        inputNames: ["routed", "w", "shared", "gate", "inverse_order"],
-        outputNames: ["out"],
-        source: addressVariant(
+    static let sortedCombineSource = addressVariant(
             TrackFastKernels.moeCombineSource,
             [
                 (
                     "routed[(row * K + k) * H + d]",
                     "routed[static_cast<uint>(inverse_order[row * K + k]) * H + d]"
                 )
-            ]),
+            ])
+
+    nonisolated(unsafe) private static let sortedCombineKernel = MLXFast.metalKernel(
+        name: "track_p12_moe_sorted_combine",
+        inputNames: ["routed", "w", "shared", "gate", "inverse_order"],
+        outputNames: ["out"], source: sortedCombineSource,
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
+
+    nonisolated(unsafe) private static let lastPositionCombineKernel = MLXFast.metalKernel(
+        name: "track_p12_moe_last_position_combine",
+        inputNames: ["routed", "w", "shared", "gate", "inverse_order"],
+        outputNames: ["out"], source: lastPositionCombineSource(sortedCombineSource),
+        header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
+
+    static func lastPositionCombineSource(_ source: String) -> String {
+        addressVariant(source, [
+            ("if (d >= H) return;", """
+            if (d >= H) return;
+            if (row != LAST_ROW) {
+                out[row * H + d] = InT(0);
+                return;
+            }
+            """)
+        ])
+    }
+
+    /// Only the last row is observable through the last-position prefill
+    /// interface. Keep full shapes and retained tiles; zero all other outputs.
+    static func sortedMoELastPosition(
+        _ m: TrackMoE, _ x: MLXArray, indices: MLXArray, weights: MLXArray,
+        shared: MLXArray, gate: MLXArray
+    ) -> MLXArray? {
+        guard sortedCombine, eligible(x), x.dim(1) <= 1024, x.dim(2) == 2560,
+            m.topK == 10, indices.ndim == 3, indices.dim(2) == 10,
+            weights.shape == indices.shape, weights.dtype == .float32,
+            shared.shape == x.shape, shared.dtype == .bfloat16,
+            gate.size == x.dim(1), gate.dtype == .bfloat16,
+            m.p12SortedParts != nil, !m.switchMLP.hasFusedGateUp,
+            StreamOrDevice.default.stream === Stream.gpu,
+            let indirect = TrackPrefillIndirect.apply(m, x: x, indices: indices, lastPositionOnly: true)
+        else { return nil }
+        // apply validated the down weights before making sparse activations.
+        // Its output shape and dtype satisfy every remaining down guard.
+        let down = TrackPrefillIndirect.down(
+            m, activated: indirect.activated, sortedIDs: indirect.sortedIDs, tiles: indirect.tiles)!
+        return lastPositionCombineKernel(
+            [down, weights, shared, gate, indirect.inverse],
+            template: [("InT", down.dtype), ("K", 10), ("H", 2560), ("LAST_ROW", x.dim(1) - 1)],
+            grid: (2560, x.dim(1), 1), threadGroup: (256, 1, 1),
+            outputShapes: [x.shape], outputDTypes: [.bfloat16])[0]
+    }
 
     /// Keep sorted expert rows through the projections and weighted combine.
     static func sortedMoE(
