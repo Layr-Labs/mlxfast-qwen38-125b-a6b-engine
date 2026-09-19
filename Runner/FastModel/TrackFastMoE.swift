@@ -806,11 +806,37 @@ extension TrackFastMoEKernels {
             v[j] = (e < E) ? lr[e] : -INFINITY;
             taken[j] = (e >= E);
         }
+        // A deletion changes only its four-entry block's maximum. Keep the
+        // other block winners, preserving the original strict comparison and
+        // ascending-index tie rule. Other geometries retain the full scan.
+        constexpr bool BLOCK_MAX = E == 512 && K == 10 && VPT == 1;
+        float block_value[4];
+        int block_index[4];
+        if constexpr (BLOCK_MAX) {
+            for (int block = 0; block < 4; ++block) {
+                float best = -INFINITY;
+                int best_j = -1;
+                for (int i = 0; i < 4; ++i) {
+                    const int j = block * 4 + i;
+                    if (!taken[j] && v[j] > best) { best = v[j]; best_j = j; }
+                }
+                block_value[block] = best;
+                block_index[block] = best_j;
+            }
+        }
         for (int k = 0; k < K; ++k) {
             // lane-local best: largest value, then lowest index
             float bv = -INFINITY; int bj = -1;
-            for (int j = 0; j < E_PER; ++j) {
-                if (!taken[j] && (v[j] > bv)) { bv = v[j]; bj = j; }
+            if constexpr (BLOCK_MAX) {
+                for (int block = 0; block < 4; ++block) {
+                    if (block_value[block] > bv) {
+                        bv = block_value[block]; bj = block_index[block];
+                    }
+                }
+            } else {
+                for (int j = 0; j < E_PER; ++j) {
+                    if (!taken[j] && (v[j] > bv)) { bv = v[j]; bj = j; }
+                }
             }
             const float gmax = simd_max(bv);
             const uint cand = (bv == gmax && bj >= 0) ? (uint)(lane + 32 * bj) : 0xffffffffu;
@@ -820,7 +846,22 @@ extension TrackFastMoEKernels {
                     if (k == (int)lane * N_READS + i) { ld[i] = gmax; selected[i] = gidx; }
                 }
             } else if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
-            if (gidx == (uint)(lane + 32 * bj) && bj >= 0) { taken[bj] = true; }
+            if (gidx == (uint)(lane + 32 * bj) && bj >= 0) {
+                taken[bj] = true;
+                if constexpr (BLOCK_MAX) {
+                    if (k + 1 < K) {
+                        const int block = bj / 4;
+                        float best = -INFINITY;
+                        int best_j = -1;
+                        for (int i = 0; i < 4; ++i) {
+                            const int j = block * 4 + i;
+                            if (!taken[j] && v[j] > best) { best = v[j]; best_j = j; }
+                        }
+                        block_value[block] = best;
+                        block_index[block] = best_j;
+                    }
+                }
+            }
         }
         }
         if constexpr (REGISTER_RESULTS) {
