@@ -39,10 +39,29 @@ enum TrackPleContextMirror {
     nonisolated(unsafe) private(set) static var nextOffset: Int? = nil
     nonisolated(unsafe) private(set) static var stateLayerIndex: Int? = nil
     nonisolated(unsafe) private(set) static var contextLength: Int? = nil
+    // MLXFAST-MIRRORCAP: a captured window's history is kept whole, so the
+    // context the *next* window needs is a slice of it -- `stageCaptured`
+    // stores exactly `history[s+1 ..< s+1+contextLength]` per row, which is
+    // the same slice for every accept count. `baseOffset` is the attention
+    // offset of `history[0]` (offset - contextLength at store time).
+    nonisolated(unsafe) private(set) static var history: [Int64]? = nil
+    nonisolated(unsafe) private(set) static var baseOffset: Int? = nil
     nonisolated(unsafe) private(set) static var dirty = true
 
     static func matches(offset: Int, layer: Int, length: Int) -> Bool {
         !dirty && nextOffset == offset && stateLayerIndex == layer && contextLength == length
+    }
+
+    /// The context for a window starting at `offset`, from either the stored
+    /// tail (non-captured store) or a slice of the captured history. Returns
+    /// nil when the fence does not match or the slice is out of range.
+    static func contextAt(offset: Int, layer: Int, length: Int) -> [Int64]? {
+        guard !dirty, stateLayerIndex == layer, contextLength == length else { return nil }
+        if nextOffset == offset, let context { return context }
+        guard let history, let baseOffset else { return nil }
+        let start = offset - length - baseOffset
+        guard start >= 0, start + length <= history.count else { return nil }
+        return Array(history[start ..< start + length])
     }
 
     static func store(
@@ -50,6 +69,22 @@ enum TrackPleContextMirror {
     ) {
         self.context = context
         self.nextOffset = nextOffset
+        self.stateLayerIndex = stateLayerIndex
+        self.contextLength = contextLength
+        self.history = nil
+        self.baseOffset = nil
+        dirty = false
+    }
+
+    /// Captured-window store: keep the whole history so any accept count's
+    /// continuation context is servable, and drop the tail-only context.
+    static func storeCaptured(
+        history: [Int64], baseOffset: Int, stateLayerIndex: Int, contextLength: Int
+    ) {
+        self.context = nil
+        self.nextOffset = nil
+        self.history = history
+        self.baseOffset = baseOffset
         self.stateLayerIndex = stateLayerIndex
         self.contextLength = contextLength
         dirty = false
@@ -60,6 +95,8 @@ enum TrackPleContextMirror {
         nextOffset = nil
         stateLayerIndex = nil
         contextLength = nil
+        history = nil
+        baseOffset = nil
         dirty = true
     }
 }
@@ -76,6 +113,32 @@ private final class TrackGDNJournalEntry {
         self.state = state
         self.nextOffset = nextOffset
         self.array = array
+    }
+}
+
+/// One in-flight host n-gram gather for the PLE layer.
+///
+/// `fastStreams` kicks the row gather off beside the layer-0 graph build so
+/// the LRU read, the buffer fill and the lazy dequantize construction overlap
+/// GPU work instead of serializing inside `pleForward`. The token/context
+/// readbacks and the context mirror stay on the caller's thread; only
+/// `Qwen4ExpNGramHostRowSource.rows(globalIds:shape:)` — documented safe for
+/// concurrent gathers — crosses over.
+private final class TrackPleGather {
+    let history: [Int64]
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var rows: MLXArray? = nil
+
+    init(history: [Int64]) { self.history = history }
+
+    func finish(_ rows: MLXArray) {
+        self.rows = rows
+        semaphore.signal()
+    }
+
+    func join() -> MLXArray? {
+        semaphore.wait()
+        return rows
     }
 }
 
@@ -681,11 +744,29 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return o
     }
 
+    /// MLXFAST-ROPETAB: the table depends only on the position index, so it is
+    /// built once over `[0, indexerBudget)` and sliced. `cosSin` forms
+    /// `freqs = position * invFreq` and then concatenates, cosines and sines
+    /// elementwise, so row `p` of the whole-range table is exactly what a build
+    /// over `[p, p+1)` returns. The fast path is bounded by
+    /// `offset + S <= indexerBudget` (see `fastPlan`), so the cache is built
+    /// once and every later call is a contiguous row slice of it.
+    private var ropeTableCache: (dtype: DType, rows: Int, cos: MLXArray, sin: MLXArray)?
+
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
-        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
-        return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
+        let need = offset + count
+        if let cached = ropeTableCache, cached.dtype == dtype, cached.rows >= need {
+            return (cached.cos[offset ..< need, 0...], cached.sin[offset ..< need, 0...])
+        }
+        let rows = Swift.max(need, indexerBudget)
+        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: 0, count: rows))
+        let cosAll = c.asType(dtype).reshaped(rows, rotaryDims)
+        let sinAll = s.asType(dtype).reshaped(rows, rotaryDims)
+        eval(cosAll, sinAll)
+        ropeTableCache = (dtype, rows, cosAll, sinAll)
+        return (cosAll[offset ..< need, 0...], sinAll[offset ..< need, 0...])
     }
 
     private func attnForward(
@@ -897,7 +978,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
-        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool,
+        prefetched: TrackPleGather? = nil
     ) -> MLXArray {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
@@ -921,33 +1003,44 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
-            let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
-            let ctx: [Int64]
-            if !capture,
-                TrackPleContextMirror.matches(
-                    offset: offset, layer: p.stateLayerIndex, length: contextLength),
-                let mirrored = TrackPleContextMirror.context
-            {
-                ctx = mirrored
+            let history: [Int64]
+            if let prefetched, let rows = prefetched.join() {
+                // The gather ran beside the layer-0 work; the history and the
+                // context mirror were settled on this thread at kickoff.
+                embedded = rows.asType(stream.dtype)
+                history = prefetched.history
             } else {
-                let rawPrev = state?.ssm
-                ctx = rawPrev.map {
-                    $0.dtype == .int32
-                        ? $0.asArray(Int32.self).map(Int64.init)
-                        : $0.asType(.int64).asArray(Int64.self)
-                } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+                let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
+                let ctx: [Int64]
+                if let mirrored = TrackPleContextMirror.contextAt(
+                    offset: offset, layer: p.stateLayerIndex, length: contextLength)
+                {
+                    ctx = mirrored
+                } else {
+                    let rawPrev = state?.ssm
+                    ctx = rawPrev.map {
+                        $0.dtype == .int32
+                            ? $0.asArray(Int32.self).map(Int64.init)
+                            : $0.asType(.int64).asArray(Int64.self)
+                    } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+                }
+                history = ctx + toks
+                let gid = p.embedding.hostRowIds(history: [history], newCount: S)
+                let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
+                embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
             }
-            let history = ctx + toks
             if capture {
-                TrackPleContextMirror.invalidate()
+                // The next window's context is a slice of this history for
+                // every accept count, so keep it whole instead of dropping
+                // the mirror on the floor.
+                TrackPleContextMirror.storeCaptured(
+                    history: history, baseOffset: offset - contextLength,
+                    stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
             } else {
                 TrackPleContextMirror.store(
                     Array(history.suffix(contextLength)), nextOffset: offset + S,
                     stateLayerIndex: p.stateLayerIndex, contextLength: contextLength)
             }
-            let gid = p.embedding.hostRowIds(history: [history], newCount: S)
-            let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
-            embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
             hostHistory = history
         } else {
             TrackPleContextMirror.invalidate()
@@ -973,7 +1066,14 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
-            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
+            // MLXFAST-DIVCACHE: `sqrt(hidden)` is a constant and both spellings
+            // round identically into the activation dtype (checked at hidden =
+            // 2560/1024/4096/640/320: bit-for-bit equal), so the cached scalar
+            // serves it. `TrackFastKernels.scalar` exists for exactly this --
+            // building one per call is a host allocation and a cast launch --
+            // and the `floor` on the next line already uses it.
+            let divisor = TrackFastKernels.scalar(
+                Foundation.sqrt(Float(hidden)), dtype: dot.dtype)
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
             let gn = TrackFastPLEKernels.gated(
                 g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
@@ -990,9 +1090,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 let contextStack: MLXArray
                 if let h = hostHistory {
                     // Row s = the context after consuming window token s.
-                    var flat: [Int32] = []
+                    var flat = [Int32]()
                     flat.reserveCapacity(S * contextLength)
-                    for s in 0 ..< S { flat.append(contentsOf: h[(s + 1) ..< (s + 1 + contextLength)].map(Int32.init)) }
+                    for s in 0 ..< S {
+                        for j in 0 ..< contextLength { flat.append(Int32(h[s + 1 + j])) }
+                    }
                     contextStack = MLXArray(flat).reshaped(S, contextLength)
                 } else {
                     let history = concatenated([devicePrevious(), ids], axis: 1)
@@ -1056,6 +1158,49 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         var attentionIndex = 0
         var stream = residual
         let ropeTab = ropeTables(offset: offset, count: ids.dim(1), dtype: residual.dtype)
+        // MLXFAST-PLEASYNC: the layer-1 n-gram row gather is host work (LRU
+        // read, buffer fill, lazy dequantize construction). Kick it off on a
+        // global queue beside the layer-0 graph build instead of serializing
+        // it inside pleForward; the token/context readbacks stay here so the
+        // step keeps its single device sync, and the mirror is still settled
+        // on this thread when pleForward runs.
+        var pleGather: TrackPleGather? = nil
+        if ids.dim(0) == 1, ids.dim(1) <= 8,
+            let ple = layers.lazy.compactMap({ $0.ple }).first,
+            let host = ple.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource
+        {
+            let S = ids.dim(1)
+            let contextLength = max(1, ple.dilation - 1)
+            let toks: [Int64] =
+                ids.dtype == .int32
+                ? ids.asArray(Int32.self).map(Int64.init)
+                : ids.asType(.int64).asArray(Int64.self)
+            let ctx: [Int64]
+            if let mirrored = TrackPleContextMirror.contextAt(
+                offset: offset, layer: ple.stateLayerIndex, length: contextLength)
+            {
+                ctx = mirrored
+            } else {
+                let rawPrev = evaluation.inputState(modelLayerIndex: ple.stateLayerIndex)?.ssm
+                ctx =
+                    rawPrev.map {
+                        $0.dtype == .int32
+                            ? $0.asArray(Int32.self).map(Int64.init)
+                            : $0.asType(.int64).asArray(Int64.self)
+                    } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+            }
+            let gather = TrackPleGather(history: ctx + toks)
+            let gid = ple.embedding.hostRowIds(history: [gather.history], newCount: S)
+            let heads = (cfg.ngramSize - 1) * cfg.headsPerNGram
+            // No dtype cast here: pleForward applies the single
+            // `.asType(stream.dtype)` the inline path applies, so the
+            // dequantized rows round exactly once, on the same dtype.
+            DispatchQueue.global().async {
+                gather.finish(
+                    host.rows(globalIds: gid, shape: [1, S, heads]).reshaped(1, S, -1))
+            }
+            pleGather = gather
+        }
 
         let profiling = TrackFastProfile.prefill != nil && ids.dim(1) >= TrackFastProfile.minWindow
         var profT = profiling ? CFAbsoluteTimeGetCurrent() : 0
@@ -1072,7 +1217,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     stream
                     + pleForward(
                         ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
+                        offset: offset, capture: capture, prefetched: pleGather)
+                pleGather = nil
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
@@ -1140,6 +1286,19 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             scale: finalMixer.normScaleQ,
             tile: false)
         let mixed = hcMix(finalMixer, normed: finalNormed).input
+        // MLXFAST-TAILFLUSH: the loop's dispatch schedule lands its last flush
+        // on layer 47 -- with `asyncChunk` 3 and `asyncFirst` 2 the hits are
+        // ... 41, 44, 47 -- so layer 48, the final `injectNorm` above and this
+        // final `hcMix`, plus the head and the sampler the caller builds on top
+        // of `mixed`, are all still unenqueued at this return. On the pure
+        // decode path the engine launches the NEXT step feeding this step's
+        // still-lazy sampled token and only finalizes afterwards, so nothing
+        // enqueues that tail until something reads the token -- and the read
+        // then waits on all of it. Enqueue it here instead.
+        //
+        // `asyncEval` does not block and computes nothing new: the same arrays
+        // are returned, with the same contents, in the same order.
+        asyncEval(mixed, multi)
         return (mixed, multi)
     }
 
@@ -1176,7 +1335,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         _ tokens: MLXArray, inputEmbeddings: MLXArray?, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, capture: Bool
     ) -> (mixed: MLXArray, multi: MLXArray)? {
-        if capture { TrackPleContextMirror.invalidate() }
+        // The mirror is fenced by (offset, layer, length) and now serves
+        // captured windows too, so it must survive a captured forward.
         guard let plan = fastPlan(
             tokens: tokens, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds)
