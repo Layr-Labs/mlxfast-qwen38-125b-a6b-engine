@@ -167,8 +167,14 @@ enum TrackFastGDNDecode {
                 for (int i = 0; i < 4; ++i) { state[i] = static_cast<float>(i_state[4 * lane + i]); }
             }
             if constexpr (HAS_JOURNAL) {
-                const float pending_decay = journal_float(J_DECAY_OFF + 2 * hv_idx);
-                const float pending_delta = journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx));
+                float pending_decay = 0.0f;
+                float pending_delta = 0.0f;
+                if (lane == 0) {
+                    pending_decay = journal_float(J_DECAY_OFF + 2 * hv_idx);
+                    pending_delta = journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx));
+                }
+                pending_decay = simd_broadcast(pending_decay, 0);
+                pending_delta = simd_broadcast(pending_delta, 0);
                 for (int i = 0; i < 4; ++i) {
                     state[i] = state[i] * pending_decay;
                     state[i] = state[i]
