@@ -320,22 +320,27 @@ METAL_FUNC void track_mixer_act_dense(
           }
         }
         for (int k = 0; k < K; k += BK) {
-          threadgroup_barrier(mem_flags::mem_threadgroup);
+          // MLXFAST-PINGPONG: on the prefetch path Ws is two tile buffers; the
+          // store for tile k lands in half (k/BK)&1 while the MMA still drains
+          // the other half, so the WAR barrier is gone and the next tile's
+          // device loads issue before the barrier that publishes the stores.
+          const int woff =
+              kPrefetch.value ? ((k / BK) & 1) * (BN * BK_padded) : 0;
           if constexpr (kPrefetch.value) {
-            packed_w.store(loader_w.dst);
-          } else if constexpr (kAlignedN.value) {
-            loader_w.load_unsafe();
-          } else {
-            loader_w.load_safe(short2(BK, tgp_bn));
-          }
-
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-
-          if constexpr (kPrefetch.value) {
+            packed_w.store(loader_w.dst + woff);
             if (k + BK < K) {
               loader_w.next();
               packed_w.prefetch(loader_w);
             }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          } else {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if constexpr (kAlignedN.value) {
+              loader_w.load_unsafe();
+            } else {
+              loader_w.load_safe(short2(BK, tgp_bn));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
           }
 
           STEEL_PRAGMA_NO_UNROLL
@@ -351,7 +356,7 @@ METAL_FUNC void track_mixer_act_dense(
               Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
             }
 
-            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+            Btile.template load<T, BK_padded, 1>(Ws + woff + tn * BK_padded + kk1);
 
             tile_matmad_nax(
                 Dtile,

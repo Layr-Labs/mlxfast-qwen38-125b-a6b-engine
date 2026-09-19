@@ -141,8 +141,8 @@ enum TrackPrefillIndirect {
     static let downBlockN = 128
 
     static let sourceDown = #"""
-        alignas(16) threadgroup T Ws[128 * 40];
-        alignas(16) threadgroup T As[32 * 40];
+        alignas(16) threadgroup T Ws[2 * 128 * 40];
+        alignas(16) threadgroup T As[2 * 32 * 40];
         track_prefill_indirect<T, 32, 4, 32, 128, 32, 2, 2, true, N, true>(
             x, w, scales, biases, indices, token_rows, tiles, y,
             N, K, Ws, As, threadgroup_position_in_grid,
@@ -150,8 +150,8 @@ enum TrackPrefillIndirect {
         """#
 
     static let source = #"""
-        alignas(16) threadgroup T Ws[64 * 72];
-        alignas(16) threadgroup T As[32 * 72];
+        alignas(16) threadgroup T Ws[2 * 64 * 72];
+        alignas(16) threadgroup T As[2 * 32 * 72];
         track_prefill_indirect<T, 32, 4, 32, 64, 64, 2, 2, true, N>(
             x, w, scales, biases, indices, token_rows, tiles, y,
             N, K, Ws, As, threadgroup_position_in_grid,

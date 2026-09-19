@@ -1509,24 +1509,31 @@ METAL_FUNC void track_prefill_indirect(
         }
       }
       if (!a_live) {
-        // A dead row's slice of the activation stage is zero for every K step:
-        // `a_dst` never advances (only `xb`, the device side, does), so it is
-        // written once here instead of once per step. Half the threadgroup is
-        // dead in the ranked window's last tile.
+        // A dead row's slice of the activation stage is zero for every K step
+        // in both halves of the ping-ponged stage: `a_dst` never advances
+        // (only `xb`, the device side, does), so both halves are written once
+        // here instead of once per step. Half the threadgroup is dead in the
+        // ranked window's last tile.
         threadgroup uint4* d0 = (threadgroup uint4*)a_dst;
+        threadgroup uint4* d1 = (threadgroup uint4*)(a_dst + BM * BKA_padded);
         STEEL_PRAGMA_UNROLL
-        for (short v = 0; v < A_VECS; ++v) { d0[v] = uint4(0); }
+        for (short v = 0; v < A_VECS; ++v) { d0[v] = uint4(0); d1[v] = uint4(0); }
       }
       for (int k = 0; k < K_it; k++) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        packed_w.store(loader_w.dst);
+        // MLXFAST-PINGPONG: Ws/As are two tile buffers. Tile k lands in half
+        // k&1 while the MMA still drains half (k-1)&1, so the store no longer
+        // overwrites data the previous iteration is reading and the first of
+        // the old two barriers is gone. The next tile's device loads issue
+        // before the barrier so their latency overlaps the wait itself; the
+        // barrier publishes the stores before the MMA reads them.
+        const int woff = (k & 1) * (BN * BK_padded);
+        const int aoff = (k & 1) * (BM * BKA_padded);
+        packed_w.store(loader_w.dst + woff);
         if (a_live) {
-          threadgroup uint4* d4 = (threadgroup uint4*)a_dst;
+          threadgroup uint4* d4 = (threadgroup uint4*)(a_dst + aoff);
           STEEL_PRAGMA_UNROLL
           for (short v = 0; v < A_VECS; ++v) { d4[v] = a_buf[v]; }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
         if (k + 1 < K_it) {
           loader_w.next();
           packed_w.prefetch(loader_w);
@@ -1536,6 +1543,7 @@ METAL_FUNC void track_prefill_indirect(
             for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a_next[v]; }
           }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         STEEL_PRAGMA_UNROLL
         for (int kk1 = 0; kk1 < BK; kk1 += SK) {
@@ -1546,9 +1554,9 @@ METAL_FUNC void track_prefill_indirect(
             volatile int compiler_barrier;
 
             Atile.template loadV<BKA_padded>(
-                As + tm * BKA_padded + kk1);
+                As + aoff + tm * BKA_padded + kk1);
 
-            Btile.template loadV<BK_padded>(Ws + tn * BK_padded + kk1);
+            Btile.template loadV<BK_padded>(Ws + woff + tn * BK_padded + kk1);
 
             // The same walk `tile_matmad_nax` performs for TN % 2 == 0: `TN / 2`
             // destination pairs, each accumulated by its own cooperative tensor.
