@@ -26,7 +26,16 @@ enum TrackPrefillRouter {
         name: "track_router_split_sum", inputNames: ["partials"], outputNames: ["y"],
         source: sumSource, ensureRowContiguous: true)
 
-    static func apply(x: MLXArray, w: MLXArray) -> MLXArray? {
+    private static let fusedRouteKernel = MLXFast.metalKernel(
+        name: "track_router_split_route",
+        inputNames: ["partials", "x", "wg", "sgw", "bgw"],
+        outputNames: ["idx", "w", "gate"], source: fusedRouteSource,
+        header: TrackFastKernels.mixerHeadHeader + TrackFastMoEKernels.wideHelpers,
+        ensureRowContiguous: true)
+
+    private static func makePartials(x: MLXArray, w: MLXArray)
+        -> (partials: MLXArray, rows: Int)?
+    {
         guard enabled, supportsNAX, StreamOrDevice.default.stream == Stream.gpu,
             x.ndim == 3, x.dim(0) == 1, x.dim(1) >= 32, x.dim(1) <= 1024,
             x.dim(2) == 2560, x.dtype == .bfloat16,
@@ -39,10 +48,33 @@ enum TrackPrefillRouter {
             [x, w], template: [("M", rows)],
             grid: (groups * 32, 2, 2), threadGroup: (32, 2, 2),
             outputShapes: [[2, rows, 512]], outputDTypes: [.float32])[0]
+        return (partials, rows)
+    }
+
+    static func apply(x: MLXArray, w: MLXArray) -> MLXArray? {
+        guard let (partials, rows) = makePartials(x: x, w: w) else { return nil }
         return sumKernel(
             [partials], template: [("M", rows)],
             grid: (512, rows, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, rows, 512]], outputDTypes: [.float32])[0]
+    }
+
+    /// Wide prefill route directly from the two f32 router partitions. The
+    /// partition GEMM and the old `apply` fallback stay unchanged.
+    static func applyRouted(x: MLXArray, w: MLXArray)
+        -> (idx: MLXArray, w: MLXArray)?
+    {
+        guard let (partials, rows) = makePartials(x: x, w: w) else { return nil }
+        let routed = fusedRouteKernel(
+            [partials, x, x, x, x],
+            template: [
+                ("E", 512), ("K", 10), ("T", x.dtype), ("GS", 32),
+                ("BITS", 4), ("KD", 2560), ("VPT", rows), ("HAS_GATE", false),
+            ],
+            grid: (32, rows, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[1, rows, 10], [1, rows, 10], [1, rows]],
+            outputDTypes: [.uint32, .float32, x.dtype])
+        return (routed[0], routed[1])
     }
 
     static let source = #"""
@@ -88,4 +120,39 @@ enum TrackPrefillRouter {
         total += partials[M * 512 + i];
         y[i] = total;
         """
+
+    private static func routeSourceVariant(_ source: String) -> String {
+        let replacements = [
+            (
+                "const device float* lr = logits + (size_t)row * (size_t)E;",
+                "const device float* p0 = partials + (size_t)row * 512;\n"
+                    + "const device float* p1 = partials + (size_t)VPT * 512 + (size_t)row * 512;"
+            ),
+            (
+                "v[j] = (e < E) ? lr[e] : -INFINITY;",
+                "if (e < E) {\n"
+                    + "    float total = 0.0f;\n"
+                    + "    total += p0[e];\n"
+                    + "    total += p1[e];\n"
+                    + "    v[j] = total;\n"
+                    + "} else {\n"
+                    + "    v[j] = -INFINITY;\n"
+                    + "}"
+            ),
+        ]
+        var result = source
+        for (old, new) in replacements {
+            precondition(
+                result.components(separatedBy: old).count == 2,
+                "TrackPrefillRouter: route source anchor is not unique")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        return result
+    }
+
+
+    // Derive the fused route from the production route tail. The two replacements
+    // add the original zero + partition-0 + partition-1 sum before the unchanged
+    // stable top-k and float32 softmax code.
+    private static let fusedRouteSource = routeSourceVariant(TrackFastMoEKernels.routeSource)
 }
