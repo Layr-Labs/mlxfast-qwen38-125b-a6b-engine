@@ -1,7 +1,7 @@
 // MLXFAST-PLEFUSE2: S=1 PLE fusion. No projection or weight-layout changes.
 // Scratch: ONE reused float[32] (128 B) in prepare, ZERO in convolution.
-// This retains the RMS/reduction lane layout and the dilated convolution's
-// channel-per-threadgroup layout; token tolerance, not bit equality, applies.
+// This retains the RMS/reduction lane layout. BF16 convolution packs eight
+// channels per SIMD group; other contexts retain one channel per threadgroup.
 import Foundation
 import MLX
 
@@ -104,30 +104,47 @@ enum TrackPLEFusion {
         """
 
     static let convolutionSource = """
-        // MLXFAST-PLEFUSE2: preserve the S=1 dilated implicit-GEMM dispatch:
-        // group=(32,1,4), grid of groups=(1,1,W), channel=group.z.
-        // Its small-channel loaders assign taps 0..3 to SIMD 0 lanes 0..3;
-        // lane 0 owns the single valid output. Keep those owners, discard
-        // the padded matrix work, and require no threadgroup storage.
+        // Four tap products and chronological additions per channel.
+        // PACKED uses eight four-lane channel groups in one SIMD group.
+        // The fallback retains SIMD 0 lanes 0..3 and one channel per group.
         constexpr uint W = 10240;
-        const uint c = threadgroup_position_in_grid.z;
-        const uint lane = thread_index_in_simdgroup;
-        if (simdgroup_index_in_threadgroup != 0) { return; }
-        float product = 0.0f;
-        if (lane < 4) {
-            product = float(full[(lane * 3) * W + c]) * float(weight[c * 4 + lane]);
-        }
-        // FP32 products and chronological FP32 additions, taps 0,1,2,3.
-        // Shuffle broadcasts retain the weight-loading lanes. Unlike a
-        // padded simdgroup MMA, this has no matrix accumulator or spill array.
-        float acc = simd_broadcast(product, 0);
-        acc += simd_broadcast(product, 1);
-        acc += simd_broadcast(product, 2);
-        acc += simd_broadcast(product, 3);
-        if (lane == 0) {
-            InT convolved = InT(acc);
-            InT activated = mlx_silu(convolved);
-            out[c] = gated[c] + activated;
+        if constexpr (PACKED) {
+            const uint group = threadgroup_position_in_grid.z;
+            const uint lane = thread_index_in_simdgroup;
+            const uint c = group * 8 + lane / 4;
+            const uint tap = lane % 4;
+            const uint owner = (lane / 4) * 4;
+            const float product =
+                float(full[(tap * 3) * W + c]) * float(weight[c * 4 + tap]);
+            float acc = simd_shuffle(product, (ushort)owner);
+            acc += simd_shuffle(product, (ushort)(owner + 1));
+            acc += simd_shuffle(product, (ushort)(owner + 2));
+            acc += simd_shuffle(product, (ushort)(owner + 3));
+            if ((lane & 3) == 0) {
+                InT convolved = InT(acc);
+                InT activated = mlx_silu(convolved);
+                out[c] = gated[c] + activated;
+            }
+        } else {
+            const uint c = threadgroup_position_in_grid.z;
+            const uint lane = thread_index_in_simdgroup;
+            if (simdgroup_index_in_threadgroup != 0) { return; }
+            float product = 0.0f;
+            if (lane < 4) {
+                product = float(full[(lane * 3) * W + c]) * float(weight[c * 4 + lane]);
+            }
+            // FP32 products and chronological FP32 additions, taps 0,1,2,3.
+            // Shuffle broadcasts retain the weight-loading lanes. Unlike a
+            // padded simdgroup MMA, this has no matrix accumulator or spill array.
+            float acc = simd_broadcast(product, 0);
+            acc += simd_broadcast(product, 1);
+            acc += simd_broadcast(product, 2);
+            acc += simd_broadcast(product, 3);
+            if (lane == 0) {
+                InT convolved = InT(acc);
+                InT activated = mlx_silu(convolved);
+                out[c] = gated[c] + activated;
+            }
         }
         """
 
@@ -171,9 +188,15 @@ enum TrackPLEFusion {
             grid: (640, 4, 1), threadGroup: (640, 1, 1),
             outputShapes: [[1, 1, 10240], [1, 10, 10240]],
             outputDTypes: [stream.dtype, stream.dtype])
+        let convolutionPacked =
+            stream.dtype == .bfloat16 && StreamOrDevice.default.stream === Stream.gpu
+        let convolutionGridZ = convolutionPacked ? 1280 : 4 * 10240
+        let convolutionThreadgroupZ = convolutionPacked ? 1 : 4
         let output = convolutionKernel(
-            [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
-            grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
+            [r[1], p.convW, r[0]],
+            template: [("InT", stream.dtype), ("PACKED", convolutionPacked)],
+            grid: (32, 1, convolutionGridZ),
+            threadGroup: (32, 1, convolutionThreadgroupZ),
             outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
         return (r[1], output)
     }
