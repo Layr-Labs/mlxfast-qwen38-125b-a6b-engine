@@ -69,7 +69,7 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
             supportsCompiledDecode: false,
             supportsPackedPrefill: false,
             supportsMTP: true,
-            supportsCompactRecurrentMTPReplay: false),
+            supportsCompactRecurrentMTPReplay: TrackQwen4ExpFastModel.enabled),
         kvBackends: [.contiguous],
         decoders: [
             DecoderDeclaration(
