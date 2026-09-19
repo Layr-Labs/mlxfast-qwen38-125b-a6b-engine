@@ -1397,38 +1397,34 @@ extension TrackFastMoEKernels {
         float res[RPS];
         // K % KSG == 0, so the trip count is the constant K / KSG and the loop
         // still unrolls: each simdgroup keeps that many expert walks in flight.
-        if (sgi < KSG) {
-            for (int kk = 0; kk < K / KSG; ++kk) {
-                const int k = (int)sgi + kk * KSG;
-                const uint z = t * K + k;
-                const uint e = idx[z];
-                const size_t eoff = (size_t)e * (size_t)H;
-                const device T* xb = act + (size_t)z * (size_t)F;
-                if (FAST) { qmv_fast_reg<T, GS, BITS, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
-                else { qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
-                const float wk = w[z];
-                // MLXFAST-STAGELANES: `qmv_reg`/`qmv_fast_reg` close with a
-                // `simd_sum` on every row, so every lane of the simdgroup already
-                // holds the identical `res[RPS]`. The staging write therefore only
-                // needs *a* lane per entry, not lane 0 for all of them; each k slot
-                // is written by the simdgroup that owns it (`k = sgi + kk * KSG`).
-                if constexpr (VPT == 1 && RPS <= 32) {
-                    if (lid < RPS) {
-                        prod[k][lid] = static_cast<float>(static_cast<T>(res[lid])) * wk;
-                    }
-                } else {
-                    if (lid == 0) {
-                        for (int i = 0; i < RPS; ++i) { prod[k][i] = static_cast<float>(static_cast<T>(res[i])) * wk; }
-                    }
+        for (int kk = 0; kk < K / KSG; ++kk) {
+            const int k = (int)sgi + kk * KSG;
+            const uint z = t * K + k;
+            const uint e = idx[z];
+            const size_t eoff = (size_t)e * (size_t)H;
+            const device T* xb = act + (size_t)z * (size_t)F;
+            if (FAST) { qmv_fast_reg<T, GS, BITS, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
+            else { qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0, lid, res); }
+            const float wk = w[z];
+            // MLXFAST-STAGELANES: `qmv_reg`/`qmv_fast_reg` close with a
+            // `simd_sum` on every row, so every lane of the simdgroup already
+            // holds the identical `res[RPS]`. The staging write therefore only
+            // needs *a* lane per entry, not lane 0 for all of them; each k slot
+            // is written by the simdgroup that owns it (`k = sgi + kk * KSG`).
+            if constexpr (VPT == 1 && RPS <= 32) {
+                if (lid < RPS) {
+                    prod[k][lid] = static_cast<float>(static_cast<T>(res[lid])) * wk;
+                }
+            } else {
+                if (lid == 0) {
+                    for (int i = 0; i < RPS; ++i) { prod[k][i] = static_cast<float>(static_cast<T>(res[i])) * wk; }
                 }
             }
         }
         // Shared expert down rows d0..d0+3 for token t: one token routes to `qmv`'s
         // normal branch (K = 640), two to eight to `qmv_wide` (full tiles; a row's
         // walk does not depend on how many vectors share its tile).
-        constexpr uint shared_sg = VPT == 1 && K == 10 && KSG >= 5
-            ? (uint)KSG : (KSG > K ? (uint)K : 0u);
-        if (sgi == shared_sg) {
+        if (sgi == (KSG > K ? (uint)K : 0u)) {
             const device T* xs = act + (size_t)(BR + t) * (size_t)F;
             if constexpr (VPT == 1) {
                 float rs[RPS];
@@ -1503,12 +1499,8 @@ extension TrackFastMoEKernels {
     /// fewer rows per threadgroup means more threadgroups in flight (H / rows).
     static let downRowsPerSimdgroup = 2
 
-    // MLXFAST-ONESG: one simdgroup per routed expert. With K = 10 and KSG = 10
-    // each group runs exactly one expert walk (kk loop trip count 1) instead of
-    // two serial walks; the per-row fold order over k is unchanged, so the
-    // output is bit-identical for any value.
     static let downCombineSimdgroups =
-        ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 10
+        ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 5
 
     /// act [BR + S, F] (routed slots, then the shared expert per token), gate [S] pre-sigmoid.
     static func downCombine(
@@ -1521,11 +1513,10 @@ extension TrackFastMoEKernels {
         precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
         let rps = S == 1 ? downRowsPerSimdgroup : 4
-        let groups = ksg + (S == 1 && topK == 10 && ksg >= 5 ? 1 : 0)
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
             template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
-            grid: (32, (H / rps) * groups, S), threadGroup: (32, groups, 1),
+            grid: (32, (H / rps) * ksg, S), threadGroup: (32, ksg, 1),
             outputShapes: [[S, H]], outputDTypes: [act.dtype])[0]
     }
 }
