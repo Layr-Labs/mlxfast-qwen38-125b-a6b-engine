@@ -234,7 +234,7 @@ enum TrackFastPLEKernels {
                 ("InT", gated.dtype), ("W", W), ("S", S), ("KC", kc), ("DIL", dilation),
                 ("NIN", full.dim(1)),
             ],
-            grid: (W, S, B), threadGroup: (256, 1, 1),
+            grid: (W, S, B), threadGroup: (512, 1, 1),
             outputShapes: [[B, S, W]], outputDTypes: [gated.dtype])[0]
     }
 }
