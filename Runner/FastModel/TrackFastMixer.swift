@@ -168,12 +168,23 @@ enum TrackFastMixerKernels {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const uint t = sg * 32 + lid;
-        if (t < 2) {
-            const int d = d0 + (int)t;
-            for (int v = 0; v < VPT; ++v) {
+        // MLXFAST-MIXFOLD: the (row, token) outputs of this tile used to be
+        // folded by two threads, each walking all VPT tokens while the other 62
+        // threads waited at the barrier below. The fold is independent per
+        // (row, token) pair -- its own accumulator, its own output address --
+        // so the tokens are handed out across the whole threadgroup instead.
+        // The sum over HC keeps its original order, so every output value is
+        // bit-identical; only which thread computes it changes. The threadgroup
+        // is (32, 2, 1), so `t` runs over 64 threads and the stride is 32.
+        // At VPT = 1 (decode) only threads 0 and 1 enter the loop with
+        // `t & 1u == t`, exactly as the original guard did, so the decode path
+        // is unchanged; this is a prefill win.
+        {
+            const int d = d0 + (int)(t & 1u);
+            for (int v = (int)(t >> 1); v < VPT; v += 32) {
                 T acc = T(0);
                 for (int s = 0; s < HC; ++s) {
-                    const T p = products[s * 2 + (int)t][v];
+                    const T p = products[s * 2 + (int)(t & 1u)][v];
                     acc = acc + p;
                 }
                 input[(size_t)v * (size_t)H + (size_t)d] = acc;
@@ -204,18 +215,30 @@ enum TrackFastMixerKernels {
         let S = act.dim(0), LW = act.dim(1)
         precondition(S >= 1 && S <= 8 && hidden % 2 == 0 && up.rows == hcCount * hidden && up.bits == 4)
         precondition(LW % 32 == 0 && LW < 512 + 256)  // K = 320: one full block + a tail, the `qmv` normal branch
-        let sigmoidTable = act.dtype == .bfloat16 ? TrackBF16Functions.sigmoid : normed
+        // MLXFAST-UPMIXDT: `act.dtype` is a pure metadata read --
+        // `DType(mlx_array_dtype(ctx))`, no evaluation, no allocation -- of a
+        // `let` parameter that nothing in this function rebinds, and it was
+        // evaluated FOUR times: the `sigmoidTable` selector below, the `T`
+        // template value, and both `act` entries of `outputDTypes`. All four
+        // are reached on every call -- the `precondition`s above trap, they do
+        // not return -- so binding it once turns four reads into one.
+        // Host-side only: the same `DType` picks the same sigmoid table, fills
+        // the same template slot and describes the same outputs, so the kernel
+        // choice, every template constant, the grid, the threadgroup shape and
+        // every byte moved are unchanged.
+        let actDType = act.dtype
+        let sigmoidTable = actDType == .bfloat16 ? TrackBF16Functions.sigmoid : normed
         precondition(!packedRows || (S == 1 && hcCount == 4))
         let outs = (S == 1 ? upMixKernel1 : upMixKernel)(
             [act, normed, up.weight, up.scales, up.biases!, inj, sigmoidTable],
             template: [
-                ("T", act.dtype), ("GS", up.groupSize), ("BITS", up.bits), ("H", hidden), ("HC", hcCount),
+                ("T", actDType), ("GS", up.groupSize), ("BITS", up.bits), ("H", hidden), ("HC", hcCount),
                 ("LW", LW), ("VPT", S), ("HAS_INJECT", hasInject), ("EMIT_F32", emitF32),
                 ("PACKED_ROWS", packedRows),
             ],
             grid: (32, (hidden / 2) * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [[S, hidden], [S, hcCount], [emitF32 ? S : 1, emitF32 ? hidden : 1]],
-            outputDTypes: [act.dtype, act.dtype, .float32])
+            outputDTypes: [actDType, actDType, .float32])
         return (outs[0], outs[1], outs[2])
     }
 }
