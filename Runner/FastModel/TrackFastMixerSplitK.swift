@@ -5,7 +5,15 @@ import MLX
 // ascending block fold and the final simd_sum. No target weight changes.
 enum TrackFastMixerSplitK {
     // Four partitions in production; zero selects the original A/B control.
-    nonisolated(unsafe) static var split = 4
+    // MLXFAST-SPLIT51: K-partitions per threadgroup, paired with one output row
+    // per simdgroup below. `research_split_qmv` cuts the contraction into
+    // `NB = K / (V * 32)` whole quantized blocks and gives simdgroup `sg` the
+    // range `[sg * COUNT, min((sg + 1) * COUNT, NB))` with
+    // `COUNT = (NB + SPLIT - 1) / SPLIT`. On the down half V is 16, so NB = 5:
+    // at SPLIT 4 that is COUNT 2 and the ranges are 2, 2, 1 and EMPTY, at
+    // SPLIT 5 it is COUNT 1 and each of the five owns exactly one block. On the
+    // inject half V is 8, NB = 10, and COUNT goes 3 (3,3,3,1) -> 2 (2,2,2,2,2).
+    nonisolated(unsafe) static var split = 5
     static let helper = #"""
         template <typename T, int K, int V, int R, int SPLIT, bool ORDERED>
         METAL_FUNC void research_split_qmv(
@@ -78,7 +86,14 @@ enum TrackFastMixerSplitK {
 
     static func apply(_ x: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?) -> [MLXArray] {
         let k = x.size, n = down.rows, hc = inject?.rows ?? 4
-        let rows = 2, partitions = split
+        // MLXFAST-SPLIT51: one output row per simdgroup. `RPS` is a loop bound
+        // and an array extent only -- `DN = ND / RPS`, `float r[RPS]`, the
+        // `research_split_qmv` template argument, and the `lo`/`act` stores at
+        // `tile * RPS + i`. At 1 each simdgroup owns a single down row, the
+        // per-thread accumulator is one float instead of two, and the launch's
+        // y extent `(n / rows + hc) * partitions` covers the same `n` rows with
+        // twice as many tiles. `n % rows == 0` holds trivially at 1.
+        let rows = 1, partitions = split
         let inj = inject ?? down
         precondition(x.shape == [1, k] && k % 512 == 0 && n % rows == 0 && partitions > 0)
         return fusedKernel([x, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
