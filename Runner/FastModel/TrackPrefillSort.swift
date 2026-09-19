@@ -165,10 +165,26 @@ enum TrackPrefillSort {
         threadgroup uint pre[E];
         threadgroup uint sA[E];
         threadgroup uint sB[E];
+        threadgroup uint planes[8][10];
         const uint blk = threadgroup_position_in_grid.x;
         const uint t = thread_position_in_threadgroup.x;
         const uint gi = blk * BLK + t;
-        vals[t] = (gi < (uint)R) ? ids[gi] : (uint)E;
+        const uint value = (gi < (uint)R) ? ids[gi] : (uint)E;
+        vals[t] = value;
+        // MLXFAST-SCATTERPLANES: the same ballot bit planes `countSource`
+        // builds, reused below to rank this element among its equals in
+        // O(simdgroups) instead of the O(BLK) serial scan. Plane 9 is the
+        // validity bit (value < E) so sentinel rows can never alias value 0.
+        if constexpr (E == 512 && BLK == 256) {
+            const uint p_lane = thread_index_in_simdgroup;
+            const uint p_sg = simdgroup_index_in_threadgroup;
+            if (p_lane == 0) { planes[p_sg][9] = (uint)((simd_vote::vote_t)simd_ballot(value < (uint)E)); }
+            #pragma clang loop unroll(full)
+            for (uint bit = 0; bit < 9; ++bit) {
+                const uint mask = (uint)((simd_vote::vote_t)simd_ballot((value & (1u << bit)) != 0));
+                if (p_lane == 0) { planes[p_sg][bit] = mask; }
+            }
+        }
         for (uint b = t; b < (uint)E; b += BLK) {
             uint s = 0, before = 0;
             for (uint n = 0; n < (uint)NB; ++n) {
@@ -192,7 +208,31 @@ enum TrackPrefillSort {
         if (gi >= (uint)R) { return; }
         const uint v = vals[t];
         uint rank = 0;
-        for (uint j = 0; j < t; ++j) { rank += (vals[j] == v) ? 1u : 0u; }
+        if constexpr (E == 512 && BLK == 256) {
+            // Rank among equals = popcount of matching lanes before `t`.
+            // The bit-9 validity plane keeps sentinel rows out of value 0's
+            // set, so this counts exactly the j < t with vals[j] == v.
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            for (uint g = 0; g < sg; ++g) {
+                uint matches = planes[g][9];
+                #pragma clang loop unroll(full)
+                for (uint bit = 0; bit < 9; ++bit) {
+                    const uint mask = planes[g][bit];
+                    matches &= (v & (1u << bit)) ? mask : ~mask;
+                }
+                rank += popcount(matches);
+            }
+            uint matches = planes[sg][9] & ((1u << lane) - 1u);
+            #pragma clang loop unroll(full)
+            for (uint bit = 0; bit < 9; ++bit) {
+                const uint mask = planes[sg][bit];
+                matches &= (v & (1u << bit)) ? mask : ~mask;
+            }
+            rank += popcount(matches);
+        } else {
+            for (uint j = 0; j < t; ++j) { rank += (vals[j] == v) ? 1u : 0u; }
+        }
         const uint dest = (sA[v] - tot[v]) + pre[v] + rank;
         sorted_ids[dest] = v;
         token_rows[dest] = gi / (uint)TOPK;
