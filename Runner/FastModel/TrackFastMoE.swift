@@ -1237,9 +1237,29 @@ extension TrackFastMoEKernels {
         source: gateUpActSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
 
-    static let gateUpReuseRowsPerSimdgroup = 2
+    // MLXFAST-GUONESG: one output row per simdgroup. With RPS = 1 each group
+    // runs a single gate+up walk pair over K instead of two serial row pairs;
+    // the per-row fold order over k is unchanged, so act is bit-identical.
+    static let gateUpReuseRowsPerSimdgroup = 1
 
     static let gateUpReuseHelpers = #"""
+        // Bit-exact twin of helpersCore `load_vector` for a threadgroup
+        // pointer: same per-element converts and the same sum order, only the
+        // address space differs.
+        template <typename T, typename U, int values_per_thread, int bits>
+        inline U load_vector_tg(const threadgroup T* x, thread U* x_thread) {
+          static_assert(bits == 4, "gate_up_reuse only instantiates 4-bit");
+          U sum = 0;
+          for (int i = 0; i < values_per_thread; i += 4) {
+            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            x_thread[i] = x[i];
+            x_thread[i + 1] = x[i + 1] / 16.0f;
+            x_thread[i + 2] = x[i + 2] / 256.0f;
+            x_thread[i + 3] = x[i + 3] / 4096.0f;
+          }
+          return sum;
+        }
+
         template <typename T, int group_size, int bits, int rows>
         METAL_FUNC void qmv_fast_reg_dual(
             const device uint32_t* w0,
@@ -1248,7 +1268,7 @@ extension TrackFastMoEKernels {
             const device uint32_t* w1,
             const device T* scales1,
             const device T* biases1,
-            const device T* x,
+            const threadgroup T* x,
             const int in_vec_size,
             const int out_row,
             uint simd_lid,
@@ -1278,7 +1298,7 @@ extension TrackFastMoEKernels {
           biases1 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
           x += simd_lid * values_per_thread;
           for (int k = 0; k < in_vec_size; k += block_size) {
-            U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+            U sum = load_vector_tg<T, U, values_per_thread, bits>(x, x_thread);
             for (int row = 0; row < rows; row++) {
               auto wl0 = (const device uint8_t*)(ws0 + row * in_vec_size_w);
               const device T* sl0 = scales0 + row * in_vec_size_g;
@@ -1322,11 +1342,28 @@ extension TrackFastMoEKernels {
         const device uint32_t* uw = shared ? wsh + (size_t)N * kw : wu + eoff * kw;
         const device T* us = shared ? ssh + (size_t)N * kg : su + eoff * kg;
         const device T* ub = shared ? bsh + (size_t)N * kg : bu + eoff * kg;
+        // MLXFAST-GUONESG: RPS output rows per simdgroup; at RPS = 1 the two
+        // simdgroups of a threadgroup own adjacent rows and both walk the
+        // same x row. MLXFAST-XTG: that row is staged once into threadgroup
+        // memory by all 64 threads (coalesced uint32 copies), so each block's
+        // x fetch is a threadgroup load instead of a second L2 round trip.
+        // The staged copy is raw T bits; load_vector_tg applies the identical
+        // converts and sum order, so act is bit-identical.
+        threadgroup T xtg[KD];
+        {
+            const device uint32_t* xw = (const device uint32_t*)(x + (size_t)r * (size_t)KD);
+            threadgroup uint32_t* xtw = (threadgroup uint32_t*)xtg;
+            const uint tid = simdgroup_index_in_threadgroup * 32u + thread_index_in_simdgroup;
+            for (uint i = tid; i < (uint)(KD / 2); i += 64u) {
+                xtw[i] = xw[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         const int out_row = (int)threadgroup_position_in_grid.y * (2 * RPS)
             + (int)simdgroup_index_in_threadgroup * RPS;
         float g[RPS], u[RPS];
         qmv_fast_reg_dual<T, GS, BITS, RPS>(
-            gw, gs, gb, uw, us, ub, x + (size_t)r * (size_t)KD,
+            gw, gs, gb, uw, us, ub, xtg,
             KD, out_row, thread_index_in_simdgroup, g, u);
         if (thread_index_in_simdgroup == 0) {
             for (int i = 0; i < RPS; ++i) {
@@ -1338,7 +1375,7 @@ extension TrackFastMoEKernels {
         """
 
     nonisolated(unsafe) static let gateUpReuseKernel = MLXFast.metalKernel(
-        name: "track_moe_gate_up_reuse_2row",
+        name: "track_moe_gate_up_reuse_1row_xtg",
         inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
         outputNames: ["act"],
         source: gateUpReuseSource,
