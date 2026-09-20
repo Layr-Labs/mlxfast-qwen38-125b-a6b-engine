@@ -1237,7 +1237,13 @@ extension TrackFastMoEKernels {
         source: gateUpActSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
 
-    static let gateUpReuseRowsPerSimdgroup = 2
+    // MLXFAST-GUONESG: one output row per simdgroup. With RPS = 1 each group
+    // runs a single gate+up walk pair over K instead of two serial row pairs;
+    // the per-row fold order over k is unchanged, so act is bit-identical.
+    static let gateUpReuseRowsPerSimdgroup = 1
+    // Four independent row owners share one threadgroup. This keeps the same
+    // total simdgroup count while halving threadgroup scheduling granularity.
+    static let gateUpReuseSimdgroups = 4
 
     static let gateUpReuseHelpers = #"""
         template <typename T, int group_size, int bits, int rows>
@@ -1322,7 +1328,9 @@ extension TrackFastMoEKernels {
         const device uint32_t* uw = shared ? wsh + (size_t)N * kw : wu + eoff * kw;
         const device T* us = shared ? ssh + (size_t)N * kg : su + eoff * kg;
         const device T* ub = shared ? bsh + (size_t)N * kg : bu + eoff * kg;
-        const int out_row = (int)threadgroup_position_in_grid.y * (2 * RPS)
+        // RPS output rows per simdgroup. Packing four independent row owners
+        // changes only threadgroup scheduling; each group retains its row walk.
+        const int out_row = (int)threadgroup_position_in_grid.y * (SGS * RPS)
             + (int)simdgroup_index_in_threadgroup * RPS;
         float g[RPS], u[RPS];
         qmv_fast_reg_dual<T, GS, BITS, RPS>(
@@ -1338,7 +1346,7 @@ extension TrackFastMoEKernels {
         """
 
     nonisolated(unsafe) static let gateUpReuseKernel = MLXFast.metalKernel(
-        name: "track_moe_gate_up_reuse_2row",
+        name: "track_moe_gate_up_reuse_1row_4sg",
         inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
         outputNames: ["act"],
         source: gateUpReuseSource,
@@ -1358,13 +1366,15 @@ extension TrackFastMoEKernels {
             && groupSize == 32 && bits == 4 && shared.mode == .affine
         {
             let rows = gateUpReuseRowsPerSimdgroup
+            let simdgroups = gateUpReuseSimdgroups
+            precondition(N % (rows * simdgroups) == 0)
             return gateUpReuseKernel(
                 [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
                 template: [
                     ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N),
-                    ("KD", KD), ("BR", BR), ("RPS", rows),
+                    ("KD", KD), ("BR", BR), ("RPS", rows), ("SGS", simdgroups),
                 ],
-                grid: (32, N / rows, BR + 1), threadGroup: (32, 2, 1),
+                grid: (32, N / rows, BR + 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
         }
         return (S == 1 ? gateUpActKernel1 : gateUpActKernel)(
@@ -1423,24 +1433,13 @@ extension TrackFastMoEKernels {
                 }
             }
         }
-        // Shared expert down rows d0..d0+RPS-1 for token t. MLXFAST-SHAREDROWSG:
-        // the one-token path gives each shared row its own simdgroup, so the
-        // barrier waits on ONE row walk instead of RPS serial ones. Each row
-        // keeps its own qmv walk, accumulation order and reduction. Two to
-        // eight tokens keep the wide tile (a row's walk does not depend on how
-        // many vectors share its tile).
+        // Shared expert down rows d0..d0+3 for token t: one token routes to `qmv`'s
+        // normal branch (K = 640), two to eight to `qmv_wide` (full tiles; a row's
+        // walk does not depend on how many vectors share its tile).
         constexpr uint shared_sg = VPT == 1 && K == 10 && KSG >= 5
             ? (uint)KSG : (KSG > K ? (uint)K : 0u);
-        const device T* xs = act + (size_t)(BR + t) * (size_t)F;
-        if constexpr (VPT == 1 && K == 10 && KSG >= 5) {
-            if (sgi >= shared_sg && sgi < shared_sg + RPS) {
-                const int i = (int)(sgi - shared_sg);
-                float rs[1];
-                qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, 1>(
-                    wsd, ssd, bsd, xs, F, d0 + i, lid, rs);
-                if (lid == 0) { shvT[i] = static_cast<float>(static_cast<T>(rs[0])); }
-            }
-        } else if (sgi == shared_sg) {
+        if (sgi == shared_sg) {
+            const device T* xs = act + (size_t)(BR + t) * (size_t)F;
             if constexpr (VPT == 1) {
                 float rs[RPS];
                 qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wsd, ssd, bsd, xs, F, d0, lid, rs);
@@ -1532,9 +1531,7 @@ extension TrackFastMoEKernels {
         precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
         let rps = S == 1 ? downRowsPerSimdgroup : 4
-        // MLXFAST-SHAREDROWSG: one simdgroup per shared-expert row on the
-        // one-token path, so the threadgroup gains `rps` groups, not one.
-        let groups = ksg + (S == 1 && topK == 10 && ksg >= 5 ? rps : 0)
+        let groups = ksg + (S == 1 && topK == 10 && ksg >= 5 ? 1 : 0)
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
             template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
@@ -2227,20 +2224,11 @@ extension TrackFastMoEKernels {
         out_row = out_row + TM <= N ? out_row : N - TM;
         const device T* mat = w + (size_t)out_row * (size_t)K;
         const int n_iter = K / blockN;
-        // MLXFAST-ROUTERVEC4: both operand tiles are TN == 4 contiguous
-        // elements at a TN-aligned offset -- `bn` starts at `simd_lid * 4` and
-        // advances by blockN == 128, and every row base is a multiple of K (a
-        // multiple of 128) -- so the four scalar loads per tile are one aligned
-        // vector load. The products, their order, the accumulator and the simd
-        // reduction are untouched; only the loads issued per K block change.
-        const device float4* xv = reinterpret_cast<const device float4*>(x);
         for (int i = 0; i < n_iter; ++i) {
-            const float4 vx = xv[bn / TN];
-            for (int tn = 0; tn < TN; tn++) { v_coeff[tn] = vx[tn]; }
+            for (int tn = 0; tn < TN; tn++) { v_coeff[tn] = x[bn + tn]; }
             int mat_offset = 0;
             for (int tm = 0; tm < TM; tm++) {
-                const vec<T, 4> vw = *reinterpret_cast<const device vec<T, 4>*>(mat + mat_offset + bn);
-                for (int tn = 0; tn < TN; tn++) { inter[tn] = static_cast<float>(vw[tn]); }
+                for (int tn = 0; tn < TN; tn++) { inter[tn] = static_cast<float>(mat[mat_offset + bn + tn]); }
                 for (int tn = 0; tn < TN; tn++) { result[tm] += inter[tn] * v_coeff[tn]; }
                 mat_offset += K;
             }
@@ -2443,3 +2431,4 @@ extension TrackFastMoEKernels {
         """#
 
 }
+private let gauntletRedraw_df45c406_20260920T233822Z: Int = 0
