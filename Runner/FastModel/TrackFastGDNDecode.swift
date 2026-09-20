@@ -119,7 +119,10 @@ enum TrackFastGDNDecode {
                 }
             }
         }
-        if (sg == 0 && lane == 0) {
+        // MLXFAST-GBIDLE: gate scalars do not depend on conv staging.
+        // Simdgroups >= 12 are idle until the barrier; lane 0 of group 12
+        // produces the identical values while conv groups work.
+        if (sg == 12 && lane == 0) {
             const device InT* row = proj + b_idx * PW;
             const InT b_raw = row[B_OFF + hv_idx];
             gb_shared[1] = static_cast<float>(mlx_sigmoid(b_raw));
