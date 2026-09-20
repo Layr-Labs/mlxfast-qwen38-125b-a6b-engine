@@ -1501,7 +1501,9 @@ extension TrackFastMoEKernels {
     /// MLXFAST-DOWNRPS: output rows per down+combine threadgroup in a one-token
     /// window. Each row's expert walks and the fold are unchanged for any value;
     /// fewer rows per threadgroup means more threadgroups in flight (H / rows).
-    static let downRowsPerSimdgroup = 2
+    /// One row matches the mixer MIX2ROW decode setting: half the live
+    /// accumulators, twice the grid, same per-row arithmetic.
+    static let downRowsPerSimdgroup = 1
 
     // MLXFAST-ONESG: one simdgroup per routed expert. With K = 10 and KSG = 10
     // each group runs exactly one expert walk (kk loop trip count 1) instead of
