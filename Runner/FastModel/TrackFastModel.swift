@@ -245,6 +245,7 @@ struct TrackPLE {
     let embedding: Qwen4ExpNGramEmbedding
     let keyProj: TrackProj
     let valueProj: TrackProj
+    let decodeProj: TrackMultiProj
     let normKeyScale: MLXArray
     let normQueryScale: MLXArray
     let normConvScale: MLXArray
@@ -271,6 +272,11 @@ struct TrackLayer {
 // MARK: - The model
 
 public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
+
+    private struct PLEForwardResult {
+        let output: MLXArray
+        let residualAdded: Bool
+    }
 
     let base: Qwen4ExpModel
     let cfg: Qwen4ExpTextConfiguration
@@ -492,10 +498,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         -> TrackPLE
     {
         let convW = ple.trackChild("conv1d").trackArray("weight")
+        let keyProj = TrackProj(ple.trackChild("key_proj"))
+        let valueProj = TrackProj(ple.trackChild("value_proj"))
         return TrackPLE(
             embedding: ple.pleEmbedding,
-            keyProj: TrackProj(ple.trackChild("key_proj")),
-            valueProj: TrackProj(ple.trackChild("value_proj")),
+            keyProj: keyProj,
+            valueProj: valueProj,
+            decodeProj: TrackMultiProj([keyProj, valueProj]),
             normKeyScale: ple.trackChild("norm_key").trackArray("weight"),
             normQueryScale: ple.trackChild("norm_query").trackArray("weight"),
             normConvScale: ple.trackChild("norm_conv").trackArray("weight"),
@@ -898,7 +907,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
         evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
-    ) -> MLXArray {
+    ) -> PLEForwardResult {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
         let wide = hcCount * hidden
@@ -953,19 +962,35 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             TrackPleContextMirror.invalidate()
             embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
         }
-        // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
-        // every other shape takes the three-launch PLE block below.
+        // MLXFAST-PLEFUSE2: fuse the decode key/value projections, then prepare
+        // and convolution; every other shape takes the three-launch PLE block.
+        let keyFlat: MLXArray
+        let value: MLXArray
+        if S <= 8, p.decodeProj.fused != nil {
+            let projected = p.decodeProj.apply(embedded)
+            keyFlat = projected[.ellipsis, 0 ..< p.keyProj.rows]
+            value = projected[.ellipsis, p.keyProj.rows...]
+        } else {
+            keyFlat = p.keyProj.apply(embedded)
+            value = p.valueProj.apply(embedded)
+        }
+        let fusedResidual = S == 1 && !capture && stream.dtype == .bfloat16
+            && StreamOrDevice.default.stream === Stream.gpu
         let full: MLXArray
         let output: MLXArray
+        let residualAdded: Bool
         if S == 1, TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
             convState.shape == [1, 9, wide], convState.dtype == stream.dtype,
-            let fused = TrackPLEFusion.forward(
-                p, embedded: embedded, stream: stream, convState: convState, eps: eps)
+            let result = TrackPLEFusion.forwardProjected(
+                p, key: keyFlat, value: value, stream: stream, convState: convState,
+                eps: eps, fusedResidual: fusedResidual)
         {
-            (full, output) = fused
+            full = result.full
+            output = result.output
+            residualAdded = result.residualAdded
         } else {
-            let keyFlat = p.keyProj.apply(embedded)
-            let value = p.valueProj.apply(embedded)
+            // Use these same projection results when the post-projection guard
+            // rejects the fused helper; do not run either GEMV a second time.
             // norm_key * norm_query, then MLX's own reduction over the last axis.
             let prod = TrackFastPLEKernels.prod(
                 keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
@@ -982,6 +1007,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
             output = TrackFastPLEKernels.conv(
                 full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
+            residualAdded = false
         }
         do {
             if capture {
@@ -1018,7 +1044,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } catch {
             preconditionFailure("TrackFastModel: PLE stage failed: \(error)")
         }
-        return output
+        return PLEForwardResult(output: output, residualAdded: residualAdded)
     }
 
     private func injectNorm(
@@ -1068,11 +1094,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     residual: residual, out: pendingOut, inject: pendingInject,
                     scale: layer.attnHC.normScaleQ,
                     tile: tile)
-                stream =
-                    stream
-                    + pleForward(
-                        ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
+                let pleResult = pleForward(
+                    ple, stream: stream, ids: ids, evaluation: evaluation,
+                    offset: offset, capture: capture)
+                stream = pleResult.residualAdded ? pleResult.output : stream + pleResult.output
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
