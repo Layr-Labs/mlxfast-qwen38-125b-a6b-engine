@@ -483,6 +483,121 @@ extension TrackFastKernels {
             outputShapes: [[B, S, HQ * D]], outputDTypes: [att.dtype])[0]
     }
 
+    /// MLXFAST-GATEDOUT: one-token `attnGate` *then* `o_proj` qmv_fast, without
+    /// the 6144-wide intermediate. `load_vector_gate` does the same bf16
+    /// `att * sigmoid(gate)` attnGate stored, then the same 4-bit packed
+    /// scales and qdot `qmv_fast_reg` would run on that buffer.
+    static let attnGateOutHelpers = #"""
+        template <typename T, typename U, int values_per_thread, int bits>
+        inline U load_vector_gate(const device T* x, const device T* g, thread U* x_thread) {
+          static_assert(bits == 4, "gated-on-load: 4-bit only");
+          U sum = 0;
+          for (int i = 0; i < values_per_thread; i += 4) {
+            const vec<T, 4> xv = *((const device vec<T, 4>*)(x + i));
+            const vec<T, 4> gv = *((const device vec<T, 4>*)(g + i));
+            const T a = xv.x * mlx_sigmoid(gv.x);
+            const T b = xv.y * mlx_sigmoid(gv.y);
+            const T c = xv.z * mlx_sigmoid(gv.z);
+            const T d = xv.w * mlx_sigmoid(gv.w);
+            sum += a + b + c + d;
+            x_thread[i] = a;
+            x_thread[i + 1] = b / 16.0f;
+            x_thread[i + 2] = c / 256.0f;
+            x_thread[i + 3] = d / 4096.0f;
+          }
+          return sum;
+        }
+        template <typename T, int group_size, int bits, int rows>
+        METAL_FUNC void qmv_fast_reg_gated(
+            const device uint32_t* w,
+            const device T* scales,
+            const device T* biases,
+            const device T* x,
+            const device T* g,
+            const int in_vec_size,
+            const int out_row,
+            uint simd_lid,
+            thread float (&result)[rows]) {
+          constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+          constexpr int pack_factor = get_pack_factor<bits, 32>();
+          constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+          constexpr int values_per_thread = pack_factor * packs_per_thread;
+          constexpr int block_size = values_per_thread * SIMD_SIZE;
+          constexpr int scale_step_per_thread = group_size / values_per_thread;
+          const device uint8_t* ws = (const device uint8_t*)w;
+          typedef float U;
+          thread U x_thread[values_per_thread];
+          for (int row = 0; row < rows; row++) { result[row] = 0; }
+          const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+          const int in_vec_size_g = in_vec_size / group_size;
+          ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+          scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          x += simd_lid * values_per_thread;
+          g += simd_lid * values_per_thread;
+          for (int k = 0; k < in_vec_size; k += block_size) {
+            U sum = load_vector_gate<T, U, values_per_thread, bits>(x, g, x_thread);
+            for (int row = 0; row < rows; row++) {
+              auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+              const device T* sl = scales + row * in_vec_size_g;
+              const device T* bl = biases + row * in_vec_size_g;
+              result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, sl[0], bl[0], sum);
+            }
+            ws += block_size * bytes_per_pack / pack_factor;
+            scales += block_size / group_size;
+            biases += block_size / group_size;
+            x += block_size;
+            g += block_size;
+          }
+          for (int row = 0; row < rows; row++) { result[row] = simd_sum(result[row]); }
+        }
+        """#
+
+    static let attnGateOutSource = """
+        constexpr int RPS = 4;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint lid = thread_index_in_simdgroup;
+        const int out_row = (int)threadgroup_position_in_grid.y * (2 * RPS) + (int)sg * RPS;
+        const device T* gate = qkv + GATE_OFF;
+        float r[RPS];
+        qmv_fast_reg_gated<T, GS, BITS, RPS>(
+            wo, so, bo, att, gate, K, out_row, lid, r);
+        if (lid < (uint)RPS) {
+            y[out_row + (int)lid] = static_cast<T>(r[lid]);
+        }
+        """
+
+    nonisolated(unsafe) static let attnGateOutKernel = MLXFast.metalKernel(
+        name: "track_attn_gate_out",
+        inputNames: ["att", "qkv", "wo", "so", "bo"],
+        outputNames: ["y"],
+        source: attnGateOutSource,
+        header: TrackFastMoEKernels.helpersCore + exactHeader + attnGateOutHelpers,
+        ensureRowContiguous: true)
+
+    /// One-token gated `o_proj`. `att` is `[1,HQ,1,D]` (contiguous `HQ*D`),
+    /// `qkv` holds the gate slice at `gateOffset`. Nil when the shape is not
+    /// the decode `qmv_fast` geometry.
+    static func attnGateOut(
+        att: MLXArray, qkv: MLXArray, gateOffset: Int, weight: TrackQuantWeight
+    ) -> MLXArray? {
+        let B = att.dim(0), HQ = att.dim(1), S = att.dim(2), D = att.dim(3)
+        let K = HQ * D, N = weight.rows
+        guard B == 1, S == 1, att.dtype == .bfloat16, qkv.dim(0) == 1, qkv.dim(1) == 1,
+            gateOffset + K <= qkv.dim(2), weight.bits == 4, weight.groupSize == 32,
+            weight.biases != nil, weight.mode == .affine, K % 512 == 0, N % 8 == 0
+        else { return nil }
+        let rps = 4
+        return attnGateOutKernel(
+            [att, qkv, weight.weight, weight.scales, weight.biases!],
+            template: [
+                ("T", att.dtype), ("GS", weight.groupSize), ("BITS", weight.bits),
+                ("K", K), ("GATE_OFF", gateOffset),
+            ],
+            grid: (32, N / rps, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[B, S, N]], outputDTypes: [att.dtype])[0]
+    }
+
     // MARK: MoE combine
 
     /// out = bf16(sum_k f32(routed[k]) * w[k]) + sigmoid(gate) * shared   (bf16 ops after the f32 sum)
