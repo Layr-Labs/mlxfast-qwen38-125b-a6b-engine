@@ -84,7 +84,10 @@ enum TrackFastMixerSplitK {
         return fusedKernel([x, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
             template: [("T", x.dtype), ("K", k), ("ND", n), ("RPS", rows), ("SPLIT", partitions),
                        ("ORDERED", true), ("HAS_INJECT", inject != nil)],
-            grid: (32, (n / rows + (inject != nil ? hc : 0)) * partitions, 1), threadGroup: (32, partitions, 1),
+            // MLXFAST-SKGRID: tile indexes threadgroup_position_in_grid.y
+            // directly, so groups beyond the tile count ran the prologue and
+            // exited — (partitions - 1)/partitions of the launch was no-op.
+            grid: (32, n / rows + (inject != nil ? hc : 0), 1), threadGroup: (32, partitions, 1),
             outputShapes: [[1, n], [1, n], [1, hc]], outputDTypes: [x.dtype, x.dtype, x.dtype])
     }
 }
