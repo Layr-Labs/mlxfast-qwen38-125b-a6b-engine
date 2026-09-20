@@ -67,3 +67,9 @@ public enum TrackFastProfile {
         t0 = t
     }
 }
+
+// Re-measurement marker for round 0920163218. Referenced nowhere: it exists only so
+// this archive differs from the frontier's bytes, as stated in the public note.
+private enum TrackRemeasureRound0920163218 {
+    static let stamp: UInt64 = 920163218
+}
