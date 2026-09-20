@@ -1,4 +1,3 @@
-// Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
 // TrackFastKernels.prepSource, leanSource and gatedRMSSource.
 
 import MLX
@@ -119,7 +118,14 @@ enum TrackFastGDNDecode {
                 }
             }
         }
-        if (sg == 0 && lane == 0) {
+        // MLXFAST-GBIDLE: the gate scalars depend only on proj/neg_exp_alog/
+        // dt_bias — not on the conv staging — but they used to run on
+        // simdgroup 0 *after* its conv work, serializing them behind the
+        // longest prologue chain. Simdgroups >= 12 are idle until the
+        // barrier; lane 0 of group 12 produces the identical values while
+        // the conv groups work, so the scalars are staged earlier and
+        // simdgroup 0 reaches the barrier sooner.
+        if (sg == 12 && lane == 0) {
             const device InT* row = proj + b_idx * PW;
             const InT b_raw = row[B_OFF + hv_idx];
             gb_shared[1] = static_cast<float>(mlx_sigmoid(b_raw));
@@ -152,6 +158,13 @@ enum TrackFastGDNDecode {
             static_cast<float>(k_[4 * lane]), static_cast<float>(k_[4 * lane + 1]),
             static_cast<float>(k_[4 * lane + 2]), static_cast<float>(k_[4 * lane + 3]));
         threadgroup InT y_shared[Dv];
+        // MLXFAST-DECAYHOIST: the pending-decay journal entry is indexed by
+        // hv_idx only — it does not depend on the row loop. Load it once per
+        // simdgroup instead of once per row.
+        float pending_decay = 0.0f;
+        if constexpr (HAS_JOURNAL) {
+            pending_decay = journal_float(J_DECAY_OFF + 2 * hv_idx);
+        }
         for (int r = 0; r < RPS; ++r) {
             const uint dv_idx = sg * RPS + r;
             const device StT* i_state = state_in + (n * Dv + dv_idx) * Dk;
@@ -167,7 +180,6 @@ enum TrackFastGDNDecode {
                 for (int i = 0; i < 4; ++i) { state[i] = static_cast<float>(i_state[4 * lane + i]); }
             }
             if constexpr (HAS_JOURNAL) {
-                const float pending_decay = journal_float(J_DECAY_OFF + 2 * hv_idx);
                 const float pending_delta = journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx));
                 for (int i = 0; i < 4; ++i) {
                     state[i] = state[i] * pending_decay;
