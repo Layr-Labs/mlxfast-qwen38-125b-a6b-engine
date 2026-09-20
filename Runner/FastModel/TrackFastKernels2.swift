@@ -435,17 +435,27 @@ extension TrackFastKernels {
         qkv: MLXArray, qNorm: MLXArray, kNorm: MLXArray, cos: MLXArray, sin: MLXArray,
         heads: Int, kvHeads: Int, headDim: Int, rotaryDims: Int, eps: Float
     ) -> (q: MLXArray, k: MLXArray, v: MLXArray) {
-        let B = qkv.dim(0), S = qkv.dim(1)
+        // MLXFAST-PREPDT: `qkv.dtype` is a pure metadata read --
+        // `DType(mlx_array_dtype(ctx))`, no evaluation, no allocation -- of a
+        // `let` parameter that nothing in this function rebinds, and it was
+        // evaluated FOUR times: the `InT` template value and all three entries
+        // of `outputDTypes`. There is no early return between them, so all four
+        // are reached on every call. Bind it beside the two dimensions that are
+        // already bound this way. Host-side only: the same `DType` fills the
+        // same template slot and describes the same three outputs, so the
+        // kernel, every template constant, the grid, the threadgroup shape and
+        // every byte moved are unchanged.
+        let B = qkv.dim(0), S = qkv.dim(1), inT = qkv.dtype
         precondition(headDim % 4 == 0 && rotaryDims % 8 == 0 && cos.dim(1) == rotaryDims)
         let outs = attnPrepKernel(
             [qkv, qNorm, kNorm, cos, sin],
             template: [
-                ("InT", qkv.dtype), ("D", headDim), ("HQ", heads), ("HK", kvHeads), ("S", S),
+                ("InT", inT), ("D", headDim), ("HQ", heads), ("HK", kvHeads), ("S", S),
                 ("QW", qkv.dim(2)), ("ROT", rotaryDims), ("EPS_BITS", Int(eps.bitPattern)),
             ],
             grid: (headDim / 4, heads + 2 * kvHeads, B * S), threadGroup: (headDim / 4, 1, 1),
             outputShapes: [[B, heads, S, headDim], [B, kvHeads, S, headDim], [B, kvHeads, S, headDim]],
-            outputDTypes: [qkv.dtype, qkv.dtype, qkv.dtype])
+            outputDTypes: [inT, inT, inT])
         return (outs[0], outs[1], outs[2])
     }
 
