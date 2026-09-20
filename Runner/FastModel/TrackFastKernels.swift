@@ -60,18 +60,47 @@ enum TrackFastKernels {
             if (r < KM1) { return static_cast<float>(cst_b[(uint)(r * CONV_DIM) + ch]); }
             return static_cast<float>(proj_b[(uint)((r - KM1) * PROJ_W) + ch]);
         };
+        const uint ch0 = vec * 128 + lane * N_READS;
         float thread_x[N_READS];
         float acc = 0.0f;
-        for (int i = 0; i < N_READS; ++i) {
-            const uint ch = vec * 128 + lane * N_READS + i;
-            float cacc = 0.0f;
-            for (int j = 0; j < KC; ++j) {
-                cacc += win((int)t + j, ch) * conv_w[ch * KC + j];
+        // MLXFAST-GDNCONV4: same four-channel / four-tap walk as the decode
+        // fused kernel. KC=4 loads each tap and each channel's weights as
+        // one vec<InT,4>. Addends stay tap0*w0 + ... + tap3*w3.
+        if constexpr (KC == 4) {
+            auto tap4 = [&](int r) -> vec<InT, 4> {
+                const device InT* p = (r < KM1)
+                    ? (cst_b + (uint)(r * CONV_DIM) + ch0)
+                    : (proj_b + (uint)((r - KM1) * PROJ_W) + ch0);
+                return *reinterpret_cast<const device vec<InT, 4>*>(p);
+            };
+            const vec<InT, 4> t0 = tap4((int)t + 0);
+            const vec<InT, 4> t1 = tap4((int)t + 1);
+            const vec<InT, 4> t2 = tap4((int)t + 2);
+            const vec<InT, 4> t3 = tap4((int)t + 3);
+            for (int i = 0; i < N_READS; ++i) {
+                const vec<InT, 4> wv = *reinterpret_cast<const device vec<InT, 4>*>(
+                    conv_w + (ch0 + i) * KC);
+                float cacc = static_cast<float>(t0[i]) * static_cast<float>(wv[0]);
+                cacc += static_cast<float>(t1[i]) * static_cast<float>(wv[1]);
+                cacc += static_cast<float>(t2[i]) * static_cast<float>(wv[2]);
+                cacc += static_cast<float>(t3[i]) * static_cast<float>(wv[3]);
+                const InT c0 = static_cast<InT>(cacc);
+                const InT c1 = mlx_silu(c0);
+                thread_x[i] = static_cast<float>(c1);
+                acc += thread_x[i] * thread_x[i];
             }
-            const InT c0 = static_cast<InT>(cacc);
-            const InT c1 = mlx_silu(c0);
-            thread_x[i] = static_cast<float>(c1);
-            acc += thread_x[i] * thread_x[i];
+        } else {
+            for (int i = 0; i < N_READS; ++i) {
+                const uint ch = ch0 + i;
+                float cacc = 0.0f;
+                for (int j = 0; j < KC; ++j) {
+                    cacc += win((int)t + j, ch) * conv_w[ch * KC + j];
+                }
+                const InT c0 = static_cast<InT>(cacc);
+                const InT c1 = mlx_silu(c0);
+                thread_x[i] = static_cast<float>(c1);
+                acc += thread_x[i] * thread_x[i];
+            }
         }
         if (vec < VEC_K) {
             acc = simd_sum(acc);
@@ -107,10 +136,21 @@ enum TrackFastKernels {
         if (CAPTURE || t == (uint)(T - 1)) {
             const uint slot = CAPTURE ? bt : b;
             device InT* o_conv = conv_out + (uint)(slot * KM1 * CONV_DIM);
-            for (int i = 0; i < N_READS; ++i) {
-                const uint ch = vec * 128 + lane * N_READS + i;
+            if constexpr (KC == 4) {
                 for (int j = 0; j < KM1; ++j) {
-                    o_conv[(uint)(j * CONV_DIM) + ch] = static_cast<InT>(win((int)t + 1 + j, ch));
+                    const int r = (int)t + 1 + j;
+                    const device InT* p = (r < KM1)
+                        ? (cst_b + (uint)(r * CONV_DIM) + ch0)
+                        : (proj_b + (uint)((r - KM1) * PROJ_W) + ch0);
+                    *reinterpret_cast<device vec<InT, 4>*>(o_conv + (uint)(j * CONV_DIM) + ch0) =
+                        *reinterpret_cast<const device vec<InT, 4>*>(p);
+                }
+            } else {
+                for (int i = 0; i < N_READS; ++i) {
+                    const uint ch = ch0 + i;
+                    for (int j = 0; j < KM1; ++j) {
+                        o_conv[(uint)(j * CONV_DIM) + ch] = static_cast<InT>(win((int)t + 1 + j, ch));
+                    }
                 }
             }
         }

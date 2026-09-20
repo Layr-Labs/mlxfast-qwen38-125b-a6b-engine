@@ -1,5 +1,8 @@
 // Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
 // TrackFastKernels.prepSource, leanSource and gatedRMSSource.
+// MLXFAST-GDNCONV4: the KC=4 depthwise walk issues vec<InT,4> tap and weight
+// loads. The recurrence, journal, gated RMS, grid, and host dispatch are
+// unchanged. Keep the prep twin in TrackFastKernels.prepSource in step.
 
 import MLX
 
@@ -77,22 +80,53 @@ enum TrackFastGDNDecode {
             const uint vec = sg == 0 ? hk_idx : (sg == 1 ? Hk + hk_idx : 2 * Hk + hv_idx);
             const device InT* proj_b = proj + b_idx * PW;
             const device InT* cst_b = conv_state + b_idx * KM1 * CONV_DIM;
-            auto win = [&](int r, uint ch) -> float {
-                if (r < KM1) { return static_cast<float>(cst_b[(uint)(r * CONV_DIM) + ch]); }
-                return static_cast<float>(proj_b[(uint)((r - KM1) * PW) + ch]);
+            const uint ch0 = vec * 128 + lane * 4;
+            auto win_row = [&](int r) -> const device InT* {
+                return (r < KM1)
+                    ? (cst_b + (uint)(r * CONV_DIM) + ch0)
+                    : (proj_b + (uint)((r - KM1) * PW) + ch0);
             };
             float thread_x[4];
             float acc = 0.0f;
-            for (int i = 0; i < 4; ++i) {
-                const uint ch = vec * 128 + lane * 4 + i;
-                float cacc = 0.0f;
-                for (int j = 0; j < KC; ++j) {
-                    cacc += win(j, ch) * conv_w[ch * KC + j];
+            vec<InT, 4> shift[3];
+            // MLXFAST-GDNCONV4: KC=4 is the pinned geometry. Four adjacent
+            // channels are 8-byte aligned (bf16) / 16-byte aligned (f32), so
+            // each tap and each channel's four weights are one vec<InT,4>
+            // load. Addends stay tap0*w0 + tap1*w1 + tap2*w2 + tap3*w3.
+            if constexpr (KC == 4) {
+                const vec<InT, 4> t0 = *reinterpret_cast<const device vec<InT, 4>*>(win_row(0));
+                const vec<InT, 4> t1 = *reinterpret_cast<const device vec<InT, 4>*>(win_row(1));
+                const vec<InT, 4> t2 = *reinterpret_cast<const device vec<InT, 4>*>(win_row(2));
+                const vec<InT, 4> t3 = *reinterpret_cast<const device vec<InT, 4>*>(win_row(3));
+                shift[0] = t1; shift[1] = t2; shift[2] = t3;
+                for (int i = 0; i < 4; ++i) {
+                    const vec<InT, 4> wv = *reinterpret_cast<const device vec<InT, 4>*>(
+                        conv_w + (ch0 + i) * KC);
+                    float cacc = static_cast<float>(t0[i]) * static_cast<float>(wv[0]);
+                    cacc += static_cast<float>(t1[i]) * static_cast<float>(wv[1]);
+                    cacc += static_cast<float>(t2[i]) * static_cast<float>(wv[2]);
+                    cacc += static_cast<float>(t3[i]) * static_cast<float>(wv[3]);
+                    const InT c0 = static_cast<InT>(cacc);
+                    const InT c1 = mlx_silu(c0);
+                    thread_x[i] = static_cast<float>(c1);
+                    acc += thread_x[i] * thread_x[i];
                 }
-                const InT c0 = static_cast<InT>(cacc);
-                const InT c1 = mlx_silu(c0);
-                thread_x[i] = static_cast<float>(c1);
-                acc += thread_x[i] * thread_x[i];
+            } else {
+                auto win = [&](int r, uint ch) -> float {
+                    if (r < KM1) { return static_cast<float>(cst_b[(uint)(r * CONV_DIM) + ch]); }
+                    return static_cast<float>(proj_b[(uint)((r - KM1) * PW) + ch]);
+                };
+                for (int i = 0; i < 4; ++i) {
+                    const uint ch = ch0 + i;
+                    float cacc = 0.0f;
+                    for (int j = 0; j < KC; ++j) {
+                        cacc += win(j, ch) * conv_w[ch * KC + j];
+                    }
+                    const InT c0 = static_cast<InT>(cacc);
+                    const InT c1 = mlx_silu(c0);
+                    thread_x[i] = static_cast<float>(c1);
+                    acc += thread_x[i] * thread_x[i];
+                }
             }
             if (sg < 2) {
                 acc = simd_sum(acc);
@@ -111,10 +145,21 @@ enum TrackFastGDNDecode {
             }
             if (sg == 2 || hv_idx % (Hv / Hk) == 0) {
                 device InT* o_conv = conv_out + b_idx * KM1 * CONV_DIM;
-                for (int i = 0; i < 4; ++i) {
-                    const uint ch = vec * 128 + lane * 4 + i;
+                if constexpr (KC == 4) {
                     for (int j = 0; j < KM1; ++j) {
-                        o_conv[(uint)(j * CONV_DIM) + ch] = static_cast<InT>(win(1 + j, ch));
+                        *reinterpret_cast<device vec<InT, 4>*>(o_conv + (uint)(j * CONV_DIM) + ch0) =
+                            shift[j];
+                    }
+                } else {
+                    auto win = [&](int r, uint ch) -> float {
+                        if (r < KM1) { return static_cast<float>(cst_b[(uint)(r * CONV_DIM) + ch]); }
+                        return static_cast<float>(proj_b[(uint)((r - KM1) * PW) + ch]);
+                    };
+                    for (int i = 0; i < 4; ++i) {
+                        const uint ch = ch0 + i;
+                        for (int j = 0; j < KM1; ++j) {
+                            o_conv[(uint)(j * CONV_DIM) + ch] = static_cast<InT>(win(1 + j, ch));
+                        }
                     }
                 }
             }
