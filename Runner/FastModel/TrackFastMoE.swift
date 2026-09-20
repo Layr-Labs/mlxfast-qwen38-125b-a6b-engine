@@ -1459,7 +1459,14 @@ extension TrackFastMoEKernels {
         if constexpr (VPT == 1 && RPS <= 32) {
             if (sgi == 0 && lid < RPS) {
                 const int i = (int)lid;
-                const T sg = mlx_sigmoid(gate[t]);
+                // Reuse the existing full-domain BF16 table; preserve the
+                // gate logit API and the multiply/add rounding boundaries.
+                T sg;
+                if constexpr (GATE_LUT) {
+                    sg = sigmoid_lut[as_type<ushort>(static_cast<bfloat16_t>(gate[t]))];
+                } else {
+                    sg = mlx_sigmoid(gate[t]);
+                }
                 float col[K];
                 for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
                 const T r = static_cast<T>(mlx_colsum_small_f32<K>(col));
@@ -1468,7 +1475,14 @@ extension TrackFastMoEKernels {
             }
         } else {
             if (sgi == 0 && lid == 0) {
-                const T sg = mlx_sigmoid(gate[t]);
+                // Reuse the existing full-domain BF16 table; preserve the
+                // gate logit API and the multiply/add rounding boundaries.
+                T sg;
+                if constexpr (GATE_LUT) {
+                    sg = sigmoid_lut[as_type<ushort>(static_cast<bfloat16_t>(gate[t]))];
+                } else {
+                    sg = mlx_sigmoid(gate[t]);
+                }
                 for (int i = 0; i < RPS; ++i) {
                     float col[K];
                     for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
@@ -1482,13 +1496,13 @@ extension TrackFastMoEKernels {
 
     nonisolated(unsafe) static let downCombineKernel = MLXFast.metalKernel(
         name: "track_moe_down_combine",
-        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate"],
+        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate", "sigmoid_lut"],
         outputNames: ["out"],
         source: downCombineSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideHelpers,
         ensureRowContiguous: true)
     nonisolated(unsafe) static let downCombineKernel1 = MLXFast.metalKernel(
         name: "track_moe_down_combine_1",
-        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate"],
+        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate", "sigmoid_lut"],
         outputNames: ["out"],
         source: downCombineSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
@@ -1522,9 +1536,11 @@ extension TrackFastMoEKernels {
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
         let rps = S == 1 ? downRowsPerSimdgroup : 4
         let groups = ksg + (S == 1 && topK == 10 && ksg >= 5 ? 1 : 0)
+        let gateLUT = act.dtype == .bfloat16 && gate.dtype == .bfloat16
+        let sigmoidTable = gateLUT ? TrackBF16Functions.sigmoid : act
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
-            [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
-            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
+            [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate, sigmoidTable],
+            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps), ("GATE_LUT", gateLUT)],
             grid: (32, (H / rps) * groups, S), threadGroup: (32, groups, 1),
             outputShapes: [[S, H]], outputDTypes: [act.dtype])[0]
     }
