@@ -958,7 +958,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let full: MLXArray
         let output: MLXArray
         if S == 1, TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
-            convState.shape == [1, 9, wide], convState.dtype == stream.dtype,
+            convState.ndim == 3 && convState.dim(0) == 1 && convState.dim(1) == 9 && convState.dim(2) == wide,
+            convState.dtype == stream.dtype,
             let fused = TrackPLEFusion.forward(
                 p, embedded: embedded, stream: stream, convState: convState, eps: eps)
         {
@@ -1102,7 +1103,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             Self.debugTaps?.append(("L\(layer.index).attn.out", attended))
             if profiling { TrackFastProfile.tick(layer.gdn != nil ? "gdn" : "attn", &profT, [attended]) }
-            if TrackFastMLPReplay.enabled, ids.shape == [1, 1], stream.dtype == .bfloat16,
+            if TrackFastMLPReplay.enabled, ids.ndim == 2 && ids.dim(0) == 1 && ids.dim(1) == 1, stream.dtype == .bfloat16,
                 !profiling, Self.debugTaps == nil, StreamOrDevice.default.stream === Stream.gpu,
                 let replay = layer.mlpReplay
             {
