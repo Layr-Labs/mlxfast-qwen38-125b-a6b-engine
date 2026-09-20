@@ -1,4 +1,3 @@
-// Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
 // TrackFastKernels.prepSource, leanSource and gatedRMSSource.
 
 import MLX
@@ -119,7 +118,14 @@ enum TrackFastGDNDecode {
                 }
             }
         }
-        if (sg == 0 && lane == 0) {
+        // MLXFAST-GBIDLE: the gate scalars depend only on proj/neg_exp_alog/
+        // dt_bias — not on the conv staging — but they used to run on
+        // simdgroup 0 *after* its conv work, serializing them behind the
+        // longest prologue chain. Simdgroups >= 12 are idle until the
+        // barrier; lane 0 of group 12 produces the identical values while
+        // the conv groups work, so the scalars are staged earlier and
+        // simdgroup 0 reaches the barrier sooner.
+        if (sg == 12 && lane == 0) {
             const device InT* row = proj + b_idx * PW;
             const InT b_raw = row[B_OFF + hv_idx];
             gb_shared[1] = static_cast<float>(mlx_sigmoid(b_raw));
