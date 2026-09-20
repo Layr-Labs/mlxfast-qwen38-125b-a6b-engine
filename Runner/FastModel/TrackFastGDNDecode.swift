@@ -25,14 +25,18 @@ enum TrackFastGDNDecode {
             g.aOffset >= 0, g.aOffset + g.hv <= g.projWidth
         else { return nil }
         let B = proj.dim(0)
-        guard convState.shape == [B, g.convKernel - 1, g.convDim],
-            stateIn.shape == [B, g.hv, g.dv, g.dk],
-            convW.shape == [g.convDim, g.convKernel],
-            negExpALog.shape == [g.hv], dtBias.shape == [g.hv], normW.shape == [g.dv],
+        guard convState.ndim == 3 && convState.dim(0) == B
+                && convState.dim(1) == g.convKernel - 1 && convState.dim(2) == g.convDim,
+            stateIn.ndim == 4 && stateIn.dim(0) == B
+                && stateIn.dim(1) == g.hv && stateIn.dim(2) == g.dv && stateIn.dim(3) == g.dk,
+            convW.ndim == 2 && convW.dim(0) == g.convDim && convW.dim(1) == g.convKernel,
+            negExpALog.ndim == 1 && negExpALog.dim(0) == g.hv,
+            dtBias.ndim == 1 && dtBias.dim(0) == g.hv,
+            normW.ndim == 1 && normW.dim(0) == g.dv,
             convState.dtype == proj.dtype
         else { return nil }
         let journalStride = g.hv * g.dk + 2 * g.hv * g.dv + 2 * g.hv
-        let hasJournal = pendingJournal?.shape == [B, journalStride]
+        let hasJournal = pendingJournal.map { $0.ndim == 2 && $0.dim(0) == B && $0.dim(1) == journalStride } ?? false
         let journalIn = pendingJournal ?? convState
         let result = kernel(
             [proj, convState, convW, negExpALog, dtBias, stateIn, normW, journalIn],
