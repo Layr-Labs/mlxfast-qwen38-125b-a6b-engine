@@ -272,8 +272,22 @@ struct TrackLayer {
 
 public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
+    private struct PLEForwardResult {
+        let output: MLXArray
+        let residualAdded: Bool
+    }
+
     let base: Qwen4ExpModel
     let cfg: Qwen4ExpTextConfiguration
+
+    /// MLXFAST-TAPEDEFER: indexer keys accumulated while the fast path owns the
+    /// row. `updateIndexerTape` concatenates the whole tape on every call, and
+    /// nothing in the fast path reads the result -- the indexer only selects
+    /// blocks past the budget, which is exactly where `fastPlan` hands the row
+    /// back. The keys are therefore held here, in order, and folded into the
+    /// cache's tape in one concatenation at the moment the wrapped model takes
+    /// over.
+    private var pendingIndexerTape: [ObjectIdentifier: (row: ObjectIdentifier, keys: [MLXArray])] = [:]
     let embedTokens: Embedding
     let layers: [TrackLayer]
     let finalMixer: TrackHC
@@ -718,7 +732,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } else {
             idxKeys = a.indexerFull.apply(x)[.ellipsis, a.indexerQWidth...]
         }
-        _ = cache.updateIndexerTape(keys: idxKeys)
+        if let rowID = cache.rows.first.map(ObjectIdentifier.init) {
+            let key = ObjectIdentifier(cache)
+            // A row that left the batch keeps no accumulation: its object
+            // identity can be reused, exactly as the cache drops its own tape
+            // in `setRows`.
+            if var held = pendingIndexerTape[key], held.row == rowID {
+                held.keys.append(idxKeys)
+                pendingIndexerTape[key] = held
+            } else {
+                pendingIndexerTape[key] = (row: rowID, keys: [idxKeys])
+            }
+        } else {
+            _ = cache.updateIndexerTape(keys: idxKeys)
+        }
 
         let prep: (q: MLXArray, k: MLXArray, v: MLXArray)
         if let parts = splitInputs {
@@ -764,11 +791,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
     }
 
-    /// Row index of each (token, expert) slot, one constant array per window size
-    /// (uploading it per step was one host copy per layer).
+    /// Row index of each (token, expert) slot. Decode always uses ten slots
+    /// from row zero, so keep that hot constant outside the locked size cache.
+    nonisolated(unsafe) private static let decodeXrow10: MLXArray = {
+        let t = MLXArray(Array(repeating: UInt32(0), count: 10))
+        eval(t)
+        return t
+    }()
     nonisolated(unsafe) private static var xrowTables: [Int: MLXArray] = [:]
     private static let xrowLock = NSLock()
     static func xrowTable(S: Int, K: Int) -> MLXArray {
+        if S == 1 && K == 10 { return decodeXrow10 }
         xrowLock.lock(); defer { xrowLock.unlock() }
         if let t = xrowTables[S * 1024 + K] { return t }
         let t = MLXArray((0 ..< (S * K)).map { UInt32($0 / K) })
@@ -898,7 +931,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
         evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
-    ) -> MLXArray {
+    ) -> PLEForwardResult {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
         let wide = hcCount * hidden
@@ -955,17 +988,26 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
         // every other shape takes the three-launch PLE block below.
+        let keyFlat = p.keyProj.apply(embedded)
+        let value = p.valueProj.apply(embedded)
+        let fusedResidual = S == 1 && !capture && stream.dtype == .bfloat16
+            && StreamOrDevice.default.stream === Stream.gpu
         let full: MLXArray
         let output: MLXArray
+        let residualAdded: Bool
         if S == 1, TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
-            convState.shape == [1, 9, wide], convState.dtype == stream.dtype,
-            let fused = TrackPLEFusion.forward(
-                p, embedded: embedded, stream: stream, convState: convState, eps: eps)
+            convState.ndim == 3 && convState.dim(0) == 1 && convState.dim(1) == 9 && convState.dim(2) == wide,
+            convState.dtype == stream.dtype,
+            let result = TrackPLEFusion.forwardProjected(
+                p, key: keyFlat, value: value, stream: stream, convState: convState,
+                eps: eps, fusedResidual: fusedResidual)
         {
-            (full, output) = fused
+            full = result.full
+            output = result.output
+            residualAdded = result.residualAdded
         } else {
-            let keyFlat = p.keyProj.apply(embedded)
-            let value = p.valueProj.apply(embedded)
+            // Use these same projection results when the post-projection guard
+            // rejects the fused helper; do not run either GEMV a second time.
             // norm_key * norm_query, then MLX's own reduction over the last axis.
             let prod = TrackFastPLEKernels.prod(
                 keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
@@ -982,6 +1024,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
             output = TrackFastPLEKernels.conv(
                 full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
+            residualAdded = false
         }
         do {
             if capture {
@@ -1018,7 +1061,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } catch {
             preconditionFailure("TrackFastModel: PLE stage failed: \(error)")
         }
-        return output
+        return PLEForwardResult(output: output, residualAdded: residualAdded)
     }
 
     private func injectNorm(
@@ -1068,11 +1111,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     residual: residual, out: pendingOut, inject: pendingInject,
                     scale: layer.attnHC.normScaleQ,
                     tile: tile)
-                stream =
-                    stream
-                    + pleForward(
-                        ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
+                let pleResult = pleForward(
+                    ple, stream: stream, ids: ids, evaluation: evaluation,
+                    offset: offset, capture: capture)
+                stream = pleResult.residualAdded ? pleResult.output : stream + pleResult.output
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
@@ -1102,7 +1144,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             Self.debugTaps?.append(("L\(layer.index).attn.out", attended))
             if profiling { TrackFastProfile.tick(layer.gdn != nil ? "gdn" : "attn", &profT, [attended]) }
-            if TrackFastMLPReplay.enabled, ids.shape == [1, 1], stream.dtype == .bfloat16,
+            if TrackFastMLPReplay.enabled, ids.ndim == 2 && ids.dim(0) == 1 && ids.dim(1) == 1, stream.dtype == .bfloat16,
                 !profiling, Self.debugTaps == nil, StreamOrDevice.default.stream === Stream.gpu,
                 let replay = layer.mlpReplay
             {
@@ -1140,10 +1182,35 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             scale: finalMixer.normScaleQ,
             tile: false)
         let mixed = hcMix(finalMixer, normed: finalNormed).input
+        // MLXFAST-TAILFLUSH: enqueue mixed and multi before returning to overlap execution
+        asyncEval(mixed, multi)
         return (mixed, multi)
     }
 
     // MARK: routing
+
+    /// Fold the accumulated keys into each layer cache's tape, in order, and
+    /// stop accumulating. `updateIndexerTape` truncates the EXISTING tape to the
+    /// row's pre-update `absoluteOffset` and then appends, so the run this fold
+    /// contributes is only the part past what the tape already holds.
+    private func flushIndexerTapes(_ caches: [KVCache]) {
+        guard !pendingIndexerTape.isEmpty else { return }
+        for c in caches {
+            guard let typed = c as? Qwen4ExpCBv2LayerCache else { continue }
+            guard let held = pendingIndexerTape.removeValue(forKey: ObjectIdentifier(typed)),
+                !held.keys.isEmpty, let row = typed.rows.first,
+                ObjectIdentifier(row) == held.row
+            else { continue }
+            let pending = held.keys
+            var all = pending.count == 1 ? pending[0] : concatenated(pending, axis: 1)
+            let committed = row.absoluteOffset
+            let kept = Swift.min(typed.indexerTapeLength, committed)
+            let allowed = committed - kept
+            if all.dim(1) > allowed { all = all[0..., ..<allowed, 0...] }
+            _ = typed.updateIndexerTape(keys: all)
+        }
+        pendingIndexerTape.removeAll()
+    }
 
     private func typedCaches(_ caches: [KVCache]) -> [Qwen4ExpCBv2LayerCache]? {
         var out: [Qwen4ExpCBv2LayerCache] = []
@@ -1182,6 +1249,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             positionIds: positionIds)
         else {
             TrackPleContextMirror.invalidate()
+            flushIndexerTapes(caches)
             return nil
         }
         return fastStreams(

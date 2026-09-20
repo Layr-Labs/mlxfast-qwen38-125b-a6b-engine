@@ -69,11 +69,12 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 
   else if (bits == 4) {
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+      vec<T, 4> xv = ((const device vec<T, 4>*)(x + i))[0];
+      sum += xv[0] + xv[1] + xv[2] + xv[3];
+      x_thread[i] = xv[0];
+      x_thread[i + 1] = xv[1] / 16.0f;
+      x_thread[i + 2] = xv[2] / 256.0f;
+      x_thread[i + 3] = xv[3] / 4096.0f;
     }
   }
 
@@ -148,12 +149,18 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
   }
 
   else if (bits == 4) {
-    for (int i = 0; i < N; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+    int i = 0;
+    for (; i + 4 <= N; i += 4) {
+      vec<T, 4> xv = ((const device vec<T, 4>*)(x + i))[0];
+      sum += xv[0] + xv[1] + xv[2] + xv[3];
+      x_thread[i] = xv[0];
+      x_thread[i + 1] = xv[1] / 16.0f;
+      x_thread[i + 2] = xv[2] / 256.0f;
+      x_thread[i + 3] = xv[3] / 4096.0f;
+    }
+    for (; i < N; i++) {
+      sum += x[i];
+      x_thread[i] = (i % 4 == 0) ? x[i] : (i % 4 == 1) ? x[i] / 16.0f : (i % 4 == 2) ? x[i] / 256.0f : x[i] / 4096.0f;
     }
   }
 
@@ -1052,10 +1059,11 @@ extension TrackFastMoEKernels {
           static_assert(bits == 4, "silu-on-load: 4-bit only");
           U sum = 0;
           for (int i = 0; i < values_per_thread; i += 4) {
-            const T a = mlx_silu(x[i]);
-            const T b = mlx_silu(x[i + 1]);
-            const T c = mlx_silu(x[i + 2]);
-            const T d = mlx_silu(x[i + 3]);
+            vec<T, 4> xv = ((const device vec<T, 4>*)(x + i))[0];
+            const T a = mlx_silu(xv.x);
+            const T b = mlx_silu(xv.y);
+            const T c = mlx_silu(xv.z);
+            const T d = mlx_silu(xv.w);
             sum += a + b + c + d;
             x_thread[i] = a;
             x_thread[i + 1] = b / 16.0f;
@@ -1069,10 +1077,11 @@ extension TrackFastMoEKernels {
           static_assert(bits == 4, "silu-on-load: 4-bit only");
           U sum = 0;
           for (int i = 0; i < N; i += 4) {
-            const T a = mlx_silu(x[i]);
-            const T b = mlx_silu(x[i + 1]);
-            const T c = mlx_silu(x[i + 2]);
-            const T d = mlx_silu(x[i + 3]);
+            vec<T, 4> xv = ((const device vec<T, 4>*)(x + i))[0];
+            const T a = mlx_silu(xv.x);
+            const T b = mlx_silu(xv.y);
+            const T c = mlx_silu(xv.z);
+            const T d = mlx_silu(xv.w);
             sum += a + b + c + d;
             x_thread[i] = a;
             x_thread[i + 1] = b / 16.0f;
@@ -1237,7 +1246,10 @@ extension TrackFastMoEKernels {
         source: gateUpActSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
 
-    static let gateUpReuseRowsPerSimdgroup = 2
+    // MLXFAST-GUONESG: one output row per simdgroup. With RPS = 1 each group
+    // runs a single gate+up walk pair over K instead of two serial row pairs;
+    // the per-row fold order over k is unchanged, so act is bit-identical.
+    static let gateUpReuseRowsPerSimdgroup = 1
 
     static let gateUpReuseHelpers = #"""
         template <typename T, int group_size, int bits, int rows>
@@ -1322,6 +1334,9 @@ extension TrackFastMoEKernels {
         const device uint32_t* uw = shared ? wsh + (size_t)N * kw : wu + eoff * kw;
         const device T* us = shared ? ssh + (size_t)N * kg : su + eoff * kg;
         const device T* ub = shared ? bsh + (size_t)N * kg : bu + eoff * kg;
+        // MLXFAST-GUONESG: RPS output rows per simdgroup; at RPS = 1 the two
+        // simdgroups of a threadgroup own adjacent rows and the dual helper
+        // still loads x once per block for the gate and up walks of its row.
         const int out_row = (int)threadgroup_position_in_grid.y * (2 * RPS)
             + (int)simdgroup_index_in_threadgroup * RPS;
         float g[RPS], u[RPS];
@@ -1338,7 +1353,7 @@ extension TrackFastMoEKernels {
         """
 
     nonisolated(unsafe) static let gateUpReuseKernel = MLXFast.metalKernel(
-        name: "track_moe_gate_up_reuse_2row",
+        name: "track_moe_gate_up_reuse_1row",
         inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
         outputNames: ["act"],
         source: gateUpReuseSource,
@@ -1518,13 +1533,21 @@ extension TrackFastMoEKernels {
         let BR = idx.dim(0), F = act.dim(1), H = wd.dim(1)
         let S = BR / topK
         precondition(BR % topK == 0 && H % 4 == 0 && bits == 4 && w.dtype == .float32 && S >= 1 && S <= 8)
-        precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
+        // MLXFAST-DCFAST: `isFast(k:n:)` is a pure function of F and H, both
+        // `let` bindings from `act.dim(1)` / `wd.dim(1)` that are never rebound
+        // here, and it was evaluated twice -- once for the precondition below
+        // and once as the `FAST` template value. Bind it once. Host-side only:
+        // the template receives the same Bool (the precondition asserts it is
+        // false), so the kernel selection, every template constant, the grid,
+        // the threadgroup shape and every byte moved are unchanged.
+        let fast = isFast(k: F, n: H)
+        precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !fast)
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
         let rps = S == 1 ? downRowsPerSimdgroup : 4
         let groups = ksg + (S == 1 && topK == 10 && ksg >= 5 ? 1 : 0)
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
-            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
+            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", fast), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
             grid: (32, (H / rps) * groups, S), threadGroup: (32, groups, 1),
             outputShapes: [[S, H]], outputDTypes: [act.dtype])[0]
     }
