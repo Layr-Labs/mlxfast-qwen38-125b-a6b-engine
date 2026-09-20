@@ -103,6 +103,52 @@ enum TrackPLEFusion {
         }
         """
 
+    private static func replaceOnce(_ source: String, _ old: String, _ new: String) -> String {
+        let pieces = source.components(separatedBy: old)
+        precondition(pieces.count == 2, "PLE fused prepare anchor must be unique")
+        return pieces[0] + new + pieces[1]
+    }
+
+    // The fused prepare keeps the checked source and changes only its final epilogue.
+    private static let fusedPrepareSource: String = {
+        let old = """
+        for (uint i = 0; i < 4; ++i) {
+            InT n = InT(float(g[i]) * iv);
+            full[9 * W + base + i] = n * convScale[base + i];
+        }
+        """
+        let new = """
+        for (uint i = 0; i < 4; ++i) {
+            const uint c = base + i;
+            InT n = InT(float(g[i]) * iv);
+            const InT newest = n * convScale[c];
+            full[9 * W + c] = newest;
+
+            float acc = 0.0f;
+            {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+                const float p0 = float(convState[c]) * float(convW[c * 4 + 0]);
+                const float p1 = float(convState[3 * W + c]) * float(convW[c * 4 + 1]);
+                const float p2 = float(convState[6 * W + c]) * float(convW[c * 4 + 2]);
+                const float p3 = float(newest) * float(convW[c * 4 + 3]);
+                acc = p0;
+                acc += p1;
+                acc += p2;
+                acc += p3;
+            }
+
+            const InT convolved = InT(acc);
+            const InT activated = mlx_silu(convolved);
+            const InT pleDelta = g[i] + activated;
+            added[c] = query[c] + pleDelta;
+        }
+        """
+        let withoutGated = replaceOnce(
+            prepareSource, "    gated[base + i] = g[i];\n", "")
+        return replaceOnce(withoutGated, old, new)
+    }()
+
     static let convolutionSource = """
         // MLXFAST-PLEFUSE2: preserve the S=1 dilated implicit-GEMM dispatch:
         // group=(32,1,4), grid of groups=(1,1,W), channel=group.z.
@@ -142,32 +188,64 @@ enum TrackPLEFusion {
         outputNames: ["out"], source: convolutionSource,
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
+    static let fusedPrepareKernel = MLXFast.metalKernel(
+        name: "track_ple_prepare_conv_fused2_residual",
+        inputNames: ["key", "query", "value", "keyScale", "queryScale", "convScale", "convState", "convW"],
+        outputNames: ["full", "added"], source: fusedPrepareSource,
+        header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
+
+    @inline(__always)
     static func supports(_ p: TrackPLE, stream: MLXArray, hidden: Int, hcCount: Int) -> Bool {
-        // Guard the exact geometry; every other path builds the original chain.
-        hidden == 2560 && hcCount == 4 && stream.shape == [1, 1, 10240]
-            && [.bfloat16, .float16, .float32].contains(stream.dtype)
+        // This predicate runs once per decode token. Avoid constructing shape
+        // and membership arrays for the fixed geometry checks.
+        let dtype = stream.dtype
+        return hidden == 2560 && hcCount == 4
+            && stream.ndim == 3 && stream.dim(0) == 1 && stream.dim(1) == 1
+            && stream.dim(2) == 10240
+            && (dtype == .bfloat16 || dtype == .float16 || dtype == .float32)
             && p.dilation == 3 && p.stateLength == 9
             && p.keyProj.rows == 10240 && p.valueProj.rows == 2560
-            && p.convW.shape == [10240, 4, 1] && p.convW.dtype == stream.dtype
-            && [p.normKeyScale, p.normQueryScale, p.normConvScale].allSatisfy {
-                $0.shape == [10240] && $0.dtype == stream.dtype
-            }
+            && p.convW.ndim == 3 && p.convW.dim(0) == 10240
+            && p.convW.dim(1) == 4 && p.convW.dim(2) == 1 && p.convW.dtype == dtype
+            && p.normKeyScale.ndim == 1 && p.normKeyScale.dim(0) == 10240
+            && p.normKeyScale.dtype == dtype
+            && p.normQueryScale.ndim == 1 && p.normQueryScale.dim(0) == 10240
+            && p.normQueryScale.dtype == dtype
+            && p.normConvScale.ndim == 1 && p.normConvScale.dim(0) == 10240
+            && p.normConvScale.dtype == dtype
     }
 
-    static func forward(
-        _ p: TrackPLE, embedded: MLXArray, stream: MLXArray, convState: MLXArray, eps: Float
-    ) -> (full: MLXArray, output: MLXArray)? {
-        // The original two projections stay separate, with unchanged kernels,
-        // quantization, tiling, and weight-loading lane ownership.
-        let key = p.keyProj.apply(embedded)
-        let value = p.valueProj.apply(embedded)
+    private static func prepareTemplates(dtype: DType, eps: Float)
+        -> [(String, any KernelTemplateArg)]
+    {
+        [
+            ("InT", dtype),
+            ("EPS_BITS", Int(eps.bitPattern)),
+            // Float(2560).squareRoot().bitPattern, fixed by the fused geometry.
+            ("DIVISOR_BITS", 1_112_171_202),
+        ]
+    }
+
+    static func forwardProjected(
+        _ p: TrackPLE, key: MLXArray, value: MLXArray, stream: MLXArray,
+        convState: MLXArray, eps: Float, fusedResidual: Bool
+    ) -> (full: MLXArray, output: MLXArray, residualAdded: Bool)? {
         guard key.shape == [1, 1, 10240], value.shape == [1, 1, 2560],
             key.dtype == stream.dtype, value.dtype == stream.dtype
         else { return nil }
+        if fusedResidual {
+            let r = fusedPrepareKernel(
+                [key, stream, value, p.normKeyScale, p.normQueryScale,
+                 p.normConvScale, convState, p.convW],
+                template: prepareTemplates(dtype: stream.dtype, eps: eps),
+                grid: (640, 4, 1), threadGroup: (640, 1, 1),
+                outputShapes: [[1, 10, 10240], [1, 1, 10240]],
+                outputDTypes: [stream.dtype, stream.dtype])
+            return (r[0], r[1], true)
+        }
         let r = prepareKernel(
             [key, stream, value, p.normKeyScale, p.normQueryScale, p.normConvScale, convState],
-            template: [("InT", stream.dtype), ("EPS_BITS", Int(eps.bitPattern)),
-                       ("DIVISOR_BITS", Int(Foundation.sqrt(Float(2560)).bitPattern))],
+            template: prepareTemplates(dtype: stream.dtype, eps: eps),
             grid: (640, 4, 1), threadGroup: (640, 1, 1),
             outputShapes: [[1, 1, 10240], [1, 10, 10240]],
             outputDTypes: [stream.dtype, stream.dtype])
@@ -175,6 +253,6 @@ enum TrackPLEFusion {
             [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
             grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
             outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
-        return (r[1], output)
+        return (r[1], output, false)
     }
 }
