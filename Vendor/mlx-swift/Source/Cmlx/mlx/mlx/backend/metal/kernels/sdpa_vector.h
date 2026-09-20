@@ -248,8 +248,22 @@ template <typename T, int D, int V = D>
           score += q_hi[h].w * k_hi.w;
           score = simd_sum(score);
           const float next_maximum = max(maximum[h], score);
-          const float factor = fast::exp(maximum[h] - next_maximum);
-          const float exp_score = fast::exp(score - next_maximum);
+          float factor;
+          float exp_score;
+          const uint old_bits = as_type<uint>(maximum[h]);
+          const uint score_bits = as_type<uint>(score);
+          if ((old_bits & 0x7f800000u) != 0x7f800000u &&
+              (score_bits & 0x7f800000u) != 0x7f800000u) {
+            // For finite operands, one original exponent argument is zero.
+            const float e = fast::exp(-metal::abs(score - maximum[h]));
+            const bool raised = score > maximum[h];
+            factor = raised ? e : 1.0f;
+            exp_score = raised ? 1.0f : e;
+          } else {
+            // Preserve the original inf/NaN expressions and propagation.
+            factor = fast::exp(maximum[h] - next_maximum);
+            exp_score = fast::exp(score - next_maximum);
+          }
           maximum[h] = next_maximum;
           denominator[h] = denominator[h] * factor + exp_score;
           o_lo[h] = o_lo[h] * factor + exp_score * v_lo;
