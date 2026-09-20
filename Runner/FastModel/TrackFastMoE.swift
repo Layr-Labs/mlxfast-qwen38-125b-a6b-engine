@@ -1423,13 +1423,24 @@ extension TrackFastMoEKernels {
                 }
             }
         }
-        // Shared expert down rows d0..d0+3 for token t: one token routes to `qmv`'s
-        // normal branch (K = 640), two to eight to `qmv_wide` (full tiles; a row's
-        // walk does not depend on how many vectors share its tile).
+        // Shared expert down rows d0..d0+RPS-1 for token t. MLXFAST-SHAREDROWSG:
+        // the one-token path gives each shared row its own simdgroup, so the
+        // barrier waits on ONE row walk instead of RPS serial ones. Each row
+        // keeps its own qmv walk, accumulation order and reduction. Two to
+        // eight tokens keep the wide tile (a row's walk does not depend on how
+        // many vectors share its tile).
         constexpr uint shared_sg = VPT == 1 && K == 10 && KSG >= 5
             ? (uint)KSG : (KSG > K ? (uint)K : 0u);
-        if (sgi == shared_sg) {
-            const device T* xs = act + (size_t)(BR + t) * (size_t)F;
+        const device T* xs = act + (size_t)(BR + t) * (size_t)F;
+        if constexpr (VPT == 1 && K == 10 && KSG >= 5) {
+            if (sgi >= shared_sg && sgi < shared_sg + RPS) {
+                const int i = (int)(sgi - shared_sg);
+                float rs[1];
+                qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, 1>(
+                    wsd, ssd, bsd, xs, F, d0 + i, lid, rs);
+                if (lid == 0) { shvT[i] = static_cast<float>(static_cast<T>(rs[0])); }
+            }
+        } else if (sgi == shared_sg) {
             if constexpr (VPT == 1) {
                 float rs[RPS];
                 qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wsd, ssd, bsd, xs, F, d0, lid, rs);
@@ -1521,7 +1532,9 @@ extension TrackFastMoEKernels {
         precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
         let rps = S == 1 ? downRowsPerSimdgroup : 4
-        let groups = ksg + (S == 1 && topK == 10 && ksg >= 5 ? 1 : 0)
+        // MLXFAST-SHAREDROWSG: one simdgroup per shared-expert row on the
+        // one-token path, so the threadgroup gains `rps` groups, not one.
+        let groups = ksg + (S == 1 && topK == 10 && ksg >= 5 ? rps : 0)
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
             template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
@@ -2198,7 +2211,7 @@ extension TrackFastMoEKernels {
 
 extension TrackFastMoEKernels {
     static let routerGemvSource = """
-        constexpr int TM = RPS, TN = 4, SN = 32, blockM = 4 * RPS, blockN = 128;
+        constexpr int TM = RPS, TN = 4, SN = 32, blockM = SGPTG * RPS, blockN = 128;
         const int tid_x = (int)threadgroup_position_in_grid.x;
         const int simd_gid = (int)simdgroup_index_in_threadgroup;
         const int simd_lid = (int)thread_index_in_simdgroup;
@@ -2247,10 +2260,21 @@ extension TrackFastMoEKernels {
         precondition(x.dtype == .float32 && x.size == K && w.dtype == .bfloat16)
         precondition(K % 128 == 0 && K > 64 && K < 16 * N && N % 16 == 0 && N < 4096)
         let rowsPerSimdgroup = K == 2560 && N == 512 ? 1 : 4  // MLXFAST-ROUTERRPS1
+        // MLXFAST-ROUTERSG2: the 512-row router keeps one row per simdgroup and
+        // halves the threadgroup, so the rows spread over 256 two-simdgroup
+        // threadgroups instead of 128 four-simdgroup ones. `blockM` follows the
+        // template, so each row's K walk, its accumulation order and its
+        // simd_shuffle_down reduction are untouched for any SGPTG.
+        let simdgroupsPerThreadgroup = K == 2560 && N == 512 ? 2 : 4
+        precondition(N % (simdgroupsPerThreadgroup * rowsPerSimdgroup) == 0)
         return routerGemvKernel(
             [x.reshaped(K), w],
-            template: [("T", w.dtype), ("K", K), ("N", N), ("RPS", rowsPerSimdgroup)],
-            grid: (32 * (N / (4 * rowsPerSimdgroup)), 1, 4), threadGroup: (32, 1, 4),
+            template: [
+                ("T", w.dtype), ("K", K), ("N", N), ("RPS", rowsPerSimdgroup),
+                ("SGPTG", simdgroupsPerThreadgroup),
+            ],
+            grid: (32 * (N / (simdgroupsPerThreadgroup * rowsPerSimdgroup)), 1, simdgroupsPerThreadgroup),
+            threadGroup: (32, 1, simdgroupsPerThreadgroup),
             outputShapes: [[N]], outputDTypes: [.float32])[0]
     }
 }
