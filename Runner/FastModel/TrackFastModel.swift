@@ -764,11 +764,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
     }
 
-    /// Row index of each (token, expert) slot, one constant array per window size
-    /// (uploading it per step was one host copy per layer).
+    /// Row index of each (token, expert) slot. Decode always uses ten slots
+    /// from row zero, so keep that hot constant outside the locked size cache.
+    nonisolated(unsafe) private static let decodeXrow10: MLXArray = {
+        let t = MLXArray(Array(repeating: UInt32(0), count: 10))
+        eval(t)
+        return t
+    }()
     nonisolated(unsafe) private static var xrowTables: [Int: MLXArray] = [:]
     private static let xrowLock = NSLock()
     static func xrowTable(S: Int, K: Int) -> MLXArray {
+        if S == 1 && K == 10 { return decodeXrow10 }
         xrowLock.lock(); defer { xrowLock.unlock() }
         if let t = xrowTables[S * 1024 + K] { return t }
         let t = MLXArray((0 ..< (S * K)).map { UInt32($0 / K) })
