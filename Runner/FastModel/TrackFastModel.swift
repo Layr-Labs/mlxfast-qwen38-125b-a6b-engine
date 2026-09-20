@@ -202,6 +202,8 @@ struct TrackGDN {
     let geometry: TrackFastKernels.GDNGeometry
     let zOffset: Int
     let valueDim: Int
+    let zCPUWeight: MLXArray?
+    let zGPUSuffix: TrackProj?
 }
 
 struct TrackAttn {
@@ -388,6 +390,34 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let a = TrackProj(m.trackChild("in_proj_a"))
         precondition(qkv.rows == convDim && z.rows == valueDim && b.rows == hv && a.rows == hv)
         let proj = TrackMultiProj([qkv, z, b, a])
+        let cpuRows = 1088
+        let zCPUWeight: MLXArray?
+        let zGPUSuffix: TrackProj?
+        if StreamOrDevice.default.stream === Stream.gpu, valueDim == 6144,
+            case .quant(let weight) = z, let biases = weight.biases,
+            weight.bits == 4, weight.groupSize == 32, weight.mode == .affine,
+            weight.weight.dtype == .uint32, weight.weight.shape == [6144, 320],
+            weight.scales.shape == [6144, 80],
+            biases.shape == weight.scales.shape, weight.scales.dtype == .bfloat16,
+            biases.dtype == .bfloat16
+        {
+            // Preserve the BF16 dequantized operands, then promote them exactly.
+            let prefix = dequantized(
+                weight.weight[0 ..< cpuRows, 0...],
+                scales: weight.scales[0 ..< cpuRows, 0...],
+                biases: biases[0 ..< cpuRows, 0...], groupSize: 32, bits: 4,
+                mode: .affine, dtype: .bfloat16).asType(.float32)
+            eval(prefix)
+            zCPUWeight = prefix
+            zGPUSuffix = .quant(TrackQuantWeight(
+                weight: weight.weight[cpuRows ..< valueDim, 0...],
+                scales: weight.scales[cpuRows ..< valueDim, 0...],
+                biases: biases[cpuRows ..< valueDim, 0...],
+                groupSize: weight.groupSize, bits: weight.bits, mode: weight.mode))
+        } else {
+            zCPUWeight = nil
+            zGPUSuffix = nil
+        }
         let convRaw = m.trackChild("conv1d").trackArray("weight")  // [C, K, 1]
         let kc = convRaw.dim(1)
         let convW = convRaw.reshaped(convDim, kc)
@@ -402,7 +432,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             bOffset: proj.offsets[2], aOffset: proj.offsets[3])
         return TrackGDN(
             proj: proj, convW: convW, negExpALog: negExpALog, dtBias: dtBias, normW: normW,
-            out: out, geometry: geometry, zOffset: proj.offsets[1], valueDim: valueDim)
+            out: out, geometry: geometry, zOffset: proj.offsets[1], valueDim: valueDim,
+            zCPUWeight: zCPUWeight, zGPUSuffix: zGPUSuffix)
     }
 
     static func bindAttn(_ m: Module, cfg: Qwen4ExpTextConfiguration) -> TrackAttn {
@@ -618,7 +649,25 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let geo = separate ? TrackP12Prefill.splitGeometry(g.geometry) : g.geometry
         let prof = TrackFastProfile.prefill != nil && S >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
-        let split = separate ? g.proj.parts.map { $0.apply(x) } : nil
+        let split: [MLXArray]?
+        let cpuZ: MLXArray?, gpuZ: MLXArray?
+        if separate, B == 1, S == 1024, x.dtype == .bfloat16,
+            x.dim(-1) == 2560, StreamOrDevice.default.stream === Stream.gpu,
+            let cpuWeight = g.zCPUWeight, let gpuSuffix = g.zGPUSuffix
+        {
+            let prefix = matmul(
+                x.asType(.float32, stream: .cpu), cpuWeight.transposed(), stream: .cpu)
+                .asType(.bfloat16, stream: .cpu)
+            let suffix = gpuSuffix.apply(x)
+            cpuZ = prefix
+            gpuZ = suffix
+            split = [g.proj.parts[0].apply(x), concatenated([prefix, suffix], axis: -1),
+                     g.proj.parts[2].apply(x), g.proj.parts[3].apply(x)]
+        } else {
+            cpuZ = nil
+            gpuZ = nil
+            split = separate ? g.proj.parts.map { $0.apply(x) } : nil
+        }
         let proj = split?[0] ?? g.proj.apply(x)  // [B,S,PROJ_W]
         if prof { TrackFastProfile.tick("gdn.proj", &pt, split ?? [proj]) }
         let state = evaluation.inputState(modelLayerIndex: layerIndex)
@@ -660,6 +709,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo,
                 separateBA: split.map { (b: $0[2], a: $0[3]) })
             if prof { TrackFastProfile.tick("gdn.prep+lean", &pt, [r.y, r.stateOut, r.convOut]) }
+            if let cpuZ, let gpuZ {
+                asyncEval(cpuZ)
+                asyncEval(r.y, r.stateOut, r.convOut, gpuZ)
+            }
             gated = TrackFastKernels.gatedRMS(
                 y: r.y, proj: split?[1] ?? proj, w: g.normW,
                 zOffset: separate ? 0 : g.zOffset, eps: 1e-6)
