@@ -204,6 +204,69 @@ template <typename T, int D, int V = D>
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  // Stage a short strided K/V block once for all twelve query heads.
+  if constexpr (metal::is_same_v<T, bfloat16_t> && D == 256 && V == 256) {
+    if (N >= 1024 && tptg.z == 1 && tptg.y == 12 && !has_mask && !has_sinks &&
+        (N / blocks + (N % blocks != 0)) <= 16) {
+      threadgroup metal::vec<T, 4> shared_k[16 * 64];
+      threadgroup metal::vec<T, 4> shared_v[16 * 64];
+      const uint block = tid.z;
+      const uint kv_batch = tid.y * tpg.x + tid.x;
+      const uint head = kv_batch * 12 + tidtg.y;
+      const uint local_count = block < (uint)N ? 1 + ((uint)N - 1 - block) / blocks : 0;
+      const uint worker = tidtg.y * 32 + simd_lid;
+      for (uint v = worker; v < local_count * 64; v += 12 * 32) {
+        const uint token = block + (v / 64) * blocks;
+        const uint component = (v % 64) * 4;
+        shared_k[v] = *reinterpret_cast<const device metal::vec<T, 4>*>(
+            keys + kv_batch * k_head_stride + token * k_seq_stride + component);
+        shared_v[v] = *reinterpret_cast<const device metal::vec<T, 4>*>(
+            values + kv_batch * v_head_stride + token * v_seq_stride + component);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const device metal::vec<T, 4>* qp =
+          reinterpret_cast<const device metal::vec<T, 4>*>(queries + head * D + simd_lid * 8);
+      const float4 q_lo = static_cast<float>(scale) * float4(qp[0]);
+      const float4 q_hi = static_cast<float>(scale) * float4(qp[1]);
+      float4 o_lo(0), o_hi(0);
+      float maximum = Limits<float>::finite_min;
+      float denominator = 0;
+      for (uint t = 0; t < local_count; ++t) {
+        const uint slot = t * 64 + simd_lid * 2;
+        const float4 k_lo = float4(shared_k[slot]);
+        const float4 k_hi = float4(shared_k[slot + 1]);
+        const float4 v_lo = float4(shared_v[slot]);
+        const float4 v_hi = float4(shared_v[slot + 1]);
+        float score = q_lo.x * k_lo.x;
+        score += q_lo.y * k_lo.y;
+        score += q_lo.z * k_lo.z;
+        score += q_lo.w * k_lo.w;
+        score += q_hi.x * k_hi.x;
+        score += q_hi.y * k_hi.y;
+        score += q_hi.z * k_hi.z;
+        score += q_hi.w * k_hi.w;
+        score = simd_sum(score);
+        const float next_maximum = max(maximum, score);
+        const float factor = fast::exp(maximum - next_maximum);
+        const float exp_score = fast::exp(score - next_maximum);
+        maximum = next_maximum;
+        denominator = denominator * factor + exp_score;
+        o_lo = o_lo * factor + exp_score * v_lo;
+        o_hi = o_hi * factor + exp_score * v_hi;
+      }
+      const uint offset = head * blocks + block;
+      if (simd_lid == 0) {
+        sums[offset] = denominator;
+        maxs[offset] = maximum;
+      }
+      device metal::vec<T, 4>* destination =
+          reinterpret_cast<device metal::vec<T, 4>*>(out + offset * V + simd_lid * 8);
+      destination[0] = static_cast<metal::vec<T, 4>>(o_lo);
+      destination[1] = static_cast<metal::vec<T, 4>>(o_hi);
+      return;
+    }
+  }
+
   // Two query heads reuse each K/V load while retaining their own block walk.
   // K/V/Q move in 16-byte vector loads; the score keeps its sequential
   // component order so the accumulated value is unchanged.
