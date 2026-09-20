@@ -272,8 +272,14 @@ struct TrackLayer {
 
 public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
+    private struct PLEForwardResult {
+        let output: MLXArray
+        let residualAdded: Bool
+    }
+
     let base: Qwen4ExpModel
     let cfg: Qwen4ExpTextConfiguration
+
     let embedTokens: Embedding
     let layers: [TrackLayer]
     let finalMixer: TrackHC
@@ -764,11 +770,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
     }
 
-    /// Row index of each (token, expert) slot, one constant array per window size
-    /// (uploading it per step was one host copy per layer).
+    /// Row index of each (token, expert) slot. Decode always uses ten slots
+    /// from row zero, so keep that hot constant outside the locked size cache.
+    nonisolated(unsafe) private static let decodeXrow10: MLXArray = {
+        let t = MLXArray(Array(repeating: UInt32(0), count: 10))
+        eval(t)
+        return t
+    }()
     nonisolated(unsafe) private static var xrowTables: [Int: MLXArray] = [:]
     private static let xrowLock = NSLock()
     static func xrowTable(S: Int, K: Int) -> MLXArray {
+        if S == 1 && K == 10 { return decodeXrow10 }
         xrowLock.lock(); defer { xrowLock.unlock() }
         if let t = xrowTables[S * 1024 + K] { return t }
         let t = MLXArray((0 ..< (S * K)).map { UInt32($0 / K) })
@@ -898,7 +910,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
         evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
-    ) -> MLXArray {
+    ) -> PLEForwardResult {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
         let wide = hcCount * hidden
@@ -955,17 +967,26 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
         // every other shape takes the three-launch PLE block below.
+        let keyFlat = p.keyProj.apply(embedded)
+        let value = p.valueProj.apply(embedded)
+        let fusedResidual = S == 1 && !capture && stream.dtype == .bfloat16
+            && StreamOrDevice.default.stream === Stream.gpu
         let full: MLXArray
         let output: MLXArray
+        let residualAdded: Bool
         if S == 1, TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
-            convState.shape == [1, 9, wide], convState.dtype == stream.dtype,
-            let fused = TrackPLEFusion.forward(
-                p, embedded: embedded, stream: stream, convState: convState, eps: eps)
+            convState.ndim == 3 && convState.dim(0) == 1 && convState.dim(1) == 9 && convState.dim(2) == wide,
+            convState.dtype == stream.dtype,
+            let result = TrackPLEFusion.forwardProjected(
+                p, key: keyFlat, value: value, stream: stream, convState: convState,
+                eps: eps, fusedResidual: fusedResidual)
         {
-            (full, output) = fused
+            full = result.full
+            output = result.output
+            residualAdded = result.residualAdded
         } else {
-            let keyFlat = p.keyProj.apply(embedded)
-            let value = p.valueProj.apply(embedded)
+            // Use these same projection results when the post-projection guard
+            // rejects the fused helper; do not run either GEMV a second time.
             // norm_key * norm_query, then MLX's own reduction over the last axis.
             let prod = TrackFastPLEKernels.prod(
                 keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
@@ -982,6 +1003,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
             output = TrackFastPLEKernels.conv(
                 full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
+            residualAdded = false
         }
         do {
             if capture {
@@ -1018,7 +1040,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } catch {
             preconditionFailure("TrackFastModel: PLE stage failed: \(error)")
         }
-        return output
+        return PLEForwardResult(output: output, residualAdded: residualAdded)
     }
 
     private func injectNorm(
@@ -1068,11 +1090,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     residual: residual, out: pendingOut, inject: pendingInject,
                     scale: layer.attnHC.normScaleQ,
                     tile: tile)
-                stream =
-                    stream
-                    + pleForward(
-                        ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
+                let pleResult = pleForward(
+                    ple, stream: stream, ids: ids, evaluation: evaluation,
+                    offset: offset, capture: capture)
+                stream = pleResult.residualAdded ? pleResult.output : stream + pleResult.output
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
@@ -1102,7 +1123,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             Self.debugTaps?.append(("L\(layer.index).attn.out", attended))
             if profiling { TrackFastProfile.tick(layer.gdn != nil ? "gdn" : "attn", &profT, [attended]) }
-            if TrackFastMLPReplay.enabled, ids.shape == [1, 1], stream.dtype == .bfloat16,
+            if TrackFastMLPReplay.enabled, ids.ndim == 2 && ids.dim(0) == 1 && ids.dim(1) == 1, stream.dtype == .bfloat16,
                 !profiling, Self.debugTaps == nil, StreamOrDevice.default.stream === Stream.gpu,
                 let replay = layer.mlpReplay
             {
@@ -1140,6 +1161,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             scale: finalMixer.normScaleQ,
             tile: false)
         let mixed = hcMix(finalMixer, normed: finalNormed).input
+        // MLXFAST-TAILFLUSH: enqueue mixed and multi before returning to overlap execution
         return (mixed, multi)
     }
 
