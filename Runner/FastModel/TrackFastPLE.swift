@@ -34,19 +34,20 @@
 // `metal::abs`, `Maximum` `isnan(x) ? x : (x > y ? x : y)`, `Sqrt`
 // `metal::precise::sqrt`, `Sign` `(x > 0) - (x < 0)`, `Sigmoid` and compiled
 // `silu` as already used elsewhere in this tree. The two scalars the chain
-// divides and clamps by are built with the same `asMLXArray(dtype:)` and
-// `MLXArray(_:dtype:)` calls the reference builds them with, so they carry
+// divides and clamps by ride as template bit patterns: `InT(float)` is the
+// same round-to-nearest cast `asMLXArray(dtype:)` performs, so they carry
 // the same bf16 rounding. The convolution accumulates its `kernel_size` taps
 // in float in ascending tap order and rounds once, which is what the
 // reference's implicit GEMM does for this shape; that is the one claim here
 // that is empirical rather than structural, and it is what the comparison
 // test checks element by element at S = 1..8.
 //
-// The reduction between `track_ple_prod` and `track_ple_gated` is left to
-// MLX. `sum` over a bf16 row accumulates in bf16 through `simd_sum`, and its
-// kernel changes with the window (`row_reduce_looped` below 32 rows,
-// `row_reduce_simple` at or above), so reproducing it would have to
-// reproduce both -- for one launch out of twenty.
+// The reduction between `track_ple_prod` and `track_ple_gated` is folded
+// inside `track_ple_prod` for S <= 7 -- the window sizes where MLX dispatches
+// `row_reduce_looped`, whose per-thread four-element InT fold, simd_sum and
+// cross-simdgroup partials the kernel reproduces exactly. At S >= 8 MLX
+// switches to `row_reduce_simple`, whose fold differs, so wide windows still
+// take MLX's own `sum` over the last axis.
 
 import Foundation
 import MLX
@@ -67,8 +68,9 @@ enum TrackFastPLEKernels {
 
     // MARK: norm_key(key_proj(e)) * norm_query(stream)
 
-    /// keyFlat [B,S,W], stream [B,S,W], kscale [W], qscale [W], eps
-    ///   -> prod [B,S,W]
+    /// keyFlat [B,S,W], stream [B,S,W], kscale [W], qscale [W]; eps rides as a
+    /// template bit pattern.
+    ///   -> prod [B,S,W], dots [B,S,HC] (the row dot, folded in the same pass)
     /// grid (H/4, HC, B*S), threadgroup (H/4, 1, 1)
     static let prodSource = """
         constexpr int N_READS = 4;
@@ -79,7 +81,9 @@ enum TrackFastPLEKernels {
         const uint sg = simdgroup_index_in_threadgroup;
         threadgroup float ksums[32];
         threadgroup float qsums[32];
+        threadgroup InT dsums[32];
         const uint base = row * W + hc * H;
+        const float eps = as_type<float>((uint)EPS_BITS);
         float kx[N_READS];
         float qx[N_READS];
         float kacc = 0.0f;
@@ -101,37 +105,54 @@ enum TrackFastPLEKernels {
         qacc = simd_sum(qsums[lane]);
         const float kinv = metal::precise::rsqrt(kacc / (float)H + eps);
         const float qinv = metal::precise::rsqrt(qacc / (float)H + eps);
+        // MLXFAST-PRODDOT: the row's dot product is folded in the same pass,
+        // bit-exact with `row_reduce_looped` -- the kernel MLX dispatches for
+        // this reduction whenever 4*S < 32 rows, i.e. exactly S <= 7. Same
+        // thread-to-element mapping (lid * 4 + i), same sequential InT fold,
+        // same simd_sum, same cross-simdgroup partials in the InT accumulator.
+        InT dot = InT(0);
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
             const InT kn = static_cast<InT>(kx[i] * kinv) * kscale[hc * H + d];
             const InT qn = static_cast<InT>(qx[i] * qinv) * qscale[hc * H + d];
-            prod[base + d] = kn * qn;
+            const InT p = kn * qn;
+            prod[base + d] = p;
+            dot = p + dot;
         }
+        dot = simd_sum(dot);
+        if (sg == 0 && lane >= simd_groups) { dsums[lane] = InT(0); }
+        if (lane == 0) { dsums[sg] = dot; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dot = simd_sum(dsums[lane]);
+        if (sg == 0 && lane == 0) { dots[row * HC + hc] = dot; }
         """
 
     nonisolated(unsafe) static let prodKernel = MLXFast.metalKernel(
         name: "track_ple_prod",
-        inputNames: ["keyFlat", "stream", "kscale", "qscale", "eps"],
-        outputNames: ["prod"],
+        inputNames: ["keyFlat", "stream", "kscale", "qscale"],
+        outputNames: ["prod", "dots"],
         source: prodSource, header: header, ensureRowContiguous: true)
 
     static func prod(
         keyFlat: MLXArray, stream: MLXArray, kScale: MLXArray, qScale: MLXArray,
         hcCount: Int, hidden: Int, eps: Float
-    ) -> MLXArray {
+    ) -> (prod: MLXArray, dots: MLXArray) {
         let B = keyFlat.dim(0), S = keyFlat.dim(1), W = hcCount * hidden
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && keyFlat.dim(2) == W)
-        return prodKernel(
-            [keyFlat, stream, kScale, qScale, MLXArray(eps)],
-            template: [("InT", keyFlat.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+        let outs = prodKernel(
+            [keyFlat, stream, kScale, qScale],
+            template: [("InT", keyFlat.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+                       ("EPS_BITS", Int(eps.bitPattern))],
             grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
-            outputShapes: [[B, S, W]], outputDTypes: [keyFlat.dtype])[0]
+            outputShapes: [[B, S, W], [B, S, hcCount]],
+            outputDTypes: [keyFlat.dtype, keyFlat.dtype])
+        return (outs[0], outs[1])
     }
 
     // MARK: the gate scalar chain, the gated value, and norm_conv
 
-    /// g0 [B,S,HC,1] (the reduced dot), value [B,S,H], cscale [W], divisor and
-    /// floor as 0-dim arrays in the activation dtype, eps
+    /// g0 [B,S,HC] (the reduced dot), value [B,S,H], cscale [W]; the divisor,
+    /// floor and eps scalars ride as template bit patterns.
     ///   -> gated [B,S,W], normed [B,S,W]
     /// grid (H/4, HC, B*S), threadgroup (H/4, 1, 1)
     static let gatedSource = """
@@ -143,6 +164,13 @@ enum TrackFastPLEKernels {
         const uint sg = simdgroup_index_in_threadgroup;
         threadgroup float sums[32];
         const uint base = row * W + hc * H;
+        const float eps = as_type<float>((uint)EPS_BITS);
+        // The two scalars the reference's `/` and `maximum` build, carried as
+        // bit patterns: `InT(float)` is the same round-to-nearest cast
+        // `asMLXArray(dtype:)` performs, so the divide and the clamp see the
+        // identical bf16 values without a per-window scalar upload.
+        const InT divisor = InT(as_type<float>((uint)DIVISOR_BITS));
+        const InT floorv = InT(as_type<float>((uint)FLOOR_BITS));
 
         InT g = g0[row * HC + hc] / divisor;
         g = mlx_sqrt_t(mlx_maximum(mlx_abs_t(g), floorv)) * mlx_sign(g);
@@ -172,7 +200,7 @@ enum TrackFastPLEKernels {
 
     nonisolated(unsafe) static let gatedKernel = MLXFast.metalKernel(
         name: "track_ple_gated",
-        inputNames: ["g0", "value", "cscale", "divisor", "floorv", "eps"],
+        inputNames: ["g0", "value", "cscale"],
         outputNames: ["gated", "normed"],
         source: gatedSource,
         header: header + """
@@ -182,14 +210,17 @@ enum TrackFastPLEKernels {
         ensureRowContiguous: true)
 
     static func gated(
-        g0: MLXArray, value: MLXArray, cScale: MLXArray, divisor: MLXArray, floor: MLXArray,
+        g0: MLXArray, value: MLXArray, cScale: MLXArray,
         hcCount: Int, hidden: Int, eps: Float
     ) -> (gated: MLXArray, normed: MLXArray) {
         let B = value.dim(0), S = value.dim(1), W = hcCount * hidden
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024 && value.dim(2) == hidden)
         let outs = gatedKernel(
-            [g0, value, cScale, divisor, floor, MLXArray(eps)],
-            template: [("InT", value.dtype), ("H", hidden), ("W", W), ("HC", hcCount)],
+            [g0, value, cScale],
+            template: [("InT", value.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+                       ("EPS_BITS", Int(eps.bitPattern)),
+                       ("DIVISOR_BITS", Int(Foundation.sqrt(Float(hidden)).bitPattern)),
+                       ("FLOOR_BITS", Int(Float(1e-6).bitPattern))],
             grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
             outputShapes: [[B, S, W], [B, S, W]],
             outputDTypes: [value.dtype, value.dtype])
