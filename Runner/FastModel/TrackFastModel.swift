@@ -275,6 +275,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let base: Qwen4ExpModel
     let cfg: Qwen4ExpTextConfiguration
     let embedTokens: Embedding
+    private let decodeHead: TrackProj?
     let layers: [TrackLayer]
     let finalMixer: TrackHC
     let hcCount: Int
@@ -331,6 +332,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             preconditionFailure("TrackFastModel: tower has no embed_tokens")
         }
         self.embedTokens = embed
+        if let head = base.children()[unwrapping: "lm_head"] as? QuantizedLinear {
+            self.decodeHead = TrackProj(head)
+        } else {
+            self.decodeHead = nil
+        }
 
         let tower = base.model
         var built: [TrackLayer] = []
@@ -346,6 +352,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     }
 
     // MARK: binding
+
+    private func projectedHead(_ hiddenState: MLXArray) -> MLXArray {
+        if case .quant(let q)? = decodeHead,
+            let result = TrackWideRowDecode.apply(q, hiddenState)
+        {
+            return result
+        }
+        return base.head(hiddenState)
+    }
 
     static func bindHC(_ m: Module, cfg: Qwen4ExpTextConfiguration) -> TrackHC {
         let scale = m.trackChild("hc_norm").trackArray("weight")
@@ -1243,7 +1258,7 @@ extension TrackQwen4ExpFastModel: CBv2PositionedRecurrentLanguageModelForwardabl
             tokens, inputEmbeddings: nil, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds, capture: false)
         {
-            return base.head(s.mixed)
+            return projectedHead(s.mixed)
         }
         return base.cbv2Forward(
             tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
@@ -1270,7 +1285,7 @@ extension TrackQwen4ExpFastModel: CBv2PositionedRecurrentLanguageModelForwardabl
             inputs, inputEmbeddings: inputEmbedding, caches: cache ?? [],
             recurrentState: recurrentState, positionIds: positionIds, capture: false)
         {
-            return base.head(s.mixed)
+            return projectedHead(s.mixed)
         }
         return base.embeddingForward(
             inputs, inputEmbedding: inputEmbedding, cache: cache,
@@ -1298,7 +1313,7 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentLanguageModelPrefillForwardable {
             case .evaluationOnly:
                 return s.mixed[0..., -1, 0 ..< 1]
             case .lastPositionLogits:
-                return base.head(s.mixed[0..., -1, 0...])
+                return projectedHead(s.mixed[0..., -1, 0...])
             }
         }
         return base.cbv2RecurrentPrefill(
@@ -1318,7 +1333,7 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentMTPForwardable {
             tokens, inputEmbeddings: nil, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds, capture: false)
         {
-            return (base.head(s.mixed), s.multi)
+            return (projectedHead(s.mixed), s.multi)
         }
         return base.cbv2ForwardWithHidden(
             tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
@@ -1340,7 +1355,7 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentCaptureMTPForwardable {
             tokens, inputEmbeddings: nil, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds, capture: true)
         {
-            return (base.head(s.mixed), s.multi)
+            return (projectedHead(s.mixed), s.multi)
         }
         return base.cbv2ForwardWithHiddenCaptured(
             tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)

@@ -16,7 +16,8 @@ struct TrackQuantWeight {
     var rows: Int { weight.dim(0) }
 
     func apply(_ x: MLXArray) -> MLXArray {
-        quantizedMM(
+        if let result = TrackWideRowDecode.apply(self, x) { return result }
+        return quantizedMM(
             x, weight, scales: scales, biases: biases, transpose: true,
             groupSize: groupSize, bits: bits, mode: mode)
     }
