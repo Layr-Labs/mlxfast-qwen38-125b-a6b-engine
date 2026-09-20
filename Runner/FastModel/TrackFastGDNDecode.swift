@@ -4,6 +4,10 @@
 import MLX
 
 enum TrackFastGDNDecode {
+    // Keep each row's SIMD reduction intact while halving the threads per head.
+    // The q/k/v preparation still belongs to groups 0, 1 and 2 respectively.
+    private static let rowsPerSimdgroup = 8
+
     private static let kernel = MLXFast.metalKernel(
         name: "track_gdn_decode_complete",
         inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w", "journal_in"],
@@ -40,12 +44,13 @@ enum TrackFastGDNDecode {
                 ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
                 ("Hk", g.hk), ("Hv", g.hv), ("KC", g.convKernel), ("CONV_DIM", g.convDim),
                 ("PW", g.projWidth), ("B_OFF", g.bOffset), ("A_OFF", g.aOffset),
-                ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)), ("RPS", 4),
+                ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)), ("RPS", rowsPerSimdgroup),
                 ("J_KEY_OFF", 0), ("J_DELTA_OFF", g.hv * g.dk),
                 ("J_DECAY_OFF", g.hv * g.dk + 2 * g.hv * g.dv),
                 ("J_STRIDE", journalStride), ("HAS_JOURNAL", hasJournal),
             ],
-            grid: (32, g.dv / 4, B * g.hv), threadGroup: (32, g.dv / 4, 1),
+            grid: (32, g.dv / rowsPerSimdgroup, B * g.hv),
+            threadGroup: (32, g.dv / rowsPerSimdgroup, 1),
             outputShapes: [
                 hasJournal ? [B, g.hv, g.dv, g.dk] : [1],
                 [B, 1, g.hv * g.dv], [B, g.convKernel - 1, g.convDim],
@@ -57,6 +62,7 @@ enum TrackFastGDNDecode {
 
     private static let source = #"""
         static_assert(Dk == 128 && Dv == 128, "GDN head geometry");
+        static_assert(RPS > 0 && Dv % RPS == 0 && Dv / RPS >= 3, "GDN row ownership");
         const uint n = threadgroup_position_in_grid.z;
         const uint b_idx = n / Hv;
         const uint hv_idx = n % Hv;
