@@ -570,11 +570,13 @@ template <typename T, int D>
   max_score = simd_max(max_score);
 
   // Reduce the d
-  for (int b = 0; b < blocks / BN; ++b) {
-    U factor = fast::exp(maxs[simd_lid + BN * b] - max_score);
-    sum_exp_score += factor * sums[simd_lid + BN * b];
+  if (!batch_components || simd_gid == 0) {
+    for (int b = 0; b < blocks / BN; ++b) {
+      U factor = fast::exp(maxs[simd_lid + BN * b] - max_score);
+      sum_exp_score += factor * sums[simd_lid + BN * b];
+    }
+    sum_exp_score = simd_sum(sum_exp_score);
   }
-  sum_exp_score = simd_sum(sum_exp_score);
 
   // Reduce the sum exp and partials
   for (int b = 0; b < blocks / BN; ++b) {
@@ -592,11 +594,21 @@ template <typename T, int D>
   // Use shared memory to transpose and reduce the final block
   if constexpr (batch_components) {
     for (int i = 0; i < elem_per_thread; i++) {
-      outputs[i * BN * BD + simd_lid * BD + simd_gid] = o[i];
+      if (i != 0 || simd_lid != 0 || simd_gid != 0) {
+        outputs[i * BN * BD + simd_lid * BD + simd_gid] = o[i];
+      }
+    }
+    // The transpose's (0,0) element stays in its owner's register.
+    if (simd_gid == 0 && simd_lid == 0) {
+      outputs[0] = sum_exp_score;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum_exp_score = outputs[0];
     for (int i = 0; i < elem_per_thread; i++) {
-      o[i] = simd_sum(outputs[i * BN * BD + simd_gid * BD + simd_lid]);
+      U value = (i == 0 && simd_gid == 0 && simd_lid == 0)
+          ? o[i]
+          : outputs[i * BN * BD + simd_gid * BD + simd_lid];
+      o[i] = simd_sum(value);
       o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
     }
   } else {
