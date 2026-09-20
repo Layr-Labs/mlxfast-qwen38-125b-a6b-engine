@@ -144,14 +144,16 @@ enum TrackPLEFusion {
 
     static func supports(_ p: TrackPLE, stream: MLXArray, hidden: Int, hcCount: Int) -> Bool {
         // Guard the exact geometry; every other path builds the original chain.
-        hidden == 2560 && hcCount == 4 && stream.shape == [1, 1, 10240]
-            && [.bfloat16, .float16, .float32].contains(stream.dtype)
+        hidden == 2560 && hcCount == 4
+            && stream.ndim == 3 && stream.dim(0) == 1 && stream.dim(1) == 1 && stream.dim(2) == 10240
+            && (stream.dtype == .bfloat16 || stream.dtype == .float16 || stream.dtype == .float32)
             && p.dilation == 3 && p.stateLength == 9
             && p.keyProj.rows == 10240 && p.valueProj.rows == 2560
-            && p.convW.shape == [10240, 4, 1] && p.convW.dtype == stream.dtype
-            && [p.normKeyScale, p.normQueryScale, p.normConvScale].allSatisfy {
-                $0.shape == [10240] && $0.dtype == stream.dtype
-            }
+            && p.convW.ndim == 3 && p.convW.dim(0) == 10240 && p.convW.dim(1) == 4 && p.convW.dim(2) == 1
+            && p.convW.dtype == stream.dtype
+            && p.normKeyScale.ndim == 1 && p.normKeyScale.dim(0) == 10240 && p.normKeyScale.dtype == stream.dtype
+            && p.normQueryScale.ndim == 1 && p.normQueryScale.dim(0) == 10240 && p.normQueryScale.dtype == stream.dtype
+            && p.normConvScale.ndim == 1 && p.normConvScale.dim(0) == 10240 && p.normConvScale.dtype == stream.dtype
     }
 
     static func forward(
@@ -161,7 +163,8 @@ enum TrackPLEFusion {
         // quantization, tiling, and weight-loading lane ownership.
         let key = p.keyProj.apply(embedded)
         let value = p.valueProj.apply(embedded)
-        guard key.shape == [1, 1, 10240], value.shape == [1, 1, 2560],
+        guard key.ndim == 3 && key.dim(0) == 1 && key.dim(1) == 1 && key.dim(2) == 10240,
+            value.ndim == 3 && value.dim(0) == 1 && value.dim(1) == 1 && value.dim(2) == 2560,
             key.dtype == stream.dtype, value.dtype == stream.dtype
         else { return nil }
         let r = prepareKernel(
