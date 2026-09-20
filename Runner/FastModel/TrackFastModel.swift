@@ -238,6 +238,8 @@ struct TrackMoE {
     let sharedDown: TrackProj
     let sharedGate: TrackProj
     let topK: Int
+    /// Shape-only maps shared across layers and acquired before inference.
+    let narrowXrows: [MLXArray]
     let sharedHidden: Int
 }
 
@@ -485,6 +487,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             expertGroupSize: qdown.groupSize, expertBits: qdown.bits,
             sharedGateUp: TrackMultiProj([sg, su]),
             sharedDown: sd, sharedGate: sharedGate, topK: cfg.numExpertsPerTok,
+            narrowXrows: (1...8).map { xrowTable(S: $0, K: cfg.numExpertsPerTok) },
             sharedHidden: sg.rows)
     }
 
@@ -738,27 +741,26 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return a.out.apply(out)
     }
 
-    /// Replay only the two opaque expert launches; routing and all current arrays stay live.
+    /// Replay only the two opaque expert launches. Request-dependent arrays
+    /// are inputs; the bound model's immutable weights are captured constants.
     static func makeMoEPairReplay(_ m: TrackMoE) -> (@Sendable ([MLXArray]) -> [MLXArray])? {
         guard let fused = m.sharedGateUp.fused, case .quant(let guq) = fused,
             case .quant(let dq) = m.sharedDown, guq.biases != nil, dq.biases != nil
         else { return nil }
+        let eg = m.expertGate, eu = m.expertUp, ed = m.expertDown
+        // Materialize once so a trace captures values, not preparation graphs.
+        // These are references to the existing model arrays, not new weights.
+        eval([eg.w, eg.s, eg.b, eu.w, eu.s, eu.b, ed.w, ed.s, ed.b,
+              guq.weight, guq.scales, guq.biases!, dq.weight, dq.scales, dq.biases!])
         return compile(shapeless: false) {
-            [groupSize = m.expertGroupSize, bits = m.expertBits, topK = m.topK,
-             guGroupSize = guq.groupSize, guBits = guq.bits, guMode = guq.mode,
-             downGroupSize = dq.groupSize, downBits = dq.bits, downMode = dq.mode] inputs in
-            let sharedGU = TrackQuantWeight(
-                weight: inputs[11], scales: inputs[12], biases: inputs[13],
-                groupSize: guGroupSize, bits: guBits, mode: guMode)
+            [eg, eu, ed, guq, dq,
+             groupSize = m.expertGroupSize, bits = m.expertBits, topK = m.topK] inputs in
             let act = TrackFastMoEKernels.gateUpAct(
-                wg: inputs[5], sg: inputs[6], bg: inputs[7],
-                wu: inputs[8], su: inputs[9], bu: inputs[10], shared: sharedGU,
+                wg: eg.w, sg: eg.s, bg: eg.b,
+                wu: eu.w, su: eu.s, bu: eu.b, shared: guq,
                 x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits)
-            let sharedDown = TrackQuantWeight(
-                weight: inputs[17], scales: inputs[18], biases: inputs[19],
-                groupSize: downGroupSize, bits: downBits, mode: downMode)
             return [TrackFastMoEKernels.downCombine(
-                wd: inputs[14], sd: inputs[15], bd: inputs[16], sharedDown: sharedDown,
+                wd: ed.w, sd: ed.s, bd: ed.b, sharedDown: dq,
                 act: act, idx: inputs[1], w: inputs[2], gate: inputs[3], topK: topK,
                 groupSize: groupSize, bits: bits)]
         }
@@ -818,15 +820,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let gate = gateQ != nil ? r.gate : m.sharedGate.apply(x).reshaped(S)
             if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights, gate]) }
             let flatIdx = idx.reshaped(S * K)
-            let xrow = Self.xrowTable(S: S, K: K)
+            let xrow = m.narrowXrows[S - 1]
             if let replay, StreamOrDevice.default.stream === Stream.gpu {
                 return replay([
                     x2, flatIdx, weights.reshaped(S * K), gate, xrow,
-                    m.expertGate.w, m.expertGate.s, m.expertGate.b,
-                    m.expertUp.w, m.expertUp.s, m.expertUp.b,
-                    guq.weight, guq.scales, guq.biases!,
-                    m.expertDown.w, m.expertDown.s, m.expertDown.b,
-                    dq.weight, dq.scales, dq.biases!,
                 ])[0].reshaped(1, S, H)
             }
             let act = TrackFastMoEKernels.gateUpAct(
