@@ -155,12 +155,13 @@ enum TrackPLEFusion {
     }
 
     static func forward(
-        _ p: TrackPLE, embedded: MLXArray, stream: MLXArray, convState: MLXArray, eps: Float
+        _ p: TrackPLE, embedded: MLXArray, stream: MLXArray, convState: MLXArray, eps: Float,
+        prepared: (key: MLXArray, value: MLXArray)? = nil
     ) -> (full: MLXArray, output: MLXArray)? {
         // The original two projections stay separate, with unchanged kernels,
         // quantization, tiling, and weight-loading lane ownership.
-        let key = p.keyProj.apply(embedded)
-        let value = p.valueProj.apply(embedded)
+        let key = prepared?.key ?? p.keyProj.apply(embedded)
+        let value = prepared?.value ?? p.valueProj.apply(embedded)
         guard key.shape == [1, 1, 10240], value.shape == [1, 1, 2560],
             key.dtype == stream.dtype, value.dtype == stream.dtype
         else { return nil }

@@ -896,9 +896,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     }
 
     private func pleForward(
-        _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
+        _ p: TrackPLE, residual: MLXArray, pendingOut: MLXArray?, pendingInject: MLXArray?,
+        scale: MLXArray, tile: Bool, ids: MLXArray,
         evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
-    ) -> MLXArray {
+    ) -> (stream: MLXArray, normed: MLXArray) {
+        var stream = residual
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
         let wide = hcCount * hidden
@@ -953,35 +955,68 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             TrackPleContextMirror.invalidate()
             embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
         }
-        // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
-        // every other shape takes the three-launch PLE block below.
         let full: MLXArray
         let output: MLXArray
-        if S == 1, TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
-            convState.shape == [1, 9, wide], convState.dtype == stream.dtype,
-            let fused = TrackPLEFusion.forward(
-                p, embedded: embedded, stream: stream, convState: convState, eps: eps)
+        var fusedNorm: MLXArray? = nil
+        let eligible = !capture && !tile && S == 1 && residual.dtype == .bfloat16
+            && Self.debugTaps == nil && TrackFastProfile.prefill == nil
+            && StreamOrDevice.default.stream === Stream.gpu
+            && TrackPLEFusion.supports(p, stream: residual, hidden: hidden, hcCount: hcCount)
+            && convState.shape == [1, 9, wide] && convState.dtype == residual.dtype
+            && pendingOut?.shape == [1, 1, hidden] && pendingOut?.dtype == residual.dtype
+            && pendingInject?.shape == [1, 1, hcCount] && pendingInject?.dtype == residual.dtype
+            && scale.shape == [wide] && scale.dtype == residual.dtype
+        // Projection eligibility is checked before choosing the injection owner.
+        var prepared: (key: MLXArray, value: MLXArray)? = nil
+        if eligible {
+            prepared = (p.keyProj.apply(embedded), p.valueProj.apply(embedded))
+        }
+        if eligible, let prepared,
+            prepared.key.shape == [1, 1, wide], prepared.value.shape == [1, 1, hidden],
+            prepared.key.dtype == residual.dtype, prepared.value.dtype == residual.dtype,
+            let pendingOut, let pendingInject
         {
-            (full, output) = fused
+            let result = TrackPLEWholeDecode.apply(
+                p, key: prepared.key, value: prepared.value, residual: residual,
+                pending: pendingOut, inject: pendingInject, convState: convState,
+                finalScale: scale, eps: eps)
+            full = result.full
+            output = result.stream
+            fusedNorm = result.normed
         } else {
-            let keyFlat = p.keyProj.apply(embedded)
-            let value = p.valueProj.apply(embedded)
-            // norm_key * norm_query, then MLX's own reduction over the last axis.
-            let prod = TrackFastPLEKernels.prod(
-                keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
-                hcCount: hcCount, hidden: hidden, eps: eps)
-            let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
-            // The two scalars the reference's `/` and `maximum` build, built the
-            // same way so they carry the same rounding into the activation dtype.
-            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
-            let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
-            let gn = TrackFastPLEKernels.gated(
-                g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
-                hcCount: hcCount, hidden: hidden, eps: eps)
-            let gated = gn.gated
-            full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
-            output = TrackFastPLEKernels.conv(
-                full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
+            // Every fallback materializes injection once before the old PLE path.
+            (stream, _) = injectNorm(
+                residual: residual, out: pendingOut, inject: pendingInject,
+                scale: scale, tile: tile)
+            // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
+            // every other shape takes the three-launch PLE block below.
+            if S == 1, TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
+                convState.shape == [1, 9, wide], convState.dtype == stream.dtype,
+                let fused = TrackPLEFusion.forward(
+                    p, embedded: embedded, stream: stream, convState: convState, eps: eps,
+                    prepared: prepared)
+            {
+                (full, output) = fused
+            } else {
+                let keyFlat = prepared?.key ?? p.keyProj.apply(embedded)
+                let value = prepared?.value ?? p.valueProj.apply(embedded)
+                // norm_key * norm_query, then MLX's own reduction over the last axis.
+                let prod = TrackFastPLEKernels.prod(
+                    keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
+                    hcCount: hcCount, hidden: hidden, eps: eps)
+                let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
+                // The two scalars the reference's `/` and `maximum` build, built the
+                // same way so they carry the same rounding into the activation dtype.
+                let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
+                let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
+                let gn = TrackFastPLEKernels.gated(
+                    g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
+                    hcCount: hcCount, hidden: hidden, eps: eps)
+                let gated = gn.gated
+                full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
+                output = TrackFastPLEKernels.conv(
+                    full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
+            }
         }
         do {
             if capture {
@@ -1018,7 +1053,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } catch {
             preconditionFailure("TrackFastModel: PLE stage failed: \(error)")
         }
-        return output
+        if let fusedNorm { return (output, fusedNorm) }
+        return injectNorm(
+            residual: stream + output, out: nil, inject: nil, scale: scale, tile: false)
     }
 
     private func injectNorm(
@@ -1063,20 +1100,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         for layer in layers {
             var normed: MLXArray
             if let ple = layer.ple {
-                // Materialize the stream, add the PLE block, then norm.
-                (stream, _) = injectNorm(
-                    residual: residual, out: pendingOut, inject: pendingInject,
-                    scale: layer.attnHC.normScaleQ,
-                    tile: tile)
-                stream =
-                    stream
-                    + pleForward(
-                        ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
-                (stream, normed) = injectNorm(
-                    residual: stream, out: nil, inject: nil,
-                    scale: layer.attnHC.normScaleQ,
-                    tile: false)
+                (stream, normed) = pleForward(
+                    ple, residual: residual, pendingOut: pendingOut, pendingInject: pendingInject,
+                    scale: layer.attnHC.normScaleQ, tile: tile, ids: ids,
+                    evaluation: evaluation, offset: offset, capture: capture)
             } else {
                 (stream, normed) = injectNorm(
                     residual: residual, out: pendingOut, inject: pendingInject,
