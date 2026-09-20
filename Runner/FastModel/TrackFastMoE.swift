@@ -69,11 +69,12 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 
   else if (bits == 4) {
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+      vec<T, 4> xv = ((const device vec<T, 4>*)(x + i))[0];
+      sum += xv[0] + xv[1] + xv[2] + xv[3];
+      x_thread[i] = xv[0];
+      x_thread[i + 1] = xv[1] / 16.0f;
+      x_thread[i + 2] = xv[2] / 256.0f;
+      x_thread[i + 3] = xv[3] / 4096.0f;
     }
   }
 
@@ -148,12 +149,18 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
   }
 
   else if (bits == 4) {
-    for (int i = 0; i < N; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+    int i = 0;
+    for (; i + 4 <= N; i += 4) {
+      vec<T, 4> xv = ((const device vec<T, 4>*)(x + i))[0];
+      sum += xv[0] + xv[1] + xv[2] + xv[3];
+      x_thread[i] = xv[0];
+      x_thread[i + 1] = xv[1] / 16.0f;
+      x_thread[i + 2] = xv[2] / 256.0f;
+      x_thread[i + 3] = xv[3] / 4096.0f;
+    }
+    for (; i < N; i++) {
+      sum += x[i];
+      x_thread[i] = (i % 4 == 0) ? x[i] : (i % 4 == 1) ? x[i] / 16.0f : (i % 4 == 2) ? x[i] / 256.0f : x[i] / 4096.0f;
     }
   }
 
@@ -1052,10 +1059,11 @@ extension TrackFastMoEKernels {
           static_assert(bits == 4, "silu-on-load: 4-bit only");
           U sum = 0;
           for (int i = 0; i < values_per_thread; i += 4) {
-            const T a = mlx_silu(x[i]);
-            const T b = mlx_silu(x[i + 1]);
-            const T c = mlx_silu(x[i + 2]);
-            const T d = mlx_silu(x[i + 3]);
+            vec<T, 4> xv = ((const device vec<T, 4>*)(x + i))[0];
+            const T a = mlx_silu(xv.x);
+            const T b = mlx_silu(xv.y);
+            const T c = mlx_silu(xv.z);
+            const T d = mlx_silu(xv.w);
             sum += a + b + c + d;
             x_thread[i] = a;
             x_thread[i + 1] = b / 16.0f;
@@ -1069,10 +1077,11 @@ extension TrackFastMoEKernels {
           static_assert(bits == 4, "silu-on-load: 4-bit only");
           U sum = 0;
           for (int i = 0; i < N; i += 4) {
-            const T a = mlx_silu(x[i]);
-            const T b = mlx_silu(x[i + 1]);
-            const T c = mlx_silu(x[i + 2]);
-            const T d = mlx_silu(x[i + 3]);
+            vec<T, 4> xv = ((const device vec<T, 4>*)(x + i))[0];
+            const T a = mlx_silu(xv.x);
+            const T b = mlx_silu(xv.y);
+            const T c = mlx_silu(xv.z);
+            const T d = mlx_silu(xv.w);
             sum += a + b + c + d;
             x_thread[i] = a;
             x_thread[i + 1] = b / 16.0f;
