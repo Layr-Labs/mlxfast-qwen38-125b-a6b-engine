@@ -238,6 +238,8 @@ struct TrackMoE {
     let sharedDown: TrackProj
     let sharedGate: TrackProj
     let topK: Int
+    /// Immutable row maps for every supported narrow window, bound before inference.
+    let narrowXrows: [MLXArray]
     let sharedHidden: Int
 }
 
@@ -485,6 +487,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             expertGroupSize: qdown.groupSize, expertBits: qdown.bits,
             sharedGateUp: TrackMultiProj([sg, su]),
             sharedDown: sd, sharedGate: sharedGate, topK: cfg.numExpertsPerTok,
+            narrowXrows: (1...8).map { xrowTable(S: $0, K: cfg.numExpertsPerTok) },
             sharedHidden: sg.rows)
     }
 
@@ -818,7 +821,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let gate = gateQ != nil ? r.gate : m.sharedGate.apply(x).reshaped(S)
             if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights, gate]) }
             let flatIdx = idx.reshaped(S * K)
-            let xrow = Self.xrowTable(S: S, K: K)
+            let xrow = m.narrowXrows[S - 1]
             if let replay, StreamOrDevice.default.stream === Stream.gpu {
                 return replay([
                     x2, flatIdx, weights.reshaped(S * K), gate, xrow,
