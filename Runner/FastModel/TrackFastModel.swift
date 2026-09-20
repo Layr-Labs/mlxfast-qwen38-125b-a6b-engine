@@ -681,11 +681,29 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return o
     }
 
+    /// MLXFAST-ROPETAB: the table depends only on the position index, so it is
+    /// built once over `[0, indexerBudget)` and sliced. `cosSin` forms
+    /// `freqs = position * invFreq` and then concatenates, cosines and sines
+    /// elementwise, so row `p` of the whole-range table is exactly what a build
+    /// over `[p, p+1)` returns. The fast path is bounded by
+    /// `offset + S <= indexerBudget` (see `fastPlan`), so the cache is built
+    /// once and every later call is a contiguous row slice of it.
+    private var ropeTableCache: (dtype: DType, rows: Int, cos: MLXArray, sin: MLXArray)?
+
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
-        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
-        return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
+        let need = offset + count
+        if let cached = ropeTableCache, cached.dtype == dtype, cached.rows >= need {
+            return (cached.cos[offset ..< need, 0...], cached.sin[offset ..< need, 0...])
+        }
+        let rows = Swift.max(need, indexerBudget)
+        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: 0, count: rows))
+        let cosAll = c.asType(dtype).reshaped(rows, rotaryDims)
+        let sinAll = s.asType(dtype).reshaped(rows, rotaryDims)
+        eval(cosAll, sinAll)
+        ropeTableCache = (dtype, rows, cosAll, sinAll)
+        return (cosAll[offset ..< need, 0...], sinAll[offset ..< need, 0...])
     }
 
     private func attnForward(
@@ -897,7 +915,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
-        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
+        evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool,
+        hoistedHistory: [Int64]? = nil
     ) -> MLXArray {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
@@ -921,23 +940,29 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // one on the fed token itself.
         var hostHistory: [Int64]? = nil
         if let host = p.embedding.rowSourceHolder.source as? Qwen4ExpNGramHostRowSource, S <= 8 {
-            let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
-            let ctx: [Int64]
-            if !capture,
-                TrackPleContextMirror.matches(
-                    offset: offset, layer: p.stateLayerIndex, length: contextLength),
-                let mirrored = TrackPleContextMirror.context
-            {
-                ctx = mirrored
+            let history: [Int64]
+            if let hoistedHistory {
+                // MLXFAST-PLEHOIST: readbacks already ran at forward entry.
+                history = hoistedHistory
             } else {
-                let rawPrev = state?.ssm
-                ctx = rawPrev.map {
-                    $0.dtype == .int32
-                        ? $0.asArray(Int32.self).map(Int64.init)
-                        : $0.asType(.int64).asArray(Int64.self)
-                } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+                let toks: [Int64] = ids.dtype == .int32 ? ids.asArray(Int32.self).map(Int64.init) : ids.asType(.int64).asArray(Int64.self)
+                let ctx: [Int64]
+                if !capture,
+                    TrackPleContextMirror.matches(
+                        offset: offset, layer: p.stateLayerIndex, length: contextLength),
+                    let mirrored = TrackPleContextMirror.context
+                {
+                    ctx = mirrored
+                } else {
+                    let rawPrev = state?.ssm
+                    ctx = rawPrev.map {
+                        $0.dtype == .int32
+                            ? $0.asArray(Int32.self).map(Int64.init)
+                            : $0.asType(.int64).asArray(Int64.self)
+                    } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+                }
+                history = ctx + toks
             }
-            let history = ctx + toks
             if capture {
                 TrackPleContextMirror.invalidate()
             } else {
@@ -973,7 +998,14 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
-            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
+            // MLXFAST-DIVCACHE: `sqrt(hidden)` is a constant and both spellings
+            // round identically into the activation dtype (checked at hidden =
+            // 2560/1024/4096/640/320: bit-for-bit equal), so the cached scalar
+            // serves it. `TrackFastKernels.scalar` exists for exactly this --
+            // building one per call is a host allocation and a cast launch --
+            // and the `floor` on the next line already uses it.
+            let divisor = TrackFastKernels.scalar(
+                Foundation.sqrt(Float(hidden)), dtype: dot.dtype)
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
             let gn = TrackFastPLEKernels.gated(
                 g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
@@ -1048,6 +1080,39 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         precondition(recurrentState.count == 1)
         let evaluation = recurrentState[0]
         var residual = inputEmbeddings ?? embedTokens(ids)  // [B,S,H] until tiled
+        // MLXFAST-PLEHOIST: the host n-gram path needs the fed ids and the
+        // rolling context on the CPU.  Read them here, before the layer loop
+        // enqueues any GPU work, so the two readbacks complete against an
+        // empty pipeline instead of draining whatever layer 0 has launched.
+        // The values are identical to the ones `pleForward` read at layer 1.
+        var pleHostHistory: [Int64]? = nil
+        if let ple = layers.first(where: { $0.ple != nil })?.ple,
+            ple.embedding.rowSourceHolder.source is Qwen4ExpNGramHostRowSource,
+            ids.dim(1) <= 8
+        {
+            let contextLength = max(1, ple.dilation - 1)
+            let toks: [Int64] =
+                ids.dtype == .int32
+                ? ids.asArray(Int32.self).map(Int64.init)
+                : ids.asType(.int64).asArray(Int64.self)
+            let ctx: [Int64]
+            if !capture,
+                TrackPleContextMirror.matches(
+                    offset: offset, layer: ple.stateLayerIndex, length: contextLength),
+                let mirrored = TrackPleContextMirror.context
+            {
+                ctx = mirrored
+            } else {
+                let rawPrev = evaluation.inputState(modelLayerIndex: ple.stateLayerIndex)?.ssm
+                ctx =
+                    rawPrev.map {
+                        $0.dtype == .int32
+                            ? $0.asArray(Int32.self).map(Int64.init)
+                            : $0.asType(.int64).asArray(Int64.self)
+                    } ?? Array(repeating: Int64(cfg.eosTokenId), count: contextLength)
+            }
+            pleHostHistory = ctx + toks
+        }
         // A fully injected hyper-stream can continue through a layer block.
         // Normal token/embedding entry points retain the initial tiling.
         var tile = !inputIsMultiStream
@@ -1072,7 +1137,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     stream
                     + pleForward(
                         ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
+                        offset: offset, capture: capture, hoistedHistory: pleHostHistory)
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
@@ -1140,6 +1205,19 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             scale: finalMixer.normScaleQ,
             tile: false)
         let mixed = hcMix(finalMixer, normed: finalNormed).input
+        // MLXFAST-TAILFLUSH: the loop's dispatch schedule lands its last flush
+        // on layer 47 -- with `asyncChunk` 3 and `asyncFirst` 2 the hits are
+        // ... 41, 44, 47 -- so layer 48, the final `injectNorm` above and this
+        // final `hcMix`, plus the head and the sampler the caller builds on top
+        // of `mixed`, are all still unenqueued at this return. On the pure
+        // decode path the engine launches the NEXT step feeding this step's
+        // still-lazy sampled token and only finalizes afterwards, so nothing
+        // enqueues that tail until something reads the token -- and the read
+        // then waits on all of it. Enqueue it here instead.
+        //
+        // `asyncEval` does not block and computes nothing new: the same arrays
+        // are returned, with the same contents, in the same order.
+        asyncEval(mixed, multi)
         return (mixed, multi)
     }
 
