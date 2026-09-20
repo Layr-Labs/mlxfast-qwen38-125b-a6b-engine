@@ -753,7 +753,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: inputs[5], sg: inputs[6], bg: inputs[7],
                 wu: inputs[8], su: inputs[9], bu: inputs[10], shared: sharedGU,
-                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits)
+                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits, inputSums: inputs[20])
             let sharedDown = TrackQuantWeight(
                 weight: inputs[17], scales: inputs[18], biases: inputs[19],
                 groupSize: downGroupSize, bits: downBits, mode: downMode)
@@ -784,13 +784,26 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let prof = TrackFastProfile.prefill != nil && x.dim(1) >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
         let logits: MLXArray
+        var inputSums: MLXArray? = nil
         if x.dim(0) == 1, x.dim(1) == 1, m.routerW16.dtype == .bfloat16, x.dim(2) % 128 == 0,
             m.routerW16.dim(0) % 16 == 0, x.dim(2) < 16 * m.routerW16.dim(0), m.routerW16.dim(0) < 4096
         {
             // One token: MLX's float gemv arithmetic over the bf16 weight (the
             // reference upcasts it to float32 and reads twice the bytes).
             let xf = (inputF32 ?? x.asType(.float32)).reshaped(x.dim(2))
-            logits = TrackFastMoEKernels.routerGemv(x: xf, w: m.routerW16).reshaped(1, 1, -1)
+            if x.dtype == .bfloat16, x.dim(2) == 2560, m.routerW16.dim(0) == 512,
+                m.expertGroupSize == 32, m.expertBits == 4,
+                m.expertGate.w.dim(1) == 640,
+                case .quant(let guq) = m.sharedGateUp.fused ?? .dense(x),
+                guq.mode == .affine, guq.biases != nil,
+                case .quant(let dq) = m.sharedDown, dq.biases != nil
+            {
+                let prepared = TrackFastMoEKernels.routerGemvPrepared(x: xf, w: m.routerW16, xb: x)
+                logits = prepared.logits.reshaped(1, 1, -1)
+                inputSums = prepared.sums
+            } else {
+                logits = TrackFastMoEKernels.routerGemv(x: xf, w: m.routerW16).reshaped(1, 1, -1)
+            }
         } else if inputF32 == nil, let wide = TrackPrefillRouter.apply(x: x, w: m.routerW16) {
             logits = wide
         } else {
@@ -827,12 +840,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     guq.weight, guq.scales, guq.biases!,
                     m.expertDown.w, m.expertDown.s, m.expertDown.b,
                     dq.weight, dq.scales, dq.biases!,
+                    inputSums ?? x2,
                 ])[0].reshaped(1, S, H)
             }
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
                 wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b, shared: guq,
-                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits)
+                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits, inputSums: inputSums)
             return TrackFastMoEKernels.downCombine(
                 wd: m.expertDown.w, sd: m.expertDown.s, bd: m.expertDown.b, sharedDown: dq,
                 act: act, idx: flatIdx, w: weights.reshaped(S * K), gate: gate, topK: K,

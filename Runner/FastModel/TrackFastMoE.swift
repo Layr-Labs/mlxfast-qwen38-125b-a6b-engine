@@ -1345,10 +1345,42 @@ extension TrackFastMoEKernels {
         header: helpersCore + TrackFastKernels.exactHeader + gateUpReuseHelpers,
         ensureRowContiguous: true)
 
+    // Same dual dot product, with the input-only affine correction shared
+    // across all rows and experts. Keep the original helper as the fallback.
+    static let gateUpPreparedHelpers = gateUpReuseHelpers
+        .replacingOccurrences(of: "qmv_fast_reg_dual(", with: "qmv_fast_reg_dual_prepared(")
+        .replacingOccurrences(of: "const device T* x,", with:
+            "const device T* x, const device float* inputSums,")
+        .replacingOccurrences(
+            of: "U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);",
+            with: """
+            static_assert(bits == 4 && values_per_thread == 16, "prepared 4-bit inputs");
+            U sum = inputSums[k / values_per_thread + simd_lid];
+            for (int i = 0; i < values_per_thread; i += 4) {
+                x_thread[i] = x[i];
+                x_thread[i + 1] = x[i + 1] / 16.0f;
+                x_thread[i + 2] = x[i + 2] / 256.0f;
+                x_thread[i + 3] = x[i + 3] / 4096.0f;
+            }
+            """)
+
+    static let gateUpPreparedSource = gateUpReuseSource
+        .replacingOccurrences(of: "qmv_fast_reg_dual<T, GS, BITS, RPS>",
+            with: "qmv_fast_reg_dual_prepared<T, GS, BITS, RPS>")
+        .replacingOccurrences(of: "KD, out_row, thread_index_in_simdgroup, g, u);",
+            with: "inputSums, KD, out_row, thread_index_in_simdgroup, g, u);")
+
+    nonisolated(unsafe) static let gateUpPreparedKernel = MLXFast.metalKernel(
+        name: "track_moe_gate_up_shared_input_sums",
+        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow", "inputSums"],
+        outputNames: ["act"], source: gateUpPreparedSource,
+        header: helpersCore + TrackFastKernels.exactHeader + gateUpPreparedHelpers,
+        ensureRowContiguous: true)
+
     /// Routed slots [0, BR) then the shared expert for the S tokens: act [BR + S, N].
     static func gateUpAct(
         wg: MLXArray, sg: MLXArray, bg: MLXArray, wu: MLXArray, su: MLXArray, bu: MLXArray,
-        shared: TrackQuantWeight, x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int
+        shared: TrackQuantWeight, x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int, inputSums: MLXArray? = nil
     ) -> MLXArray {
         let BR = idx.dim(0), S = x.dim(0), KD = x.dim(1), N = wg.dim(1)
         precondition(N % 8 == 0 && bits == 4 && idx.dtype == .uint32 && xrow.dtype == .uint32)
@@ -1358,6 +1390,16 @@ extension TrackFastMoEKernels {
             && groupSize == 32 && bits == 4 && shared.mode == .affine
         {
             let rows = gateUpReuseRowsPerSimdgroup
+            if let inputSums, inputSums.dtype == .float32, inputSums.shape == [KD / 16] {
+                return gateUpPreparedKernel(
+                    [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow, inputSums],
+                    template: [
+                        ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N),
+                        ("KD", KD), ("BR", BR), ("RPS", rows),
+                    ],
+                    grid: (32, N / rows, BR + 1), threadGroup: (32, 2, 1),
+                    outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
+            }
             return gateUpReuseKernel(
                 [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
                 template: [
@@ -2239,6 +2281,41 @@ extension TrackFastMoEKernels {
         inputNames: ["x", "w"],
         outputNames: ["out"],
         source: routerGemvSource, ensureRowContiguous: true)
+
+    // One additional workgroup in the router launch owns the 160 sums.
+    // Read the exact BF16 expert input, retaining load_vector's typed adds.
+    // Other workgroups execute the original router source without edits.
+    static let routerPreparedSource = """
+        if ((int)threadgroup_position_in_grid.x == N / (4 * RPS)) {
+            const int t = (int)simdgroup_index_in_threadgroup * 32
+                + (int)thread_index_in_simdgroup;
+            for (int c = t; c < K / 16; c += 128) {
+                const device T* xp = xb + c * 16;
+                float sum = 0;
+                for (int i = 0; i < 16; i += 4) {
+                    sum += xp[i] + xp[i + 1] + xp[i + 2] + xp[i + 3];
+                }
+                inputSums[c] = sum;
+            }
+            return;
+        }
+        """ + "\n" + routerGemvSource
+
+    nonisolated(unsafe) static let routerPreparedKernel = MLXFast.metalKernel(
+        name: "track_router_gemv_input_sums",
+        inputNames: ["x", "w", "xb"], outputNames: ["out", "inputSums"],
+        source: routerPreparedSource, ensureRowContiguous: true)
+
+    static func routerGemvPrepared(x: MLXArray, w: MLXArray, xb: MLXArray) -> (logits: MLXArray, sums: MLXArray) {
+        precondition(x.dtype == .float32 && x.size == 2560 && w.dtype == .bfloat16)
+        precondition(w.shape == [512, 2560] && xb.dtype == .bfloat16 && xb.size == 2560)
+        let output = routerPreparedKernel(
+            [x.reshaped(2560), w, xb.reshaped(2560)],
+            template: [("T", w.dtype), ("K", 2560), ("N", 512), ("RPS", 1)],
+            grid: (32 * 129, 1, 4), threadGroup: (32, 1, 4),
+            outputShapes: [[512], [160]], outputDTypes: [.float32, .float32])
+        return (output[0], output[1])
+    }
 
     /// x float32 [K], w bf16 [N, K] -> logits float32 [N]. One-token windows only
     /// Retains MLX's per-row arithmetic for K in [65, 16N) with N < 4096.
