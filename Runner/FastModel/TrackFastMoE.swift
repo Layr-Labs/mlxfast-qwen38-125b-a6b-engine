@@ -15,7 +15,10 @@ import MLX
 
 enum TrackFastMoEKernels {
     /// `mlx/backend/metal/kernels/quantized.h` lines 12-393 and 757-987.
-    /// MLX `quantized.h` verbatim: the pack helpers, `load_vector*` and `qdot*` the replicas call.
+    /// MLX `quantized.h` helpers: pack, `load_vector*`, `qdot*`. 4-bit
+    /// `load_vector` / `load_vector_safe` use MLXFAST-XVEC4 (one `vec<T,4>`
+    /// device load per four activations; same left-to-right sum). `qdot*` is
+    /// still verbatim.
     static let helpersCore = #"""
 #define MLX_MTL_CONST static constant constexpr const
 
@@ -68,12 +71,15 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 4) {
+    // MLXFAST-XVEC4: one vec<T,4> device load per pack of 4 activations.
+    // Addends stay xv.x+xv.y+xv.z+xv.w (same left-to-right order as x[i]..x[i+3]).
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+      const vec<T, 4> xv = *((const device vec<T, 4>*)(x + i));
+      sum += xv.x + xv.y + xv.z + xv.w;
+      x_thread[i] = xv.x;
+      x_thread[i + 1] = xv.y / 16.0f;
+      x_thread[i + 2] = xv.z / 256.0f;
+      x_thread[i + 3] = xv.w / 4096.0f;
     }
   }
 
@@ -148,12 +154,15 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
   }
 
   else if (bits == 4) {
+    // MLXFAST-XVEC4: same vec<T,4> load as load_vector. N is a multiple of the
+    // 4-bit pack (8), so the original i+=4 walk already owned four elements.
     for (int i = 0; i < N; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+      const vec<T, 4> xv = *((const device vec<T, 4>*)(x + i));
+      sum += xv.x + xv.y + xv.z + xv.w;
+      x_thread[i] = xv.x;
+      x_thread[i + 1] = xv.y / 16.0f;
+      x_thread[i + 2] = xv.z / 256.0f;
+      x_thread[i + 3] = xv.w / 4096.0f;
     }
   }
 
@@ -1052,10 +1061,11 @@ extension TrackFastMoEKernels {
           static_assert(bits == 4, "silu-on-load: 4-bit only");
           U sum = 0;
           for (int i = 0; i < values_per_thread; i += 4) {
-            const T a = mlx_silu(x[i]);
-            const T b = mlx_silu(x[i + 1]);
-            const T c = mlx_silu(x[i + 2]);
-            const T d = mlx_silu(x[i + 3]);
+            const vec<T, 4> xv = *((const device vec<T, 4>*)(x + i));
+            const T a = mlx_silu(xv.x);
+            const T b = mlx_silu(xv.y);
+            const T c = mlx_silu(xv.z);
+            const T d = mlx_silu(xv.w);
             sum += a + b + c + d;
             x_thread[i] = a;
             x_thread[i + 1] = b / 16.0f;
@@ -1069,10 +1079,11 @@ extension TrackFastMoEKernels {
           static_assert(bits == 4, "silu-on-load: 4-bit only");
           U sum = 0;
           for (int i = 0; i < N; i += 4) {
-            const T a = mlx_silu(x[i]);
-            const T b = mlx_silu(x[i + 1]);
-            const T c = mlx_silu(x[i + 2]);
-            const T d = mlx_silu(x[i + 3]);
+            const vec<T, 4> xv = *((const device vec<T, 4>*)(x + i));
+            const T a = mlx_silu(xv.x);
+            const T b = mlx_silu(xv.y);
+            const T c = mlx_silu(xv.z);
+            const T d = mlx_silu(xv.w);
             sum += a + b + c + d;
             x_thread[i] = a;
             x_thread[i + 1] = b / 16.0f;
@@ -1501,6 +1512,8 @@ extension TrackFastMoEKernels {
     /// MLXFAST-DOWNRPS: output rows per down+combine threadgroup in a one-token
     /// window. Each row's expert walks and the fold are unchanged for any value;
     /// fewer rows per threadgroup means more threadgroups in flight (H / rows).
+    /// Ranked A/B at KSG=10: RPS=1 lost 3.95% vs RPS=2 (extra x traffic, more
+    /// tiles). Leave 2; MIX2ROW's 1-row mixer result does not transfer here.
     static let downRowsPerSimdgroup = 2
 
     // MLXFAST-ONESG: one simdgroup per routed expert. With K = 10 and KSG = 10
