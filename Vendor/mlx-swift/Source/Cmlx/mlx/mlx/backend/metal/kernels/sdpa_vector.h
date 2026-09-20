@@ -559,6 +559,64 @@ template <typename T, int D>
   maxs += q_offset * blocks;
   out += q_offset * D + simd_gid * elem_per_thread;
 
+  if constexpr (batch_components) {
+    if (blocks == 128) {
+      constexpr int chunks = 4;
+      constexpr int denominator_slot = chunks * BN * BD;
+      // Diagonal transpose cells have the same producer and consumer.
+      // Keep those partials in registers and use their cells for factors.
+      if (simd_gid == 0) {
+        U maximum = Limits<U>::finite_min;
+        for (int b = 0; b < chunks; ++b) {
+          maximum = max(maximum, maxs[simd_lid + BN * b]);
+        }
+        maximum = simd_max(maximum);
+        U denominator = 0.0;
+        for (int b = 0; b < chunks; ++b) {
+          U factor = fast::exp(maxs[simd_lid + BN * b] - maximum);
+          outputs[b * BN * BD + simd_lid * (BD + 1)] = factor;
+          denominator += factor * sums[simd_lid + BN * b];
+        }
+        denominator = simd_sum(denominator);
+        if (simd_lid == 0) {
+          outputs[denominator_slot] = denominator;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int b = 0; b < chunks; ++b) {
+        U factor = outputs[b * BN * BD + simd_gid * (BD + 1)];
+        for (int i = 0; i < elem_per_thread; ++i) {
+          o[i] += factor * static_cast<U>(partials[i]);
+        }
+        partials += BN * D;
+      }
+      for (int i = 0; i < elem_per_thread; ++i) {
+        bool keep = (i < chunks && simd_lid == simd_gid) ||
+            (i == chunks && simd_lid == 0 && simd_gid == 0);
+        if (!keep) {
+          outputs[i * BN * BD + simd_lid * BD + simd_gid] = o[i];
+        }
+      }
+      // Factor cells are never overwritten while any group can read them.
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      U denominator = outputs[denominator_slot];
+      for (int i = 0; i < elem_per_thread; ++i) {
+        bool keep = (i < chunks && simd_lid == simd_gid) ||
+            (i == chunks && simd_lid == 0 && simd_gid == 0);
+        U value = keep ? o[i] :
+            outputs[i * BN * BD + simd_gid * BD + simd_lid];
+        o[i] = simd_sum(value);
+        o[i] = denominator == 0 ? o[i] : (o[i] / denominator);
+      }
+      if (simd_lid == 0) {
+        for (int i = 0; i < elem_per_thread; ++i) {
+          out[i] = static_cast<T>(o[i]);
+        }
+      }
+      return;
+    }
+  }
+
   // Set defaults
   U sum_exp_score = 0.0;
   U max_score = Limits<U>::finite_min;
