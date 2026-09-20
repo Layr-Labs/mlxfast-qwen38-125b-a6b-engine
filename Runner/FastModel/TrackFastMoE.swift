@@ -1237,7 +1237,13 @@ extension TrackFastMoEKernels {
         source: gateUpActSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
 
-    static let gateUpReuseRowsPerSimdgroup = 2
+    // MLXFAST-GUONESG: one output row per simdgroup. With RPS = 1 each group
+    // runs a single gate+up walk pair over K instead of two serial row pairs;
+    // the per-row fold order over k is unchanged, so act is bit-identical.
+    static let gateUpReuseRowsPerSimdgroup = 1
+    // Eight independent row owners share one threadgroup. This keeps the same
+    // total simdgroup count while quartering threadgroup scheduling granularity.
+    static let gateUpReuseSimdgroups = 8
 
     static let gateUpReuseHelpers = #"""
         template <typename T, int group_size, int bits, int rows>
@@ -1322,7 +1328,9 @@ extension TrackFastMoEKernels {
         const device uint32_t* uw = shared ? wsh + (size_t)N * kw : wu + eoff * kw;
         const device T* us = shared ? ssh + (size_t)N * kg : su + eoff * kg;
         const device T* ub = shared ? bsh + (size_t)N * kg : bu + eoff * kg;
-        const int out_row = (int)threadgroup_position_in_grid.y * (2 * RPS)
+        // RPS output rows per simdgroup. Packing independent row owners changes
+        // only threadgroup scheduling; each group retains its complete row walk.
+        const int out_row = (int)threadgroup_position_in_grid.y * (SGS * RPS)
             + (int)simdgroup_index_in_threadgroup * RPS;
         float g[RPS], u[RPS];
         qmv_fast_reg_dual<T, GS, BITS, RPS>(
@@ -1338,7 +1346,7 @@ extension TrackFastMoEKernels {
         """
 
     nonisolated(unsafe) static let gateUpReuseKernel = MLXFast.metalKernel(
-        name: "track_moe_gate_up_reuse_2row",
+        name: "track_moe_gate_up_reuse_1row_8sg",
         inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
         outputNames: ["act"],
         source: gateUpReuseSource,
@@ -1358,13 +1366,15 @@ extension TrackFastMoEKernels {
             && groupSize == 32 && bits == 4 && shared.mode == .affine
         {
             let rows = gateUpReuseRowsPerSimdgroup
+            let simdgroups = gateUpReuseSimdgroups
+            precondition(N % (rows * simdgroups) == 0)
             return gateUpReuseKernel(
                 [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
                 template: [
                     ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N),
-                    ("KD", KD), ("BR", BR), ("RPS", rows),
+                    ("KD", KD), ("BR", BR), ("RPS", rows), ("SGS", simdgroups),
                 ],
-                grid: (32, N / rows, BR + 1), threadGroup: (32, 2, 1),
+                grid: (32, N / rows, BR + 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
         }
         return (S == 1 ? gateUpActKernel1 : gateUpActKernel)(
