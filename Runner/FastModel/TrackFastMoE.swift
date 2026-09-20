@@ -2214,11 +2214,22 @@ extension TrackFastMoEKernels {
         out_row = out_row + TM <= N ? out_row : N - TM;
         const device T* mat = w + (size_t)out_row * (size_t)K;
         const int n_iter = K / blockN;
+        // MLXFAST-ROUTERVEC4: both operand tiles are TN == 4 contiguous
+        // elements at a TN-aligned offset -- `bn` starts at `simd_lid * 4` and
+        // advances by blockN == 128, and each row base is a multiple of
+        // K (a multiple of 128) -- so the four scalar loads per tile are one
+        // aligned vector load. `x` is float32 and `w` is bf16, so the casts are
+        // to float4 and vec<T, 4> respectively. The products, their order, the
+        // accumulator and the simd reduction are untouched: only the number of
+        // load instructions issued per K block changes.
+        const device float4* xv = reinterpret_cast<const device float4*>(x);
         for (int i = 0; i < n_iter; ++i) {
-            for (int tn = 0; tn < TN; tn++) { v_coeff[tn] = x[bn + tn]; }
+            const float4 vx = xv[bn / TN];
+            for (int tn = 0; tn < TN; tn++) { v_coeff[tn] = vx[tn]; }
             int mat_offset = 0;
             for (int tm = 0; tm < TM; tm++) {
-                for (int tn = 0; tn < TN; tn++) { inter[tn] = static_cast<float>(mat[mat_offset + bn + tn]); }
+                const vec<T, 4> vw = *reinterpret_cast<const device vec<T, 4>*>(mat + mat_offset + bn);
+                for (int tn = 0; tn < TN; tn++) { inter[tn] = static_cast<float>(vw[tn]); }
                 for (int tn = 0; tn < TN; tn++) { result[tm] += inter[tn] * v_coeff[tn]; }
                 mat_offset += K;
             }
