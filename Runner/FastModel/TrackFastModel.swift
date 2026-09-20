@@ -254,6 +254,9 @@ struct TrackPLE {
     let dilation: Int
     let stateLength: Int
     let stateLayerIndex: Int
+    /// Dtype accepted by the fixed-geometry PLE fusion, or nil when the
+    /// immutable layer weights do not match that geometry.
+    let fusionDType: DType?
 }
 
 struct TrackLayer {
@@ -271,6 +274,11 @@ struct TrackLayer {
 // MARK: - The model
 
 public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
+
+    private struct PLEForwardResult {
+        let output: MLXArray
+        let residualAdded: Bool
+    }
 
     let base: Qwen4ExpModel
     let cfg: Qwen4ExpTextConfiguration
@@ -491,19 +499,37 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     static func bindPLE(_ ple: Qwen4ExpPLELayer, ordinal: Int, cfg: Qwen4ExpTextConfiguration)
         -> TrackPLE
     {
+        let keyProj = TrackProj(ple.trackChild("key_proj"))
+        let valueProj = TrackProj(ple.trackChild("value_proj"))
+        let normKeyScale = ple.trackChild("norm_key").trackArray("weight")
+        let normQueryScale = ple.trackChild("norm_query").trackArray("weight")
+        let normConvScale = ple.trackChild("norm_conv").trackArray("weight")
         let convW = ple.trackChild("conv1d").trackArray("weight")
+        let dilation = cfg.ngramSize
+        let stateLength = (cfg.pleConvKernelSize - 1) * cfg.ngramSize
+        let dtype = convW.dtype
+        let fusionDType: DType? =
+            keyProj.rows == 10240 && valueProj.rows == 2560
+            && dilation == 3 && stateLength == 9
+            && convW.shape == [10240, 4, 1]
+            && normKeyScale.shape == [10240] && normKeyScale.dtype == dtype
+            && normQueryScale.shape == [10240] && normQueryScale.dtype == dtype
+            && normConvScale.shape == [10240] && normConvScale.dtype == dtype
+            && (dtype == .bfloat16 || dtype == .float16 || dtype == .float32)
+                ? dtype : nil
         return TrackPLE(
             embedding: ple.pleEmbedding,
-            keyProj: TrackProj(ple.trackChild("key_proj")),
-            valueProj: TrackProj(ple.trackChild("value_proj")),
-            normKeyScale: ple.trackChild("norm_key").trackArray("weight"),
-            normQueryScale: ple.trackChild("norm_query").trackArray("weight"),
-            normConvScale: ple.trackChild("norm_conv").trackArray("weight"),
+            keyProj: keyProj,
+            valueProj: valueProj,
+            normKeyScale: normKeyScale,
+            normQueryScale: normQueryScale,
+            normConvScale: normConvScale,
             convW: convW,
             convW2: convW.reshaped(convW.dim(0), convW.dim(1)),
-            dilation: cfg.ngramSize,
-            stateLength: (cfg.pleConvKernelSize - 1) * cfg.ngramSize,
-            stateLayerIndex: cfg.pleStateLayerIndex(ordinal: ordinal))
+            dilation: dilation,
+            stateLength: stateLength,
+            stateLayerIndex: cfg.pleStateLayerIndex(ordinal: ordinal),
+            fusionDType: fusionDType)
     }
 
     static func bind(layer: Qwen4ExpDecoderLayer, index: Int, cfg: Qwen4ExpTextConfiguration)
@@ -898,7 +924,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     private func pleForward(
         _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
         evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
-    ) -> MLXArray {
+    ) -> PLEForwardResult {
         let B = stream.dim(0), S = stream.dim(1)
         precondition(B == 1)
         let wide = hcCount * hidden
@@ -955,17 +981,25 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
         // every other shape takes the three-launch PLE block below.
+        let keyFlat = p.keyProj.apply(embedded)
+        let value = p.valueProj.apply(embedded)
+        let fusedResidual = S == 1 && !capture && stream.dtype == .bfloat16
+            && StreamOrDevice.default.stream === Stream.gpu
         let full: MLXArray
         let output: MLXArray
+        let residualAdded: Bool
         if S == 1, TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
             convState.shape == [1, 9, wide], convState.dtype == stream.dtype,
-            let fused = TrackPLEFusion.forward(
-                p, embedded: embedded, stream: stream, convState: convState, eps: eps)
+            let result = TrackPLEFusion.forwardProjected(
+                p, key: keyFlat, value: value, stream: stream, convState: convState,
+                eps: eps, fusedResidual: fusedResidual)
         {
-            (full, output) = fused
+            full = result.full
+            output = result.output
+            residualAdded = result.residualAdded
         } else {
-            let keyFlat = p.keyProj.apply(embedded)
-            let value = p.valueProj.apply(embedded)
+            // Use these same projection results when the post-projection guard
+            // rejects the fused helper; do not run either GEMV a second time.
             // norm_key * norm_query, then MLX's own reduction over the last axis.
             let prod = TrackFastPLEKernels.prod(
                 keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
@@ -982,6 +1016,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
             output = TrackFastPLEKernels.conv(
                 full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
+            residualAdded = false
         }
         do {
             if capture {
@@ -1018,7 +1053,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } catch {
             preconditionFailure("TrackFastModel: PLE stage failed: \(error)")
         }
-        return output
+        return PLEForwardResult(output: output, residualAdded: residualAdded)
     }
 
     private func injectNorm(
@@ -1068,11 +1103,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     residual: residual, out: pendingOut, inject: pendingInject,
                     scale: layer.attnHC.normScaleQ,
                     tile: tile)
-                stream =
-                    stream
-                    + pleForward(
-                        ple, stream: stream, ids: ids, evaluation: evaluation,
-                        offset: offset, capture: capture)
+                let pleResult = pleForward(
+                    ple, stream: stream, ids: ids, evaluation: evaluation,
+                    offset: offset, capture: capture)
+                stream = pleResult.residualAdded ? pleResult.output : stream + pleResult.output
                 (stream, normed) = injectNorm(
                     residual: stream, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
