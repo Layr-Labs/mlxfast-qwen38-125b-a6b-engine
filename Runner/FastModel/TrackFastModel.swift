@@ -42,7 +42,12 @@ enum TrackPleContextMirror {
     nonisolated(unsafe) private(set) static var dirty = true
 
     static func matches(offset: Int, layer: Int, length: Int) -> Bool {
-        !dirty && nextOffset == offset && stateLayerIndex == layer && contextLength == length
+        guard !dirty else { return false }
+        return hasSameWindow(offset: offset, layer: layer, length: length)
+    }
+
+    private static func hasSameWindow(offset: Int, layer: Int, length: Int) -> Bool {
+        nextOffset == offset && stateLayerIndex == layer && contextLength == length
     }
 
     static func store(
@@ -681,11 +686,29 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return o
     }
 
+    /// MLXFAST-ROPETAB: the table depends only on the position index, so it is
+    /// built once over `[0, indexerBudget)` and sliced. `cosSin` forms
+    /// `freqs = position * invFreq` and then concatenates, cosines and sines
+    /// elementwise, so row `p` of the whole-range table is exactly what a build
+    /// over `[p, p+1)` returns. The fast path is bounded by
+    /// `offset + S <= indexerBudget` (see `fastPlan`), so the cache is built
+    /// once and every later call is a contiguous row slice of it.
+    private var ropeTableCache: (dtype: DType, rows: Int, cos: MLXArray, sin: MLXArray)?
+
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
-        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
-        return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
+        let need = offset + count
+        if let cached = ropeTableCache, cached.dtype == dtype, cached.rows >= need {
+            return (cached.cos[offset ..< need, 0...], cached.sin[offset ..< need, 0...])
+        }
+        let rows = Swift.max(need, indexerBudget)
+        let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: 0, count: rows))
+        let cosAll = c.asType(dtype).reshaped(rows, rotaryDims)
+        let sinAll = s.asType(dtype).reshaped(rows, rotaryDims)
+        eval(cosAll, sinAll)
+        ropeTableCache = (dtype, rows, cosAll, sinAll)
+        return (cosAll[offset ..< need, 0...], sinAll[offset ..< need, 0...])
     }
 
     private func attnForward(
@@ -966,17 +989,33 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } else {
             let keyFlat = p.keyProj.apply(embedded)
             let value = p.valueProj.apply(embedded)
-            // norm_key * norm_query, then MLX's own reduction over the last axis.
-            let prod = TrackFastPLEKernels.prod(
+            // norm_key * norm_query; the kernel also folds each row's dot in
+            // the same pass, bit-exact with `row_reduce_looped` -- the kernel
+            // MLX dispatches for this reduction whenever 4*S < 32 rows, i.e.
+            // exactly S <= 7. S >= 8 takes `row_reduce_simple`, whose fold
+            // differs, so wide windows keep MLX's own reduction.
+            let pe = TrackFastPLEKernels.prod(
                 keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
                 hcCount: hcCount, hidden: hidden, eps: eps)
-            let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
+            let dot: MLXArray
+            if S <= 7 {
+                dot = pe.dots
+            } else {
+                dot = pe.prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
+            }
             // The two scalars the reference's `/` and `maximum` build, built the
             // same way so they carry the same rounding into the activation dtype.
-            let divisor = Foundation.sqrt(Float(hidden)).asMLXArray(dtype: dot.dtype)
+            // MLXFAST-DIVCACHE: `sqrt(hidden)` is a constant and both spellings
+            // round identically into the activation dtype (checked at hidden =
+            // 2560/1024/4096/640/320: bit-for-bit equal), so the cached scalar
+            // serves it. `TrackFastKernels.scalar` exists for exactly this --
+            // building one per call is a host allocation and a cast launch --
+            // and the `floor` on the next line already uses it.
+            let divisor = TrackFastKernels.scalar(
+                Foundation.sqrt(Float(hidden)), dtype: dot.dtype)
             let floor = TrackFastKernels.scalar(Float(1e-6), dtype: dot.dtype)
             let gn = TrackFastPLEKernels.gated(
-                g0: dot, value: value, cScale: p.normConvScale, divisor: divisor, floor: floor,
+                g0: dot, value: value, cScale: p.normConvScale,
                 hcCount: hcCount, hidden: hidden, eps: eps)
             let gated = gn.gated
             full = concatenated([convState, gn.normed], axis: 1)  // [1, n+S, wide]
@@ -1140,6 +1179,19 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             scale: finalMixer.normScaleQ,
             tile: false)
         let mixed = hcMix(finalMixer, normed: finalNormed).input
+        // MLXFAST-TAILFLUSH: the loop's dispatch schedule lands its last flush
+        // on layer 47 -- with `asyncChunk` 3 and `asyncFirst` 2 the hits are
+        // ... 41, 44, 47 -- so layer 48, the final `injectNorm` above and this
+        // final `hcMix`, plus the head and the sampler the caller builds on top
+        // of `mixed`, are all still unenqueued at this return. On the pure
+        // decode path the engine launches the NEXT step feeding this step's
+        // still-lazy sampled token and only finalizes afterwards, so nothing
+        // enqueues that tail until something reads the token -- and the read
+        // then waits on all of it. Enqueue it here instead.
+        //
+        // `asyncEval` does not block and computes nothing new: the same arrays
+        // are returned, with the same contents, in the same order.
+        asyncEval(mixed, multi)
         return (mixed, multi)
     }
 
