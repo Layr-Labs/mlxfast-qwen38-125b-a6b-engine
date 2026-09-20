@@ -286,6 +286,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let rotary: Qwen4ExpRotary
     let indexerBudget: Int
     let attentionScale: Float
+    private let attentionScaleArray: MLXArray
 
     /// Debug taps (tests): when set, every layer's output stream and the block
     /// inputs/outputs are appended here.
@@ -323,6 +324,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         self.rotary = Qwen4ExpRotary(dimensions: cfg.rotaryDimensions, base: cfg.ropeTheta)
         self.indexerBudget = cfg.indexerBudget
         self.attentionScale = Foundation.pow(Float(cfg.headDim), -0.5)
+        self.attentionScaleArray = MLXArray([Foundation.pow(Float(cfg.headDim), -0.5)])
         precondition(
             cfg.rmsNormWeightOffset == 0,
             "TrackFastModel: baked norm convention expected (offset 0)")
@@ -690,7 +692,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func attnForward(
         _ a: TrackAttn, _ x: MLXArray, cache: Qwen4ExpCBv2LayerCache,
-        rope: (cos: MLXArray, sin: MLXArray)
+        rope: (cos: MLXArray, sin: MLXArray), capture: Bool
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let heads = cfg.attentionHeads, kvHeads = cfg.kvHeads, d = cfg.headDim
@@ -731,10 +733,40 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 qkv: qkv, qNorm: a.qNormW, kNorm: a.kNormW, cos: rope.cos, sin: rope.sin,
                 heads: heads, kvHeads: kvHeads, headDim: d, rotaryDims: rotaryDims, eps: eps)
         }
-        let att = cache.updateAndAttend(
-            queries: prep.q, keys: prep.k, values: prep.v,
-            scale: attentionScale, sinks: nil, keepMask: nil)  // [B,HQ,S,D]
-        let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: a.qWidth)
+        let out: MLXArray
+        let rows = cache.rows
+        if B == 1, S == 1, !capture, Self.debugTaps == nil,
+            TrackFastProfile.prefill == nil, StreamOrDevice.default.stream === Stream.gpu,
+            heads == 24, kvHeads == 2, d == 256, a.qWidth == 6144,
+            qkv.dtype == .bfloat16, qkv.shape == [1, 1, 13440],
+            prep.q.dtype == .bfloat16, prep.k.dtype == .bfloat16, prep.v.dtype == .bfloat16,
+            cache.kind.attention == .full, !cache.kind.isBidirectional, !cache.kind.hasSinks,
+            cache.kind.sharesKVWithLayer == nil, !cache.mtpSerializesRectangularAttention,
+            rows.count == 1, let row = rows[0] as? CBv2FullSequenceKV,
+            let blocks = TrackSDPAGate.blockCount(length: row.retainedCount + 1)
+        {
+            // FullSequenceKV owns contiguous [1,2,capacity,256] storage and
+            // returns prefix views. Metal reads the evaluated capacity strides.
+            let (keys, values) = row.update(keys: prep.k, values: prep.v)
+            cache.setRows(rows)
+            if keys.shape == [1, 2, row.retainedCount, 256], values.shape == keys.shape,
+                keys.dtype == .bfloat16, values.dtype == .bfloat16
+            {
+                out = TrackSDPAGate.apply(
+                    queries: prep.q, keys: keys, values: values, scale: attentionScaleArray,
+                    qkv: qkv, blocks: blocks)
+            } else {
+                // The row is already updated. Do not append again on fallback.
+                let att = MLXFast.scaledDotProductAttention(
+                    queries: prep.q, keys: keys, values: values, scale: attentionScale, mask: .none)
+                out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: a.qWidth)
+            }
+        } else {
+            let att = cache.updateAndAttend(
+                queries: prep.q, keys: prep.k, values: prep.v,
+                scale: attentionScale, sinks: nil, keepMask: nil)  // [B,HQ,S,D]
+            out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: a.qWidth)
+        }
         return a.out.apply(out)
     }
 
@@ -1098,7 +1130,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             } else {
                 let cache = caches[attentionIndex]
                 attentionIndex += 1
-                attended = attnForward(layer.attn!, input, cache: cache, rope: ropeTab)
+                attended = attnForward(layer.attn!, input, cache: cache, rope: ropeTab, capture: capture)
             }
             Self.debugTaps?.append(("L\(layer.index).attn.out", attended))
             if profiling { TrackFastProfile.tick(layer.gdn != nil ? "gdn" : "attn", &profT, [attended]) }
