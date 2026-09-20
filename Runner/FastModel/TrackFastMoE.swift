@@ -1237,7 +1237,8 @@ extension TrackFastMoEKernels {
         source: gateUpActSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
 
-    static let gateUpReuseRowsPerSimdgroup = 2
+    // One row per group shortens each serial walk; per-row reduction is unchanged.
+    static let gateUpReuseRowsPerSimdgroup = 1
 
     static let gateUpReuseHelpers = #"""
         template <typename T, int group_size, int bits, int rows>
