@@ -68,22 +68,29 @@ enum TrackPrefillSort {
         inputNames: ["ids"], outputNames: ["counts"],
         source: countSource, header: "", ensureRowContiguous: true)
 
+    /// Prefixes the count table once and emits the exact tile table consumed
+    /// by the indirect kernels. The next scatter launch only reads block bases.
+    private static let metadataKernel = MLXFast.metalKernel(
+        name: "track_route_metadata",
+        inputNames: ["counts"], outputNames: ["block_bases", "tiles"],
+        source: metadataSource, header: "", ensureRowContiguous: true)
+
     /// The stable destination of every assignment, plus the three arrays the
     /// consumers actually read.
     private static let scatterKernel = MLXFast.metalKernel(
         name: "track_route_counting_scatter",
-        inputNames: ["ids", "counts"],
+        inputNames: ["ids", "block_bases"],
         outputNames: ["sorted_ids", "token_rows", "inverse"],
         source: scatterSource, header: "", ensureRowContiguous: true)
 
-    /// `(sortedIDs, tokenRows, inverse)` for `flatIDs` over `E` expert ids,
-    /// or nil when the shape is outside the supported window.
+    /// `(sortedIDs, tokenRows, inverse, tiles)` for `flatIDs` over `E` expert
+    /// ids, or nil when the shape is outside the supported window.
     static func apply(flatIDs: MLXArray, experts E: Int, topK: Int)
-        -> (sortedIDs: MLXArray, tokenRows: MLXArray, inverse: MLXArray)?
+        -> (sortedIDs: MLXArray, tokenRows: MLXArray, inverse: MLXArray, tiles: MLXArray)?
     {
         let R = flatIDs.size
         guard enabled, flatIDs.ndim == 1, flatIDs.dtype == .uint32, topK > 0,
-            E > 0, E % blockSize == 0, E <= 4096, R % topK == 0,
+            E == 512, R % topK == 0,
             R >= blockSize, R % blockSize == 0
         else { return nil }
         let nBlocks = R / blockSize
@@ -92,13 +99,21 @@ enum TrackPrefillSort {
             template: [("E", E), ("BLK", blockSize), ("R", R)],
             grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
             outputShapes: [[nBlocks * E]], outputDTypes: [.uint32])[0]
+        let maxT = (R + 32 - 1) / 32 + E
+        let metadata = metadataKernel(
+            [counts],
+            template: [("E", E), ("BLK", blockSize), ("R", R), ("NB", nBlocks),
+                       ("BM", 32), ("MAXT", maxT), ("TG", 1024)],
+            grid: (1024, 1, 1), threadGroup: (1024, 1, 1),
+            outputShapes: [[nBlocks * E], [2 * maxT]],
+            outputDTypes: [.uint32, .uint32])
         let outs = scatterKernel(
-            [flatIDs, counts],
+            [flatIDs, metadata[0]],
             template: [("E", E), ("BLK", blockSize), ("R", R), ("NB", nBlocks), ("TOPK", topK)],
             grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
             outputShapes: [[R], [R], [R]],
             outputDTypes: [.uint32, .uint32, .uint32])
-        return (outs[0], outs[1], outs[2])
+        return (outs[0], outs[1], outs[2], metadata[1])
     }
 
     // MARK: - kernels
@@ -149,51 +164,94 @@ enum TrackPrefillSort {
         }
         """#
 
-    /// One threadgroup per block again. Each threadgroup re-derives the whole
-    /// bucket base table (`E` exclusive-scanned totals) and its own block's
-    /// running offset from the `[NB, E]` count table -- `NB * E` reads, which
-    /// is cheaper than a third launch -- then places its own elements.
+    /// One 1024-threadgroup launch. Per-expert totals and tile counts use two
+    /// SIMD scans in parallel; the tile table and per-block bases are then
+    /// disjoint writes. Both barriers are uniform.
+    static let metadataSource = #"""
+        threadgroup uint2 group_totals[TG / 32];
+        threadgroup uint2 group_offsets[TG / 32];
+        threadgroup uint tile_total;
+        const uint t = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint nGroups = ((uint)E + 31u) / 32u;
+
+        uint total = 0;
+        if (t < (uint)E) {
+            for (uint n = 0; n < (uint)NB; ++n) {
+                total += counts[n * (uint)E + t];
+            }
+        }
+        const uint totalValue = (t < (uint)E) ? total : 0u;
+        const uint tileValue = (totalValue + (uint)BM - 1u) / (uint)BM;
+        const uint totalLocal = simd_prefix_exclusive_sum(totalValue);
+        const uint tileLocal = simd_prefix_exclusive_sum(tileValue);
+        if (lane == 31 && sg < nGroups) {
+            group_totals[sg] = uint2(
+                totalLocal + totalValue, tileLocal + tileValue);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg == 0) {
+            const uint2 groupValue = (t < nGroups) ? group_totals[t] : uint2(0);
+            const uint rowBase = simd_prefix_exclusive_sum(groupValue.x);
+            const uint tileBase = simd_prefix_exclusive_sum(groupValue.y);
+            if (t < nGroups) {
+                group_offsets[t] = uint2(rowBase, tileBase);
+            }
+            if (t == nGroups - 1u) {
+                tile_total = tileBase + groupValue.y;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (t < (uint)E) {
+            const uint base = group_offsets[sg].x + totalLocal;
+            const uint slot = group_offsets[sg].y + tileLocal;
+            const uint tileCount = tileValue;
+            for (uint j = 0; j < tileCount; ++j) {
+                const uint begin = base + j * (uint)BM;
+                const uint end = base + min(total, (j + 1u) * (uint)BM);
+                tiles[2 * (slot + j)] = begin;
+                tiles[2 * (slot + j) + 1] = end;
+            }
+
+            uint blockBase = base;
+            for (uint n = 0; n < (uint)NB; ++n) {
+                block_bases[n * (uint)E + t] = blockBase;
+                blockBase += counts[n * (uint)E + t];
+            }
+        }
+
+        // Active tile slots are [0, tile_total). Zero only the disjoint suffix;
+        // no device-memory barrier is needed between these writes.
+        for (uint slot = tile_total + t; slot < (uint)MAXT; slot += (uint)TG) {
+            tiles[2 * slot] = 0u;
+            tiles[2 * slot + 1] = 0u;
+        }
+        """#
+
+    /// One threadgroup per block. The metadata launch already materialized the
+    /// destination of each block/expert pair; this launch only computes the
+    /// unchanged within-block stable rank and places each assignment.
     ///
-    /// `dest = bucketBase[v] + (# assignments with id v in earlier blocks)
-    ///                       + (# assignments with id v earlier in this block)`
+    /// `dest = blockBase[block, v] + (# assignments with id v earlier in this
+    /// block)`
     ///
     /// is the stable rank of the assignment among its equals, i.e. exactly the
     /// position `argSort` gives it.
     static let scatterSource = #"""
         threadgroup uint vals[BLK];
-        threadgroup uint tot[E];
-        threadgroup uint pre[E];
-        threadgroup uint sA[E];
-        threadgroup uint sB[E];
         const uint blk = threadgroup_position_in_grid.x;
         const uint t = thread_position_in_threadgroup.x;
         const uint gi = blk * BLK + t;
         vals[t] = (gi < (uint)R) ? ids[gi] : (uint)E;
-        for (uint b = t; b < (uint)E; b += BLK) {
-            uint s = 0, before = 0;
-            for (uint n = 0; n < (uint)NB; ++n) {
-                const uint c = counts[n * (uint)E + b];
-                if (n < blk) { before += c; }
-                s += c;
-            }
-            tot[b] = s;
-            pre[b] = before;
-            sA[b] = s;
-        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint off = 1; off < (uint)E; off <<= 1) {
-            for (uint b = t; b < (uint)E; b += BLK) {
-                sB[b] = sA[b] + ((b >= off) ? sA[b - off] : 0u);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint b = t; b < (uint)E; b += BLK) { sA[b] = sB[b]; }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
         if (gi >= (uint)R) { return; }
         const uint v = vals[t];
         uint rank = 0;
         for (uint j = 0; j < t; ++j) { rank += (vals[j] == v) ? 1u : 0u; }
-        const uint dest = (sA[v] - tot[v]) + pre[v] + rank;
+        const uint dest = block_bases[blk * (uint)E + v] + rank;
         sorted_ids[dest] = v;
         token_rows[dest] = gi / (uint)TOPK;
         inverse[gi] = dest;
