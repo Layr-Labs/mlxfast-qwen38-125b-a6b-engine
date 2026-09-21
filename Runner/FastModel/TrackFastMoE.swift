@@ -2443,3 +2443,4 @@ extension TrackFastMoEKernels {
         """#
 
 }
+private let gauntletRedraw_0d439637_20260921T004137Z: Int = 0
