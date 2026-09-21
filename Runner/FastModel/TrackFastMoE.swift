@@ -1397,7 +1397,26 @@ extension TrackFastMoEKernels {
         float res[RPS];
         // K % KSG == 0, so the trip count is the constant K / KSG and the loop
         // still unrolls: each simdgroup keeps that many expert walks in flight.
-        if (sgi < KSG) {
+        // MLXFAST-DOWNPAIR: the canonical one-token shape has ten routed
+        // experts and two output rows per tile. Give each expert two
+        // simdgroups, one per row, so each qmv walk uses RPS == 1 while the
+        // final fold still reads prod[K][RPS] in the original k/row order.
+        if constexpr (VPT == 1 && K == 10 && KSG == 20 && RPS == 2) {
+            if (sgi < 20) {
+                const int k = (int)(sgi / 2);
+                const int i = (int)(sgi % 2);
+                const uint z = t * K + (uint)k;
+                const uint e = idx[z];
+                const size_t eoff = (size_t)e * (size_t)H;
+                const device T* xb = act + (size_t)z * (size_t)F;
+                float res[1];
+                qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, 1>(
+                    wd + eoff * kw, sd + eoff * kg, bd + eoff * kg, xb, F, d0 + i, lid, res);
+                if (lid == 0) {
+                    prod[k][i] = static_cast<float>(static_cast<T>(res[0])) * w[z];
+                }
+            }
+        } else if (sgi < KSG) {
             for (int kk = 0; kk < K / KSG; ++kk) {
                 const int k = (int)sgi + kk * KSG;
                 const uint z = t * K + k;
@@ -1530,11 +1549,18 @@ extension TrackFastMoEKernels {
         let S = BR / topK
         precondition(BR % topK == 0 && H % 4 == 0 && bits == 4 && w.dtype == .float32 && S >= 1 && S <= 8)
         precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
-        let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
+        // MLXFAST-DOWNPAIR: use the pair-partition trial only for the exact
+        // canonical decode shape. An explicit down-simdg override keeps its
+        // existing meaning and all other shapes keep the accepted selector.
+        let pairReplay = StreamOrDevice.default.stream === Stream.gpu
+            && S == 1 && BR == topK && topK == 10 && F == 640 && H == 2560
+            && act.dtype == .bfloat16 && groupSize == 32 && bits == 4
+            && sharedDown.mode == .affine && downCombineSimdgroups == 10
+        let ksg = pairReplay ? 20 : (topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1)
         let rps = S == 1 ? downRowsPerSimdgroup : 4
         // MLXFAST-SHAREDROWSG: one simdgroup per shared-expert row on the
         // one-token path, so the threadgroup gains `rps` groups, not one.
-        let groups = ksg + (S == 1 && topK == 10 && ksg >= 5 ? rps : 0)
+        let groups = pairReplay ? 22 : ksg + (S == 1 && topK == 10 && ksg >= 5 ? rps : 0)
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
             template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
