@@ -150,27 +150,23 @@ enum TrackPLEFusion {
     }()
 
     static let convolutionSource = """
-        // MLXFAST-PLEFUSE2: preserve the S=1 dilated implicit-GEMM dispatch:
-        // group=(32,1,4), grid of groups=(1,1,W), channel=group.z.
-        // Its small-channel loaders assign taps 0..3 to SIMD 0 lanes 0..3;
-        // lane 0 owns the single valid output. Keep those owners, discard
-        // the padded matrix work, and require no threadgroup storage.
+        // YUKON-20260921: eight disjoint four-lane channels per SIMD group.
+        // The supports() guard fixes W and dtype; all 32 lanes reach shuffles.
         constexpr uint W = 10240;
-        const uint c = threadgroup_position_in_grid.z;
         const uint lane = thread_index_in_simdgroup;
-        if (simdgroup_index_in_threadgroup != 0) { return; }
+        const uint tap = lane & 3u;
+        const uint c = thread_position_in_grid.x >> 2u;
+        const uint first = lane & ~3u;
         float product = 0.0f;
-        if (lane < 4) {
-            product = float(full[(lane * 3) * W + c]) * float(weight[c * 4 + lane]);
+        if (c < W) {
+            product = float(full[(tap * 3u) * W + c])
+                    * float(weight[c * 4u + tap]);
         }
-        // FP32 products and chronological FP32 additions, taps 0,1,2,3.
-        // Shuffle broadcasts retain the weight-loading lanes. Unlike a
-        // padded simdgroup MMA, this has no matrix accumulator or spill array.
-        float acc = simd_broadcast(product, 0);
-        acc += simd_broadcast(product, 1);
-        acc += simd_broadcast(product, 2);
-        acc += simd_broadcast(product, 3);
-        if (lane == 0) {
+        float acc = simd_shuffle(product, first);
+        acc += simd_shuffle(product, first + 1u);
+        acc += simd_shuffle(product, first + 2u);
+        acc += simd_shuffle(product, first + 3u);
+        if (tap == 0u && c < W) {
             InT convolved = InT(acc);
             InT activated = mlx_silu(convolved);
             out[c] = gated[c] + activated;
@@ -184,7 +180,7 @@ enum TrackPLEFusion {
         header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
 
     static let convolutionKernel = MLXFast.metalKernel(
-        name: "track_ple_convolution_fuse2", inputNames: ["full", "weight", "gated"],
+        name: "track_ple_convolution_quad_20260921", inputNames: ["full", "weight", "gated"],
         outputNames: ["out"], source: convolutionSource,
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
@@ -241,7 +237,7 @@ enum TrackPLEFusion {
             outputDTypes: [stream.dtype, stream.dtype])
         let output = convolutionKernel(
             [r[1], p.convW, r[0]], template: [("InT", stream.dtype)],
-            grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
+            grid: (4 * 10240, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
         return (r[1], output, false)
     }
