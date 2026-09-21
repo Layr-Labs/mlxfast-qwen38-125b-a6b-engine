@@ -119,7 +119,8 @@ enum TrackFastGDNDecode {
                 }
             }
         }
-        if (sg == 0 && lane == 0) {
+        // Gate scalars depend only on inputs; compute alongside q/k preparation.
+        if (sg == 6 && lane == 0) {
             const device InT* row = proj + b_idx * PW;
             const InT b_raw = row[B_OFF + hv_idx];
             gb_shared[1] = static_cast<float>(mlx_sigmoid(b_raw));
