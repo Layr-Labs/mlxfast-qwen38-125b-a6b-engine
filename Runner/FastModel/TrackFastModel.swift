@@ -127,6 +127,7 @@ enum TrackProj {
         }
     }
 
+    @inline(__always)
     func apply(_ x: MLXArray) -> MLXArray {
         switch self {
         case .quant(let q): return q.apply(x)
@@ -169,6 +170,7 @@ struct TrackMultiProj {
     /// accumulation regardless of N), but the split-K GEMM the wide (prefill)
     /// shapes dispatch chooses its split from N, so wide inputs run the parts
     /// separately and stay exact with the reference.
+    @inline(__always)
     func apply(_ x: MLXArray) -> MLXArray {
         if let fused, x.dim(-2) <= 8 { return fused.apply(x) }
         return concatenated(parts.map { $0.apply(x) }, axis: -1)
