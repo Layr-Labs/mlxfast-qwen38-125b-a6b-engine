@@ -79,6 +79,12 @@ extension TrackFastKernels {
         if (HAS_INJECT) { inj_t = inject[row * HC + hc]; inj = static_cast<float>(inj_t); }
         (void)inj;
         float thread_x[N_READS];
+        // MLXFAST-PRESCALE: source-time choice; the scale row a thread needs in
+        // the epilogue depends on neither the group sum nor the barrier, so it
+        // is fetched in the streaming pass and its latency overlaps the two
+        // reductions. Set to false for the original post-barrier fetch.
+        constexpr bool PRESCALE = true;
+        InT thread_s[N_READS];
         float acc = 0.0f;
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
@@ -91,6 +97,7 @@ extension TrackFastKernels {
             stream[base + d] = r;
             thread_x[i] = static_cast<float>(r);
             acc += thread_x[i] * thread_x[i];
+            if constexpr (PRESCALE) { thread_s[i] = scale[hc * H + d]; }
         }
         acc = simd_sum(acc);
         constexpr uint simd_groups = (H + 32 * N_READS - 1) / (32 * N_READS);
@@ -102,7 +109,8 @@ extension TrackFastKernels {
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
             InT n = static_cast<InT>(thread_x[i] * inv_mean);
-            normed[base + d] = n * scale[hc * H + d];
+            const InT s = PRESCALE ? thread_s[i] : scale[hc * H + d];
+            normed[base + d] = n * s;
         }
         """
 
