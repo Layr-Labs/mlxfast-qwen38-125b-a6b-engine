@@ -1423,24 +1423,13 @@ extension TrackFastMoEKernels {
                 }
             }
         }
-        // Shared expert down rows d0..d0+RPS-1 for token t. MLXFAST-SHAREDROWSG:
-        // the one-token path gives each shared row its own simdgroup, so the
-        // barrier waits on ONE row walk instead of RPS serial ones. Each row
-        // keeps its own qmv walk, accumulation order and reduction. Two to
-        // eight tokens keep the wide tile (a row's walk does not depend on how
-        // many vectors share its tile).
+        // Shared expert down rows d0..d0+3 for token t: one token routes to `qmv`'s
+        // normal branch (K = 640), two to eight to `qmv_wide` (full tiles; a row's
+        // walk does not depend on how many vectors share its tile).
         constexpr uint shared_sg = VPT == 1 && K == 10 && KSG >= 5
             ? (uint)KSG : (KSG > K ? (uint)K : 0u);
-        const device T* xs = act + (size_t)(BR + t) * (size_t)F;
-        if constexpr (VPT == 1 && K == 10 && KSG >= 5) {
-            if (sgi >= shared_sg && sgi < shared_sg + RPS) {
-                const int i = (int)(sgi - shared_sg);
-                float rs[1];
-                qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, 1>(
-                    wsd, ssd, bsd, xs, F, d0 + i, lid, rs);
-                if (lid == 0) { shvT[i] = static_cast<float>(static_cast<T>(rs[0])); }
-            }
-        } else if (sgi == shared_sg) {
+        if (sgi == shared_sg) {
+            const device T* xs = act + (size_t)(BR + t) * (size_t)F;
             if constexpr (VPT == 1) {
                 float rs[RPS];
                 qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wsd, ssd, bsd, xs, F, d0, lid, rs);
@@ -1532,9 +1521,7 @@ extension TrackFastMoEKernels {
         precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
         let rps = S == 1 ? downRowsPerSimdgroup : 4
-        // MLXFAST-SHAREDROWSG: one simdgroup per shared-expert row on the
-        // one-token path, so the threadgroup gains `rps` groups, not one.
-        let groups = ksg + (S == 1 && topK == 10 && ksg >= 5 ? rps : 0)
+        let groups = ksg + (S == 1 && topK == 10 && ksg >= 5 ? 1 : 0)
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
             template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
@@ -2227,20 +2214,11 @@ extension TrackFastMoEKernels {
         out_row = out_row + TM <= N ? out_row : N - TM;
         const device T* mat = w + (size_t)out_row * (size_t)K;
         const int n_iter = K / blockN;
-        // MLXFAST-ROUTERVEC4: both operand tiles are TN == 4 contiguous
-        // elements at a TN-aligned offset -- `bn` starts at `simd_lid * 4` and
-        // advances by blockN == 128, and every row base is a multiple of K (a
-        // multiple of 128) -- so the four scalar loads per tile are one aligned
-        // vector load. The products, their order, the accumulator and the simd
-        // reduction are untouched; only the loads issued per K block change.
-        const device float4* xv = reinterpret_cast<const device float4*>(x);
         for (int i = 0; i < n_iter; ++i) {
-            const float4 vx = xv[bn / TN];
-            for (int tn = 0; tn < TN; tn++) { v_coeff[tn] = vx[tn]; }
+            for (int tn = 0; tn < TN; tn++) { v_coeff[tn] = x[bn + tn]; }
             int mat_offset = 0;
             for (int tm = 0; tm < TM; tm++) {
-                const vec<T, 4> vw = *reinterpret_cast<const device vec<T, 4>*>(mat + mat_offset + bn);
-                for (int tn = 0; tn < TN; tn++) { inter[tn] = static_cast<float>(vw[tn]); }
+                for (int tn = 0; tn < TN; tn++) { inter[tn] = static_cast<float>(mat[mat_offset + bn + tn]); }
                 for (int tn = 0; tn < TN; tn++) { result[tm] += inter[tn] * v_coeff[tn]; }
                 mat_offset += K;
             }
@@ -2443,3 +2421,4 @@ extension TrackFastMoEKernels {
         """#
 
 }
+private let gauntletRedraw_b1c053c1_20260921T063807Z: Int = 0
