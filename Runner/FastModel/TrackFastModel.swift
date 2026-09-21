@@ -558,6 +558,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             if hc.hasInject, case .quant(let q)? = hc.inject, q.biases != nil { injQ = q }
             if !hc.hasInject || injQ != nil {
                 let n2 = normed.reshaped(S, hcCount * hidden)
+                if Self.debugTaps == nil, let live = TrackFastMixerSplitK.applyNoLo(n2, down: dq, inject: injQ) {
+                    let u = TrackFastMixerKernels.upMix(
+                        act: live[0], normed: n2, up: hc.decodeUp ?? uq, inj: live[1], hcCount: hcCount, hidden: hidden,
+                        hasInject: hc.hasInject, emitF32: emitF32, packedRows: hc.decodeUp != nil)
+                    let f32 = emitF32 ? u.inputF32.reshaped(1, S, hidden) : nil
+                    return (u.input.reshaped(1, S, hidden), u.inject.reshaped(1, S, hcCount), f32)
+                }
                 let d = TrackFastMixerKernels.downInject(normed: n2, down: dq, inject: injQ)
                 let packedUp = S == 1 ? hc.decodeUp : nil
                 let u = TrackFastMixerKernels.upMix(

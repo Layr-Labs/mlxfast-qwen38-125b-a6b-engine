@@ -76,6 +76,20 @@ enum TrackFastMixerSplitK {
         header: TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader + helper,
         ensureRowContiguous: true)
 
+    // The one-token decode path never reads `lo` outside debug taps. This source
+    // is the fused kernel with that one store removed; act and inj stay.
+    static let noLoSource: String = {
+        let anchor = "lo[tile * RPS + i] = l;\n"
+        let parts = fusedSource.components(separatedBy: anchor)
+        precondition(parts.count == 2, "split-K lo store is not unique")
+        return parts.joined()
+    }()
+    static let noLoKernel = MLXFast.metalKernel(name: "track_split_k_mixer_no_lo",
+        inputNames: ["x", "wd", "sd", "bd", "wi", "si", "bi"],
+        outputNames: ["act", "inj"], source: noLoSource,
+        header: TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader + helper,
+        ensureRowContiguous: true)
+
     static func apply(_ x: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?) -> [MLXArray] {
         let k = x.size, n = down.rows, hc = inject?.rows ?? 4
         let rows = 2, partitions = split
@@ -86,5 +100,23 @@ enum TrackFastMixerSplitK {
                        ("ORDERED", true), ("HAS_INJECT", inject != nil)],
             grid: (32, (n / rows + (inject != nil ? hc : 0)) * partitions, 1), threadGroup: (32, partitions, 1),
             outputShapes: [[1, n], [1, n], [1, hc]], outputDTypes: [x.dtype, x.dtype, x.dtype])
+    }
+
+    /// Same one-token split as `apply`, without the unread pre-silu output.
+    /// Nil unless the live mixer geometry matches, so every other shape stays
+    /// on the three-output kernel.
+    static func applyNoLo(_ x: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?) -> [MLXArray]? {
+        let k = x.size, n = down.rows, hc = inject?.rows ?? 4
+        guard split > 0, x.shape == [1, k], k == 10240, n == 320, hc == 4,
+            down.bits == 4, down.groupSize == 32, down.biases != nil,
+            inject == nil || (inject!.bits == 4 && inject!.groupSize == 32 && inject!.biases != nil)
+        else { return nil }
+        let partitions = split
+        let inj = inject ?? down
+        return noLoKernel([x, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
+            template: [("T", x.dtype), ("K", k), ("ND", n), ("RPS", 2), ("SPLIT", partitions),
+                       ("ORDERED", true), ("HAS_INJECT", inject != nil)],
+            grid: (32, (n / 2 + (inject != nil ? hc : 0)) * partitions, 1), threadGroup: (32, partitions, 1),
+            outputShapes: [[1, n], [1, hc]], outputDTypes: [x.dtype, x.dtype])
     }
 }
