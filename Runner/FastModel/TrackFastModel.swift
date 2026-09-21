@@ -347,6 +347,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         super.init()
         if finalMixer.normScaleQ.dtype == .bfloat16 && StreamOrDevice.default.stream === Stream.gpu {
             _ = TrackBF16Functions.sigmoid
+            _ = TrackFastGDNDecode.sigmoidFP32
         }
     }
 
