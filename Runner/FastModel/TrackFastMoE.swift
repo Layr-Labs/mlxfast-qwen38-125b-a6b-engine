@@ -1378,8 +1378,9 @@ extension TrackFastMoEKernels {
     /// gate/add (MLX's `col_reduce_small` association over the K experts, as
     /// `track_moe_combine`). act [BR, F], idx uint32 [BR], w f32 [BR] (slot
     /// order), shared [S, H], gate [S] (pre-sigmoid) -> out [S, H].
-    /// grid threads (32, H/4, S), threadgroup (32, 1, 1): one simdgroup owns
-    /// 4 output columns for one token across all K experts.
+    /// Each threadgroup owns `RPS` output columns for one token. Its routed
+    /// expert SIMD groups stage products by expert and row; the added shared
+    /// groups stage one shared-expert result per row before the ordered fold.
     static let downCombineSource = """
         const uint t = threadgroup_position_in_grid.z;
         // MLXFAST-DOWNRPS: RPS output rows per threadgroup (4 for wide windows).
@@ -1514,10 +1515,10 @@ extension TrackFastMoEKernels {
     /// fewer rows per threadgroup means more threadgroups in flight (H / rows).
     static let downRowsPerSimdgroup = 2
 
-    // MLXFAST-ONESG: one simdgroup per routed expert. With K = 10 and KSG = 10
-    // each group runs exactly one expert walk (kk loop trip count 1) instead of
-    // two serial walks; the per-row fold order over k is unchanged, so the
-    // output is bit-identical for any value.
+    // MLXFAST-ONESG: one SIMD group per routed expert. With K = 10 and KSG = 10,
+    // each group runs one expert walk that covers the tile's RPS rows; the
+    // pre-split KSG = 5 layout ran two experts serially per group. The per-row
+    // fold order over k is unchanged, so the output is bit-identical.
     static let downCombineSimdgroups =
         ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 10
 
