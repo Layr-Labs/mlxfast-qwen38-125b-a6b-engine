@@ -65,14 +65,14 @@ enum TrackPrefillSort {
     /// Per-block occupancy counts, `[nBlocks, E]`.
     private static let countKernel = MLXFast.metalKernel(
         name: "track_route_block_counts",
-        inputNames: ["ids"], outputNames: ["counts"],
+        inputNames: ["ids"], outputNames: ["counts", "local_rank"],
         source: countSource, header: "", ensureRowContiguous: true)
 
     /// The stable destination of every assignment, plus the three arrays the
     /// consumers actually read.
     private static let scatterKernel = MLXFast.metalKernel(
         name: "track_route_counting_scatter",
-        inputNames: ["ids", "counts"],
+        inputNames: ["ids", "counts", "local_rank"],
         outputNames: ["sorted_ids", "token_rows", "inverse"],
         source: scatterSource, header: "", ensureRowContiguous: true)
 
@@ -87,13 +87,13 @@ enum TrackPrefillSort {
             R >= blockSize, R % blockSize == 0
         else { return nil }
         let nBlocks = R / blockSize
-        let counts = countKernel(
+        let countOutputs = countKernel(
             [flatIDs],
             template: [("E", E), ("BLK", blockSize), ("R", R)],
             grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
-            outputShapes: [[nBlocks * E]], outputDTypes: [.uint32])[0]
+            outputShapes: [[nBlocks * E], [R]], outputDTypes: [.uint32, .uint32])
         let outs = scatterKernel(
-            [flatIDs, counts],
+            [flatIDs, countOutputs[0], countOutputs[1]],
             template: [("E", E), ("BLK", blockSize), ("R", R), ("NB", nBlocks), ("TOPK", topK)],
             grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
             outputShapes: [[R], [R], [R]],
@@ -121,6 +121,31 @@ enum TrackPrefillSort {
                 if (lane == 0) { planes[sg][bit] = mask; }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // The ballot planes already encode every value in the block.
+            // Count matches in earlier SIMD groups, then lower lanes in this
+            // SIMD group. The explicit branch avoids a shift by 32 for lane 0.
+            uint rank = 0;
+            for (uint word = 0; word < sg; ++word) {
+                uint matches = planes[word][9];
+                #pragma clang loop unroll(full)
+                for (uint bit = 0; bit < 9; ++bit) {
+                    const uint mask = planes[word][bit];
+                    matches &= (value & (1u << bit)) ? mask : ~mask;
+                }
+                rank += popcount(matches);
+            }
+            uint lowerMask = 0u;
+            if (lane > 0u) { lowerMask = (1u << lane) - 1u; }
+            uint matches = planes[sg][9];
+            #pragma clang loop unroll(full)
+            for (uint bit = 0; bit < 9; ++bit) {
+                const uint mask = planes[sg][bit];
+                matches &= (value & (1u << bit)) ? mask : ~mask;
+            }
+            rank += popcount(matches & lowerMask);
+            local_rank[blk * (uint)BLK + t] = rank;
+
             for (uint b = t; b < (uint)E; b += BLK) {
                 uint count = 0;
                 for (uint word = 0; word < 8; ++word) {
@@ -141,6 +166,9 @@ enum TrackPrefillSort {
         const uint gi = blk * BLK + t;
         vals[t] = (gi < (uint)R) ? ids[gi] : (uint)E;
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint local = 0;
+        for (uint j = 0; j < t; ++j) { local += (vals[j] == vals[t]) ? 1u : 0u; }
+        local_rank[gi] = local;
         for (uint b = t; b < (uint)E; b += BLK) {
             uint c = 0;
             for (uint j = 0; j < BLK; ++j) { c += (vals[j] == b) ? 1u : 0u; }
@@ -191,8 +219,7 @@ enum TrackPrefillSort {
         }
         if (gi >= (uint)R) { return; }
         const uint v = vals[t];
-        uint rank = 0;
-        for (uint j = 0; j < t; ++j) { rank += (vals[j] == v) ? 1u : 0u; }
+        const uint rank = local_rank[gi];
         const uint dest = (sA[v] - tot[v]) + pre[v] + rank;
         sorted_ids[dest] = v;
         token_rows[dest] = gi / (uint)TOPK;
