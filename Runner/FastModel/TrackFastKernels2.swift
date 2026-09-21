@@ -487,17 +487,40 @@ extension TrackFastKernels {
 
     /// out = bf16(sum_k f32(routed[k]) * w[k]) + sigmoid(gate) * shared   (bf16 ops after the f32 sum)
     static let moeCombineSource = """
-        const uint d = thread_position_in_grid.x;
+        const uint dv = thread_position_in_grid.x;
         const uint row = thread_position_in_grid.y;
-        if (d >= H) return;
+        if constexpr (VEC4) {
+            if (dv >= (uint)(H / 4)) return;
+            const uint d = dv * 4;
+            const device vec<InT, 4>* routed4 =
+                reinterpret_cast<const device vec<InT, 4>*>(routed + row * K * H + d);
+            float prod[4][K];
+            for (int k = 0; k < K; ++k) {
+                const vec<InT, 4> r4 = routed4[(uint)k * (H / 4)];
+                const float wk = w[row * K + k];
+                for (int i = 0; i < 4; ++i) { prod[i][k] = static_cast<float>(r4[i]) * wk; }
+            }
+            const InT sg = mlx_sigmoid(gate[row]);
+            const vec<InT, 4> sh4 =
+                *reinterpret_cast<const device vec<InT, 4>*>(shared + row * H + d);
+            vec<InT, 4> o4;
+            for (int i = 0; i < 4; ++i) {
+                const InT r = static_cast<InT>(mlx_colsum_small_f32<K>(prod[i]));
+                const InT sh = sg * sh4[i];
+                o4[i] = r + sh;
+            }
+            *reinterpret_cast<device vec<InT, 4>*>(out + row * H + d) = o4;
+            return;
+        }
+        if (dv >= H) return;
         float prod[K];
         for (int k = 0; k < K; ++k) {
-            prod[k] = static_cast<float>(routed[(row * K + k) * H + d]) * w[row * K + k];
+            prod[k] = static_cast<float>(routed[(row * K + k) * H + dv]) * w[row * K + k];
         }
         const InT r = static_cast<InT>(mlx_colsum_small_f32<K>(prod));
         const InT sg = mlx_sigmoid(gate[row]);
-        const InT sh = sg * shared[row * H + d];
-        out[row * H + d] = r + sh;
+        const InT sh = sg * shared[row * H + dv];
+        out[row * H + dv] = r + sh;
         """
 
     nonisolated(unsafe) static let moeCombineKernel = MLXFast.metalKernel(
@@ -511,10 +534,11 @@ extension TrackFastKernels {
     {
         let B = routed.dim(0), S = routed.dim(1), K = routed.dim(2), H = routed.dim(3)
         precondition(w.dtype == .float32)
+        let vec4 = H % 4 == 0
         return moeCombineKernel(
             [routed, w, shared, gate],
-            template: [("InT", routed.dtype), ("K", K), ("H", H)],
-            grid: (H, B * S, 1), threadGroup: (256, 1, 1),
+            template: [("InT", routed.dtype), ("K", K), ("H", H), ("VEC4", vec4)],
+            grid: (vec4 ? H / 4 : H, B * S, 1), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, H]], outputDTypes: [routed.dtype])[0]
     }
 
