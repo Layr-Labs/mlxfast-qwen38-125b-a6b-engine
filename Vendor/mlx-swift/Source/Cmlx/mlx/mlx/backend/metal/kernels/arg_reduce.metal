@@ -113,17 +113,34 @@ template <typename T, typename Op, int N_READS = 4>
 
   threadgroup IndexValPair<T> local_data[32];
 
-  // Loop over the reduction axis in lsize*N_READS buckets
+  // Loop over the reduction axis in lsize*N_READS buckets. When the axis is
+  // contiguous and the block is fully in bounds the N_READS values arrive in
+  // one vector load instead of N_READS guarded scalar loads; the values, their
+  // order and their offsets are unchanged.
+  const bool packed_axis = (axis_stride == 1) && ((in_idx % N_READS) == 0);
   for (uint r = 0; r < ceildiv(axis_size, N_READS * lsize.x); r++) {
     // Read the current value
     uint32_t current_index = r * lsize.x * N_READS + lid.x * N_READS;
     uint32_t offset = current_index;
     const device T* current_in = in + in_idx + current_index * axis_stride;
     T vals[N_READS];
-    for (int i = 0; i < N_READS; i++) {
-      vals[i] = (current_index < axis_size) ? *current_in : T(Op::init);
-      current_index++;
-      current_in += axis_stride;
+    bool packed = false;
+    if constexpr (sizeof(T) == 2 || sizeof(T) == 4) {
+      if (packed_axis && (current_index + N_READS <= axis_size)) {
+        const auto block =
+            *reinterpret_cast<const device vec<T, N_READS>*>(current_in);
+        for (int i = 0; i < N_READS; i++) {
+          vals[i] = block[i];
+        }
+        packed = true;
+      }
+    }
+    if (!packed) {
+      for (int i = 0; i < N_READS; i++) {
+        vals[i] = (current_index < axis_size) ? *current_in : T(Op::init);
+        current_index++;
+        current_in += axis_stride;
+      }
     }
     best = op.template reduce_many<N_READS>(best, vals, offset);
   }
