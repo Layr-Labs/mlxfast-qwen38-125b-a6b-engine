@@ -188,7 +188,17 @@ extension TrackFastKernels {
     nonisolated(unsafe) static var wideNormMinS = 9
 
     /// Simdgroups per (row, stream) in the wide inject+norm launch.
-    static let wideNormSimdgroups = 4
+    /// MLXFAST-WIDENORMSG2: two instead of four. The launch already presents
+    /// `HC * B * S` threadgroups -- thousands on a prefill window -- so its
+    /// scarce resource is per-core residency, not dispatch breadth: a
+    /// 64-thread threadgroup is a smaller allocation unit than a 128-thread one
+    /// and more of them fit per core under the same scheduler and register
+    /// budget. Each simdgroup then owns ten 128-element slices instead of five,
+    /// and the slice fold is SG-generic: slice `g = sgi + si * SG` keeps its own
+    /// lanes and its own `simd_sum`, stages into `local_sums[g]`, and the final
+    /// fold is the same `simd_sum` over the same 32 slots, so the sums stay
+    /// bit-identical for any SG dividing the slice count.
+    static let wideNormSimdgroups = 2
 
     static func injectNorm(
         residual: MLXArray, out: MLXArray?, inject: MLXArray?, scale: MLXArray,
