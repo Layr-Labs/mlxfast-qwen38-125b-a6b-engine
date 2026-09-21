@@ -78,18 +78,31 @@ extension TrackFastKernels {
         InT inj_t = InT(0);
         if (HAS_INJECT) { inj_t = inject[row * HC + hc]; inj = static_cast<float>(inj_t); }
         (void)inj;
+        // MLXFAST-NORMVEC4: every thread owns N_READS == 4 CONTIGUOUS elements
+        // at `lid * N_READS`, and W, H and HC * H are all multiples of four, so
+        // each thread's residual, out, stream and normed tiles are one aligned
+        // four-wide access instead of four scalar ones. The per-element chain is
+        // untouched: the inject product is still formed in InT and added to the
+        // residual in InT, the squares still enter `acc` in ascending `i`, and
+        // the normed value is still rounded to InT before the scale multiply.
+        // `scale` stays scalar-indexed: it is a separate array whose element
+        // type need not match InT.
+        using V = vec<InT, N_READS>;
         float thread_x[N_READS];
         float acc = 0.0f;
-        for (int i = 0; i < N_READS; ++i) {
-            const uint d = lid * N_READS + i;
-            const uint src = TILE ? (row * H + d) : (base + d);
-            InT r = residual[src];
-            if (HAS_INJECT) {
-                InT sp = out[row * H + d] * inj_t;
-                r = r + sp;
+        const uint d0 = lid * N_READS;
+        const uint src0 = TILE ? (row * H + d0) : (base + d0);
+        V rv = *reinterpret_cast<const device V*>(residual + src0);
+        if (HAS_INJECT) {
+            const V ov = *reinterpret_cast<const device V*>(out + row * H + d0);
+            for (int i = 0; i < N_READS; ++i) {
+                const InT sp = ov[i] * inj_t;
+                rv[i] = rv[i] + sp;
             }
-            stream[base + d] = r;
-            thread_x[i] = static_cast<float>(r);
+        }
+        *reinterpret_cast<device V*>(stream + base + d0) = rv;
+        for (int i = 0; i < N_READS; ++i) {
+            thread_x[i] = static_cast<float>(rv[i]);
             acc += thread_x[i] * thread_x[i];
         }
         acc = simd_sum(acc);
@@ -99,11 +112,12 @@ extension TrackFastKernels {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         acc = simd_sum(local_sums[lane]);
         const float inv_mean = metal::precise::rsqrt(acc / (float)H + as_type<float>((uint)EPS_BITS));
+        V nv;
         for (int i = 0; i < N_READS; ++i) {
-            const uint d = lid * N_READS + i;
-            InT n = static_cast<InT>(thread_x[i] * inv_mean);
-            normed[base + d] = n * scale[hc * H + d];
+            const InT n = static_cast<InT>(thread_x[i] * inv_mean);
+            nv[i] = static_cast<InT>(n * scale[hc * H + d0 + i]);
         }
+        *reinterpret_cast<device V*>(normed + base + d0) = nv;
         """
 
     nonisolated(unsafe) static let injectNormKernel = MLXFast.metalKernel(
