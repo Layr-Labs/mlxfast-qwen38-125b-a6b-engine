@@ -4,9 +4,22 @@
 import MLX
 
 enum TrackFastGDNDecode {
+    private static let sigmoidFP32Kernel = MLXFast.metalKernel(
+        name: "track_gdn_decode_fp32_sigmoid_table",
+        inputNames: [], outputNames: ["table"],
+        source: sigmoidFP32Source, header: TrackFastKernels.exactHeader)
+
+    nonisolated(unsafe) static let sigmoidFP32: MLXArray = {
+        let table = sigmoidFP32Kernel(
+            [], grid: (65536, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[65536]], outputDTypes: [.float32], stream: .gpu)[0]
+        eval(table)
+        return table
+    }()
+
     private static let kernel = MLXFast.metalKernel(
         name: "track_gdn_decode_complete",
-        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w", "journal_in"],
+        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w", "journal_in", "sigmoid_fp32"],
         outputNames: ["state_out", "gated", "conv_out", "journal_out"],
         source: source, header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
@@ -25,6 +38,11 @@ enum TrackFastGDNDecode {
             g.aOffset >= 0, g.aOffset + g.hv <= g.projWidth
         else { return nil }
         let B = proj.dim(0)
+        let useFP32Sigmoid = StreamOrDevice.default.stream === Stream.gpu
+            && B == 1
+            && g.projWidth == 16480 && g.convDim == 10240 && g.convKernel == 4
+            && g.hk == 16 && g.hv == 48 && g.dk == 128 && g.dv == 128
+            && zOffset == 10240 && g.bOffset == 16384 && g.aOffset == 16432
         guard convState.shape == [B, g.convKernel - 1, g.convDim],
             stateIn.shape == [B, g.hv, g.dv, g.dk],
             convW.shape == [g.convDim, g.convKernel],
@@ -34,8 +52,9 @@ enum TrackFastGDNDecode {
         let journalStride = g.hv * g.dk + 2 * g.hv * g.dv + 2 * g.hv
         let hasJournal = pendingJournal?.shape == [B, journalStride]
         let journalIn = pendingJournal ?? convState
+        let sigmoidInput = useFP32Sigmoid ? sigmoidFP32 : convState
         let result = kernel(
-            [proj, convState, convW, negExpALog, dtBias, stateIn, normW, journalIn],
+            [proj, convState, convW, negExpALog, dtBias, stateIn, normW, journalIn, sigmoidInput],
             template: [
                 ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
                 ("Hk", g.hk), ("Hv", g.hv), ("KC", g.convKernel), ("CONV_DIM", g.convDim),
@@ -43,6 +62,7 @@ enum TrackFastGDNDecode {
                 ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)), ("RPS", 4),
                 ("J_KEY_OFF", 0), ("J_DELTA_OFF", g.hv * g.dk),
                 ("J_DECAY_OFF", g.hv * g.dk + 2 * g.hv * g.dv),
+                ("USE_FP32_SIGMOID", useFP32Sigmoid),
                 ("J_STRIDE", journalStride), ("HAS_JOURNAL", hasJournal),
             ],
             grid: (32, g.dv / 4, B * g.hv), threadGroup: (32, g.dv / 4, 1),
@@ -243,10 +263,20 @@ enum TrackFastGDNDecode {
             vec<InT, 4> out4;
             for (int i = 0; i < 4; ++i) {
                 InT normalized = w4[i] * static_cast<InT>(thread_x[i] * inv_mean);
-                const float zg = mlx_sigmoid(static_cast<float>(z4[i]));
+                float zg;
+                if constexpr (USE_FP32_SIGMOID) {
+                    zg = sigmoid_fp32[as_type<ushort>(z4[i])];
+                } else {
+                    zg = mlx_sigmoid(static_cast<float>(z4[i]));
+                }
                 out4[i] = static_cast<InT>(zg * static_cast<float>(normalized));
             }
             *reinterpret_cast<device vec<InT, 4>*>(gated + (n * Dv + lane * 4)) = out4;
         }
+        """#
+
+    private static let sigmoidFP32Source = #"""
+        const uint i = thread_position_in_grid.x;
+        table[i] = mlx_sigmoid(float(as_type<bfloat16_t>(ushort(i))));
         """#
 }
