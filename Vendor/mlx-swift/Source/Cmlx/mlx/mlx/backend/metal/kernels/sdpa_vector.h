@@ -470,12 +470,24 @@ template <typename T, int D, int V, int G, int HPT>
     }
     kp += k_seq_stride;
     vp += v_seq_stride;
+    // The HPT heads share this token's K/V and are independent of one another,
+    // so their partials are formed first and their reductions are issued back
+    // to back instead of one reduction sitting on the next head's chain. Each
+    // head keeps its own component order, its own running maximum and its own
+    // accumulator.
+    U scores[HPT];
     for (int j = 0; j < HPT; j++) {
       U score = 0;
       for (int i = 0; i < qk_per_thread; i++) {
         score += q[j][i] * kr[i];
       }
-      score = simd_sum(score);
+      scores[j] = score;
+    }
+    for (int j = 0; j < HPT; j++) {
+      scores[j] = simd_sum(scores[j]);
+    }
+    for (int j = 0; j < HPT; j++) {
+      U score = scores[j];
       U new_max = max(max_score[j], score);
       U factor = fast::exp(max_score[j] - new_max);
       U exp_score = fast::exp(score - new_max);
