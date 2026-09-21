@@ -453,16 +453,30 @@ extension TrackFastKernels {
 
     /// out[b,s,h*D+d] = att[b,h,s,d] * sigmoid(gate[b,s,h*D+d])   (bf16 ops)
     static let attnGateSource = """
-        const uint j = thread_position_in_grid.x;
+        const uint jv = thread_position_in_grid.x;
         const uint row = thread_position_in_grid.y;
-        if (j >= HQ * D) return;
-        const uint h = j / D;
-        const uint d = j % D;
         const uint b = row / S;
         const uint s = row % S;
+        if constexpr (VEC4) {
+            if (jv >= (uint)(HQ * D / 4)) return;
+            const uint j = jv * 4;
+            const uint h = j / D;
+            const uint d = j % D;
+            const auto a4 = *reinterpret_cast<const device vec<InT, 4>*>(
+                att + ((b * HQ + h) * S + s) * D + d);
+            const auto g4 = *reinterpret_cast<const device vec<InT, 4>*>(
+                qkv + row * QW + GATE_OFF + j);
+            vec<InT, 4> o4;
+            for (int i = 0; i < 4; ++i) { o4[i] = a4[i] * mlx_sigmoid(g4[i]); }
+            *reinterpret_cast<device vec<InT, 4>*>(out + row * HQ * D + j) = o4;
+            return;
+        }
+        if (jv >= HQ * D) return;
+        const uint h = jv / D;
+        const uint d = jv % D;
         const InT a = att[((b * HQ + h) * S + s) * D + d];
-        const InT g = qkv[row * QW + GATE_OFF + j];
-        out[row * HQ * D + j] = a * mlx_sigmoid(g);
+        const InT g = qkv[row * QW + GATE_OFF + jv];
+        out[row * HQ * D + jv] = a * mlx_sigmoid(g);
         """
 
     nonisolated(unsafe) static let attnGateKernel = MLXFast.metalKernel(
@@ -473,13 +487,14 @@ extension TrackFastKernels {
 
     static func attnGate(att: MLXArray, qkv: MLXArray, gateOffset: Int) -> MLXArray {
         let B = att.dim(0), HQ = att.dim(1), S = att.dim(2), D = att.dim(3)
+        let vec4 = D % 4 == 0 && gateOffset % 4 == 0 && qkv.dim(2) % 4 == 0
         return attnGateKernel(
             [att, qkv],
             template: [
                 ("InT", att.dtype), ("HQ", HQ), ("D", D), ("S", S), ("QW", qkv.dim(2)),
-                ("GATE_OFF", gateOffset),
+                ("GATE_OFF", gateOffset), ("VEC4", vec4),
             ],
-            grid: (HQ * D, B * S, 1), threadGroup: (256, 1, 1),
+            grid: (vec4 ? HQ * D / 4 : HQ * D, B * S, 1), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, HQ * D]], outputDTypes: [att.dtype])[0]
     }
 
@@ -820,3 +835,4 @@ extension TrackFastKernels {
         return (outs[0], outs[1])
     }
 }
+private let gauntletRedraw_38022ba7_20260921T194038Z: Int = 0
