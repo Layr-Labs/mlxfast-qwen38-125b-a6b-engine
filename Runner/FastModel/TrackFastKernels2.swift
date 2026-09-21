@@ -229,23 +229,50 @@ extension TrackFastKernels {
     /// input[d] = bf16( sum_s f32(bf16(sigmoid(w[s,d])) * normed[s,d]) ) (row-order f32 sum, one rounding)
     /// inject[s] = 2 * sigmoid(inj[s])   (bf16 ops)
     static let mixSource = """
-        const uint d = thread_position_in_grid.x;
+        const uint dv = thread_position_in_grid.x;
         const uint row = thread_position_in_grid.y;
-        if (d >= H) return;
         // `sum` over the stream axis of a bf16 array accumulates in bf16, one
         // rounding per add, in row order.
+        if constexpr (VEC4) {
+            if (dv >= (uint)(H / 4)) return;
+            const uint d = dv * 4;
+            vec<InT, 4> acc = vec<InT, 4>(InT(0), InT(0), InT(0), InT(0));
+            for (int s = 0; s < HC; ++s) {
+                const uint i = row * W + s * H + d;
+                const auto w4 = *reinterpret_cast<const device vec<InT, 4>*>(w + i);
+                const auto n4 = *reinterpret_cast<const device vec<InT, 4>*>(normed + i);
+                for (int c = 0; c < 4; ++c) {
+                    InT sg = mlx_sigmoid(w4[c]);
+                    InT p = sg * n4[c];
+                    acc[c] = acc[c] + p;
+                }
+            }
+            *reinterpret_cast<device vec<InT, 4>*>(input + row * H + d) = acc;
+            if (HAS_INJECT) {
+                for (int c = 0; c < 4; ++c) {
+                    const uint dd = d + (uint)c;
+                    if (dd < (uint)HC) {
+                        InT x = inj[row * LW + (LW - HC) + dd];
+                        InT sg = mlx_sigmoid(x);
+                        inject[row * HC + dd] = InT(2) * sg;
+                    }
+                }
+            }
+            return;
+        }
+        if (dv >= H) return;
         InT acc = InT(0);
         for (int s = 0; s < HC; ++s) {
-            const uint i = row * W + s * H + d;
+            const uint i = row * W + s * H + dv;
             InT sg = mlx_sigmoid(w[i]);
             InT p = sg * normed[i];
             acc = acc + p;
         }
-        input[row * H + d] = acc;
-        if (HAS_INJECT && d < HC) {
-            InT x = inj[row * LW + (LW - HC) + d];
+        input[row * H + dv] = acc;
+        if (HAS_INJECT && dv < HC) {
+            InT x = inj[row * LW + (LW - HC) + dv];
             InT sg = mlx_sigmoid(x);
-            inject[row * HC + d] = InT(2) * sg;
+            inject[row * HC + dv] = InT(2) * sg;
         }
         """
 
@@ -259,13 +286,14 @@ extension TrackFastKernels {
         w: MLXArray, normed: MLXArray, inj: MLXArray, hcCount: Int, hidden: Int, hasInject: Bool
     ) -> (input: MLXArray, inject: MLXArray) {
         let B = w.dim(0), S = w.dim(1)
+        let vec4 = hidden % 4 == 0
         let outs = mixKernel(
             [w, normed, inj],
             template: [
                 ("InT", w.dtype), ("H", hidden), ("W", hcCount * hidden), ("HC", hcCount),
-                ("LW", inj.dim(2)), ("HAS_INJECT", hasInject),
+                ("LW", inj.dim(2)), ("HAS_INJECT", hasInject), ("VEC4", vec4),
             ],
-            grid: (hidden, B * S, 1), threadGroup: (256, 1, 1),
+            grid: (vec4 ? hidden / 4 : hidden, B * S, 1), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, hidden], [B, S, hcCount]],
             outputDTypes: [w.dtype, w.dtype])
         return (outs[0], outs[1])
