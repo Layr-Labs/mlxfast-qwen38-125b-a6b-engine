@@ -4,8 +4,14 @@ import MLX
 // Partition HC input blocks across SIMD groups while retaining each lane's
 // ascending block fold and the final simd_sum. No target weight changes.
 enum TrackFastMixerSplitK {
-    // Four partitions in production; zero selects the original A/B control.
-    nonisolated(unsafe) static var split = 4
+    // MLXFAST-SPLITK5: five partitions, one per 512-wide quantized block of the
+    // 2560-long down walk. At four partitions `COUNT = ceil(5 / 4) = 2`, so two
+    // simdgroups walked two blocks in series, one walked one and the fourth sat
+    // idle at the barrier; at five every simdgroup owns exactly one block and
+    // the barrier releases after a single block fold. The ordered scratch is
+    // indexed by block, not by partition, so the fold and its order do not
+    // depend on the partition count. Zero still selects the A/B control.
+    nonisolated(unsafe) static var split = 5
     static let helper = #"""
         template <typename T, int K, int V, int R, int SPLIT, bool ORDERED>
         METAL_FUNC void research_split_qmv(
@@ -70,7 +76,7 @@ enum TrackFastMixerSplitK {
             if (sg == 0 && lane == 0) { inj[tile - DN] = static_cast<T>(r[0]); }
         }
         """#
-    static let fusedKernel = MLXFast.metalKernel(name: "track_split_k_mixer",
+    static let fusedKernel = MLXFast.metalKernel(name: "track_split_k_mixer_p5",
         inputNames: ["x", "wd", "sd", "bd", "wi", "si", "bi"],
         outputNames: ["lo", "act", "inj"], source: fusedSource,
         header: TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader + helper,
