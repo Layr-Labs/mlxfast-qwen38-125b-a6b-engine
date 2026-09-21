@@ -789,13 +789,25 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let prof = TrackFastProfile.prefill != nil && x.dim(1) >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
         let logits: MLXArray
+        var preparedGate: MLXArray? = nil
         if x.dim(0) == 1, x.dim(1) == 1, m.routerW16.dtype == .bfloat16, x.dim(2) % 128 == 0,
             m.routerW16.dim(0) % 16 == 0, x.dim(2) < 16 * m.routerW16.dim(0), m.routerW16.dim(0) < 4096
         {
             // One token: MLX's float gemv arithmetic over the bf16 weight (the
             // reference upcasts it to float32 and reads twice the bytes).
             let xf = (inputF32 ?? x.asType(.float32)).reshaped(x.dim(2))
-            logits = TrackFastMoEKernels.routerGemv(x: xf, w: m.routerW16).reshaped(1, 1, -1)
+            if inputF32 != nil, x.dtype == .bfloat16, x.dim(2) == 2560,
+                m.routerW16.dim(0) == 512, case .dense(let gateW) = m.sharedGate,
+                gateW.dtype == .bfloat16, gateW.ndim == 2,
+                gateW.dim(0) == 1, gateW.dim(1) == 2560
+            {
+                let result = TrackFastMoEKernels.routerGemvWithGate(
+                    x: xf, w: m.routerW16, xb: x, gateW: gateW)
+                logits = result.logits.reshaped(1, 1, -1)
+                preparedGate = result.gate
+            } else {
+                logits = TrackFastMoEKernels.routerGemv(x: xf, w: m.routerW16).reshaped(1, 1, -1)
+            }
         } else if inputF32 == nil, let wide = TrackPrefillRouter.apply(x: x, w: m.routerW16) {
             logits = wide
         } else {
@@ -820,7 +832,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let r = TrackFastMoEKernels.route(
                 logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, topK: K)
             let (idx, weights) = (r.idx, r.w)
-            let gate = gateQ != nil ? r.gate : m.sharedGate.apply(x).reshaped(S)
+            let gate = preparedGate ?? (gateQ != nil ? r.gate : m.sharedGate.apply(x).reshaped(S))
             if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights, gate]) }
             let flatIdx = idx.reshaped(S * K)
             let xrow = Self.xrowTable(S: S, K: K)

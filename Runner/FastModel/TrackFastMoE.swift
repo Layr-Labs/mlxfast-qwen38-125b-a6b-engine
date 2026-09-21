@@ -2262,6 +2262,64 @@ extension TrackFastMoEKernels {
         outputNames: ["out"],
         source: routerGemvSource, ensureRowContiguous: true)
 
+    // The scalar BF16 gate uses MLX's dot-product grouping, not router GEMV math.
+    static let routerWithGateSource = """
+        if ((int)threadgroup_position_in_grid.x == N / (4 * RPS)) {
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint lane = thread_index_in_simdgroup;
+            const uint tid = sg * 32 + lane;
+            const int start = (int)sg * 32 * 32 + (int)lane * 8;
+            float4 c = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 32; i += 8) {
+                const int idx = start + i * 32;
+                if (idx + 8 <= K) {
+                    #pragma unroll
+                    for (int j = 0; j < 8; j += 4) {
+                        c += float4(*reinterpret_cast<const device vec<T, 4>*>(xb + idx + j))
+                            * float4(*reinterpret_cast<const device vec<T, 4>*>(gateW + idx + j));
+                    }
+                }
+            }
+            threadgroup float partials[16];
+            float sum = c[0] + c[1] + c[2] + c[3];
+            sum = simd_sum(sum);
+            if (lane == 0) { partials[sg] = sum; }
+            if (tid >= 4 && tid < 16) { partials[tid] = 0.0f; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid < 16) {
+                sum = partials[tid];
+                sum = simd_sum(sum);
+            }
+            if (sg == 0) {
+                // Match all_reduce(float[1], sum), then the BF16 scalar copy.
+                float total = lane == 0 ? sum + 0.0f : 0.0f;
+                total = simd_sum(total);
+                if (lane == 0) { gate[0] = static_cast<T>(total); }
+            }
+            return;
+        }
+        """ + "\n" + routerGemvSource
+
+    nonisolated(unsafe) static let routerWithGateKernel = MLXFast.metalKernel(
+        name: "track_router_gemv_with_shared_gate_dot",
+        inputNames: ["x", "w", "xb", "gateW"], outputNames: ["out", "gate"],
+        source: routerWithGateSource, ensureRowContiguous: true)
+
+    static func routerGemvWithGate(
+        x: MLXArray, w: MLXArray, xb: MLXArray, gateW: MLXArray
+    ) -> (logits: MLXArray, gate: MLXArray) {
+        precondition(x.dtype == .float32 && x.size == 2560 && w.dtype == .bfloat16)
+        precondition(w.shape == [512, 2560] && xb.dtype == .bfloat16 && xb.size == 2560)
+        precondition(gateW.dtype == .bfloat16 && gateW.shape == [1, 2560])
+        let output = routerWithGateKernel(
+            [x.reshaped(2560), w, xb.reshaped(2560), gateW.reshaped(2560)],
+            template: [("T", w.dtype), ("K", 2560), ("N", 512), ("RPS", 1)],
+            grid: (32 * 129, 1, 4), threadGroup: (32, 1, 4),
+            outputShapes: [[512], [1]], outputDTypes: [.float32, .bfloat16])
+        return (output[0], output[1])
+    }
+
     /// x float32 [K], w bf16 [N, K] -> logits float32 [N]. One-token windows only
     /// Retains MLX's per-row arithmetic for K in [65, 16N) with N < 4096.
     static func routerGemv(x: MLXArray, w: MLXArray) -> MLXArray {
