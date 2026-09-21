@@ -1237,7 +1237,12 @@ extension TrackFastMoEKernels {
         source: gateUpActSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
 
-    static let gateUpReuseRowsPerSimdgroup = 2
+    // MLXFAST-GU1ROW: one output row per simdgroup on the one-token gate/up
+    // reuse path. The row map `tid_y * (2 * RPS) + sg * RPS` with `N / RPS`
+    // threads in y is a bijection onto [0, N) for either value, and each row's
+    // K fold, operand tiling, accumulation order and closing reduction depend
+    // on the row alone, so the ownership change is exact.
+    static let gateUpReuseRowsPerSimdgroup = 1
 
     static let gateUpReuseHelpers = #"""
         template <typename T, int group_size, int bits, int rows>
@@ -1338,7 +1343,7 @@ extension TrackFastMoEKernels {
         """
 
     nonisolated(unsafe) static let gateUpReuseKernel = MLXFast.metalKernel(
-        name: "track_moe_gate_up_reuse_2row",
+        name: "track_moe_gate_up_reuse_1row",
         inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
         outputNames: ["act"],
         source: gateUpReuseSource,
