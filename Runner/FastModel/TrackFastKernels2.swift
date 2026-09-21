@@ -521,12 +521,22 @@ extension TrackFastKernels {
     // MARK: SwiGLU over a fused gate|up output (compiled silu, then bf16 multiply)
 
     static let swigluSource = """
-        const uint f = thread_position_in_grid.x;
+        const uint fv = thread_position_in_grid.x;
         const uint row = thread_position_in_grid.y;
-        if (f >= F) return;
-        const InT g = gu[row * 2 * F + f];
-        const InT u = gu[row * 2 * F + F + f];
-        out[row * F + f] = mlx_silu(g) * u;
+        if constexpr (VEC4) {
+            if (fv >= (uint)(F / 4)) return;
+            const uint f = fv * 4;
+            const auto g4 = *reinterpret_cast<const device vec<InT, 4>*>(gu + row * 2 * F + f);
+            const auto u4 = *reinterpret_cast<const device vec<InT, 4>*>(gu + row * 2 * F + F + f);
+            vec<InT, 4> o4;
+            for (int i = 0; i < 4; ++i) { o4[i] = mlx_silu(g4[i]) * u4[i]; }
+            *reinterpret_cast<device vec<InT, 4>*>(out + row * F + f) = o4;
+            return;
+        }
+        if (fv >= F) return;
+        const InT g = gu[row * 2 * F + fv];
+        const InT u = gu[row * 2 * F + F + fv];
+        out[row * F + fv] = mlx_silu(g) * u;
         """
 
     nonisolated(unsafe) static let swigluKernel = MLXFast.metalKernel(
@@ -537,9 +547,10 @@ extension TrackFastKernels {
 
     static func swiglu(gu: MLXArray) -> MLXArray {
         let B = gu.dim(0), S = gu.dim(1), F = gu.dim(2) / 2
+        let vec4 = F % 4 == 0
         return swigluKernel(
-            [gu], template: [("InT", gu.dtype), ("F", F)],
-            grid: (F, B * S, 1), threadGroup: (256, 1, 1),
+            [gu], template: [("InT", gu.dtype), ("F", F), ("VEC4", vec4)],
+            grid: (vec4 ? F / 4 : F, B * S, 1), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, F]], outputDTypes: [gu.dtype])[0]
     }
 }
