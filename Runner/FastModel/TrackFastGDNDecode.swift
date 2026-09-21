@@ -73,14 +73,14 @@ enum TrackFastGDNDecode {
             const device StT* first_state = state_in + (n * Dv + sg * RPS) * Dk;
             next_state = *reinterpret_cast<const device float4*>(first_state + 4 * lane);
         }
+        const device InT* proj_b = proj + b_idx * PW;
+        const device InT* cst_b = conv_state + b_idx * KM1 * CONV_DIM;
+        auto win = [&](int r, uint ch) -> float {
+            if (r < KM1) { return static_cast<float>(cst_b[(uint)(r * CONV_DIM) + ch]); }
+            return static_cast<float>(proj_b[(uint)((r - KM1) * PW) + ch]);
+        };
         if (sg < 3) {
             const uint vec = sg == 0 ? hk_idx : (sg == 1 ? Hk + hk_idx : 2 * Hk + hv_idx);
-            const device InT* proj_b = proj + b_idx * PW;
-            const device InT* cst_b = conv_state + b_idx * KM1 * CONV_DIM;
-            auto win = [&](int r, uint ch) -> float {
-                if (r < KM1) { return static_cast<float>(cst_b[(uint)(r * CONV_DIM) + ch]); }
-                return static_cast<float>(proj_b[(uint)((r - KM1) * PW) + ch]);
-            };
             float thread_x[4];
             float acc = 0.0f;
             for (int i = 0; i < 4; ++i) {
@@ -109,7 +109,10 @@ enum TrackFastGDNDecode {
             } else {
                 for (int i = 0; i < 4; ++i) { v_shared[lane * 4 + i] = static_cast<InT>(thread_x[i]); }
             }
-            if (sg == 2 || hv_idx % (Hv / Hk) == 0) {
+        } else if (sg < 6) {
+            const uint sel = sg - 3;
+            if (sel == 0 || hv_idx % (Hv / Hk) == 0) {
+                const uint vec = sel == 0 ? 2 * Hk + hv_idx : (sel == 1 ? hk_idx : Hk + hk_idx);
                 device InT* o_conv = conv_out + b_idx * KM1 * CONV_DIM;
                 for (int i = 0; i < 4; ++i) {
                     const uint ch = vec * 128 + lane * 4 + i;
@@ -118,14 +121,15 @@ enum TrackFastGDNDecode {
                     }
                 }
             }
-        }
-        if (sg == 0 && lane == 0) {
-            const device InT* row = proj + b_idx * PW;
-            const InT b_raw = row[B_OFF + hv_idx];
-            gb_shared[1] = static_cast<float>(mlx_sigmoid(b_raw));
-            const InT ax = row[A_OFF + hv_idx] + dt_bias[hv_idx];
-            const InT sp = mlx_logaddexp0(ax);
-            gb_shared[0] = metal::precise::exp(neg_exp_alog[hv_idx] * sp);
+        } else if (sg == 6 && lane < 2) {
+            if (lane == 0) {
+                const InT ax = proj_b[A_OFF + hv_idx] + dt_bias[hv_idx];
+                const InT sp = mlx_logaddexp0(ax);
+                gb_shared[0] = metal::precise::exp(neg_exp_alog[hv_idx] * sp);
+            } else {
+                const InT b_raw = proj_b[B_OFF + hv_idx];
+                gb_shared[1] = static_cast<float>(mlx_sigmoid(b_raw));
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const threadgroup InT* q_ = q_shared;
