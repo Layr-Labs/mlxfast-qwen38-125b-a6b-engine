@@ -109,7 +109,19 @@ enum TrackFastGDNDecode {
             } else {
                 for (int i = 0; i < 4; ++i) { v_shared[lane * 4 + i] = static_cast<InT>(thread_x[i]); }
             }
-            if (sg == 2 || hv_idx % (Hv / Hk) == 0) {
+        }
+        // State-tail copies depend only on the input window. Give them their
+        // own resident groups so q/k normalization need not serialize the stores.
+        if (sg >= 3 && sg < 6) {
+            const uint copy_sg = sg - 3;
+            const uint vec = copy_sg == 0 ? hk_idx : (copy_sg == 1 ? Hk + hk_idx : 2 * Hk + hv_idx);
+            const device InT* proj_b = proj + b_idx * PW;
+            const device InT* cst_b = conv_state + b_idx * KM1 * CONV_DIM;
+            auto win = [&](int r, uint ch) -> float {
+                if (r < KM1) { return static_cast<float>(cst_b[(uint)(r * CONV_DIM) + ch]); }
+                return static_cast<float>(proj_b[(uint)((r - KM1) * PW) + ch]);
+            };
+            if (copy_sg == 2 || hv_idx % (Hv / Hk) == 0) {
                 device InT* o_conv = conv_out + b_idx * KM1 * CONV_DIM;
                 for (int i = 0; i < 4; ++i) {
                     const uint ch = vec * 128 + lane * 4 + i;
@@ -119,7 +131,8 @@ enum TrackFastGDNDecode {
                 }
             }
         }
-        if (sg == 0 && lane == 0) {
+        // Independent of convolution and normalization; all 32 groups exist.
+        if (sg == 12 && lane == 0) {
             const device InT* row = proj + b_idx * PW;
             const InT b_raw = row[B_OFF + hv_idx];
             gb_shared[1] = static_cast<float>(mlx_sigmoid(b_raw));
