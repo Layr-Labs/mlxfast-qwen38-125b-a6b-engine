@@ -101,6 +101,97 @@ enum TrackPrefillSort {
         return (outs[0], outs[1], outs[2])
     }
 
+    /// Reuse one global count-prefix calculation for scatter and tile ranges.
+    private static let metadataKernel = MLXFast.metalKernel(
+        name: "track_route_prefix_once",
+        inputNames: ["counts"], outputNames: ["bases", "tiles"],
+        source: metadataSource, header: "", ensureRowContiguous: true)
+
+    private static let preparedScatterKernel = MLXFast.metalKernel(
+        name: "track_route_prepared_scatter",
+        inputNames: ["ids", "bases"],
+        outputNames: ["sorted_ids", "token_rows", "inverse"],
+        source: preparedScatterSource, header: "", ensureRowContiguous: true)
+
+    static func applyWithTiles(flatIDs: MLXArray, experts E: Int, topK: Int)
+        -> (sortedIDs: MLXArray, tokenRows: MLXArray, inverse: MLXArray, tiles: MLXArray)?
+    {
+        let R = flatIDs.size
+        guard enabled, E == 512, flatIDs.ndim == 1, flatIDs.dtype == .uint32,
+            topK > 0, R % topK == 0, R >= 2048, R < 32768,
+            R % blockSize == 0 else { return nil }
+        let nb = R / blockSize
+        let maxT = TrackPrefillIndirect.maxTiles(rows: R, experts: E)
+        let counts = countKernel(
+            [flatIDs], template: [("E", E), ("BLK", blockSize), ("R", R)],
+            grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
+            outputShapes: [[nb * E]], outputDTypes: [.uint32])[0]
+        let metadata = metadataKernel(
+            [counts], template: [("E", E), ("NB", nb), ("MAXT", maxT),
+                                ("BM", TrackPrefillIndirect.tileRows)],
+            grid: (E, 1, 1), threadGroup: (E, 1, 1),
+            outputShapes: [[nb * E], [2 * maxT]], outputDTypes: [.uint32, .uint32])
+        let sorted = preparedScatterKernel(
+            [flatIDs, metadata[0]],
+            template: [("E", E), ("BLK", blockSize), ("TOPK", topK)],
+            grid: (R, 1, 1), threadGroup: (blockSize, 1, 1),
+            outputShapes: [[R], [R], [R]], outputDTypes: [.uint32, .uint32, .uint32])
+        return (sorted[0], sorted[1], sorted[2], metadata[1])
+    }
+
+    static let metadataSource = #"""
+        static_assert(E == 512, "one thread per expert");
+        threadgroup uint group_counts[E / 32];
+        threadgroup uint group_tiles[E / 32];
+        const uint e = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        uint total = 0;
+        for (uint b = 0; b < (uint)NB; ++b) {
+            total += counts[b * (uint)E + e];
+        }
+        const uint nt = (total + (uint)BM - 1u) / (uint)BM;
+        uint base = simd_prefix_exclusive_sum(total);
+        uint tile_base = simd_prefix_exclusive_sum(nt);
+        if (lane == 31) {
+            group_counts[sg] = base + total;
+            group_tiles[sg] = tile_base + nt;
+        }
+        for (uint i = e; i < 2u * (uint)MAXT; i += (uint)E) { tiles[i] = 0; }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+        for (uint g = 0; g < sg; ++g) {
+            base += group_counts[g];
+            tile_base += group_tiles[g];
+        }
+        uint next = base;
+        for (uint b = 0; b < (uint)NB; ++b) {
+            bases[b * (uint)E + e] = next;
+            next += counts[b * (uint)E + e];
+        }
+        for (uint j = 0; j < nt; ++j) {
+            const uint begin = base + j * (uint)BM;
+            const uint slot = 2u * (tile_base + j);
+            tiles[slot] = begin;
+            tiles[slot + 1] = min(begin + (uint)BM, base + total);
+        }
+        """#
+
+    static let preparedScatterSource = #"""
+        threadgroup uint vals[BLK];
+        const uint blk = threadgroup_position_in_grid.x;
+        const uint t = thread_position_in_threadgroup.x;
+        const uint gi = blk * (uint)BLK + t;
+        const uint v = ids[gi];
+        vals[t] = v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint rank = 0;
+        for (uint j = 0; j < t; ++j) { rank += (vals[j] == v) ? 1u : 0u; }
+        const uint dest = bases[blk * (uint)E + v] + rank;
+        sorted_ids[dest] = v;
+        token_rows[dest] = gi / (uint)TOPK;
+        inverse[gi] = dest;
+        """#
+
     // MARK: - kernels
 
     /// One threadgroup per assignment block. The 512-bucket path intersects
