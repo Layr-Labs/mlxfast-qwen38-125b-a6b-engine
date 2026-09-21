@@ -68,10 +68,11 @@ enum TrackFastGDNDecode {
         threadgroup InT k_shared[Dk];
         threadgroup InT v_shared[Dv];
         threadgroup float gb_shared[2];
-        float4 next_state;
+        float4 next_state0, next_state1;
         if constexpr (metal::is_same<StT, float>::value) {
             const device StT* first_state = state_in + (n * Dv + sg * RPS) * Dk;
-            next_state = *reinterpret_cast<const device float4*>(first_state + 4 * lane);
+            next_state0 = *reinterpret_cast<const device float4*>(first_state + 4 * lane);
+            next_state1 = *reinterpret_cast<const device float4*>(first_state + Dk + 4 * lane);
         }
         if (sg < 3) {
             const uint vec = sg == 0 ? hk_idx : (sg == 1 ? Hk + hk_idx : 2 * Hk + hv_idx);
@@ -152,69 +153,91 @@ enum TrackFastGDNDecode {
             static_cast<float>(k_[4 * lane]), static_cast<float>(k_[4 * lane + 1]),
             static_cast<float>(k_[4 * lane + 2]), static_cast<float>(k_[4 * lane + 3]));
         threadgroup InT y_shared[Dv];
-        for (int r = 0; r < RPS; ++r) {
-            const uint dv_idx = sg * RPS + r;
-            const device StT* i_state = state_in + (n * Dv + dv_idx) * Dk;
-            float state[4];
+        for (int rr = 0; rr < RPS; rr += 2) {
+            const uint dv0 = sg * RPS + (uint)rr;
+            const device StT* i_state = state_in + (n * Dv + dv0) * Dk;
+            float state[2][4];
             constexpr bool vec4 = metal::is_same<StT, float>::value;
             if constexpr (vec4) {
-                const float4 s4 = next_state;
-                if (r + 1 < RPS) {
-                    next_state = *reinterpret_cast<const device float4*>(i_state + Dk + 4 * lane);
+                const float4 s0 = next_state0;
+                const float4 s1 = next_state1;
+                if (rr + 2 < RPS) {
+                    next_state0 = *reinterpret_cast<const device float4*>(i_state + 2 * Dk + 4 * lane);
+                    next_state1 = *reinterpret_cast<const device float4*>(i_state + 3 * Dk + 4 * lane);
                 }
-                state[0] = s4.x; state[1] = s4.y; state[2] = s4.z; state[3] = s4.w;
+                state[0][0] = s0.x; state[0][1] = s0.y; state[0][2] = s0.z; state[0][3] = s0.w;
+                state[1][0] = s1.x; state[1][1] = s1.y; state[1][2] = s1.z; state[1][3] = s1.w;
             } else {
-                for (int i = 0; i < 4; ++i) { state[i] = static_cast<float>(i_state[4 * lane + i]); }
+                for (int p = 0; p < 2; ++p) {
+                    for (int i = 0; i < 4; ++i) {
+                        state[p][i] = static_cast<float>(i_state[p * Dk + 4 * lane + i]);
+                    }
+                }
             }
             if constexpr (HAS_JOURNAL) {
                 const float pending_decay = journal_float(J_DECAY_OFF + 2 * hv_idx);
-                const float pending_delta = journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx));
-                for (int i = 0; i < 4; ++i) {
-                    state[i] = state[i] * pending_decay;
-                    state[i] = state[i]
-                        + static_cast<float>(journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i])
-                            * pending_delta;
+                for (int p = 0; p < 2; ++p) {
+                    const float pending_delta =
+                        journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv0 + (uint)p));
+                    for (int i = 0; i < 4; ++i) {
+                        state[p][i] = state[p][i] * pending_decay;
+                        state[p][i] = state[p][i]
+                            + static_cast<float>(journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i])
+                                * pending_delta;
+                    }
                 }
             }
-            float kv_mem;
-            {
+            float kv_mem[2];
+            for (int p = 0; p < 2; ++p) {
                 #pragma clang fp reassociate(off)
                 #pragma clang fp contract(off)
-                state[0] = state[0] * gate_decay;
-                kv_mem = 0.0f + state[0] * local_k[0];
+                state[p][0] = state[p][0] * gate_decay;
+                kv_mem[p] = 0.0f + state[p][0] * local_k[0];
                 float kv_compensation = 0.0f;
                 for (int i = 1; i < 4; ++i) {
-                    state[i] = state[i] * gate_decay;
-                    auto product = state[i] * local_k[i];
+                    state[p][i] = state[p][i] * gate_decay;
+                    auto product = state[p][i] * local_k[i];
                     auto corrected = product - kv_compensation;
-                    auto next_sum = kv_mem + corrected;
-                    if (i + 1 < 4) { kv_compensation = (next_sum - kv_mem) - corrected; }
-                    kv_mem = next_sum;
+                    auto next_sum = kv_mem[p] + corrected;
+                    if (i + 1 < 4) { kv_compensation = (next_sum - kv_mem[p]) - corrected; }
+                    kv_mem[p] = next_sum;
                 }
             }
-            kv_mem = simd_sum(kv_mem);
-            const float delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * gate_beta;
-            if constexpr (!HAS_JOURNAL) {
-                if (lane == 0) {
-                    store_journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx), delta);
+            kv_mem[0] = simd_sum(kv_mem[0]);
+            kv_mem[1] = simd_sum(kv_mem[1]);
+            float out[2];
+            for (int p = 0; p < 2; ++p) {
+                const float delta =
+                    (static_cast<float>(v_[dv0 + (uint)p]) - kv_mem[p]) * gate_beta;
+                if constexpr (!HAS_JOURNAL) {
+                    if (lane == 0) {
+                        store_journal_float(
+                            J_DELTA_OFF + 2 * (hv_idx * Dv + dv0 + (uint)p), delta);
+                    }
+                }
+                out[p] = 0.0f;
+                for (int i = 0; i < 4; ++i) {
+                    state[p][i] = state[p][i] + local_k[i] * delta;
+                    out[p] += state[p][i] * local_q[i];
                 }
             }
-            float out = 0.0f;
-            for (int i = 0; i < 4; ++i) {
-                state[i] = state[i] + local_k[i] * delta;
-                out += state[i] * local_q[i];
-            }
-            out = simd_sum(out);
+            out[0] = simd_sum(out[0]);
+            out[1] = simd_sum(out[1]);
             if (lane == 0) {
-                const InT value = static_cast<InT>(out);
-                y_shared[dv_idx] = value;
+                y_shared[dv0] = static_cast<InT>(out[0]);
+                y_shared[dv0 + 1] = static_cast<InT>(out[1]);
             }
             if constexpr (HAS_JOURNAL) {
-                device StT* o_state = state_out + (n * Dv + dv_idx) * Dk;
-                if constexpr (vec4) {
-                    *reinterpret_cast<device float4*>(o_state + 4 * lane) = float4(state[0], state[1], state[2], state[3]);
-                } else {
-                    for (int i = 0; i < 4; ++i) { o_state[4 * lane + i] = static_cast<StT>(state[i]); }
+                for (int p = 0; p < 2; ++p) {
+                    device StT* o_state = state_out + (n * Dv + dv0 + (uint)p) * Dk;
+                    if constexpr (vec4) {
+                        *reinterpret_cast<device float4*>(o_state + 4 * lane) =
+                            float4(state[p][0], state[p][1], state[p][2], state[p][3]);
+                    } else {
+                        for (int i = 0; i < 4; ++i) {
+                            o_state[4 * lane + i] = static_cast<StT>(state[p][i]);
+                        }
+                    }
                 }
             }
         }
