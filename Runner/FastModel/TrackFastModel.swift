@@ -739,6 +739,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let att = cache.updateAndAttend(
             queries: prep.q, keys: prep.k, values: prep.v,
             scale: attentionScale, sinks: nil, keepMask: nil)  // [B,HQ,S,D]
+        // MLXFAST-GATEDOUT: the gate product moves into `o_proj`'s activation
+        // load, so the 6144-wide buffer and its own launch disappear. Any window
+        // or weight geometry the fused entry does not accept falls through to the
+        // gate launch followed by the projection, which is the parent's code.
+        if case .quant(let q) = a.out,
+            let fused = TrackFastKernels.attnOutGated(
+                att: att, qkv: qkv, gateOffset: a.qWidth, out: q)
+        {
+            return fused
+        }
         let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: a.qWidth)
         return a.out.apply(out)
     }
