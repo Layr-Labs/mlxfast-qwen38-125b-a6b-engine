@@ -296,7 +296,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// inputs/outputs are appended here.
     nonisolated(unsafe) static var debugTaps: [(String, MLXArray)]? = nil
     /// Layers per partial dispatch inside a forward (0 = one dispatch per step).
-    nonisolated(unsafe) public static var asyncChunk: Int = 3
+    // MLXFAST-ASYNCHUNK: layers per partial dispatch. The step is host-bound, so the
+    // question is how early the GPU can start on the layers the CPU has already
+    // built. Every other value in this file, every kernel and every grid is the
+    // parent's; only the number of partial dispatches changes.
+    nonisolated(unsafe) public static var asyncChunk: Int = 1
     /// Layers in the first partial-dispatch chunk (0 = same as asyncChunk):
     /// the first dispatch lands right after the PLE layer, whose host row
     /// gather is the one host sync of the step.
@@ -739,6 +743,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let att = cache.updateAndAttend(
             queries: prep.q, keys: prep.k, values: prep.v,
             scale: attentionScale, sinks: nil, keepMask: nil)  // [B,HQ,S,D]
+        // MLXFAST-GATEDOUT: the gate product moves into `o_proj`'s activation
+        // load, so the 6144-wide buffer and its own launch disappear. Any window
+        // or weight geometry the fused entry does not accept falls through to the
+        // gate launch followed by the projection, which is the parent's code.
+        if case .quant(let q) = a.out,
+            let fused = TrackFastKernels.attnOutGated(
+                att: att, qkv: qkv, gateOffset: a.qWidth, out: q)
+        {
+            return fused
+        }
         let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: a.qWidth)
         return a.out.apply(out)
     }
