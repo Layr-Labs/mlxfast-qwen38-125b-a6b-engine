@@ -968,7 +968,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let output: MLXArray
         let residualAdded: Bool
         if S == 1, TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
-            convState.shape == [1, 9, wide], convState.dtype == stream.dtype,
+            convState.ndim == 3 && convState.dim(0) == 1 && convState.dim(1) == 9
+                && convState.dim(2) == wide && convState.dtype == stream.dtype,
             let result = TrackPLEFusion.forwardProjected(
                 p, key: keyFlat, value: value, stream: stream, convState: convState,
                 eps: eps, fusedResidual: fusedResidual)
