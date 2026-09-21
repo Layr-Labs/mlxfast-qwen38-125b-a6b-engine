@@ -1,4 +1,3 @@
-// TrackFastHead.swift -- the MTP head's forward over the fast kernels.
 //
 // The head is one full-attention decoder layer between two projections and a
 // final mixer, driven once per draft step. The fork's module runs it through

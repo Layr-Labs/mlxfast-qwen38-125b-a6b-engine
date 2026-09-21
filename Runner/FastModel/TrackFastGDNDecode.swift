@@ -1,5 +1,3 @@
-// Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
-// TrackFastKernels.prepSource, leanSource and gatedRMSSource.
 
 import MLX
 
