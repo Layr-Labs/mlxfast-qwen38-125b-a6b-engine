@@ -140,23 +140,35 @@ extension TrackFastKernels {
         // pass reads registers instead of re-reading the stream row.
         static_assert(simd_groups % SG == 0, "slices split evenly over the simdgroups");
         constexpr uint SLICES = simd_groups / SG;
+        // MLXFAST-WIDENORMVEC4: each active lane owns N_READS == 4 CONTIGUOUS
+        // elements at `lid * N_READS`, and W, H and HC * H are multiples of four,
+        // so the residual, out, stream and normed tiles are one aligned four-wide
+        // access each instead of four scalar ones. The per-element chain is
+        // untouched: the inject product is formed in InT and added in InT, the
+        // squares still enter `acc` in ascending `i`, the slice partials still
+        // close with the same `simd_sum`, and the normed value is still rounded
+        // to InT before the scale multiply. `scale` stays scalar-indexed.
+        using V = vec<InT, N_READS>;
         InT kept[SLICES * N_READS];
         for (uint si = 0; si < SLICES; ++si) {
             const uint g = sgi + si * SG;
             const uint lid = g * 32 + lane;
             float acc = 0.0f;
             if (lid < NT) {
-                for (int i = 0; i < N_READS; ++i) {
-                    const uint d = lid * N_READS + i;
-                    const uint src = TILE ? (row * H + d) : (base + d);
-                    InT r = residual[src];
-                    if (HAS_INJECT) {
-                        InT sp = out[row * H + d] * inj_t;
-                        r = r + sp;
+                const uint d0 = lid * N_READS;
+                const uint src0 = TILE ? (row * H + d0) : (base + d0);
+                V rv = *reinterpret_cast<const device V*>(residual + src0);
+                if (HAS_INJECT) {
+                    const V ov = *reinterpret_cast<const device V*>(out + row * H + d0);
+                    for (int i = 0; i < N_READS; ++i) {
+                        const InT sp = ov[i] * inj_t;
+                        rv[i] = rv[i] + sp;
                     }
-                    stream[base + d] = r;
-                    kept[si * N_READS + i] = r;
-                    const float xf = static_cast<float>(r);
+                }
+                *reinterpret_cast<device V*>(stream + base + d0) = rv;
+                for (int i = 0; i < N_READS; ++i) {
+                    kept[si * N_READS + i] = rv[i];
+                    const float xf = static_cast<float>(rv[i]);
                     acc += xf * xf;
                 }
             }
@@ -170,11 +182,13 @@ extension TrackFastKernels {
             const uint g = sgi + si * SG;
             const uint lid = g * 32 + lane;
             if (lid < NT) {
+                const uint d0 = lid * N_READS;
+                V nv;
                 for (int i = 0; i < N_READS; ++i) {
-                    const uint d = lid * N_READS + i;
                     InT n = static_cast<InT>(static_cast<float>(kept[si * N_READS + i]) * inv_mean);
-                    normed[base + d] = n * scale[hc * H + d];
+                    nv[i] = static_cast<InT>(n * scale[hc * H + d0 + i]);
                 }
+                *reinterpret_cast<device V*>(normed + base + d0) = nv;
             }
         }
         """
