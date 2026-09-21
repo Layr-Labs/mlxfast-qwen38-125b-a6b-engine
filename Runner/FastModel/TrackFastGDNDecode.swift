@@ -6,7 +6,7 @@ import MLX
 enum TrackFastGDNDecode {
     private static let kernel = MLXFast.metalKernel(
         name: "track_gdn_decode_complete",
-        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w", "journal_in"],
+        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w", "journal_in", "sigmoid_table"],
         outputNames: ["state_out", "gated", "conv_out", "journal_out"],
         source: source, header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
@@ -31,11 +31,16 @@ enum TrackFastGDNDecode {
             negExpALog.shape == [g.hv], dtBias.shape == [g.hv], normW.shape == [g.dv],
             convState.dtype == proj.dtype
         else { return nil }
+        let useSigmoidTable = StreamOrDevice.default.stream === Stream.gpu
+            && B == 1 && g.hk == 16 && g.hv == 48 && g.convKernel == 4
+            && g.projWidth == 16480 && g.convDim == 10240 && zOffset == 10240
+            && g.bOffset == 16384 && g.aOffset == 16432
+        let sigmoidTable = useSigmoidTable ? TrackBF16Functions.sigmoidFloat : convState
         let journalStride = g.hv * g.dk + 2 * g.hv * g.dv + 2 * g.hv
         let hasJournal = pendingJournal?.shape == [B, journalStride]
         let journalIn = pendingJournal ?? convState
         let result = kernel(
-            [proj, convState, convW, negExpALog, dtBias, stateIn, normW, journalIn],
+            [proj, convState, convW, negExpALog, dtBias, stateIn, normW, journalIn, sigmoidTable],
             template: [
                 ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
                 ("Hk", g.hk), ("Hv", g.hv), ("KC", g.convKernel), ("CONV_DIM", g.convDim),
@@ -44,6 +49,7 @@ enum TrackFastGDNDecode {
                 ("J_KEY_OFF", 0), ("J_DELTA_OFF", g.hv * g.dk),
                 ("J_DECAY_OFF", g.hv * g.dk + 2 * g.hv * g.dv),
                 ("J_STRIDE", journalStride), ("HAS_JOURNAL", hasJournal),
+                ("USE_SIGMOID_TABLE", useSigmoidTable),
             ],
             grid: (32, g.dv / 4, B * g.hv), threadGroup: (32, g.dv / 4, 1),
             outputShapes: [
@@ -243,7 +249,12 @@ enum TrackFastGDNDecode {
             vec<InT, 4> out4;
             for (int i = 0; i < 4; ++i) {
                 InT normalized = w4[i] * static_cast<InT>(thread_x[i] * inv_mean);
-                const float zg = mlx_sigmoid(static_cast<float>(z4[i]));
+                float zg;
+                if constexpr (USE_SIGMOID_TABLE) {
+                    zg = sigmoid_table[static_cast<uint>(as_type<ushort>(z4[i]))];
+                } else {
+                    zg = mlx_sigmoid(static_cast<float>(z4[i]));
+                }
                 out4[i] = static_cast<InT>(zg * static_cast<float>(normalized));
             }
             *reinterpret_cast<device vec<InT, 4>*>(gated + (n * Dv + lane * 4)) = out4;

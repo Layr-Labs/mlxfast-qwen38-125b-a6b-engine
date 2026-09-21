@@ -14,6 +14,22 @@ enum TrackBF16Functions {
         return table
     }()
 
+    private static let sigmoidFloatKernel = MLXFast.metalKernel(
+        name: "track_bf16_input_fp32_sigmoid_table",
+        inputNames: [], outputNames: ["table"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            table[i] = mlx_sigmoid(static_cast<float>(as_type<bfloat16_t>(ushort(i))));
+            """, header: TrackFastKernels.exactHeader)
+
+    nonisolated(unsafe) static let sigmoidFloat: MLXArray = {
+        let table = sigmoidFloatKernel(
+            [], grid: (65536, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[65536]], outputDTypes: [.float32], stream: .gpu)[0]
+        eval(table)
+        return table
+    }()
+
     static let sigmoidSource = #"""
         const uint i = thread_position_in_grid.x;
         table[i] = mlx_sigmoid(as_type<bfloat16_t>(ushort(i)));
