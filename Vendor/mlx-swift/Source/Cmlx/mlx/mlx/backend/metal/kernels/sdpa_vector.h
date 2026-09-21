@@ -206,7 +206,9 @@ template <typename T, int D, int V = D>
     uint simd_lid [[thread_index_in_simdgroup]]) {
   // Two query heads reuse each K/V load while retaining their own block walk.
   // K/V/Q move in 16-byte vector loads; the score keeps its sequential
-  // component order so the accumulated value is unchanged.
+  // component order so the accumulated value is unchanged. The next token's
+  // K/V pair is issued one iteration ahead of its use, so the cache-miss
+  // latency overlaps the score reduction instead of stalling in front of it.
   if constexpr (metal::is_same_v<T, bfloat16_t> && D == 256 && V == 256) {
     const uint gqa = tptg.y;
     if (N >= 1024 && tptg.z == 1 && gqa % 2 == 0 && !has_mask && !has_sinks) {
@@ -230,13 +232,26 @@ template <typename T, int D, int V = D>
         q_lo[h] = static_cast<float>(scale) * float4(qp[0]);
         q_hi[h] = static_cast<float>(scale) * float4(qp[1]);
       }
+      const device metal::vec<T, 4>* kv4 = (const device metal::vec<T, 4>*)kp;
+      const device metal::vec<T, 4>* vv4 = (const device metal::vec<T, 4>*)vp;
+      metal::vec<T, 4> k_hold_lo = kv4[0];
+      metal::vec<T, 4> k_hold_hi = kv4[1];
+      metal::vec<T, 4> v_hold_lo = vv4[0];
+      metal::vec<T, 4> v_hold_hi = vv4[1];
       for (int token = block; token < N; token += blocks) {
-        const device metal::vec<T, 4>* kv4 = (const device metal::vec<T, 4>*)kp;
-        const device metal::vec<T, 4>* vv4 = (const device metal::vec<T, 4>*)vp;
-        const float4 k_lo = float4(kv4[0]);
-        const float4 k_hi = float4(kv4[1]);
-        const float4 v_lo = float4(vv4[0]);
-        const float4 v_hi = float4(vv4[1]);
+        const float4 k_lo = float4(k_hold_lo);
+        const float4 k_hi = float4(k_hold_hi);
+        const float4 v_lo = float4(v_hold_lo);
+        const float4 v_hi = float4(v_hold_hi);
+        const int step = (token + blocks < N) ? blocks : 0;
+        kp += step * int(k_seq_stride);
+        vp += step * int(v_seq_stride);
+        const device metal::vec<T, 4>* kn4 = (const device metal::vec<T, 4>*)kp;
+        const device metal::vec<T, 4>* vn4 = (const device metal::vec<T, 4>*)vp;
+        k_hold_lo = kn4[0];
+        k_hold_hi = kn4[1];
+        v_hold_lo = vn4[0];
+        v_hold_hi = vn4[1];
         for (int h = 0; h < 2; ++h) {
           float score = q_lo[h].x * k_lo.x;
           score += q_lo[h].y * k_lo.y;
@@ -255,8 +270,6 @@ template <typename T, int D, int V = D>
           o_lo[h] = o_lo[h] * factor + exp_score * v_lo;
           o_hi[h] = o_hi[h] * factor + exp_score * v_hi;
         }
-        kp += blocks * int(k_seq_stride);
-        vp += blocks * int(v_seq_stride);
       }
       for (int h = 0; h < 2; ++h) {
         const uint offset = (head0 + h) * blocks + block;
