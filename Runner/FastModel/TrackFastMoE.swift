@@ -1278,7 +1278,24 @@ extension TrackFastMoEKernels {
           biases1 += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
           x += simd_lid * values_per_thread;
           for (int k = 0; k < in_vec_size; k += block_size) {
-            U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+            U sum = 0;
+            if constexpr (bits == 4) {
+              for (int i = 0; i < values_per_thread; i += 4) {
+                const vec<T, 4> q =
+                    *reinterpret_cast<const device vec<T, 4>*>(x + i);
+                const T a = q.x;
+                const T b = q.y;
+                const T c = q.z;
+                const T d = q.w;
+                sum += a + b + c + d;
+                x_thread[i] = a;
+                x_thread[i + 1] = b / 16.0f;
+                x_thread[i + 2] = c / 256.0f;
+                x_thread[i + 3] = d / 4096.0f;
+              }
+            } else {
+              sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+            }
             for (int row = 0; row < rows; row++) {
               auto wl0 = (const device uint8_t*)(ws0 + row * in_vec_size_w);
               const device T* sl0 = scales0 + row * in_vec_size_g;
