@@ -73,12 +73,15 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 4) {
+    // MLXFAST-XVEC4: one vec<T,4> device load per pack of 4 activations.
+    // Addends stay xv.x+xv.y+xv.z+xv.w (same left-to-right order as x[i]..x[i+3]).
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+      const vec<T, 4> xv = *((const device vec<T, 4>*)(x + i));
+      sum += xv.x + xv.y + xv.z + xv.w;
+      x_thread[i] = xv.x;
+      x_thread[i + 1] = xv.y / 16.0f;
+      x_thread[i + 2] = xv.z / 256.0f;
+      x_thread[i + 3] = xv.w / 4096.0f;
     }
   }
 
@@ -153,12 +156,15 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
   }
 
   else if (bits == 4) {
+    // MLXFAST-XVEC4: same vec<T,4> load as load_vector. N is a multiple of the
+    // 4-bit pack (8), so the original i+=4 walk already owned four elements.
     for (int i = 0; i < N; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+      const vec<T, 4> xv = *((const device vec<T, 4>*)(x + i));
+      sum += xv.x + xv.y + xv.z + xv.w;
+      x_thread[i] = xv.x;
+      x_thread[i + 1] = xv.y / 16.0f;
+      x_thread[i + 2] = xv.z / 256.0f;
+      x_thread[i + 3] = xv.w / 4096.0f;
     }
   }
 
@@ -246,13 +252,34 @@ inline U qdot(
   }
 
   else if (bits == 4) {
-    const device uint16_t* ws = (const device uint16_t*)w;
-    for (int i = 0; i < (values_per_thread / 4); i++) {
+    // MLXFAST-QDOT32: one uint32 is the next two uint16 groups, low half
+    // first. Each accum += is still four products, in the same order.
+    const device uint32_t* ws32 = (const device uint32_t*)w;
+    constexpr int groups = values_per_thread / 4;
+    for (int i = 0; i < groups / 2; ++i) {
+      const uint32_t p = ws32[i];
+      const uint16_t lo = (uint16_t)p;
+      const uint16_t hi = (uint16_t)(p >> 16);
+      const int b = 8 * i;
       accum +=
-          (x_thread[4 * i] * (ws[i] & 0x000f) +
-           x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-           x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-           x_thread[4 * i + 3] * (ws[i] & 0xf000));
+          (x_thread[b] * (lo & 0x000f) +
+           x_thread[b + 1] * (lo & 0x00f0) +
+           x_thread[b + 2] * (lo & 0x0f00) +
+           x_thread[b + 3] * (lo & 0xf000));
+      accum +=
+          (x_thread[b + 4] * (hi & 0x000f) +
+           x_thread[b + 5] * (hi & 0x00f0) +
+           x_thread[b + 6] * (hi & 0x0f00) +
+           x_thread[b + 7] * (hi & 0xf000));
+    }
+    if constexpr ((groups & 1) != 0) {
+      constexpr int j = groups - 1;
+      const device uint16_t* ws = (const device uint16_t*)w;
+      accum +=
+          (x_thread[4 * j] * (ws[j] & 0x000f) +
+           x_thread[4 * j + 1] * (ws[j] & 0x00f0) +
+           x_thread[4 * j + 2] * (ws[j] & 0x0f00) +
+           x_thread[4 * j + 3] * (ws[j] & 0xf000));
     }
   }
 
