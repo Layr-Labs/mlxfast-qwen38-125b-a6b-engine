@@ -70,7 +70,7 @@ enum TrackFastMixerSplitK {
             if (sg == 0 && lane == 0) { inj[tile - DN] = static_cast<T>(r[0]); }
         }
         """#
-    static let fusedKernel = MLXFast.metalKernel(name: "track_split_k_mixer",
+    static let fusedKernel = MLXFast.metalKernel(name: "track_split_k_mixer_1row",
         inputNames: ["x", "wd", "sd", "bd", "wi", "si", "bi"],
         outputNames: ["lo", "act", "inj"], source: fusedSource,
         header: TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader + helper,
@@ -78,7 +78,12 @@ enum TrackFastMixerSplitK {
 
     static func apply(_ x: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?) -> [MLXArray] {
         let k = x.size, n = down.rows, hc = inject?.rows ?? 4
-        let rows = 2, partitions = split
+        // MLXFAST-SPLITK1ROW: one down row per tile instead of two. Each row's
+        // block fold, its ascending `b` order and its closing simd_sum are
+        // functions of the row alone, so the ownership change is exact; the
+        // tile count doubles, the per-lane serial `r` loop disappears and the
+        // threadgroup scratch halves.
+        let rows = 1, partitions = split
         let inj = inject ?? down
         precondition(x.shape == [1, k] && k % 512 == 0 && n % rows == 0 && partitions > 0)
         return fusedKernel([x, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
@@ -88,3 +93,4 @@ enum TrackFastMixerSplitK {
             outputShapes: [[1, n], [1, n], [1, hc]], outputDTypes: [x.dtype, x.dtype, x.dtype])
     }
 }
+private let gauntletRedraw_18ac74db_20260921T043947Z: Int = 0
