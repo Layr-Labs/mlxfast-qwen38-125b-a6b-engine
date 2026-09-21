@@ -39,9 +39,17 @@ enum TrackPrefillRouter {
             [x, w], template: [("M", rows)],
             grid: (groups * 32, 2, 2), threadGroup: (32, 2, 2),
             outputShapes: [[2, rows, 512]], outputDTypes: [.float32])[0]
+        // MLXFAST-ROUTERSUMTG64: the split-sum epilogue is pure elementwise --
+        // two float loads and one store per thread, no reduction, no barrier and
+        // no threadgroup memory -- so its thread-to-element map is
+        // `thread_position_in_grid` alone and is independent of the threadgroup
+        // width. A 64-thread group is a quarter of the allocation unit of a
+        // 256-thread one, so more groups are resident per core under the same
+        // scheduler budget, and the row count times 512 lanes already provides
+        // far more groups than the machine has cores.
         return sumKernel(
             [partials], template: [("M", rows)],
-            grid: (512, rows, 1), threadGroup: (256, 1, 1),
+            grid: (512, rows, 1), threadGroup: (64, 1, 1),
             outputShapes: [[1, rows, 512]], outputDTypes: [.float32])[0]
     }
 
