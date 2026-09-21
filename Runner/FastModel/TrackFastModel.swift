@@ -968,7 +968,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let output: MLXArray
         let residualAdded: Bool
         if S == 1, TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
-            convState.shape == [1, 9, wide], convState.dtype == stream.dtype,
+            convState.ndim == 3, convState.dim(0) == 1, convState.dim(1) == 9,
+            convState.dim(2) == wide, convState.dtype == stream.dtype,
             let result = TrackPLEFusion.forwardProjected(
                 p, key: keyFlat, value: value, stream: stream, convState: convState,
                 eps: eps, fusedResidual: fusedResidual)
@@ -1359,3 +1360,5 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentCaptureMTPForwardable {
             tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
     }
 }
+private let gauntletRedraw_e40f86fb_20260920T174855Z: Int = 0
+private let gauntletRedraw_9fad4fab_20260920T192434Z: Int = 0
