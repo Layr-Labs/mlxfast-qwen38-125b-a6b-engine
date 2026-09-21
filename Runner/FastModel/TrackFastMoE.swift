@@ -15,7 +15,10 @@ import MLX
 
 enum TrackFastMoEKernels {
     /// `mlx/backend/metal/kernels/quantized.h` lines 12-393 and 757-987.
-    /// MLX `quantized.h` verbatim: the pack helpers, `load_vector*` and `qdot*` the replicas call.
+    /// MLX `quantized.h` helpers: pack, `load_vector*`, `qdot*`. 4-bit
+    /// `load_vector` / `load_vector_safe` use MLXFAST-XVEC4 (one `vec<T,4>`
+    /// device load per four activations; same left-to-right sum). `qdot*` is
+    /// still verbatim.
     static let helpersCore = #"""
 #define MLX_MTL_CONST static constant constexpr const
 
@@ -68,12 +71,15 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 4) {
+    // MLXFAST-XVEC4: one vec<T,4> device load per pack of 4 activations.
+    // Addends stay xv.x+xv.y+xv.z+xv.w (same left-to-right order as x[i]..x[i+3]).
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+      const vec<T, 4> xv = *((const device vec<T, 4>*)(x + i));
+      sum += xv.x + xv.y + xv.z + xv.w;
+      x_thread[i] = xv.x;
+      x_thread[i + 1] = xv.y / 16.0f;
+      x_thread[i + 2] = xv.z / 256.0f;
+      x_thread[i + 3] = xv.w / 4096.0f;
     }
   }
 
@@ -148,12 +154,15 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
   }
 
   else if (bits == 4) {
+    // MLXFAST-XVEC4: same vec<T,4> load as load_vector. N is a multiple of the
+    // 4-bit pack (8), so the original i+=4 walk already owned four elements.
     for (int i = 0; i < N; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+      const vec<T, 4> xv = *((const device vec<T, 4>*)(x + i));
+      sum += xv.x + xv.y + xv.z + xv.w;
+      x_thread[i] = xv.x;
+      x_thread[i + 1] = xv.y / 16.0f;
+      x_thread[i + 2] = xv.z / 256.0f;
+      x_thread[i + 3] = xv.w / 4096.0f;
     }
   }
 
@@ -1052,10 +1061,11 @@ extension TrackFastMoEKernels {
           static_assert(bits == 4, "silu-on-load: 4-bit only");
           U sum = 0;
           for (int i = 0; i < values_per_thread; i += 4) {
-            const T a = mlx_silu(x[i]);
-            const T b = mlx_silu(x[i + 1]);
-            const T c = mlx_silu(x[i + 2]);
-            const T d = mlx_silu(x[i + 3]);
+            const vec<T, 4> xv = *((const device vec<T, 4>*)(x + i));
+            const T a = mlx_silu(xv.x);
+            const T b = mlx_silu(xv.y);
+            const T c = mlx_silu(xv.z);
+            const T d = mlx_silu(xv.w);
             sum += a + b + c + d;
             x_thread[i] = a;
             x_thread[i + 1] = b / 16.0f;
@@ -1069,10 +1079,11 @@ extension TrackFastMoEKernels {
           static_assert(bits == 4, "silu-on-load: 4-bit only");
           U sum = 0;
           for (int i = 0; i < N; i += 4) {
-            const T a = mlx_silu(x[i]);
-            const T b = mlx_silu(x[i + 1]);
-            const T c = mlx_silu(x[i + 2]);
-            const T d = mlx_silu(x[i + 3]);
+            const vec<T, 4> xv = *((const device vec<T, 4>*)(x + i));
+            const T a = mlx_silu(xv.x);
+            const T b = mlx_silu(xv.y);
+            const T c = mlx_silu(xv.z);
+            const T d = mlx_silu(xv.w);
             sum += a + b + c + d;
             x_thread[i] = a;
             x_thread[i + 1] = b / 16.0f;
@@ -1423,24 +1434,13 @@ extension TrackFastMoEKernels {
                 }
             }
         }
-        // Shared expert down rows d0..d0+RPS-1 for token t. MLXFAST-SHAREDROWSG:
-        // the one-token path gives each shared row its own simdgroup, so the
-        // barrier waits on ONE row walk instead of RPS serial ones. Each row
-        // keeps its own qmv walk, accumulation order and reduction. Two to
-        // eight tokens keep the wide tile (a row's walk does not depend on how
-        // many vectors share its tile).
+        // Shared expert down rows d0..d0+3 for token t: one token routes to `qmv`'s
+        // normal branch (K = 640), two to eight to `qmv_wide` (full tiles; a row's
+        // walk does not depend on how many vectors share its tile).
         constexpr uint shared_sg = VPT == 1 && K == 10 && KSG >= 5
             ? (uint)KSG : (KSG > K ? (uint)K : 0u);
-        const device T* xs = act + (size_t)(BR + t) * (size_t)F;
-        if constexpr (VPT == 1 && K == 10 && KSG >= 5) {
-            if (sgi >= shared_sg && sgi < shared_sg + RPS) {
-                const int i = (int)(sgi - shared_sg);
-                float rs[1];
-                qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, 1>(
-                    wsd, ssd, bsd, xs, F, d0 + i, lid, rs);
-                if (lid == 0) { shvT[i] = static_cast<float>(static_cast<T>(rs[0])); }
-            }
-        } else if (sgi == shared_sg) {
+        if (sgi == shared_sg) {
+            const device T* xs = act + (size_t)(BR + t) * (size_t)F;
             if constexpr (VPT == 1) {
                 float rs[RPS];
                 qmv_reg<T, GS, BITS, (F % get_pack_factor<BITS, 32>()) == 0, RPS>(wsd, ssd, bsd, xs, F, d0, lid, rs);
@@ -1512,6 +1512,8 @@ extension TrackFastMoEKernels {
     /// MLXFAST-DOWNRPS: output rows per down+combine threadgroup in a one-token
     /// window. Each row's expert walks and the fold are unchanged for any value;
     /// fewer rows per threadgroup means more threadgroups in flight (H / rows).
+    /// Ranked A/B at KSG=10: RPS=1 lost 3.95% vs RPS=2 (extra x traffic, more
+    /// tiles). Leave 2; MIX2ROW's 1-row mixer result does not transfer here.
     static let downRowsPerSimdgroup = 2
 
     // MLXFAST-ONESG: one simdgroup per routed expert. With K = 10 and KSG = 10
@@ -1532,9 +1534,7 @@ extension TrackFastMoEKernels {
         precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
         let rps = S == 1 ? downRowsPerSimdgroup : 4
-        // MLXFAST-SHAREDROWSG: one simdgroup per shared-expert row on the
-        // one-token path, so the threadgroup gains `rps` groups, not one.
-        let groups = ksg + (S == 1 && topK == 10 && ksg >= 5 ? rps : 0)
+        let groups = ksg + (S == 1 && topK == 10 && ksg >= 5 ? 1 : 0)
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
             [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
             template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
@@ -2227,20 +2227,11 @@ extension TrackFastMoEKernels {
         out_row = out_row + TM <= N ? out_row : N - TM;
         const device T* mat = w + (size_t)out_row * (size_t)K;
         const int n_iter = K / blockN;
-        // MLXFAST-ROUTERVEC4: both operand tiles are TN == 4 contiguous
-        // elements at a TN-aligned offset -- `bn` starts at `simd_lid * 4` and
-        // advances by blockN == 128, and every row base is a multiple of K (a
-        // multiple of 128) -- so the four scalar loads per tile are one aligned
-        // vector load. The products, their order, the accumulator and the simd
-        // reduction are untouched; only the loads issued per K block change.
-        const device float4* xv = reinterpret_cast<const device float4*>(x);
         for (int i = 0; i < n_iter; ++i) {
-            const float4 vx = xv[bn / TN];
-            for (int tn = 0; tn < TN; tn++) { v_coeff[tn] = vx[tn]; }
+            for (int tn = 0; tn < TN; tn++) { v_coeff[tn] = x[bn + tn]; }
             int mat_offset = 0;
             for (int tm = 0; tm < TM; tm++) {
-                const vec<T, 4> vw = *reinterpret_cast<const device vec<T, 4>*>(mat + mat_offset + bn);
-                for (int tn = 0; tn < TN; tn++) { inter[tn] = static_cast<float>(vw[tn]); }
+                for (int tn = 0; tn < TN; tn++) { inter[tn] = static_cast<float>(mat[mat_offset + bn + tn]); }
                 for (int tn = 0; tn < TN; tn++) { result[tm] += inter[tn] * v_coeff[tn]; }
                 mat_offset += K;
             }
