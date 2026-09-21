@@ -739,8 +739,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let att = cache.updateAndAttend(
             queries: prep.q, keys: prep.k, values: prep.v,
             scale: attentionScale, sinks: nil, keepMask: nil)  // [B,HQ,S,D]
-        let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: a.qWidth)
-        return a.out.apply(out)
+        // MLXFAST-GATEDOUT: S=1 fuses attnGate into o_proj. S>1 keeps the two launches.
+        return TrackFastKernels.attnOut(att: att, qkv: qkv, gateOffset: a.qWidth, out: a.out)
     }
 
     /// Replay only the two opaque expert launches; routing and all current arrays stay live.

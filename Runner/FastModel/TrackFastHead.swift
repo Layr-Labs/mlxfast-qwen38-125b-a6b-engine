@@ -148,7 +148,7 @@ final class TrackFastHead {
         let att = attentionWithCacheUpdate(
             queries: prep.q, keys: prep.k, values: prep.v, cache: cache,
             scale: attentionScale, mask: mask)
-        let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: attn.qWidth)
-        return attn.out.apply(out)
+        // MLXFAST-GATEDOUT: same fused decode entry as TrackFastModel.attnForward.
+        return TrackFastKernels.attnOut(att: att, qkv: qkv, gateOffset: attn.qWidth, out: attn.out)
     }
 }
