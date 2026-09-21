@@ -194,16 +194,28 @@ enum TrackPLEFusion {
         outputNames: ["full", "added"], source: fusedPrepareSource,
         header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
 
+    private static func isRow(_ a: MLXArray, _ width: Int, _ dtype: DType) -> Bool {
+        a.ndim == 3 && a.dim(0) == 1 && a.dim(1) == 1 && a.dim(2) == width && a.dtype == dtype
+    }
+
+    private static func isScaleVector(_ a: MLXArray, _ dtype: DType) -> Bool {
+        a.ndim == 1 && a.dim(0) == 10240 && a.dtype == dtype
+    }
+
     static func supports(_ p: TrackPLE, stream: MLXArray, hidden: Int, hcCount: Int) -> Bool {
         // Guard the exact geometry; every other path builds the original chain.
-        hidden == 2560 && hcCount == 4 && stream.shape == [1, 1, 10240]
-            && [.bfloat16, .float16, .float32].contains(stream.dtype)
+        // MLXFAST-PLESHAPE: the accepted set is unchanged -- the rank and the
+        // extents are read one at a time instead of materializing a shape array
+        // and a dtype array on every admission check.
+        let dtype = stream.dtype
+        return hidden == 2560 && hcCount == 4 && isRow(stream, 10240, dtype)
+            && (dtype == .bfloat16 || dtype == .float16 || dtype == .float32)
             && p.dilation == 3 && p.stateLength == 9
             && p.keyProj.rows == 10240 && p.valueProj.rows == 2560
-            && p.convW.shape == [10240, 4, 1] && p.convW.dtype == stream.dtype
-            && [p.normKeyScale, p.normQueryScale, p.normConvScale].allSatisfy {
-                $0.shape == [10240] && $0.dtype == stream.dtype
-            }
+            && p.convW.ndim == 3 && p.convW.dim(0) == 10240 && p.convW.dim(1) == 4
+            && p.convW.dim(2) == 1 && p.convW.dtype == dtype
+            && isScaleVector(p.normKeyScale, dtype) && isScaleVector(p.normQueryScale, dtype)
+            && isScaleVector(p.normConvScale, dtype)
     }
 
     private static func prepareTemplates(dtype: DType, eps: Float)
@@ -220,8 +232,7 @@ enum TrackPLEFusion {
         _ p: TrackPLE, key: MLXArray, value: MLXArray, stream: MLXArray,
         convState: MLXArray, eps: Float, fusedResidual: Bool
     ) -> (full: MLXArray, output: MLXArray, residualAdded: Bool)? {
-        guard key.shape == [1, 1, 10240], value.shape == [1, 1, 2560],
-            key.dtype == stream.dtype, value.dtype == stream.dtype
+        guard isRow(key, 10240, stream.dtype), isRow(value, 2560, stream.dtype)
         else { return nil }
         if fusedResidual {
             let r = fusedPrepareKernel(
