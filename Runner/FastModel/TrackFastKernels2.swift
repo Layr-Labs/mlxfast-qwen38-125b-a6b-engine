@@ -783,18 +783,30 @@ extension TrackFastKernels {
 
     /// lo [B,S,LW] -> act [B,S,LMIX] (compiled silu); normed [B,S,KDIM] x
     /// inject weight [HC, KDIM/8] (4-bit, group GS) -> inj [B,S,HC] with the
-    /// `qmv` arithmetic. grid threads (64, B*S, 1), threadgroup (64,1,1).
+    /// `qmv` arithmetic. grid threads (TG, B*S, 1), threadgroup (TG,1,1).
     static let mixerHeadSource = """
         const uint row = thread_position_in_grid.y;
         const uint lid = thread_position_in_threadgroup.x;
         const uint simd_gid = simdgroup_index_in_threadgroup;
         const uint simd_lid = thread_index_in_simdgroup;
-        for (uint j = lid; j < (uint)LMIX; j += 64) {
+        for (uint j = lid; j < (uint)LMIX; j += (uint)TG) {
             act[row * LMIX + j] = mlx_silu(lo[row * LW + j]);
         }
         const device InT* xr = normed + (size_t)row * (size_t)KDIM;
         device InT* yr = inj + (size_t)row * (size_t)HC;
-        track_inject_qmv<InT, GS, BITS, KDIM, HC, UNR>(injW, injS, injB, xr, yr, simd_gid, simd_lid);
+        // MLXFAST-INJSPLIT: one inject row per simdgroup, as the fast mixer's
+        // one-token down+inject tiles already own them. Same base addresses,
+        // same lane-to-K mapping, same ascending block walk, same simd_sum.
+        if constexpr (HC == 4 && TG == 128) {
+            switch (simd_gid) {
+                case 0: track_inject_qmv_row<InT, GS, BITS, KDIM, 0, UNR>(injW, injS, injB, xr, yr, simd_lid); break;
+                case 1: track_inject_qmv_row<InT, GS, BITS, KDIM, 1, UNR>(injW, injS, injB, xr, yr, simd_lid); break;
+                case 2: track_inject_qmv_row<InT, GS, BITS, KDIM, 2, UNR>(injW, injS, injB, xr, yr, simd_lid); break;
+                case 3: track_inject_qmv_row<InT, GS, BITS, KDIM, 3, UNR>(injW, injS, injB, xr, yr, simd_lid); break;
+            }
+        } else {
+            track_inject_qmv<InT, GS, BITS, KDIM, HC, UNR>(injW, injS, injB, xr, yr, simd_gid, simd_lid);
+        }
         """
 
     nonisolated(unsafe) static let mixerHeadKernel = MLXFast.metalKernel(
@@ -809,13 +821,15 @@ extension TrackFastKernels {
     ) -> (act: MLXArray, inj: MLXArray) {
         let B = lo.dim(0), S = lo.dim(1), K = normed.dim(2), HC = w.dim(0)
         precondition(bits == 4 && HC < 8 && K % 256 == 0 && K > 256 && unroll >= 1)
+        // MLXFAST-INJSPLIT: four simdgroups so each inject row owns one.
+        let tg = HC == 4 ? 128 : 64
         let outs = mixerHeadKernel(
             [lo, normed, w, s, b],
             template: [
                 ("InT", lo.dtype), ("LW", lo.dim(2)), ("LMIX", width), ("KDIM", K), ("HC", HC),
-                ("GS", groupSize), ("BITS", bits), ("UNR", unroll),
+                ("GS", groupSize), ("BITS", bits), ("UNR", unroll), ("TG", tg),
             ],
-            grid: (64, B * S, 1), threadGroup: (64, 1, 1),
+            grid: (tg, B * S, 1), threadGroup: (tg, 1, 1),
             outputShapes: [[B, S, width], [B, S, HC]], outputDTypes: [lo.dtype, lo.dtype])
         return (outs[0], outs[1])
     }
