@@ -237,6 +237,7 @@ template <typename T, int D, int V = D>
         const float4 k_hi = float4(kv4[1]);
         const float4 v_lo = float4(vv4[0]);
         const float4 v_hi = float4(vv4[1]);
+        float scores[2];
         for (int h = 0; h < 2; ++h) {
           float score = q_lo[h].x * k_lo.x;
           score += q_lo[h].y * k_lo.y;
@@ -246,7 +247,13 @@ template <typename T, int D, int V = D>
           score += q_hi[h].y * k_hi.y;
           score += q_hi[h].z * k_hi.z;
           score += q_hi[h].w * k_hi.w;
-          score = simd_sum(score);
+          scores[h] = score;
+        }
+        for (int h = 0; h < 2; ++h) {
+          scores[h] = simd_sum(scores[h]);
+        }
+        for (int h = 0; h < 2; ++h) {
+          const float score = scores[h];
           const float next_maximum = max(maximum[h], score);
           const float factor = fast::exp(maximum[h] - next_maximum);
           const float exp_score = fast::exp(score - next_maximum);
