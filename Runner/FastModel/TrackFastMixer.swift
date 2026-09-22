@@ -168,12 +168,20 @@ enum TrackFastMixerKernels {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const uint t = sg * 32 + lid;
-        if (t < 2) {
-            const int d = d0 + (int)t;
+        // MLXFAST-MIXCOLSG: the two output columns of a tile are folded by
+        // lane 0 of their OWN simdgroup instead of by two lanes of simdgroup 0.
+        // Each column keeps its own stream order over `products`, the same
+        // threadgroup entries and the same bf16 accumulation, so the stored
+        // values are bit-identical; only which lane owns a column changes, and
+        // the two folds and their stores now issue from two simdgroups instead
+        // of sharing one issue stream.
+        if (lid == 0 && sg < 2) {
+            const int col = (int)sg;
+            const int d = d0 + col;
             for (int v = 0; v < VPT; ++v) {
                 T acc = T(0);
                 for (int s = 0; s < HC; ++s) {
-                    const T p = products[s * 2 + (int)t][v];
+                    const T p = products[s * 2 + col][v];
                     acc = acc + p;
                 }
                 input[(size_t)v * (size_t)H + (size_t)d] = acc;
