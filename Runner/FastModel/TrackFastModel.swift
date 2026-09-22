@@ -70,12 +70,16 @@ enum TrackPleContextMirror {
 private final class TrackGDNJournalEntry {
     weak var state: MLXArray?
     let nextOffset: Int
-    let array: MLXArray
+    /// MLXFAST-G2: every step deferred since the state was last written, in
+    /// the order they happened.
+    let arrays: [MLXArray]
 
-    init(state: MLXArray, nextOffset: Int, array: MLXArray) {
+    var array: MLXArray { arrays[arrays.count - 1] }
+
+    init(state: MLXArray, nextOffset: Int, arrays: [MLXArray]) {
         self.state = state
         self.nextOffset = nextOffset
-        self.array = array
+        self.arrays = arrays
     }
 }
 
@@ -638,23 +642,36 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         // journal. The weak fence prevents object-identifier reuse.
         let journalKey = ObjectIdentifier(ssm)
         let entry = gdnJournals[journalKey]
-        let pendingJournal: MLXArray?
-        if !capture, let entry, entry.state === ssm, entry.nextOffset == offset {
-            pendingJournal = entry.array
-        } else {
+        let live = entry.map { $0.state === ssm && $0.nextOffset == offset } ?? false
+        let carried = live ? (entry?.arrays ?? []) : []
+        if !live { gdnJournals.removeValue(forKey: journalKey) }
+        // The fused path is refused on a capture or a wide window. The state in
+        // memory is `carried.count` steps stale at that moment, so it has to be
+        // brought forward before the slow path reads it -- dropping the journal
+        // here silently lost those steps.
+        var ssmNow = ssm
+        if !carried.isEmpty, capture || S > 1,
+            let flushed = TrackFastGDNDecode.flush(
+                stateIn: ssm, pendingJournals: carried, geometry: geo)
+        {
+            ssmNow = flushed
             gdnJournals.removeValue(forKey: journalKey)
-            pendingJournal = nil
         }
+        let pending = (capture || S > 1) ? [] : carried
+        // MLXFAST-G2: write the state out once every `journalDepth + 1` steps
+        // instead of every other one -- the state is 3 MB per layer, a journal
+        // 37 KB. Three is the deepest the kernel replays.
+        let writeState = pending.count >= Self.journalDepth
         if let fused = TrackFastGDNDecode.apply(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
-            dtBias: g.dtBias, stateIn: ssm, normW: g.normW,
-            pendingJournal: pendingJournal, zOffset: g.zOffset, eps: 1e-6,
+            dtBias: g.dtBias, stateIn: ssmNow, normW: g.normW,
+            pendingJournals: pending, writeState: writeState, zOffset: g.zOffset, eps: 1e-6,
             capture: capture, geometry: geo)
         {
             (gated, convOut, stateOut) = (fused.gated, fused.convOut, fused.stateOut)
             if let journal = fused.journal {
                 gdnJournals[journalKey] = TrackGDNJournalEntry(
-                    state: ssm, nextOffset: offset + S, array: journal)
+                    state: ssm, nextOffset: offset + S, arrays: pending + [journal])
             } else {
                 gdnJournals.removeValue(forKey: journalKey)
             }
@@ -662,7 +679,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } else {
             let r = TrackFastKernels.gdn(
                 proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
-                dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo,
+                dtBias: g.dtBias, stateIn: ssmNow, T: S, capture: capture, geometry: geo,
                 separateBA: split.map { (b: $0[2], a: $0[3]) })
             if prof { TrackFastProfile.tick("gdn.prep+lean", &pt, [r.y, r.stateOut, r.convOut]) }
             gated = TrackFastKernels.gatedRMS(
@@ -768,6 +785,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 groupSize: groupSize, bits: bits)]
         }
     }
+
+    /// MLXFAST-G2: how many decode steps the GDN state update may be deferred
+    /// before the 3 MB state is written.
+    static let journalDepth = 3
 
     /// Row index of each (token, expert) slot, one constant array per window size
     /// (uploading it per step was one host copy per layer).
