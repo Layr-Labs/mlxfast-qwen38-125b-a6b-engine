@@ -194,7 +194,9 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         // loaded tensors over. A checkpoint without the `mtp.*` block has no
         // head and is serial only.
         let head = try model.mtp.map {
-            try Self.adoptMTPHead($0, configuration: model.configuration)
+            // MLXFAST-HEAD3: serve the head at 3 bits (re-quantized on load;
+            // the target still decides every token). See adoptMTPHead.
+            try Self.adoptMTPHead($0, configuration: model.configuration, headBits: 3)
         }
         // The fork's `mtp` module stays bound to the model: a Module property
         // may only change through `update(modules:)`, and there is nothing to
@@ -322,22 +324,82 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
     /// checkpoint's and stay the checkpoint's: this seam re-encodes what the
     /// checkpoint carries, it does not replace it and it does not ship a head.
     public static func adoptMTPHead(
-        _ loaded: Qwen4ExpMTPModule, configuration: Qwen4ExpTextConfiguration
+        _ loaded: Qwen4ExpMTPModule, configuration: Qwen4ExpTextConfiguration,
+        headBits: Int? = nil
     ) throws -> TrackQwen4ExpMTPModule {
         let head = TrackQwen4ExpMTPModule(configuration, layerCount: loaded.layerCount)
 
         // The geometry the served head carries. Read off the loaded head, so
         // the default is the checkpoint's own.
+        //
+        // MLXFAST-HEAD3: re-quantize the head to 3 bits (group size and mode
+        // unchanged). Sanctioned by docs/participant-contract.md §4: "A
+        // re-quantization of the pinned head is permitted", bits in 2...8,
+        // via exactly this function. Rationale: the head only proposes; the
+        // pinned target decides every emitted token, so draft quality trades
+        // against draft speed with zero output risk. 3-bit halves nothing but
+        // cuts head weight traffic ~25% per draft; the vendored kernels carry
+        // first-class bits==3 dequant paths. Acceptance moves wherever it
+        // moves; the sealed effective_mean_draft_len reads it out.
+        //
+        // Implementation MUST dequantize first: binding the checkpoint's
+        // packed 4-bit tensors into 3-bit-geometry modules fails boot with a
+        // shape mismatch (observed on the first HEAD3 validation:
+        // LEG-SERVE-BOOT-FAILED, expectedShape [10240, 30] vs actual
+        // [10240, 40]). So each loaded QuantizedLinear leaf is dequantized
+        // to FP, rebuilt at 3 bits, and swapped in as a module; every other
+        // leaf binds its checkpoint values unchanged.
+        let targetBits = headBits
+        // Per-leaf served geometry: the checkpoint's own unless a re-quant
+        // width was requested AND differs from what the leaf carries.
         var geometry: [String: (groupSize: Int, bits: Int, mode: QuantizationMode)] = [:]
         for (path, module) in loaded.leafModules().flattened() {
-            guard let quantized = module as? Quantized else { continue }
-            geometry[path] = (quantized.groupSize, quantized.bits, quantized.mode)
+            guard let q = module as? Quantized else { continue }
+            if let ql = module as? QuantizedLinear,
+                let targetBits, targetBits != ql.bits
+            {
+                geometry[path] = (ql.groupSize, targetBits, ql.mode)
+            } else {
+                geometry[path] = (q.groupSize, q.bits, q.mode)
+            }
         }
+        // Convert the fresh FP head to quantized modules at the served
+        // geometry (unchanged leaves land exactly where the old code put
+        // them). Re-quantized leaves are rebuilt below from dequantized
+        // values; this step gives them correctly-shaped shells first.
         quantize(model: head) { path, _ in geometry[path] }
+
+        // Rebuild width-changed leaves from dequantized FP. Binding packed
+        // checkpoint tensors directly would fail boot (packed 4-bit vs
+        // 3-bit shapes differ).
+        var replacements: [(String, Module)] = []
+        for (path, module) in loaded.leafModules().flattened() {
+            guard let q = module as? QuantizedLinear,
+                let want = geometry[path], want.bits != q.bits
+            else { continue }
+            let fp = dequantized(
+                q.weight, scales: q.scales, biases: q.biases,
+                groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+            replacements.append((path, QuantizedLinear(
+                weight: fp, bias: q.bias,
+                groupSize: q.groupSize, bits: want.bits, mode: q.mode)))
+        }
+        head.update(modules: ModuleChildren.unflattened(replacements))
+
+        // Bind every leaf the swap did not rebuild. Packed shapes match the
+        // served geometry on all of them by construction.
+        let replacedPaths = Set(replacements.map(\.0))
+        let headLeaves = Dictionary(
+            uniqueKeysWithValues: head.leafModules().flattened())
+        for (path, module) in loaded.leafModules().flattened() {
+            if replacedPaths.contains(path) { continue }
+            if let hl = headLeaves[path] {
+                try hl.update(parameters: module.parameters(), verify: .all)
+            }
+        }
 
         // Verified in full: a head that took only part of the checkpoint's
         // tensors would still draft, and would draft something else.
-        try head.update(parameters: loaded.parameters(), verify: .all)
         return head
     }
 
