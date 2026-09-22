@@ -1,4 +1,3 @@
-// Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
 // TrackFastKernels.prepSource, leanSource and gatedRMSSource.
 
 import MLX
@@ -13,9 +12,9 @@ enum TrackFastGDNDecode {
     static func apply(
         proj: MLXArray, convState: MLXArray, convW: MLXArray,
         negExpALog: MLXArray, dtBias: MLXArray, stateIn: MLXArray, normW: MLXArray,
-        pendingJournal: MLXArray?, zOffset: Int, eps: Float, capture: Bool,
+        pendingJournal: MLXArray?, pendingDepth: Int, zOffset: Int, eps: Float, capture: Bool,
         geometry g: TrackFastKernels.GDNGeometry
-    ) -> (gated: MLXArray, stateOut: MLXArray, convOut: MLXArray, journal: MLXArray?)? {
+    ) -> (gated: MLXArray, stateOut: MLXArray, convOut: MLXArray, journal: MLXArray?, journalDepth: Int)? {
         guard !capture, proj.ndim == 3, proj.dim(1) == 1, proj.dtype == .bfloat16,
             stateIn.dtype == .float32, g.dk == 128, g.dv == 128,
             g.hk > 0, g.hv % g.hk == 0, g.convKernel > 1,
@@ -32,8 +31,11 @@ enum TrackFastGDNDecode {
             convState.dtype == proj.dtype
         else { return nil }
         let journalStride = g.hv * g.dk + 2 * g.hv * g.dv + 2 * g.hv
-        let hasJournal = pendingJournal?.shape == [B, journalStride]
-        let journalIn = pendingJournal ?? convState
+        let depth = pendingJournal?.shape == [B, 2 * journalStride]
+            && pendingJournal?.dtype == proj.dtype && (1...2).contains(pendingDepth)
+            ? pendingDepth : 0
+        let flush = depth == 2
+        let journalIn = depth > 0 ? pendingJournal! : convState
         let result = kernel(
             [proj, convState, convW, negExpALog, dtBias, stateIn, normW, journalIn],
             template: [
@@ -43,20 +45,21 @@ enum TrackFastGDNDecode {
                 ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)), ("RPS", 4),
                 ("J_KEY_OFF", 0), ("J_DELTA_OFF", g.hv * g.dk),
                 ("J_DECAY_OFF", g.hv * g.dk + 2 * g.hv * g.dv),
-                ("J_STRIDE", journalStride), ("HAS_JOURNAL", hasJournal),
+                ("J_STRIDE", journalStride), ("J_DEPTH", depth),
             ],
             grid: (32, g.dv / 4, B * g.hv), threadGroup: (32, g.dv / 4, 1),
             outputShapes: [
-                hasJournal ? [B, g.hv, g.dv, g.dk] : [1],
+                flush ? [B, g.hv, g.dv, g.dk] : [1],
                 [B, 1, g.hv * g.dv], [B, g.convKernel - 1, g.convDim],
-                hasJournal ? [1] : [B, journalStride],
+                flush ? [1] : [B, 2 * journalStride],
             ],
             outputDTypes: [stateIn.dtype, proj.dtype, proj.dtype, proj.dtype])
-        return (result[1], hasJournal ? result[0] : stateIn, result[2], hasJournal ? nil : result[3])
+        return (result[1], flush ? result[0] : stateIn, result[2], flush ? nil : result[3], flush ? 0 : depth + 1)
     }
 
     private static let source = #"""
         static_assert(Dk == 128 && Dv == 128, "GDN head geometry");
+        static_assert(J_DEPTH >= 0 && J_DEPTH <= 2, "GDN journal depth");
         const uint n = threadgroup_position_in_grid.z;
         const uint b_idx = n / Hv;
         const uint hv_idx = n % Hv;
@@ -133,8 +136,11 @@ enum TrackFastGDNDecode {
         const threadgroup InT* v_ = v_shared;
         const float gate_decay = gb_shared[0];
         const float gate_beta = gb_shared[1];
-        const device InT* journal = journal_in + b_idx * J_STRIDE;
-        device InT* next_journal = journal_out + b_idx * J_STRIDE;
+        const device InT* journal = journal_in;
+        if constexpr (J_DEPTH > 0) { journal += b_idx * (2 * J_STRIDE); }
+        // A flush has only a placeholder journal output; form no offset into it.
+        device InT* next_journal = journal_out;
+        if constexpr (J_DEPTH < 2) { next_journal += b_idx * (2 * J_STRIDE) + J_DEPTH * J_STRIDE; }
         auto journal_float = [&](int off) -> float {
             const uint lo = (uint)as_type<ushort>(journal[off]);
             const uint hi = (uint)as_type<ushort>(journal[off + 1]);
@@ -166,13 +172,14 @@ enum TrackFastGDNDecode {
             } else {
                 for (int i = 0; i < 4; ++i) { state[i] = static_cast<float>(i_state[4 * lane + i]); }
             }
-            if constexpr (HAS_JOURNAL) {
-                const float pending_decay = journal_float(J_DECAY_OFF + 2 * hv_idx);
-                const float pending_delta = journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx));
+            for (int pending = 0; pending < J_DEPTH; ++pending) {
+                const int slot = pending * J_STRIDE;
+                const float pending_decay = journal_float(slot + J_DECAY_OFF + 2 * hv_idx);
+                const float pending_delta = journal_float(slot + J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx));
                 for (int i = 0; i < 4; ++i) {
                     state[i] = state[i] * pending_decay;
                     state[i] = state[i]
-                        + static_cast<float>(journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i])
+                        + static_cast<float>(journal[slot + J_KEY_OFF + hv_idx * Dk + 4 * lane + i])
                             * pending_delta;
                 }
             }
@@ -194,9 +201,14 @@ enum TrackFastGDNDecode {
             }
             kv_mem = simd_sum(kv_mem);
             const float delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * gate_beta;
-            if constexpr (!HAS_JOURNAL) {
+            if constexpr (J_DEPTH < 2) {
                 if (lane == 0) {
                     store_journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx), delta);
+                    if constexpr (J_DEPTH == 1) {
+                        const int off = J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx);
+                        next_journal[off - J_STRIDE] = journal[off];
+                        next_journal[off + 1 - J_STRIDE] = journal[off + 1];
+                    }
                 }
             }
             float out = 0.0f;
@@ -209,7 +221,7 @@ enum TrackFastGDNDecode {
                 const InT value = static_cast<InT>(out);
                 y_shared[dv_idx] = value;
             }
-            if constexpr (HAS_JOURNAL) {
+            if constexpr (J_DEPTH == 2) {
                 device StT* o_state = state_out + (n * Dv + dv_idx) * Dk;
                 if constexpr (vec4) {
                     *reinterpret_cast<device float4*>(o_state + 4 * lane) = float4(state[0], state[1], state[2], state[3]);
@@ -218,14 +230,23 @@ enum TrackFastGDNDecode {
                 }
             }
         }
-        if constexpr (!HAS_JOURNAL) {
+        if constexpr (J_DEPTH < 2) {
             if (sg == 0) {
                 for (int i = 0; i < 4; ++i) {
                     next_journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i] = k_[4 * lane + i];
+                    if constexpr (J_DEPTH == 1) {
+                        const int off = J_KEY_OFF + hv_idx * Dk + 4 * lane + i;
+                        next_journal[off - J_STRIDE] = journal[off];
+                    }
                 }
             }
             if (sg == 0 && lane == 0) {
                 store_journal_float(J_DECAY_OFF + 2 * hv_idx, gate_decay);
+                if constexpr (J_DEPTH == 1) {
+                    const int off = J_DECAY_OFF + 2 * hv_idx;
+                    next_journal[off - J_STRIDE] = journal[off];
+                    next_journal[off + 1 - J_STRIDE] = journal[off + 1];
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -250,3 +271,4 @@ enum TrackFastGDNDecode {
         }
         """#
 }
+private let gauntletRedraw_26fb7d20_20260922T105612Z: Int = 0
