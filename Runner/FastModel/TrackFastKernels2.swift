@@ -820,3 +820,52 @@ extension TrackFastKernels {
         return (outs[0], outs[1])
     }
 }
+
+// YUKON-PLE-INJECT-ONLY-20260922
+extension TrackFastKernels {
+    static let pleInjectOnlyEnabled: Bool = {
+        (ProcessInfo.processInfo.environment["TRACK_PLE_INJECT_ONLY"] ?? "1") != "0"
+    }()
+
+    static let pleInjectOnlySource = """
+        constexpr int N_READS = 4;
+        const uint row = thread_position_in_grid.z;
+        const uint hc = thread_position_in_grid.y;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint base = row * W + hc * H;
+        InT inj_t = InT(0);
+        if (HAS_INJECT) { inj_t = inject[row * HC + hc]; }
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            const uint src = TILE ? (row * H + d) : (base + d);
+            InT r = residual[src];
+            if (HAS_INJECT) {
+                InT sp = out[row * H + d] * inj_t;
+                r = r + sp;
+            }
+            stream[base + d] = r;
+        }
+        """
+
+    nonisolated(unsafe) static let pleInjectOnlyKernel = MLXFast.metalKernel(
+        name: "track_ple_inject_only_20260922",
+        inputNames: ["residual", "out", "inject"], outputNames: ["stream"],
+        source: pleInjectOnlySource, header: exactHeader, ensureRowContiguous: true)
+
+    static func pleInjectOnly(
+        residual: MLXArray, out: MLXArray?, inject: MLXArray?,
+        hcCount: Int, hidden: Int, tile: Bool
+    ) -> MLXArray {
+        let B = residual.dim(0), S = residual.dim(1)
+        let W = hcCount * hidden
+        precondition(hidden % 4 == 0 && hidden / 4 <= 1024)
+        return pleInjectOnlyKernel(
+            [residual, out ?? residual, inject ?? residual],
+            template: [
+                ("InT", residual.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
+                ("HAS_INJECT", out != nil), ("TILE", tile),
+            ],
+            grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
+            outputShapes: [[B, S, W]], outputDTypes: [residual.dtype])[0]
+    }
+}

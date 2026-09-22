@@ -1078,10 +1078,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             var normed: MLXArray
             if let ple = layer.ple {
                 // Materialize the stream, add the PLE block, then norm.
-                (stream, _) = injectNorm(
-                    residual: residual, out: pendingOut, inject: pendingInject,
-                    scale: layer.attnHC.normScaleQ,
-                    tile: tile)
+                // YUKON-PLE-INJECT-ONLY-20260922: PLE consumes only this stream.
+                if TrackFastKernels.pleInjectOnlyEnabled && ids.dim(1) >= 1 && ids.dim(1) <= 8 {
+                    stream = TrackFastKernels.pleInjectOnly(
+                        residual: residual, out: pendingOut, inject: pendingInject,
+                        hcCount: hcCount, hidden: hidden, tile: tile)
+                } else {
+                    (stream, _) = injectNorm(
+                        residual: residual, out: pendingOut, inject: pendingInject,
+                        scale: layer.attnHC.normScaleQ,
+                        tile: tile)
+                }
                 let pleResult = pleForward(
                     ple, stream: stream, ids: ids, evaluation: evaluation,
                     offset: offset, capture: capture)
