@@ -879,6 +879,11 @@ extension TrackFastMoEKernels {
         let lead = Array(logits.shape.dropLast())
         let R = lead.reduce(1, *)
         precondition(topK <= 32 && topK <= E && R >= 1 && (g == nil || R <= 8) && KD % 256 == 0)
+        if g == nil, E == 512, topK == 10,
+            StreamOrDevice.default.stream === Stream.gpu {
+            let out = TrackRouteTournament.apply(logits: logits, gateType: x.dtype)
+            return (out[0].reshaped(lead + [topK]), out[1].reshaped(lead + [topK]), out[2])
+        }
         let simdgroups = g == nil ? 1 : 2
         let outs = (R == 1 ? routeKernel1 : routeKernel)(
             [logits.reshaped(R, E), x.reshaped(R, KD), g?.weight ?? x, g?.scales ?? x, g?.biases ?? x],
