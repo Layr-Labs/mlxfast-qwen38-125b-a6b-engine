@@ -16,7 +16,23 @@ struct TrackQuantWeight {
     var rows: Int { weight.dim(0) }
 
     func apply(_ x: MLXArray) -> MLXArray {
-        quantizedMM(
+        // MLXFAST-C2: the three skinny-N prefill families (HC inject N = 4,
+        // GDN b/a N = 48, shared gate N = 1) are the only shapes MLX sends
+        // down `qmm_splitk`, and it spends two launches on each -- the
+        // partials, then a reduce over the split_k axis. `TrackSplitKQMM`
+        // does both in one launch, using MLX's own `qmm_t_impl` for the
+        // partitions and `col_reduce_small`'s fold order for the sum, so the
+        // result is the same bits. Every other shape, and every window narrow
+        // enough to run a `qmv` instead, returns nil and goes to MLX.
+        if mode == .affine, let biases,
+            let fused = TrackSplitKQMM.matmul(
+                x: x.ndim == 2 ? x : x.reshaped(-1, x.dim(-1)),
+                w: weight, scales: scales, biases: biases,
+                groupSize: groupSize, bits: bits)
+        {
+            return x.ndim == 2 ? fused : fused.reshaped(x.shape.dropLast() + [rows])
+        }
+        return quantizedMM(
             x, weight, scales: scales, biases: biases, transpose: true,
             groupSize: groupSize, bits: bits, mode: mode)
     }
