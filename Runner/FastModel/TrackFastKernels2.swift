@@ -380,6 +380,25 @@ extension TrackFastKernels {
             }
             return;
         }
+        // MLXFAST-PREPPRE: the norm-weight element and the rope pair this
+        // thread needs after the two barriers depend only on `lid`, `h` and
+        // `s`, never on the reduction. Issuing them here lets them retire
+        // under the sum of squares, both simd_sum stages, the barrier and the
+        // vec staging, instead of stalling the loops that consume them. Same
+        // addresses, same values, same multiplies in the same order.
+        InT wgt_pre[N_READS];
+        InT cos_pre[N_READS];
+        InT sin_pre[N_READS];
+        for (int i = 0; i < N_READS; ++i) {
+            const uint d = lid * N_READS + i;
+            wgt_pre[i] = isQ ? qnorm[d] : knorm[d];
+            cos_pre[i] = InT(0);
+            sin_pre[i] = InT(0);
+            if (d < ROT) {
+                cos_pre[i] = cosb[s * ROT + d];
+                sin_pre[i] = sinb[s * ROT + d];
+            }
+        }
         float thread_x[N_READS];
         float acc = 0.0f;
         for (int i = 0; i < N_READS; ++i) {
@@ -395,8 +414,7 @@ extension TrackFastKernels {
         const float inv_mean = metal::precise::rsqrt(acc / (float)D + as_type<float>((uint)EPS_BITS));
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
-            const InT wgt = isQ ? qnorm[d] : knorm[d];
-            vec[d] = wgt * static_cast<InT>(thread_x[i] * inv_mean);
+            vec[d] = wgt_pre[i] * static_cast<InT>(thread_x[i] * inv_mean);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         constexpr int hrot = ROT / 2;
@@ -405,8 +423,8 @@ extension TrackFastKernels {
             const uint d = lid * N_READS + i;
             InT o = vec[d];
             if (d < ROT) {
-                const InT c = cosb[s * ROT + d];
-                const InT sn = sinb[s * ROT + d];
+                const InT c = cos_pre[i];
+                const InT sn = sin_pre[i];
                 if (d < hrot) {
                     InT x1 = vec[d];
                     InT x2 = vec[d + hrot];
