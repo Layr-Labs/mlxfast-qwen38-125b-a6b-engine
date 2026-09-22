@@ -807,20 +807,31 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             case .quant(let guq) = m.sharedGateUp.fused ?? .dense(x),
             case .quant(let dq) = m.sharedDown, guq.biases != nil, dq.biases != nil
         {
-            // The shared-expert gate is a bf16 Linear on this checkpoint (router gates
-            // are BF16): MLX's own GEMV keeps it; a quantized one rides in `route`.
-            var gateQ: TrackQuantWeight? = nil
-            if case .quant(let gq) = m.sharedGate, gq.biases != nil { gateQ = gq }
-            // Decode windows: three launches over MLX's own GEMV arithmetic for the
-            // window size (per-row `qmv_fast` / `qmv` for the gathered experts, `qmv`
-            // or `qmv_wide` for the shared expert): top-k + softmax + shared gate,
-            // gate|up + SwiGLU for the routed and the shared expert, down + combine.
+            // Decode windows: top-k + softmax + shared-expert gate in `route`,
+            // then gate|up + SwiGLU, then down + combine. A 4-bit gate with
+            // biases stays on the qmv path inside `route`. A bias-free dense
+            // row — this checkpoint's bf16 Linear — stays dense and rides in
+            // the same launch (`dot_product` for one token, N=1 gemv for two
+            // to eight). Any other gate is still its own matmul.
             let S = x.dim(1), K = m.topK, H = x.dim(2)
+            var gateQ: TrackQuantWeight? = nil
+            var gateDense: MLXArray? = nil
+            switch m.sharedGate {
+            case .quant(let gq) where gq.biases != nil:
+                gateQ = gq
+            case .dense(let w)
+                where w.dtype == x.dtype && w.dim(0) == 1 && w.dim(1) == H && H % 256 == 0
+                    && H <= 15 * 1024 && (S == 1 || H >= 16 * S):
+                gateDense = w
+            default:
+                break
+            }
             let x2 = x.reshaped(S, H)
             let r = TrackFastMoEKernels.route(
-                logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, topK: K)
+                logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, denseGate: gateDense,
+                topK: K)
             let (idx, weights) = (r.idx, r.w)
-            let gate = gateQ != nil ? r.gate : m.sharedGate.apply(x).reshaped(S)
+            let gate = (gateQ != nil || gateDense != nil) ? r.gate : m.sharedGate.apply(x).reshaped(S)
             if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights, gate]) }
             let flatIdx = idx.reshaped(S * K)
             let xrow = Self.xrowTable(S: S, K: K)
