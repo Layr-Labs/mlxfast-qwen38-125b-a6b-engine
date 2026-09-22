@@ -1,5 +1,3 @@
-// Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
-// TrackFastKernels.prepSource, leanSource and gatedRMSSource.
 
 import MLX
 
@@ -13,16 +11,17 @@ enum TrackFastGDNDecode {
     static func apply(
         proj: MLXArray, convState: MLXArray, convW: MLXArray,
         negExpALog: MLXArray, dtBias: MLXArray, stateIn: MLXArray, normW: MLXArray,
-        pendingJournal: MLXArray?, zOffset: Int, eps: Float, capture: Bool,
+        pendingJournal: MLXArray?, pendingDepth: Int, zOffset: Int, eps: Float, capture: Bool,
         geometry g: TrackFastKernels.GDNGeometry
-    ) -> (gated: MLXArray, stateOut: MLXArray, convOut: MLXArray, journal: MLXArray?)? {
+    ) -> (gated: MLXArray, stateOut: MLXArray, convOut: MLXArray, journal: MLXArray?, journalDepth: Int)? {
         guard !capture, proj.ndim == 3, proj.dim(1) == 1, proj.dtype == .bfloat16,
             stateIn.dtype == .float32, g.dk == 128, g.dv == 128,
             g.hk > 0, g.hv % g.hk == 0, g.convKernel > 1,
             g.convDim == (2 * g.hk + g.hv) * 128, g.projWidth == proj.dim(2),
             zOffset >= 0, zOffset + g.hv * g.dv <= g.projWidth,
             g.bOffset >= 0, g.bOffset + g.hv <= g.projWidth,
-            g.aOffset >= 0, g.aOffset + g.hv <= g.projWidth
+            g.aOffset >= 0, g.aOffset + g.hv <= g.projWidth,
+            pendingDepth >= 0, pendingDepth <= 2
         else { return nil }
         let B = proj.dim(0)
         guard convState.shape == [B, g.convKernel - 1, g.convDim],
@@ -31,9 +30,13 @@ enum TrackFastGDNDecode {
             negExpALog.shape == [g.hv], dtBias.shape == [g.hv], normW.shape == [g.dv],
             convState.dtype == proj.dtype
         else { return nil }
+        // Each fixed slot stores one exact key and raw 16-bit halves of the
+        // FP32 delta and decay, so replay reconstructs their original bits.
         let journalStride = g.hv * g.dk + 2 * g.hv * g.dv + 2 * g.hv
-        let hasJournal = pendingJournal?.shape == [B, journalStride]
+        guard pendingDepth == 0 || pendingJournal?.shape == [B, 2 * journalStride]
+        else { return nil }
         let journalIn = pendingJournal ?? convState
+        let flush = pendingDepth == 2
         let result = kernel(
             [proj, convState, convW, negExpALog, dtBias, stateIn, normW, journalIn],
             template: [
@@ -43,16 +46,18 @@ enum TrackFastGDNDecode {
                 ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)), ("RPS", 4),
                 ("J_KEY_OFF", 0), ("J_DELTA_OFF", g.hv * g.dk),
                 ("J_DECAY_OFF", g.hv * g.dk + 2 * g.hv * g.dv),
-                ("J_STRIDE", journalStride), ("HAS_JOURNAL", hasJournal),
+                ("J_STRIDE", journalStride), ("J_DEPTH", pendingDepth),
             ],
             grid: (32, g.dv / 4, B * g.hv), threadGroup: (32, g.dv / 4, 1),
             outputShapes: [
-                hasJournal ? [B, g.hv, g.dv, g.dk] : [1],
+                flush ? [B, g.hv, g.dv, g.dk] : [1],
                 [B, 1, g.hv * g.dv], [B, g.convKernel - 1, g.convDim],
-                hasJournal ? [1] : [B, journalStride],
+                flush ? [1] : [B, 2 * journalStride],
             ],
             outputDTypes: [stateIn.dtype, proj.dtype, proj.dtype, proj.dtype])
-        return (result[1], hasJournal ? result[0] : stateIn, result[2], hasJournal ? nil : result[3])
+        return (
+            result[1], flush ? result[0] : stateIn, result[2], flush ? nil : result[3],
+            flush ? 0 : pendingDepth + 1)
     }
 
     private static let source = #"""
@@ -133,17 +138,19 @@ enum TrackFastGDNDecode {
         const threadgroup InT* v_ = v_shared;
         const float gate_decay = gb_shared[0];
         const float gate_beta = gb_shared[1];
-        const device InT* journal = journal_in + b_idx * J_STRIDE;
-        device InT* next_journal = journal_out + b_idx * J_STRIDE;
-        auto journal_float = [&](int off) -> float {
-            const uint lo = (uint)as_type<ushort>(journal[off]);
-            const uint hi = (uint)as_type<ushort>(journal[off + 1]);
+        const device InT* journal = journal_in + b_idx * (2 * J_STRIDE);
+        device InT* next_journal = journal_out + b_idx * (2 * J_STRIDE);
+        auto journal_float = [&](int slot, int off) -> float {
+            const int base = slot * J_STRIDE + off;
+            const uint lo = (uint)as_type<ushort>(journal[base]);
+            const uint hi = (uint)as_type<ushort>(journal[base + 1]);
             return as_type<float>(lo | (hi << 16));
         };
-        auto store_journal_float = [&](int off, float value) {
+        auto store_journal_float = [&](int slot, int off, float value) {
+            const int base = slot * J_STRIDE + off;
             const uint bits = as_type<uint>(value);
-            next_journal[off] = as_type<InT>((ushort)(bits & 0xffffu));
-            next_journal[off + 1] = as_type<InT>((ushort)(bits >> 16));
+            next_journal[base] = as_type<InT>((ushort)(bits & 0xffffu));
+            next_journal[base + 1] = as_type<InT>((ushort)(bits >> 16));
         };
         const float4 local_q = float4(
             static_cast<float>(q_[4 * lane]), static_cast<float>(q_[4 * lane + 1]),
@@ -166,14 +173,17 @@ enum TrackFastGDNDecode {
             } else {
                 for (int i = 0; i < 4; ++i) { state[i] = static_cast<float>(i_state[4 * lane + i]); }
             }
-            if constexpr (HAS_JOURNAL) {
-                const float pending_decay = journal_float(J_DECAY_OFF + 2 * hv_idx);
-                const float pending_delta = journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx));
-                for (int i = 0; i < 4; ++i) {
-                    state[i] = state[i] * pending_decay;
-                    state[i] = state[i]
-                        + static_cast<float>(journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i])
-                            * pending_delta;
+            if constexpr (J_DEPTH > 0) {
+                for (int p = 0; p < J_DEPTH; ++p) {
+                    const int slot = p * J_STRIDE;
+                    const float pending_decay = journal_float(p, J_DECAY_OFF + 2 * hv_idx);
+                    const float pending_delta = journal_float(p, J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx));
+                    for (int i = 0; i < 4; ++i) {
+                        state[i] = state[i] * pending_decay;
+                        state[i] = state[i]
+                            + static_cast<float>(journal[slot + J_KEY_OFF + hv_idx * Dk + 4 * lane + i])
+                                * pending_delta;
+                    }
                 }
             }
             float kv_mem;
@@ -194,9 +204,9 @@ enum TrackFastGDNDecode {
             }
             kv_mem = simd_sum(kv_mem);
             const float delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * gate_beta;
-            if constexpr (!HAS_JOURNAL) {
+            if constexpr (J_DEPTH < 2) {
                 if (lane == 0) {
-                    store_journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx), delta);
+                    store_journal_float(J_DEPTH, J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx), delta);
                 }
             }
             float out = 0.0f;
@@ -209,7 +219,7 @@ enum TrackFastGDNDecode {
                 const InT value = static_cast<InT>(out);
                 y_shared[dv_idx] = value;
             }
-            if constexpr (HAS_JOURNAL) {
+            if constexpr (J_DEPTH == 2) {
                 device StT* o_state = state_out + (n * Dv + dv_idx) * Dk;
                 if constexpr (vec4) {
                     *reinterpret_cast<device float4*>(o_state + 4 * lane) = float4(state[0], state[1], state[2], state[3]);
@@ -218,14 +228,28 @@ enum TrackFastGDNDecode {
                 }
             }
         }
-        if constexpr (!HAS_JOURNAL) {
+        if constexpr (J_DEPTH < 2) {
+            const int current = J_DEPTH * J_STRIDE;
             if (sg == 0) {
                 for (int i = 0; i < 4; ++i) {
-                    next_journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i] = k_[4 * lane + i];
+                    next_journal[current + J_KEY_OFF + hv_idx * Dk + 4 * lane + i] = k_[4 * lane + i];
                 }
             }
             if (sg == 0 && lane == 0) {
-                store_journal_float(J_DECAY_OFF + 2 * hv_idx, gate_decay);
+                store_journal_float(J_DEPTH, J_DECAY_OFF + 2 * hv_idx, gate_decay);
+            }
+            if constexpr (J_DEPTH == 1) {
+                if (sg < 4) {
+                    const uint i = sg * 32 + lane;
+                    next_journal[J_KEY_OFF + hv_idx * Dk + i] = journal[J_KEY_OFF + hv_idx * Dk + i];
+                }
+                if (sg < 8) {
+                    const uint i = sg * 32 + lane;
+                    next_journal[J_DELTA_OFF + 2 * hv_idx * Dv + i] = journal[J_DELTA_OFF + 2 * hv_idx * Dv + i];
+                }
+                if (sg == 0 && lane < 2) {
+                    next_journal[J_DECAY_OFF + 2 * hv_idx + lane] = journal[J_DECAY_OFF + 2 * hv_idx + lane];
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
