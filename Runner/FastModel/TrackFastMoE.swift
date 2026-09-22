@@ -1512,7 +1512,20 @@ extension TrackFastMoEKernels {
     /// MLXFAST-DOWNRPS: output rows per down+combine threadgroup in a one-token
     /// window. Each row's expert walks and the fold are unchanged for any value;
     /// fewer rows per threadgroup means more threadgroups in flight (H / rows).
-    static let downRowsPerSimdgroup = 2
+    // MLXFAST-SRSG4: output rows per down+combine threadgroup in a one-token
+    // window, raised 2 -> 4. This constant reaches the launch twice. It is the
+    // `RPS` template argument, so it sets the routed-row loop extent and the
+    // `float r[RPS]` accumulator each simdgroup carries; and since
+    // MLXFAST-SHAREDROWSG it also sets `groups = ksg + rps`, the number of
+    // simdgroups the shared-expert down rows are spread over, one row each.
+    // At 4 the threadgroup is `ksg + 4 = 14` simdgroups instead of 12, the
+    // shared rows d0..d0+3 walk on four simdgroups instead of two, and the
+    // launch covers the same H rows with `H / 4` threadgroups instead of
+    // `H / 2`. H is 2560, so `H % rps == 0` holds and the `H % 4 == 0`
+    // precondition above is unchanged. Every row keeps its own `qmv_reg` walk,
+    // its own accumulation order and its own reduction, so the output is
+    // bit-identical for any value of this constant.
+    static let downRowsPerSimdgroup = 4
 
     // MLXFAST-ONESG: one simdgroup per routed expert. With K = 10 and KSG = 10
     // each group runs exactly one expert walk (kk loop trip count 1) instead of
