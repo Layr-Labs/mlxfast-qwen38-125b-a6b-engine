@@ -275,6 +275,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     private struct PLEForwardResult {
         let output: MLXArray
         let residualAdded: Bool
+        /// The injected pre-PLE stream when this call materialized it with
+        /// `injectNorm`; nil when the one-token fold consumed residual/out/
+        /// inject inside the PLE kernel and no stream exists.
+        let injectedStream: MLXArray?
     }
 
     let base: Qwen4ExpModel
@@ -900,15 +904,30 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return TrackFastKernels.moeCombine(routed: routed, w: weights, shared: shared, gate: gate)
     }
 
+    /// `residual` is the pre-inject stream; `pendingOut`/`pendingInject` are
+    /// the previous block's output and inject weights. The pre-PLE inject is
+    /// owned here: the one-token fold performs it inside the PLE kernel (no
+    /// `injectNorm` launch), and every other branch materializes the exact
+    /// same stream with this file's `injectNorm` wrapper on first use.
     private func pleForward(
-        _ p: TrackPLE, stream: MLXArray, ids: MLXArray,
+        _ p: TrackPLE, residual: MLXArray, pendingOut: MLXArray?,
+        pendingInject: MLXArray?, preInjectScale: MLXArray, tile: Bool, ids: MLXArray,
         evaluation: CBv2RecurrentStateEvaluation, offset: Int, capture: Bool
     ) -> PLEForwardResult {
-        let B = stream.dim(0), S = stream.dim(1)
+        let B = residual.dim(0), S = residual.dim(1)
         precondition(B == 1)
         let wide = hcCount * hidden
         let contextLength = max(1, p.dilation - 1)
         let state = evaluation.inputState(modelLayerIndex: p.stateLayerIndex)
+        var builtStream: MLXArray? = nil
+        func preStream() -> MLXArray {
+            if let s = builtStream { return s }
+            let s = self.injectNorm(
+                residual: residual, out: pendingOut, inject: pendingInject,
+                scale: preInjectScale, tile: tile).stream
+            builtStream = s
+            return s
+        }
         // Device-side context (prefill windows and the device row source).
         func devicePrevious() -> MLXArray {
             (state?.ssm
@@ -917,7 +936,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 .asType(ids.dtype)
         }
         let convState =
-            state?.conv ?? MLXArray.zeros([1, p.stateLength, wide], dtype: stream.dtype)
+            state?.conv ?? MLXArray.zeros([1, p.stateLength, wide], dtype: residual.dtype)
 
         let embedded: MLXArray
         // Host history for the decode/verify windows: the ids are hashed on the
@@ -952,25 +971,46 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             let gid = p.embedding.hostRowIds(history: [history], newCount: S)
             let rows = host.rows(globalIds: gid, shape: [B, S, (cfg.ngramSize - 1) * cfg.headsPerNGram])
-            embedded = rows.reshaped(B, S, -1).asType(stream.dtype)
+            embedded = rows.reshaped(B, S, -1).asType(residual.dtype)
             hostHistory = history
         } else {
             TrackPleContextMirror.invalidate()
-            embedded = p.embedding(ids, previousContext: devicePrevious()).asType(stream.dtype)
+            embedded = p.embedding(ids, previousContext: devicePrevious()).asType(residual.dtype)
         }
         // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
         // every other shape takes the three-launch PLE block below.
         let keyFlat = p.keyProj.apply(embedded)
         let value = p.valueProj.apply(embedded)
-        let fusedResidual = S == 1 && !capture && stream.dtype == .bfloat16
+        let fusedResidual = S == 1 && !capture && residual.dtype == .bfloat16
             && StreamOrDevice.default.stream === Stream.gpu
         let full: MLXArray
         let output: MLXArray
         let residualAdded: Bool
-        if S == 1, TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
-            convState.shape == [1, 9, wide], convState.dtype == stream.dtype,
+        var foldedInject = false
+        // MLXFAST-PLEINJECT: the one-token fold. Eligibility is exactly the
+        // fused branch's own guards plus the inject's inputs: no tiling (the
+        // fold reads the materialized [1,1,W] residual), a non-nil block output
+        // and inject weight, and the pinned PLE geometry. When any guard fails,
+        // `preStream()` rebuilds today's injectNorm stream and the original
+        // branches run unchanged.
+        let foldEligible = fusedResidual && !tile && pendingOut != nil && pendingInject != nil
+            && residual.shape == [1, 1, wide]
+            && TrackPLEFusion.supports(p, stream: residual, hidden: hidden, hcCount: hcCount)
+            && convState.shape == [1, 9, wide] && convState.dtype == residual.dtype
+        if foldEligible, let out = pendingOut, let inj = pendingInject,
+            let result = TrackPLEFusion.forwardProjectedInjected(
+                p, key: keyFlat, value: value, residual: residual, out: out, inject: inj,
+                convState: convState, eps: eps)
+        {
+            full = result.full
+            output = result.output
+            residualAdded = true
+            foldedInject = true
+        } else if S == 1,
+            TrackPLEFusion.supports(p, stream: preStream(), hidden: hidden, hcCount: hcCount),
+            convState.shape == [1, 9, wide], convState.dtype == residual.dtype,
             let result = TrackPLEFusion.forwardProjected(
-                p, key: keyFlat, value: value, stream: stream, convState: convState,
+                p, key: keyFlat, value: value, stream: preStream(), convState: convState,
                 eps: eps, fusedResidual: fusedResidual)
         {
             full = result.full
@@ -981,7 +1021,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // rejects the fused helper; do not run either GEMV a second time.
             // norm_key * norm_query, then MLX's own reduction over the last axis.
             let prod = TrackFastPLEKernels.prod(
-                keyFlat: keyFlat, stream: stream, kScale: p.normKeyScale, qScale: p.normQueryScale,
+                keyFlat: keyFlat, stream: preStream(), kScale: p.normKeyScale, qScale: p.normQueryScale,
                 hcCount: hcCount, hidden: hidden, eps: eps)
             let dot = prod.reshaped(B, S, hcCount, hidden).sum(axis: -1, keepDims: true)
             // The two scalars the reference's `/` and `maximum` build, built the
@@ -1032,7 +1072,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } catch {
             preconditionFailure("TrackFastModel: PLE stage failed: \(error)")
         }
-        return PLEForwardResult(output: output, residualAdded: residualAdded)
+        return PLEForwardResult(
+            output: output, residualAdded: residualAdded,
+            injectedStream: foldedInject ? nil : builtStream)
     }
 
     private func injectNorm(
@@ -1077,17 +1119,29 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         for layer in layers {
             var normed: MLXArray
             if let ple = layer.ple {
-                // Materialize the stream, add the PLE block, then norm.
-                (stream, _) = injectNorm(
-                    residual: residual, out: pendingOut, inject: pendingInject,
-                    scale: layer.attnHC.normScaleQ,
-                    tile: tile)
+                // MLXFAST-PLEINJECT: the pre-PLE inject now belongs to
+                // pleForward. On the one-token path the fused PLE kernel
+                // consumes residual + out * inject itself, so the injectNorm
+                // launch that used to materialize `stream` here is gone;
+                // every other path builds that same stream inside pleForward.
                 let pleResult = pleForward(
-                    ple, stream: stream, ids: ids, evaluation: evaluation,
+                    ple, residual: residual, pendingOut: pendingOut,
+                    pendingInject: pendingInject, preInjectScale: layer.attnHC.normScaleQ,
+                    tile: tile, ids: ids, evaluation: evaluation,
                     offset: offset, capture: capture)
-                stream = pleResult.residualAdded ? pleResult.output : stream + pleResult.output
+                let prePle: MLXArray
+                if pleResult.residualAdded {
+                    prePle = pleResult.output
+                } else {
+                    // Non-folded paths always report their materialized stream;
+                    // the ?? rebuilds today's exact stream if that ever fails.
+                    prePle = (pleResult.injectedStream ?? injectNorm(
+                        residual: residual, out: pendingOut, inject: pendingInject,
+                        scale: layer.attnHC.normScaleQ, tile: tile).stream)
+                        + pleResult.output
+                }
                 (stream, normed) = injectNorm(
-                    residual: stream, out: nil, inject: nil,
+                    residual: prePle, out: nil, inject: nil,
                     scale: layer.attnHC.normScaleQ,
                     tile: false)
             } else {

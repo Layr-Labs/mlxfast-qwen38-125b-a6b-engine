@@ -149,6 +149,72 @@ enum TrackPLEFusion {
         return replaceOnce(withoutGated, old, new)
     }()
 
+    // MLXFAST-PLEINJECT: one-token pre-PLE inject fold. The narrow
+    // `track_inject_norm` launch before PLE writes a `stream` whose only
+    // reader on the one-token path is this kernel's `query` parameter (its
+    // `normed` output is discarded at the call site), so the inject is
+    // performed here instead and that launch disappears. Each substitution
+    // repeats the exact injectNorm InT sequence --
+    // `InT sp = out[col] * inj_t; r = residual[base] + sp` --
+    // at the three places the fused body used to reload `query`; the value is
+    // the same BF16, so the query norm, the dot/gate and `added` are
+    // bit-identical. Launch geometry, buffers and every other instruction are
+    // unchanged from `fusedPrepareSource`.
+    private static let injectedFusedPrepareSource: String = {
+        var s = fusedPrepareSource
+        func sub(_ old: String, _ new: String) {
+            let pieces = s.components(separatedBy: old)
+            precondition(pieces.count == 2, "PLE inject anchor must be unique")
+            s = pieces[0] + new + pieces[1]
+        }
+        sub(
+            "const uint base = hc * H + d;\n",
+            "const uint base = hc * H + d;\n"
+                + "const InT inj_t = inject[hc];\n"
+                + "auto injected = [&](uint i) -> InT {\n"
+                + "    const InT sp = out[d + i] * inj_t;\n"
+                + "    return residual[base + i] + sp;\n"
+                + "};\n")
+        sub("float q = float(query[base + i]);", "float q = float(injected(i));")
+        sub(
+            "InT q = InT(float(query[base + i]) * iq);",
+            "InT q = InT(float(injected(i)) * iq);")
+        sub("added[c] = query[c] + pleDelta;", "added[c] = injected(i) + pleDelta;")
+        precondition(!s.contains("query["), "PLE inject: raw query reads must be gone")
+        return s
+    }()
+
+    static let injectedFusedPrepareKernel = MLXFast.metalKernel(
+        name: "track_ple_prepare_conv_fused2_residual_injected",
+        inputNames: ["key", "residual", "out", "inject", "value", "keyScale", "queryScale",
+            "convScale", "convState", "convW"],
+        outputNames: ["full", "added"], source: injectedFusedPrepareSource,
+        header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
+
+    /// The fused prepare/convolution/residual branch with the pre-PLE inject
+    /// folded in. Returns nil under exactly `forwardProjected`'s inner guards,
+    /// so the caller falls back to materializing `stream` with `injectNorm`
+    /// first; on success the caller never builds that stream at all.
+    static func forwardProjectedInjected(
+        _ p: TrackPLE, key: MLXArray, value: MLXArray, residual: MLXArray,
+        out: MLXArray, inject: MLXArray, convState: MLXArray, eps: Float
+    ) -> (full: MLXArray, output: MLXArray)? {
+        guard residual.shape == [1, 1, 10240], out.shape == [1, 1, 2560],
+            inject.shape == [1, 1, 4], key.shape == [1, 1, 10240],
+            value.shape == [1, 1, 2560], key.dtype == residual.dtype,
+            value.dtype == residual.dtype, out.dtype == residual.dtype,
+            inject.dtype == residual.dtype
+        else { return nil }
+        let r = injectedFusedPrepareKernel(
+            [key, residual, out, inject, value, p.normKeyScale, p.normQueryScale,
+                p.normConvScale, convState, p.convW],
+            template: prepareTemplates(dtype: residual.dtype, eps: eps),
+            grid: (640, 4, 1), threadGroup: (640, 1, 1),
+            outputShapes: [[1, 10, 10240], [1, 1, 10240]],
+            outputDTypes: [residual.dtype, residual.dtype])
+        return (r[0], r[1])
+    }
+
     static let convolutionSource = """
         // MLXFAST-PLEFUSE2: preserve the S=1 dilated implicit-GEMM dispatch:
         // group=(32,1,4), grid of groups=(1,1,W), channel=group.z.
