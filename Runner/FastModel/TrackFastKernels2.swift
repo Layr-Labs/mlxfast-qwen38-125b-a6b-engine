@@ -354,7 +354,7 @@ extension TrackFastKernels {
     /// qkv [B,S,QW] rows: q(HQ*D) | gate(HQ*D) | k(HK*D) | v(HK*D) | ...
     /// cos, sin [S, ROT] bf16 (the reference's tables cast to the activation dtype)
     ///   -> q [B,HQ,S,D], k [B,HK,S,D], v [B,HK,S,D]
-    /// grid (D/4, HQ + 2*HK, B*S), threadgroup (D/4, 1, 1)   (D = 256 -> 64 threads, 2 simdgroups)
+    /// grid (D/4, HQ + HK, B*S), threadgroup (D/4, 1, 1)   (D = 256 -> 64 threads, 2 simdgroups)
     static let attnPrepSource = """
         constexpr int N_READS = 4;
         const uint lid = thread_position_in_threadgroup.x;
@@ -367,18 +367,25 @@ extension TrackFastKernels {
         threadgroup float local_sums[32];
         threadgroup InT vec[D];
 
+        // MLXFAST-KVONEGROUP: a K threadgroup relocates its own V row as well,
+        // so the launch carries HQ + HK threadgroups instead of HQ + 2*HK. The
+        // V rows are a pure layout relocation with no arithmetic, and the copy
+        // is issued before the q/k reduction so its stores retire under the
+        // reduction's barrier latency instead of in a threadgroup of their own.
         const bool isQ = h < HQ;
-        const bool isV = h >= HQ + HK;
         uint hh, src;
-        if (isQ) { hh = h; src = row * QW + h * D; }
-        else if (!isV) { hh = h - HQ; src = row * QW + 2 * HQ * D + hh * D; }
-        else { hh = h - HQ - HK; src = row * QW + 2 * HQ * D + HK * D + hh * D; }
-        if (isV) {
+        if (isQ) {
+            hh = h;
+            src = row * QW + h * D;
+        } else {
+            hh = h - HQ;
+            src = row * QW + 2 * HQ * D + hh * D;
+            const uint vsrc = src + HK * D;
+            device InT* vdst = vout + ((b * HK + hh) * S + s) * D;
             for (int i = 0; i < N_READS; ++i) {
                 const uint d = lid * N_READS + i;
-                vout[((b * HK + hh) * S + s) * D + d] = qkv[src + d];
+                vdst[d] = qkv[vsrc + d];
             }
-            return;
         }
         float thread_x[N_READS];
         float acc = 0.0f;
@@ -443,7 +450,7 @@ extension TrackFastKernels {
                 ("InT", qkv.dtype), ("D", headDim), ("HQ", heads), ("HK", kvHeads), ("S", S),
                 ("QW", qkv.dim(2)), ("ROT", rotaryDims), ("EPS_BITS", Int(eps.bitPattern)),
             ],
-            grid: (headDim / 4, heads + 2 * kvHeads, B * S), threadGroup: (headDim / 4, 1, 1),
+            grid: (headDim / 4, heads + kvHeads, B * S), threadGroup: (headDim / 4, 1, 1),
             outputShapes: [[B, heads, S, headDim], [B, kvHeads, S, headDim], [B, kvHeads, S, headDim]],
             outputDTypes: [qkv.dtype, qkv.dtype, qkv.dtype])
         return (outs[0], outs[1], outs[2])
