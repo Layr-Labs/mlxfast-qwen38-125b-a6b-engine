@@ -109,7 +109,20 @@ enum TrackFastGDNDecode {
             } else {
                 for (int i = 0; i < 4; ++i) { v_shared[lane * 4 + i] = static_cast<InT>(thread_x[i]); }
             }
-            if (sg == 2 || hv_idx % (Hv / Hk) == 0) {
+        }
+        // The convolution tail only reads inputs. Use waiting SIMD groups
+        // so q/k normalization does not serialize these stores before the barrier.
+        if (sg >= 3 && sg < 6) {
+            const uint copy_sg = sg - 3;
+            const uint vec = copy_sg == 0 ? hk_idx
+                : (copy_sg == 1 ? Hk + hk_idx : 2 * Hk + hv_idx);
+            const device InT* proj_b = proj + b_idx * PW;
+            const device InT* cst_b = conv_state + b_idx * KM1 * CONV_DIM;
+            auto win = [&](int r, uint ch) -> float {
+                if (r < KM1) { return static_cast<float>(cst_b[(uint)(r * CONV_DIM) + ch]); }
+                return static_cast<float>(proj_b[(uint)((r - KM1) * PW) + ch]);
+            };
+            if (copy_sg == 2 || hv_idx % (Hv / Hk) == 0) {
                 device InT* o_conv = conv_out + b_idx * KM1 * CONV_DIM;
                 for (int i = 0; i < 4; ++i) {
                     const uint ch = vec * 128 + lane * 4 + i;
@@ -250,3 +263,5 @@ enum TrackFastGDNDecode {
         }
         """#
 }
+private let gauntletRedraw_6a204a14_20260921T190824Z: Int = 0
+private let gauntletRedraw_618508b8_20260922T024727Z: Int = 0
