@@ -71,11 +71,13 @@ private final class TrackGDNJournalEntry {
     weak var state: MLXArray?
     let nextOffset: Int
     let array: MLXArray
+    let depth: Int
 
-    init(state: MLXArray, nextOffset: Int, array: MLXArray) {
+    init(state: MLXArray, nextOffset: Int, array: MLXArray, depth: Int) {
         self.state = state
         self.nextOffset = nextOffset
         self.array = array
+        self.depth = depth
     }
 }
 
@@ -287,6 +289,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let eps: Float
     private let injectNormReplay: @Sendable ([MLXArray]) -> [MLXArray]
     private var gdnJournals: [ObjectIdentifier: TrackGDNJournalEntry] = [:]
+    // MLXFAST-REDRAW-GDN-ROPETAB: independent GDN+RoPE candidate redraw marker.
+    /// MLXFAST-ROPETAB: cached absolute-position rope rows, built once.
+    private var ropeTable: (cos: MLXArray, sin: MLXArray, count: Int, dtype: DType)? = nil
+    /// Bound on the cached table so a large indexer budget cannot turn into a
+    /// large resident allocation; past it the reference construction is used.
+    private static let ropeTableMaxRows = 16384
     let rotaryDims: Int
     let rotary: Qwen4ExpRotary
     let indexerBudget: Int
@@ -639,22 +647,25 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let journalKey = ObjectIdentifier(ssm)
         let entry = gdnJournals[journalKey]
         let pendingJournal: MLXArray?
+        let pendingDepth: Int
         if !capture, let entry, entry.state === ssm, entry.nextOffset == offset {
             pendingJournal = entry.array
+            pendingDepth = entry.depth
         } else {
             gdnJournals.removeValue(forKey: journalKey)
             pendingJournal = nil
+            pendingDepth = 0
         }
         if let fused = TrackFastGDNDecode.apply(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
             dtBias: g.dtBias, stateIn: ssm, normW: g.normW,
-            pendingJournal: pendingJournal, zOffset: g.zOffset, eps: 1e-6,
-            capture: capture, geometry: geo)
+            pendingJournal: pendingJournal, pendingDepth: pendingDepth,
+            zOffset: g.zOffset, eps: 1e-6, capture: capture, geometry: geo)
         {
             (gated, convOut, stateOut) = (fused.gated, fused.convOut, fused.stateOut)
             if let journal = fused.journal {
                 gdnJournals[journalKey] = TrackGDNJournalEntry(
-                    state: ssm, nextOffset: offset + S, array: journal)
+                    state: ssm, nextOffset: offset + S, array: journal, depth: fused.journalDepth)
             } else {
                 gdnJournals.removeValue(forKey: journalKey)
             }
@@ -688,7 +699,28 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
+    /// MLXFAST-ROPETAB: the reference builds these rows from the position
+    /// vector on every forward, so a decode step pays a trigonometric
+    /// evaluation, a dtype cast and a reshape before any layer can start, for
+    /// one row it will use once. The rows are a pure function of the absolute
+    /// position, and the op that produces them is elementwise in the position,
+    /// so row `p` of a table built over `0 ..< cap` is bit-identical to the
+    /// single row built for `p` alone. The table is therefore built once, up to
+    /// a bounded capacity, and later forwards slice it. A request past the
+    /// cached capacity falls back to the reference construction.
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
+        if let t = ropeTable, t.dtype == dtype, offset >= 0, offset + count <= t.count {
+            return (t.cos[offset ..< (offset + count)], t.sin[offset ..< (offset + count)])
+        }
+        let cap = min(max(indexerBudget, 1), Self.ropeTableMaxRows)
+        if ropeTable == nil, offset + count <= cap {
+            let (fc, fs) = rotary.cosSin(qwen4ExpPositions(offset: 0, count: cap))
+            let c = fc.asType(dtype).reshaped(cap, rotaryDims)
+            let s = fs.asType(dtype).reshaped(cap, rotaryDims)
+            eval(c, s)
+            ropeTable = (cos: c, sin: s, count: cap, dtype: dtype)
+            return (c[offset ..< (offset + count)], s[offset ..< (offset + count)])
+        }
         let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
         return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
     }
