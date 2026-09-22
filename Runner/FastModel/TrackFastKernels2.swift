@@ -304,8 +304,6 @@ extension TrackFastKernels {
         const uint lid = thread_position_in_threadgroup.x;
         const uint hv = thread_position_in_grid.y;
         const uint row = thread_position_in_grid.z;
-        const uint lane = thread_index_in_simdgroup;
-        threadgroup float local_sums[32];
         const uint ybase = (row * Hv + hv) * Dv;
         float thread_x[N_READS];
         float acc = 0.0f;
@@ -313,11 +311,12 @@ extension TrackFastKernels {
             thread_x[i] = static_cast<float>(y[ybase + lid * N_READS + i]);
             acc += thread_x[i] * thread_x[i];
         }
+        // MLXFAST-FOLD1: this threadgroup is 32 threads, i.e. ONE simdgroup, so
+        // `acc` after the lane reduction is already the whole Dv-row sum in every
+        // lane. The publish/zero/barrier/refold below it re-derived that same
+        // value as simd_sum({acc, 0 x 31}); adding exact zeros cannot change a
+        // finite float, so the fold is dropped, not reordered.
         acc = simd_sum(acc);
-        if (lane >= 1) { local_sums[lane] = 0; }
-        if (lane == 0) { local_sums[0] = acc; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        acc = simd_sum(local_sums[lane]);
         const float inv_mean = metal::precise::rsqrt(acc / (float)Dv + as_type<float>((uint)EPS_BITS));
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
@@ -388,10 +387,20 @@ extension TrackFastKernels {
         }
         acc = simd_sum(acc);
         constexpr uint simd_groups = (D + 32 * N_READS - 1) / (32 * N_READS);
-        if (sg == 0 && lane >= simd_groups) { local_sums[lane] = 0; }
+        // MLXFAST-FOLD2: at most two simdgroups own this row, so the cross-group
+        // fold has at most two non-zero addends and the remaining lanes fed the
+        // 32-lane simd_sum exact zeros. Reading the two partials directly is the
+        // same float sum (addition of the same two finite values), with the
+        // zero-fill store and the five shuffle steps removed.
+        if (simd_groups > 2 && sg == 0 && lane >= simd_groups) { local_sums[lane] = 0; }
         if (lane == 0) { local_sums[sg] = acc; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        acc = simd_sum(local_sums[lane]);
+        if (simd_groups <= 2) {
+            acc = local_sums[0];
+            if (simd_groups > 1) { acc += local_sums[1]; }
+        } else {
+            acc = simd_sum(local_sums[lane]);
+        }
         const float inv_mean = metal::precise::rsqrt(acc / (float)D + as_type<float>((uint)EPS_BITS));
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
