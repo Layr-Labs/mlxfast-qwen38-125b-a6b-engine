@@ -245,6 +245,9 @@ struct TrackPLE {
     let embedding: Qwen4ExpNGramEmbedding
     let keyProj: TrackProj
     let valueProj: TrackProj
+    /// Row-concatenated key+value projection, built once. A nil `fused`
+    /// inside means the pair keeps its two launches.
+    let kvProj: TrackMultiProj
     let normKeyScale: MLXArray
     let normQueryScale: MLXArray
     let normConvScale: MLXArray
@@ -497,10 +500,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         -> TrackPLE
     {
         let convW = ple.trackChild("conv1d").trackArray("weight")
+        let keyProj = TrackProj(ple.trackChild("key_proj"))
+        let valueProj = TrackProj(ple.trackChild("value_proj"))
         return TrackPLE(
             embedding: ple.pleEmbedding,
-            keyProj: TrackProj(ple.trackChild("key_proj")),
-            valueProj: TrackProj(ple.trackChild("value_proj")),
+            keyProj: keyProj,
+            valueProj: valueProj,
+            // Fused iff the existing helper accepts the pair (both quantized
+            // with one geometry); otherwise fused is nil and the forward keeps
+            // the two launches.
+            kvProj: TrackMultiProj([keyProj, valueProj]),
             normKeyScale: ple.trackChild("norm_key").trackArray("weight"),
             normQueryScale: ple.trackChild("norm_query").trackArray("weight"),
             normConvScale: ple.trackChild("norm_conv").trackArray("weight"),
@@ -960,8 +969,28 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         // MLXFAST-PLEFUSE2: two unchanged GEMVs + prepare + convolution at S=1;
         // every other shape takes the three-launch PLE block below.
-        let keyFlat = p.keyProj.apply(embedded)
-        let value = p.valueProj.apply(embedded)
+        // Fused decode path: one GEMM over the concatenated rows, then split.
+        // Decode only (S == 1); any guard failure keeps the two launches.
+        // No timing claim is made here.
+        let keyFlat: MLXArray
+        let value: MLXArray
+        if S == 1, embedded.dim(1) == 1, let kvFused = p.kvProj.fused,
+            kvFused.rows == p.keyProj.rows + p.valueProj.rows
+        {
+            let keyRows = p.keyProj.rows
+            let valueRows = p.valueProj.rows
+            let kv = kvFused.apply(embedded)  // [B, 1, keyRows + valueRows]
+            if kv.dim(-1) == keyRows + valueRows, keyRows > 0, valueRows > 0 {
+                keyFlat = kv[.ellipsis, 0 ..< keyRows]
+                value = kv[.ellipsis, keyRows ..< (keyRows + valueRows)]
+            } else {
+                keyFlat = p.keyProj.apply(embedded)
+                value = p.valueProj.apply(embedded)
+            }
+        } else {
+            keyFlat = p.keyProj.apply(embedded)
+            value = p.valueProj.apply(embedded)
+        }
         let fusedResidual = S == 1 && !capture && stream.dtype == .bfloat16
             && StreamOrDevice.default.stream === Stream.gpu
         let full: MLXArray
