@@ -21,7 +21,7 @@ enum TrackPrefillIndirect {
     /// weight streams, one activation staging, the product in the epilogue);
     /// `kernel` below serves the down projection.
     private static let gateUpKernel = MLXFast.metalKernel(
-        name: "track_prefill_indirect_gate_up",
+        name: "track_prefill_indirect_gate_up_pair_reuse",
         inputNames: ["x", "w0", "scales0", "biases0", "w1", "scales1", "biases1", "indices", "token_rows", "tiles"],
         outputNames: ["y"], source: sourceGU.replacingOccurrences(of: "y0, y1, N, K", with: "y, y, N, K"),
         header: metalHeader, ensureRowContiguous: true)
@@ -46,15 +46,18 @@ enum TrackPrefillIndirect {
 
     /// Every expert run of `r` rows takes `ceil(r / 32)` tiles, so the count is
     /// bounded by `rows / 32 + experts` for sorted ids over `experts` values.
-    static func maxTiles(rows: Int, experts: Int) -> Int {
-        (rows + tileRows - 1) / tileRows + experts
+    static func maxTiles(rows: Int, experts: Int, rowsPerTile: Int = 32) -> Int {
+        (rows + rowsPerTile - 1) / rowsPerTile + experts
     }
 
-    static func tileTable(sortedIDs: MLXArray, rows: Int, experts: Int) -> MLXArray {
-        let maxT = maxTiles(rows: rows, experts: experts)
+    static func tileTable(
+        sortedIDs: MLXArray, rows: Int, experts: Int, rowsPerTile: Int = 32
+    ) -> MLXArray {
+        precondition(rowsPerTile == 32 || rowsPerTile == 64)
+        let maxT = maxTiles(rows: rows, experts: experts, rowsPerTile: rowsPerTile)
         return tileKernel(
             [sortedIDs],
-            template: [("R", rows), ("E", experts), ("BM", tileRows), ("MAXT", maxT), ("TG", tileThreads)],
+            template: [("R", rows), ("E", experts), ("BM", rowsPerTile), ("MAXT", maxT), ("TG", tileThreads)],
             grid: (tileThreads, 1, 1), threadGroup: (tileThreads, 1, 1),
             outputShapes: [[2 * maxT]], outputDTypes: [.uint32])[0]
     }
@@ -96,10 +99,13 @@ enum TrackPrefillIndirect {
         }
         let rows = indices.size
         let experts = g.w.dim(0)
+        // Down keeps the original 32-row ranges. Gate/up can share one
+        // weight stage between two adjacent 32-row ranges of the same expert.
         let tiles = tileTable(sortedIDs: sortedIDs, rows: rows, experts: experts)
-        let maxT = maxTiles(rows: rows, experts: experts)
+        let gateTiles = tileTable(sortedIDs: sortedIDs, rows: rows, experts: experts, rowsPerTile: 64)
+        let maxT = maxTiles(rows: rows, experts: experts, rowsPerTile: 64)
         let activated = gateUpKernel(
-            [x, g.w, g.s, g.b, u.w, u.s, u.b, sortedIDs, tokenRows, tiles],
+            [x, g.w, g.s, g.b, u.w, u.s, u.b, sortedIDs, tokenRows, gateTiles],
             template: [("T", x.dtype), ("N", 640), ("K", 2560), ("SILU", true)],
             grid: (10 * 32, maxT * 2, 2),
             threadGroup: (32, 2, 2),
@@ -131,11 +137,20 @@ enum TrackPrefillIndirect {
     static let sourceGU = #"""
         alignas(16) threadgroup T Ws0[64 * 72];
         alignas(16) threadgroup T Ws1[64 * 72];
-        alignas(16) threadgroup T As[32 * 72];
-        track_prefill_indirect_gu<T, 32, 4, 32, 64, 64, 2, 2, true, SILU, N>(
-            x, w0, scales0, biases0, w1, scales1, biases1, indices, token_rows, tiles,
-            y0, y1, N, K, Ws0, Ws1, As, threadgroup_position_in_grid,
-            simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+        alignas(16) threadgroup T As[64 * 72];
+        const uint tile = threadgroup_position_in_grid.y;
+        const uint live_rows = tiles[2 * tile + 1] - tiles[2 * tile];
+        if (live_rows <= 32) {
+            track_prefill_indirect_gu<T, 32, 4, 32, 64, 64, 2, 2, true, SILU, N>(
+                x, w0, scales0, biases0, w1, scales1, biases1, indices, token_rows, tiles,
+                y0, y1, N, K, Ws0, Ws1, As, threadgroup_position_in_grid,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+        } else {
+            track_prefill_indirect_gu_pair<T, 32, 4, 64, 64, 64, 2, 2, true, SILU, N>(
+                x, w0, scales0, biases0, w1, scales1, biases1, indices, token_rows, tiles,
+                y0, y1, N, K, Ws0, Ws1, As, threadgroup_position_in_grid,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+        }
         """#
 
     static let downBlockN = 128
