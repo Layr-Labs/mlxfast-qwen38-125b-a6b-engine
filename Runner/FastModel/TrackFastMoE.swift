@@ -761,10 +761,104 @@ extension TrackFastMoEKernels {
         const uint row = threadgroup_position_in_grid.y;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
-        // Shared-expert gate (1 row, K = KD): one token routes to `qmv`'s small-N
-        // branch (simdgroup 0), two to eight to `qmv_wide`'s short tile, which
-        // folds K across the 8 slots of BOTH simdgroups.
-        if constexpr (HAS_GATE) {
+        static_assert(!(HAS_GATE && HAS_DENSE), "shared gate is quant or dense");
+        // Dense one-token partials (16 simdgroups) and the wide GEMV tile (8).
+        // Size 1 in the other specializations: those launches do not index it.
+        constexpr int DENSE_SCRATCH = HAS_DENSE ? 16 : 1;
+        threadgroup float dense_dot_smem[DENSE_SCRATCH];
+        threadgroup float dense_gemv_tgp[DENSE_SCRATCH];
+        // Shared-expert gate, one row, K = KD, pre-sigmoid.
+        // 4-bit: one token takes `qmv`'s small-N branch (simdgroup 0); two to
+        // eight take `qmv_wide`'s short tile across both simdgroups.
+        // Dense bf16: the weight stays dense. One token is `dot_product`
+        // (it 32, tg 512, 16 simdgroups, one block). Two to eight are `gemv`
+        // bm1/bn8/sm1/sn32/tn4, one token row per threadgroup. S >= 4 selects
+        // tm = 4 in that gemv; TM only stacks rows that never meet, so TM = 1
+        // on this row is the same products and the same BN sum.
+        if constexpr (HAS_DENSE) {
+            if constexpr (VPT == 1) {
+                // Simdgroup 15 owns K in [15360, 16384). The launch requires
+                // KD <= 15360, so that simdgroup's partial is 0 and the top-k
+                // walk below runs there while the other simdgroups dot.
+                if (sg != 15u) {
+                    constexpr int ITEMS_PER_THREAD = 32;
+                    constexpr int TG_SIZE = 512;
+                    constexpr int VEC = 16 / (int)sizeof(T);
+                    const device T* a = x + (size_t)row * (size_t)KD;
+                    const device T* b = wg;
+                    int start = (0 * TG_SIZE + (int)sg * 32) * ITEMS_PER_THREAD + (int)lane * VEC;
+                    float4 c = 0.0f;
+                    MLX_MTL_PRAGMA_UNROLL
+                    for (int i = 0; i < ITEMS_PER_THREAD; i += VEC) {
+                        int idx = start + i * ITEMS_PER_THREAD;
+                        if (idx + VEC <= KD) {
+                            MLX_MTL_PRAGMA_UNROLL
+                            for (int j = 0; j < VEC; j += 4) {
+                                c += float4(*reinterpret_cast<const device metal::vec<T, 4>*>(a + idx + j))
+                                    * float4(*reinterpret_cast<const device metal::vec<T, 4>*>(b + idx + j));
+                            }
+                        } else {
+                            MLX_MTL_PRAGMA_UNROLL
+                            for (int j = 0; j < VEC; ++j) {
+                                int nidx = idx + j;
+                                if (nidx < KD) {
+                                    c[j & 3] += float(a[nidx]) * float(b[nidx]);
+                                }
+                            }
+                        }
+                    }
+                    float sum = c[0] + c[1] + c[2] + c[3];
+                    sum = simd_sum(sum);
+                    if (lane == 0) { dense_dot_smem[sg] = sum; }
+                }
+            } else {
+                constexpr int TN = 4;
+                constexpr int BN = 8;
+                constexpr int SN = 32;
+                constexpr int blockN = BN * SN * TN;
+                const device T* mat = x + (size_t)row * (size_t)KD;
+                const device T* vec = wg;
+                float result = 0;
+                int bn = ((int)sg * SN + (int)lane) * TN;
+                constexpr int n_iter = KD / blockN;
+                constexpr int leftover = KD - n_iter * blockN;
+                for (int i = 0; i < n_iter; ++i) {
+                    float v_coeff[TN];
+                    T inter[TN];
+                    for (int tn = 0; tn < TN; tn++) { v_coeff[tn] = static_cast<float>(vec[bn + tn]); }
+                    for (int tn = 0; tn < TN; tn++) { inter[tn] = mat[bn + tn]; }
+                    for (int tn = 0; tn < TN; tn++) { result += static_cast<float>(inter[tn]) * v_coeff[tn]; }
+                    bn += blockN;
+                }
+                if (leftover > 0) {
+                    float v_coeff[TN];
+                    T inter[TN];
+                    if (bn + TN <= KD) {
+                        for (int tn = 0; tn < TN; tn++) {
+                            v_coeff[tn] = static_cast<float>(vec[bn + tn]);
+                            inter[tn] = mat[bn + tn];
+                        }
+                    } else {
+                        for (int tn = 0; tn < TN; tn++) {
+                            v_coeff[tn] = (bn + tn < KD) ? static_cast<float>(vec[bn + tn]) : 0;
+                            inter[tn] = (bn + tn < KD) ? mat[bn + tn] : static_cast<T>(0);
+                        }
+                    }
+                    for (int tn = 0; tn < TN; tn++) { result += static_cast<float>(inter[tn]) * v_coeff[tn]; }
+                }
+                for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+                    result += simd_shuffle_down(result, sn);
+                }
+                // Lane 0 holds the simdgroup sum. A uniform barrier, then the
+                // same sequential BN add gemv does on simdgroup 0 lane 0.
+                if (lane == 0) { dense_gemv_tgp[sg * 2] = result; }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg == 0 && lane == 0) {
+                    for (int sgn = 1; sgn < BN; ++sgn) { result += dense_gemv_tgp[sgn * 2]; }
+                    gate[row] = static_cast<T>(result);
+                }
+            }
+        } else if constexpr (HAS_GATE) {
             const device T* xr = x + (size_t)row * (size_t)KD;
             if constexpr (VPT == 1) {
                 track_inject_qmv<T, GS, BITS, KD, 1, 4>(wg, sgw, bgw, xr, gate + row, sg, lane);
@@ -778,7 +872,7 @@ extension TrackFastMoEKernels {
         // MLXFAST-ROUTEREG: the walk's winners come from a simd_max/simd_min
         // pair, so logit and index are already broadcast across the walk's own
         // simdgroup. Normalize them there and skip the threadgroup round trip.
-        constexpr bool REGISTER_RESULTS = VPT != 1 || HAS_GATE;
+        constexpr bool REGISTER_RESULTS = VPT != 1 || HAS_GATE || HAS_DENSE;
         constexpr int N_READS = 4;
         float ld[N_READS];
         uint selected[N_READS];
@@ -794,7 +888,9 @@ extension TrackFastMoEKernels {
         // the walk on simdgroup 1 instead so the two latency chains overlap; the
         // walk's arithmetic, tie rule and the softmax below are untouched. Wide
         // windows keep the gate on both simdgroups and the walk on simdgroup 0.
-        constexpr uint SEL_SG = (VPT == 1) ? 1u : 0u;
+        // Dense one-token: simdgroup 1 owns a real slice of K, so the walk
+        // stays on simdgroup 15 (idle under the KD <= 15360 launch).
+        constexpr uint SEL_SG = (HAS_DENSE && VPT == 1) ? 15u : ((VPT == 1) ? 1u : 0u);
         if (sg == SEL_SG) {
         const device float* lr = logits + (size_t)row * (size_t)E;
         // each lane owns E_PER experts: e = lane + 32 * j (strided so a tie at
@@ -822,6 +918,17 @@ extension TrackFastMoEKernels {
             } else if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
             if (gidx == (uint)(lane + 32 * bj) && bj >= 0) { taken[bj] = true; }
         }
+        }
+        if constexpr (HAS_DENSE && VPT == 1) {
+            if (sg == 15u && lane == 0) { dense_dot_smem[15] = 0; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // `dot_product`'s threadgroup close: lanes 0..15 of simdgroup 0,
+            // `simd_sum`, lane 0 writes the bf16 logit.
+            if (sg == 0u && lane < 16u) {
+                float red = dense_dot_smem[lane];
+                red = simd_sum(red);
+                if (lane == 0u) { gate[row] = static_cast<T>(red); }
+            }
         }
         if constexpr (REGISTER_RESULTS) {
             if (sg != SEL_SG) { return; }
@@ -869,20 +976,34 @@ extension TrackFastMoEKernels {
         source: routeSource, header: TrackFastKernels.mixerHeadHeader + wideDecls, ensureRowContiguous: true)
 
     /// logits f32 [..., E] -> (idx uint32 [..., K], w f32 [..., K])
-    /// Also the shared-expert gate logit per row: x [..., KD] x sharedGate [1, KD] -> gate [...] (pre-sigmoid).
-    static func route(logits: MLXArray, x: MLXArray, sharedGate: TrackQuantWeight?, topK: Int)
-        -> (idx: MLXArray, w: MLXArray, gate: MLXArray)
-    {
+    /// Also the shared-expert gate logit per row, pre-sigmoid.
+    /// `sharedGate` is the 4-bit row. `denseGate` is the bias-free dense row
+    /// (this checkpoint's bf16 Linear); it is not re-quantized.
+    static func route(
+        logits: MLXArray, x: MLXArray, sharedGate: TrackQuantWeight?, denseGate: MLXArray? = nil,
+        topK: Int
+    ) -> (idx: MLXArray, w: MLXArray, gate: MLXArray) {
+        precondition(sharedGate == nil || denseGate == nil)
         precondition(logits.dtype == .float32 && (sharedGate == nil || (sharedGate!.rows == 1 && sharedGate!.bits == 4)))
         let g = sharedGate
         let E = logits.dim(-1), KD = x.dim(-1)
         let lead = Array(logits.shape.dropLast())
         let R = lead.reduce(1, *)
+        if let w = denseGate {
+            precondition(w.dtype == x.dtype && w.dim(0) == 1 && w.dim(1) == KD)
+            precondition(R >= 1 && R <= 8 && KD <= 15 * 1024 && (R == 1 || KD >= 16 * R))
+        }
         precondition(topK <= 32 && topK <= E && R >= 1 && (g == nil || R <= 8) && KD % 256 == 0)
-        let simdgroups = g == nil ? 1 : 2
+        // One token, dense: 16 simdgroups, the `dot_product` threadgroup.
+        // Two to eight, dense: 8 simdgroups, the N=1 gemv tile. Quantized: 2.
+        let simdgroups = denseGate != nil ? (R == 1 ? 16 : 8) : (g == nil ? 1 : 2)
         let outs = (R == 1 ? routeKernel1 : routeKernel)(
-            [logits.reshaped(R, E), x.reshaped(R, KD), g?.weight ?? x, g?.scales ?? x, g?.biases ?? x],
-            template: [("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32), ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R), ("HAS_GATE", g != nil)],
+            [logits.reshaped(R, E), x.reshaped(R, KD), g?.weight ?? denseGate ?? x, g?.scales ?? x, g?.biases ?? x],
+            template: [
+                ("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32),
+                ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R),
+                ("HAS_GATE", g != nil), ("HAS_DENSE", denseGate != nil),
+            ],
             grid: (32, R * simdgroups, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[R, topK], [R, topK], [R]], outputDTypes: [.uint32, .float32, x.dtype])
         return (outs[0].reshaped(lead + [topK]), outs[1].reshaped(lead + [topK]), outs[2].reshaped(lead))
