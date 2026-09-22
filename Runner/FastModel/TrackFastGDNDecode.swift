@@ -119,13 +119,18 @@ enum TrackFastGDNDecode {
                 }
             }
         }
-        if (sg == 0 && lane == 0) {
+        // Simdgroups 0-2 own the q/k/v convolution windows; the gate scalars
+        // read only proj, dt_bias and neg_exp_alog, so two otherwise idle
+        // simdgroups compute them concurrently (same ops, same bits).
+        if (sg == 3 && lane == 0) {
             const device InT* row = proj + b_idx * PW;
-            const InT b_raw = row[B_OFF + hv_idx];
-            gb_shared[1] = static_cast<float>(mlx_sigmoid(b_raw));
             const InT ax = row[A_OFF + hv_idx] + dt_bias[hv_idx];
             const InT sp = mlx_logaddexp0(ax);
             gb_shared[0] = metal::precise::exp(neg_exp_alog[hv_idx] * sp);
+        } else if (sg == 4 && lane == 0) {
+            const device InT* row = proj + b_idx * PW;
+            const InT b_raw = row[B_OFF + hv_idx];
+            gb_shared[1] = static_cast<float>(mlx_sigmoid(b_raw));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const threadgroup InT* q_ = q_shared;
