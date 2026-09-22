@@ -36,11 +36,19 @@ enum TrackFastMixerSplitK {
                 for (int r = 0; r < R; ++r) { scratch[(sg * R + r) * 32 + lane] = partial[r]; }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (sg == 0) {
+            // MLXFAST-FOLDSG: row r's partial fold is owned by simdgroup r
+            // instead of running every row on simdgroup 0. A row's fold is a
+            // serial ascending walk over its own scratch slots, so moving it to
+            // another simdgroup keeps the block order, the per-lane values and
+            // the closing simd_sum identical; the R chains now issue from R
+            // instruction streams while the remaining groups still retire.
+            static_assert(R <= SPLIT, "one simdgroup per folded row");
+            if (int(sg) < R) {
+                const int r = int(sg);
                 for (int b = 0; b < (ORDERED ? NB : SPLIT); ++b) {
-                    for (int r = 0; r < R; ++r) { result[r] += scratch[(b * R + r) * 32 + lane]; }
+                    result[r] += scratch[(b * R + r) * 32 + lane];
                 }
-                for (int r = 0; r < R; ++r) { result[r] = simd_sum(result[r]); }
+                result[r] = simd_sum(result[r]);
             }
         }
         """#
@@ -56,12 +64,11 @@ enum TrackFastMixerSplitK {
             float r[RPS];
             research_split_qmv<T, K, 16, RPS, SPLIT, ORDERED>(
                 wd, sd, bd, x, tile * RPS, sg, lane, scratch, r);
-            if (sg == 0 && lane == 0) {
-                for (int i = 0; i < RPS; ++i) {
-                    T l = static_cast<T>(r[i]);
-                    lo[tile * RPS + i] = l;
-                    act[tile * RPS + i] = mlx_silu(l);
-                }
+            if (int(sg) < RPS && lane == 0) {
+                const int i = int(sg);
+                T l = static_cast<T>(r[i]);
+                lo[tile * RPS + i] = l;
+                act[tile * RPS + i] = mlx_silu(l);
             }
         } else if (HAS_INJECT) {
             float r[1];
