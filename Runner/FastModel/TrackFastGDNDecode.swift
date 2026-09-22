@@ -68,10 +68,33 @@ enum TrackFastGDNDecode {
         threadgroup InT k_shared[Dk];
         threadgroup InT v_shared[Dv];
         threadgroup float gb_shared[2];
+        // One head owns one complete saved record. Stage it alongside the
+        // convolution work; the existing preparation barrier publishes it.
+        threadgroup InT journal_key[HAS_JOURNAL ? Dk : 1];
+        threadgroup float journal_delta[HAS_JOURNAL ? Dv : 1];
+        threadgroup float journal_decay[1];
         float4 next_state;
         if constexpr (metal::is_same<StT, float>::value) {
             const device StT* first_state = state_in + (n * Dv + sg * RPS) * Dk;
             next_state = *reinterpret_cast<const device float4*>(first_state + 4 * lane);
+        }
+        if constexpr (HAS_JOURNAL) {
+            if (sg == 3) {
+                const device InT* journal = journal_in + b_idx * J_STRIDE;
+                auto load_float = [&](int off) -> float {
+                    const uint lo = (uint)as_type<ushort>(journal[off]);
+                    const uint hi = (uint)as_type<ushort>(journal[off + 1]);
+                    return as_type<float>(lo | (hi << 16));
+                };
+                for (int i = 0; i < 4; ++i) {
+                    const uint d = 4 * lane + i;
+                    journal_key[d] = journal[J_KEY_OFF + hv_idx * Dk + d];
+                    journal_delta[d] = load_float(J_DELTA_OFF + 2 * (hv_idx * Dv + d));
+                }
+                if (lane == 0) {
+                    journal_decay[0] = load_float(J_DECAY_OFF + 2 * hv_idx);
+                }
+            }
         }
         if (sg < 3) {
             const uint vec = sg == 0 ? hk_idx : (sg == 1 ? Hk + hk_idx : 2 * Hk + hv_idx);
@@ -133,13 +156,8 @@ enum TrackFastGDNDecode {
         const threadgroup InT* v_ = v_shared;
         const float gate_decay = gb_shared[0];
         const float gate_beta = gb_shared[1];
-        const device InT* journal = journal_in + b_idx * J_STRIDE;
-        device InT* next_journal = journal_out + b_idx * J_STRIDE;
-        auto journal_float = [&](int off) -> float {
-            const uint lo = (uint)as_type<ushort>(journal[off]);
-            const uint hi = (uint)as_type<ushort>(journal[off + 1]);
-            return as_type<float>(lo | (hi << 16));
-        };
+        device InT* next_journal = journal_out;
+        if constexpr (!HAS_JOURNAL) { next_journal += b_idx * J_STRIDE; }
         auto store_journal_float = [&](int off, float value) {
             const uint bits = as_type<uint>(value);
             next_journal[off] = as_type<InT>((ushort)(bits & 0xffffu));
@@ -151,6 +169,14 @@ enum TrackFastGDNDecode {
         const float4 local_k = float4(
             static_cast<float>(k_[4 * lane]), static_cast<float>(k_[4 * lane + 1]),
             static_cast<float>(k_[4 * lane + 2]), static_cast<float>(k_[4 * lane + 3]));
+        float4 saved_key;
+        float saved_decay;
+        if constexpr (HAS_JOURNAL) {
+            saved_key = float4(
+                static_cast<float>(journal_key[4 * lane]), static_cast<float>(journal_key[4 * lane + 1]),
+                static_cast<float>(journal_key[4 * lane + 2]), static_cast<float>(journal_key[4 * lane + 3]));
+            saved_decay = journal_decay[0];
+        }
         threadgroup InT y_shared[Dv];
         for (int r = 0; r < RPS; ++r) {
             const uint dv_idx = sg * RPS + r;
@@ -167,13 +193,10 @@ enum TrackFastGDNDecode {
                 for (int i = 0; i < 4; ++i) { state[i] = static_cast<float>(i_state[4 * lane + i]); }
             }
             if constexpr (HAS_JOURNAL) {
-                const float pending_decay = journal_float(J_DECAY_OFF + 2 * hv_idx);
-                const float pending_delta = journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx));
+                const float pending_delta = journal_delta[dv_idx];
                 for (int i = 0; i < 4; ++i) {
-                    state[i] = state[i] * pending_decay;
-                    state[i] = state[i]
-                        + static_cast<float>(journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i])
-                            * pending_delta;
+                    state[i] = state[i] * saved_decay;
+                    state[i] = state[i] + saved_key[i] * pending_delta;
                 }
             }
             float kv_mem;
