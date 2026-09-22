@@ -462,19 +462,31 @@ extension TrackFastKernels {
         const uint s = row % S;
         const InT a = att[((b * HQ + h) * S + s) * D + d];
         const InT g = qkv[row * QW + GATE_OFF + j];
-        out[row * HQ * D + j] = a * mlx_sigmoid(g);
+        // MLXFAST-GATELUT: for bfloat16 activations the gate sigmoid is a
+        // lookup in the table this tree already builds by evaluating
+        // `mlx_sigmoid` on every bfloat16 bit pattern, so the looked-up value
+        // is the same bits the inline call returns, and the transcendental
+        // leaves this per-element kernel.
+        InT sg;
+        if constexpr (metal::is_same_v<InT, bfloat16_t>) {
+            sg = sigmoid_lut[as_type<ushort>(static_cast<bfloat16_t>(g))];
+        } else {
+            sg = mlx_sigmoid(g);
+        }
+        out[row * HQ * D + j] = a * sg;
         """
 
     nonisolated(unsafe) static let attnGateKernel = MLXFast.metalKernel(
         name: "track_attn_gate",
-        inputNames: ["att", "qkv"],
+        inputNames: ["att", "qkv", "sigmoid_lut"],
         outputNames: ["out"],
         source: attnGateSource, header: exactHeader, ensureRowContiguous: true)
 
     static func attnGate(att: MLXArray, qkv: MLXArray, gateOffset: Int) -> MLXArray {
         let B = att.dim(0), HQ = att.dim(1), S = att.dim(2), D = att.dim(3)
+        let sigmoidTable = att.dtype == .bfloat16 ? TrackBF16Functions.sigmoid : att
         return attnGateKernel(
-            [att, qkv],
+            [att, qkv, sigmoidTable],
             template: [
                 ("InT", att.dtype), ("HQ", HQ), ("D", D), ("S", S), ("QW", qkv.dim(2)),
                 ("GATE_OFF", gateOffset),
