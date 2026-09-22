@@ -220,8 +220,9 @@ enum TrackFastGDNDecode {
         }
         if constexpr (!HAS_JOURNAL) {
             if (sg == 0) {
+                const float lk[4] = {local_k.x, local_k.y, local_k.z, local_k.w};
                 for (int i = 0; i < 4; ++i) {
-                    next_journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i] = k_[4 * lane + i];
+                    next_journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i] = static_cast<InT>(lk[i]);
                 }
             }
             if (sg == 0 && lane == 0) {
