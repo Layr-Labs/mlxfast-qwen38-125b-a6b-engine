@@ -228,6 +228,18 @@ enum TrackFastGDNDecode {
                 store_journal_float(J_DECAY_OFF + 2 * hv_idx, gate_decay);
             }
         }
+        // Early issue of the sg==0 read-only device loads. w and proj are
+        // immutable kernel inputs and the barrier below protects only the
+        // threadgroup-memory y_shared buffer, so these two loads are
+        // independent of the barrier and can overlap other simdgroups
+        // finishing y_shared. Values are retained in per-thread locals and
+        // consumed unchanged in the existing epilogue below.
+        vec<InT, 4> w4_early;
+        vec<InT, 4> z4_early;
+        if (sg == 0) {
+            w4_early = *reinterpret_cast<const device vec<InT, 4>*>(w + lane * 4);
+            z4_early = *reinterpret_cast<const device vec<InT, 4>*>(proj + (b_idx * PW + Z_OFF + hv_idx * Dv + lane * 4));
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
             float thread_x[4];
@@ -238,8 +250,8 @@ enum TrackFastGDNDecode {
             }
             acc = simd_sum(acc);
             const float inv_mean = metal::precise::rsqrt(acc / (float)Dv + as_type<float>((uint)EPS_BITS));
-            const auto w4 = *reinterpret_cast<const device vec<InT, 4>*>(w + lane * 4);
-            const auto z4 = *reinterpret_cast<const device vec<InT, 4>*>(proj + (b_idx * PW + Z_OFF + hv_idx * Dv + lane * 4));
+            const auto w4 = w4_early;
+            const auto z4 = z4_early;
             vec<InT, 4> out4;
             for (int i = 0; i < 4; ++i) {
                 InT normalized = w4[i] * static_cast<InT>(thread_x[i] * inv_mean);

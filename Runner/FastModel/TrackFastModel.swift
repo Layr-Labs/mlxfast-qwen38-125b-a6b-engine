@@ -753,33 +753,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
              guGroupSize = guq.groupSize, guBits = guq.bits, guMode = guq.mode,
              downGroupSize = dq.groupSize, downBits = dq.bits, downMode = dq.mode] inputs in
             let sharedGU = TrackQuantWeight(
-                weight: inputs[11], scales: inputs[12], biases: inputs[13],
+                weight: inputs[10], scales: inputs[11], biases: inputs[12],
                 groupSize: guGroupSize, bits: guBits, mode: guMode)
             let act = TrackFastMoEKernels.gateUpAct(
-                wg: inputs[5], sg: inputs[6], bg: inputs[7],
-                wu: inputs[8], su: inputs[9], bu: inputs[10], shared: sharedGU,
-                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits)
+                wg: inputs[4], sg: inputs[5], bg: inputs[6],
+                wu: inputs[7], su: inputs[8], bu: inputs[9], shared: sharedGU,
+                x: inputs[0], idx: inputs[1], groupSize: groupSize, bits: bits)
             let sharedDown = TrackQuantWeight(
-                weight: inputs[17], scales: inputs[18], biases: inputs[19],
+                weight: inputs[16], scales: inputs[17], biases: inputs[18],
                 groupSize: downGroupSize, bits: downBits, mode: downMode)
             return [TrackFastMoEKernels.downCombine(
-                wd: inputs[14], sd: inputs[15], bd: inputs[16], sharedDown: sharedDown,
+                wd: inputs[13], sd: inputs[14], bd: inputs[15], sharedDown: sharedDown,
                 act: act, idx: inputs[1], w: inputs[2], gate: inputs[3], topK: topK,
                 groupSize: groupSize, bits: bits)]
         }
-    }
-
-    /// Row index of each (token, expert) slot, one constant array per window size
-    /// (uploading it per step was one host copy per layer).
-    nonisolated(unsafe) private static var xrowTables: [Int: MLXArray] = [:]
-    private static let xrowLock = NSLock()
-    static func xrowTable(S: Int, K: Int) -> MLXArray {
-        xrowLock.lock(); defer { xrowLock.unlock() }
-        if let t = xrowTables[S * 1024 + K] { return t }
-        let t = MLXArray((0 ..< (S * K)).map { UInt32($0 / K) })
-        eval(t)
-        xrowTables[S * 1024 + K] = t
-        return t
     }
 
     static func moeForwardShared(
@@ -823,10 +810,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let gate = gateQ != nil ? r.gate : m.sharedGate.apply(x).reshaped(S)
             if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights, gate]) }
             let flatIdx = idx.reshaped(S * K)
-            let xrow = Self.xrowTable(S: S, K: K)
             if let replay, StreamOrDevice.default.stream === Stream.gpu {
                 return replay([
-                    x2, flatIdx, weights.reshaped(S * K), gate, xrow,
+                    x2, flatIdx, weights.reshaped(S * K), gate,
                     m.expertGate.w, m.expertGate.s, m.expertGate.b,
                     m.expertUp.w, m.expertUp.s, m.expertUp.b,
                     guq.weight, guq.scales, guq.biases!,
@@ -837,7 +823,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
                 wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b, shared: guq,
-                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits)
+                x: x2, idx: flatIdx, groupSize: m.expertGroupSize, bits: m.expertBits)
             return TrackFastMoEKernels.downCombine(
                 wd: m.expertDown.w, sd: m.expertDown.s, bd: m.expertDown.b, sharedDown: dq,
                 act: act, idx: flatIdx, w: weights.reshaped(S * K), gate: gate, topK: K,
@@ -1074,6 +1060,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let profiling = TrackFastProfile.prefill != nil && ids.dim(1) >= TrackFastProfile.minWindow
         var profT = profiling ? CFAbsoluteTimeGetCurrent() : 0
         if profiling { TrackFastProfile.windows += 1 }
+        // The partial-dispatch thresholds are per-forward constants; resolve
+        // them once here instead of rebuilding them on every layer iteration.
+        let chunk = Self.asyncChunk
+        let firstChunk = Self.asyncFirst > 0 ? Self.asyncFirst : chunk
+        let secondChunk = Self.asyncSecond > firstChunk ? Self.asyncSecond : firstChunk
         for layer in layers {
             var normed: MLXArray
             if let ple = layer.ple {
@@ -1098,7 +1089,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             }
             tile = false
             if profiling { TrackFastProfile.tick(layer.ple != nil ? "norm+ple" : "norm", &profT, [stream, normed]) }
-            let am = hcMix(layer.attnHC, normed: normed, tag: "L\(layer.index).attn.hc")
+            // The debug-tap label is read only when taps are installed, so the
+            // per-layer String is built only in that case (the guard in hcMix is
+            // unchanged; an empty tag keeps its exact skip behavior).
+            let am = hcMix(layer.attnHC, normed: normed, tag: Self.debugTaps != nil ? "L\(layer.index).attn.hc" : "")
             var input = am.input, injectW = am.inject
             if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
             Self.debugTaps?.append(("L\(layer.index).attn.stream_in", stream))
@@ -1128,7 +1122,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     tile: false)
                 if profiling { TrackFastProfile.tick("norm", &profT, [stream, normed]) }
                 Self.debugTaps?.append(("L\(layer.index).mlp.stream_in", stream))
-                let mm = hcMix(layer.mlpHC, normed: normed, tag: "L\(layer.index).mlp.hc", emitF32: true)
+                let mm = hcMix(layer.mlpHC, normed: normed, tag: Self.debugTaps != nil ? "L\(layer.index).mlp.hc" : "", emitF32: true)
                 input = mm.input; injectW = mm.inject
                 if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
                 Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
@@ -1141,11 +1135,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             residual = stream
             // Dispatch the graph so far: the GPU starts on these layers while the
             // CPU keeps building the rest (the build is otherwise GPU-idle time).
-            if Self.asyncChunk > 0 {
+            if chunk > 0 {
                 let n = layer.index + 1
-                let first = Self.asyncFirst > 0 ? Self.asyncFirst : Self.asyncChunk
-                let second = Self.asyncSecond > first ? Self.asyncSecond : first
-                if n == first || n == second || (n > second && (n - second) % Self.asyncChunk == 0) { asyncEval(stream) }
+                if n == firstChunk || n == secondChunk || (n > secondChunk && (n - secondChunk) % chunk == 0) { asyncEval(stream) }
             }
         }
         let (multi, finalNormed) = injectNorm(
