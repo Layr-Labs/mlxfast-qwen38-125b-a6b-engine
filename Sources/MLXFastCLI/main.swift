@@ -67,7 +67,7 @@ private enum MLXFastCLI {
 
     private static func runTransform(_ options: ParsedOptions) throws {
         try reexecUnderParentToolSandboxIfRequested(subcommand: "transform")
-        try options.validate(valueOptions: ["--reference", "--output"])
+        try options.validate(valueOptions: ["--reference", "--output", "--head-source"])
         let referencePath = options.value(
             for: "--reference",
             default: environmentValue(
@@ -82,18 +82,62 @@ private enum MLXFastCLI {
                 fallback: MLXFastConstants.defaultWeightsPath
             )
         )
+        let headSourcePath = resolveMTPHeadSourcePath(
+            explicit: options.value(
+                for: "--head-source",
+                default: environmentValue("MLXFAST_MTP_HEAD_SOURCE_DIR", fallback: "")
+            ),
+            referencePath: referencePath
+        )
         let report = try SwiftTransform.run(
-            TransformOptions(referencePath: referencePath, outputPath: outputPath)
+            TransformOptions(
+                referencePath: referencePath,
+                outputPath: outputPath,
+                mtpHeadSourcePath: headSourcePath
+            )
         )
         print("reference: \(report.referencePath)")
+        if let headSource = report.mtpHeadSourcePath {
+            print("head source: \(headSource)")
+        }
         print("output: \(report.outputPath)")
         print("dense tensors: \(report.denseTensorCount) across \(report.denseShardCount) shard(s)")
         print("config: \(report.configPath)")
         print("index: \(report.indexPath)")
     }
 
+    /// Where the served head's shards are, when no flag names them: the
+    /// environment, then the checkpoint's SIBLING directory (how the ranked
+    /// boxes stage it, beside MLXFAST_REFERENCE_DIR), then the checkout's
+    /// reference_weights/ default, then the shared Hugging Face cache. The
+    /// first candidate that holds a config.json wins; when none does, the
+    /// sibling is returned so the transform's refusal names where the head
+    /// was expected. Only this track's family reads the value.
+    private static func resolveMTPHeadSourcePath(explicit: String, referencePath: String) -> String {
+        if !explicit.isEmpty {
+            return explicit
+        }
+        let referenceParent = URL(fileURLWithPath: referencePath)
+            .standardizedFileURL
+            .deletingLastPathComponent()
+        var candidates = [
+            referenceParent.appendingPathComponent(MLXFastConstants.mtpHeadSourceName).path,
+            MLXFastConstants.defaultMTPHeadSourcePath,
+        ]
+        if let home = ProcessInfo.processInfo.environment["HOME"], !home.isEmpty {
+            candidates.append(
+                URL(fileURLWithPath: home)
+                    .appendingPathComponent(MLXFastConstants.defaultMTPHeadSourceCachePath)
+                    .path
+            )
+        }
+        let fileManager = FileManager.default
+        return candidates.first { fileManager.fileExists(atPath: "\($0)/config.json") }
+            ?? candidates[0]
+    }
+
     private static func runVerifyTransform(_ options: ParsedOptions) throws {
-        try options.validate(valueOptions: ["--reference", "--weights", "--tmp-parent", "--max-bytes"])
+        try options.validate(valueOptions: ["--reference", "--weights", "--tmp-parent", "--max-bytes", "--head-source"])
         let referencePath = options.value(
             for: "--reference",
             default: environmentValue(
@@ -121,12 +165,20 @@ private enum MLXFastCLI {
             defaultByteCount: MLXFastConstants.defaultMaxTransformedWeightsBytes,
             optionLabel: "--max-bytes"
         )
+        let headSourcePath = resolveMTPHeadSourcePath(
+            explicit: options.value(
+                for: "--head-source",
+                default: environmentValue("MLXFAST_MTP_HEAD_SOURCE_DIR", fallback: "")
+            ),
+            referencePath: referencePath
+        )
         let report = try TransformVerifier.verify(
             TransformVerificationOptions(
                 referencePath: referencePath,
                 weightsPath: weightsPath,
                 temporaryParentPath: temporaryParentPath.isEmpty ? nil : temporaryParentPath,
-                maxByteCount: maxByteCount
+                maxByteCount: maxByteCount,
+                mtpHeadSourcePath: headSourcePath
             )
         )
 

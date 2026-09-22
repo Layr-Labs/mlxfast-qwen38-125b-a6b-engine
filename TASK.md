@@ -44,18 +44,25 @@ The rule behind the list is simple. Code that **proposes** tokens or computes
 the forward pass is editable. Code that **verifies**, **measures**, or
 **ledgers** stays trusted.
 
-The MTP head is the organizer's pinned weights, because it is part of the
-pinned target checkpoint. You may re-quantize it. You may not replace it, and
-you may not upload head weights of your own.
+The MTP head is the organizer's pinned weights. You may re-quantize it. You may
+not replace it, and you may not upload head weights of your own.
 
-No submission carries a head weight file. Nothing stages one.
+The served head is the 8-bit head (David ruling 2026-09-12). The 4-bit target
+embeds a 4-bit copy of the head; the transform replaces those 76 tensors with
+the same 76 tensors from the publisher's 8-bit conversion,
+`Vontra/Qwen3.8-Flash-Next-MLX-8bit-MTP` @ `9c306179`, pinned per file in
+`fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256`. The tower stays 4-bit.
+`./setup.sh` downloads the two source shards beside the target, and the
+transform splices the head into `weights/`.
+
+No submission carries a head weight file. Nothing stages one in a submission.
 `mtp-head.manifest.json` stays editable and optional, and it accepts
-`"source": "pinned"` only, which on this track means the head embedded in the
-pinned target checkpoint. `"source": "remote"` and `"source": "in_branch"` are
-refused by name.
+`"source": "pinned"` only, which on this track means the head the organizer
+pins. `"source": "remote"` and `"source": "in_branch"` are refused by name.
 
-The head has a 2 GiB declaration cap. The size cap is the only gate on a
-declaration. A declared `sha256` is optional, and the runner does not verify it.
+The head has a 4 GiB declaration cap (raised from 2 GiB on 2026-09-12 for the
+8-bit head). The size cap is the only gate on a declaration. A declared
+`sha256` is optional, and the runner does not verify it.
 
 A re-quantization happens ON LOAD, in memory. Nothing on disk changes, and no
 artifact travels in a submission.
@@ -75,7 +82,7 @@ authority.
 > the numerical format of one. This holds even when the result passes every
 > correctness gate. An editable transform does not license the change. The MTP
 > head is a narrow exception, and the exception is re-quantization only. You may
-> re-quantize the head within its 2 GiB declaration cap. You may not replace it.
+> re-quantize the head within its 4 GiB declaration cap. You may not replace it.
 
 > **NOTE — the scored batch size is locked. Draft depth is not.**
 > The scored batch size is 1. It is not a tunable.
@@ -105,16 +112,20 @@ This command resolves and verifies the pinned benchmarker binary.
 ./setup.sh
 ```
 
-This command builds the Swift binaries and downloads the target model. The MTP
-head arrives inside that checkpoint, so there is no head-staging step.
+This command builds the Swift binaries, downloads the target model, and
+downloads the two 8-bit shards that carry the served MTP head. There is no
+separate head-staging step.
 
 ```bash
 .build/release/mlxfast-swift transform \
   --reference reference_weights/Qwen3.8-Flash-Next-MLX-4bit-MTP \
+  --head-source reference_weights/Qwen3.8-Flash-Next-MLX-8bit-MTP \
   --output weights
 ```
 
-This command writes the `weights/` tree that the engine loads.
+This command writes the `weights/` tree that the engine loads. It splices the
+8-bit head into shard 22. `--head-source` defaults to the sibling of the
+reference directory; the transform refuses to run without a head source.
 
 ```bash
 MLXFAST_ENGINE_BIN=.build/release/bench-worker \

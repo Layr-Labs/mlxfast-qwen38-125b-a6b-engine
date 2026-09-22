@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Prepare fresh output before replacing any existing local runtime weights.
 set -euo pipefail
-if [[ "$#" != 3 ]]; then
-  echo 'usage: prepare-runtime-weights.sh CLI REFERENCE OUTPUT' >&2
+if [[ "$#" != 3 && "$#" != 4 ]]; then
+  echo 'usage: prepare-runtime-weights.sh CLI REFERENCE OUTPUT [HEAD_SOURCE]' >&2
   exit 2
 fi
 CLI="$1"
 REFERENCE="$2"
 OUTPUT="$3"
+# The served MTP head's shards (David ruling 2026-09-12). Passed through to
+# the transform as --head-source; the transform refuses this track's family
+# without one, so setup.sh always names the directory it provisioned.
+HEAD_SOURCE="${4:-}"
 fail() { echo "prepare-runtime-weights.sh: $*" >&2; exit 1; }
 while [[ "${OUTPUT}" == */ && "${OUTPUT}" != / ]]; do OUTPUT="${OUTPUT%/}"; done
 
@@ -27,6 +31,13 @@ checkout="$(pwd -P)"
     && "${OUTPUT}" != "${reference}/"* ]] || fail 'output and reference directories must be separate'
 [[ "${checkout}" != "${OUTPUT}" && "${checkout}" != "${OUTPUT}/"* ]] \
   || fail 'output must not contain the current working directory'
+transform_args=(--reference "${REFERENCE}")
+if [[ -n "${HEAD_SOURCE}" ]]; then
+  head_source="$(cd -P "${HEAD_SOURCE}" && pwd -P)" || fail "head source is not a directory: ${HEAD_SOURCE}"
+  [[ "${OUTPUT}" != "${head_source}" && "${head_source}" != "${OUTPUT}/"* \
+      && "${OUTPUT}" != "${head_source}/"* ]] || fail 'output and head source directories must be separate'
+  transform_args+=(--head-source "${HEAD_SOURCE}")
+fi
 
 lock="${OUTPUT}.setup-lock"
 mkdir "${lock}" 2>/dev/null || fail "output is already being prepared, or a previous setup left a lock: ${lock}"
@@ -57,7 +68,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 work="$(mktemp -d "${parent}/.${name}.setup.XXXXXX")"
 prepared="${work}/prepared"
-"${CLI}" transform --reference "${REFERENCE}" --output "${prepared}"
+"${CLI}" transform "${transform_args[@]}" --output "${prepared}"
 [[ -d "${prepared}" && ! -L "${prepared}" \
     && -f "${prepared}/config.json" && ! -L "${prepared}/config.json" \
     && -f "${prepared}/model.safetensors.index.json" && ! -L "${prepared}/model.safetensors.index.json" ]] \

@@ -177,7 +177,37 @@
       4,
       5,
       6
-    ]
+    ],
+    "served_quantization": {
+      "mode": "affine",
+      "group_size": 32,
+      "bits": 8
+    },
+    "source_checkpoint": {
+      "upstream_model_id": "Vontra/Qwen3.8-Flash-Next-MLX-8bit-MTP",
+      "upstream_revision": "9c306179562765396e197a8a7a5de1b6b761c41a",
+      "manifest_path": "fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256",
+      "tensor_inventory_path": "fixtures/qwen3_8_125b_a6b_mtp_8bit_inventory.json",
+      "shards": [
+        "model-00041-of-00042.safetensors",
+        "model-00042-of-00042.safetensors"
+      ],
+      "tensor_count": 76,
+      "tensor_bytes": 2934230336,
+      "quantization": {
+        "mode": "affine",
+        "group_size": 32,
+        "bits": 8
+      }
+    },
+    "transformed_shard": {
+      "name": "model-00022-of-00022.safetensors",
+      "bytes": 5018468984,
+      "sha256": "e255039300f0aff10efe95069c24e9c1b642f9824467bcdf80dd6dbb70e56f0d",
+      "embedded_head_bytes_replaced": 1631332416,
+      "data_sha256": "5229d567d459a6a0afcf080375fc917302185fff4803a485df1b0cda124d93a4"
+    },
+    "max_bytes": 4294967296
   },
   "protocol": {
     "mtp_envelope_constants_from_darkbloom": {

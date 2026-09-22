@@ -567,3 +567,226 @@ public enum Safetensors {
         }
     }
 }
+
+// MARK: - Composite shards
+
+/// One source of a composite shard: a validated safetensors file and the
+/// names to take out of it.
+public struct SafetensorsCompositePart {
+    public let source: URL
+    public let validatedHeader: SafetensorsHeader
+    public let tensorNames: [String]
+
+    public init(source: URL, validatedHeader: SafetensorsHeader, tensorNames: [String]) {
+        self.source = source
+        self.validatedHeader = validatedHeader
+        self.tensorNames = tensorNames
+    }
+}
+
+extension Safetensors {
+    /// Write ONE shard whose tensors come from SEVERAL validated sources.
+    ///
+    /// This is how the transform serves a head of one width inside a tower of
+    /// another: the tower's own shard supplies the tower tensors, the head
+    /// source's shards supply the head tensors, and the output is a single
+    /// ordinary safetensors file -- names sorted, data contiguous, header
+    /// padded to eight bytes -- indistinguishable from a shard the publisher
+    /// could have written. Bytes are copied, never decoded. Every source is
+    /// bound to the identity its header was validated against, before the
+    /// copy and again after it, exactly like `copySubset`.
+    public static func copyComposite(
+        parts: [SafetensorsCompositePart],
+        to destination: URL,
+        metadata: [String: String]
+    ) throws -> Int {
+        guard !parts.isEmpty else {
+            throw MLXFastError.invalidInput(
+                "composite safetensors shard needs at least one source part"
+            )
+        }
+
+        struct BoundPart {
+            let source: URL
+            let identity: SafetensorsFileIdentity
+            let baseOffset: UInt64
+            let tensors: [SafetensorInfo]
+        }
+        var bound: [BoundPart] = []
+        var owners: [String: Int] = [:]
+        for (partIndex, part) in parts.enumerated() {
+            let header: SafetensorsHeader
+            if part.validatedHeader.sourceIdentity == nil {
+                let sourceHeader = try readHeader(part.source)
+                guard sourceHeader == part.validatedHeader else {
+                    throw MLXFastError.invalidInput(
+                        "validated safetensors header does not match \(part.source.lastPathComponent)"
+                    )
+                }
+                header = sourceHeader
+            } else {
+                header = part.validatedHeader
+            }
+            guard header.headerLength > 0,
+                  header.headerLength <= maximumHeaderByteCount
+            else {
+                throw MLXFastError.invalidInput(
+                    "invalid validated safetensors header length for \(part.source.lastPathComponent)"
+                )
+            }
+            let (baseOffsetInt, baseOffsetOverflow) = header.headerLength.addingReportingOverflow(8)
+            guard !baseOffsetOverflow,
+                  let baseOffset = UInt64(exactly: baseOffsetInt)
+            else {
+                throw MLXFastError.invalidInput(
+                    "validated safetensors header offset overflows for \(part.source.lastPathComponent)"
+                )
+            }
+            guard let identity = header.sourceIdentity else {
+                throw MLXFastError.invalidInput(
+                    "validated safetensors header is not bound to \(part.source.lastPathComponent)"
+                )
+            }
+            guard baseOffsetInt <= identity.byteCount else {
+                throw MLXFastError.invalidInput(
+                    "validated safetensors header exceeds file size for \(part.source.lastPathComponent)"
+                )
+            }
+            let sourceDataByteCount = identity.byteCount - baseOffsetInt
+
+            var selected: [SafetensorInfo] = []
+            selected.reserveCapacity(part.tensorNames.count)
+            for name in part.tensorNames {
+                guard owners.updateValue(partIndex, forKey: name) == nil else {
+                    throw MLXFastError.invalidInput(
+                        "tensor \(name) requested from more than one composite source"
+                    )
+                }
+                guard let tensor = header.tensors[name] else {
+                    throw MLXFastError.invalidInput(
+                        "tensor \(name) requested from \(part.source.lastPathComponent) but missing from safetensors header"
+                    )
+                }
+                let (byteCount, byteCountOverflow) = tensor.dataEnd.subtractingReportingOverflow(
+                    tensor.dataStart
+                )
+                guard tensor.name == name,
+                      !byteCountOverflow,
+                      tensor.dataStart >= 0,
+                      tensor.dataEnd >= tensor.dataStart,
+                      tensor.dataEnd <= sourceDataByteCount,
+                      byteCount >= 0
+                else {
+                    throw MLXFastError.invalidInput(
+                        "invalid validated safetensors tensor range for \(name)"
+                    )
+                }
+                selected.append(tensor)
+            }
+            bound.append(
+                BoundPart(
+                    source: part.source,
+                    identity: identity,
+                    baseOffset: baseOffset,
+                    tensors: selected
+                ))
+        }
+
+        let ordered = bound.flatMap { $0.tensors }.sorted { $0.name < $1.name }
+        guard !ordered.isEmpty else {
+            return 0
+        }
+        for part in bound {
+            try validateCopyDestination(source: part.source, destination: destination)
+        }
+
+        var inputs: [FileHandle] = []
+        defer {
+            for input in inputs {
+                try? input.close()
+            }
+        }
+        for part in bound {
+            let input = try FileHandle(forReadingFrom: part.source)
+            inputs.append(input)
+            _ = Darwin.fcntl(input.fileDescriptor, F_NOCACHE, 1)
+            _ = Darwin.fcntl(input.fileDescriptor, F_RDAHEAD, 0)
+            let openedIdentity = try fileIdentity(for: input, path: part.source.path)
+            guard openedIdentity == part.identity else {
+                throw MLXFastError.invalidInput(
+                    "safetensors source changed after its header was validated: \(part.source.path)"
+                )
+            }
+        }
+
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let temporaryDestination = destination.deletingLastPathComponent().appendingPathComponent(
+            ".\(destination.lastPathComponent).mlxfast-composite-\(UUID().uuidString)"
+        )
+        var published = false
+        defer {
+            if !published {
+                try? FileManager.default.removeItem(at: temporaryDestination)
+            }
+        }
+        try Data().write(to: temporaryDestination, options: [.withoutOverwriting])
+        let output = try FileHandle(forWritingTo: temporaryDestination)
+        _ = Darwin.fcntl(output.fileDescriptor, F_NOCACHE, 1)
+
+        do {
+            let outputHeader = try makeHeaderData(tensors: ordered, metadata: metadata)
+            var headerLength = UInt64(outputHeader.count).littleEndian
+            let prefix = Data(bytes: &headerLength, count: 8)
+            try output.write(contentsOf: prefix)
+            try output.write(contentsOf: outputHeader)
+
+            for tensor in ordered {
+                guard let partIndex = owners[tensor.name] else {
+                    throw MLXFastError.invalidInput(
+                        "composite safetensors tensor \(tensor.name) lost its source"
+                    )
+                }
+                guard let relativeOffset = UInt64(exactly: tensor.dataStart) else {
+                    throw MLXFastError.invalidInput(
+                        "negative safetensors tensor offset for \(tensor.name)"
+                    )
+                }
+                let (absoluteOffset, overflow) = bound[partIndex].baseOffset.addingReportingOverflow(
+                    relativeOffset
+                )
+                guard !overflow else {
+                    throw MLXFastError.invalidInput(
+                        "safetensors tensor offset overflows UInt64 for \(tensor.name)"
+                    )
+                }
+                try copyBytes(
+                    from: inputs[partIndex],
+                    to: output,
+                    offset: absoluteOffset,
+                    count: tensor.byteCount
+                )
+            }
+            try output.synchronize()
+            try output.close()
+        } catch {
+            try? output.close()
+            throw error
+        }
+
+        for (partIndex, part) in bound.enumerated() {
+            let finalIdentity = try fileIdentity(for: inputs[partIndex], path: part.source.path)
+            guard finalIdentity == part.identity else {
+                throw MLXFastError.invalidInput(
+                    "safetensors source changed while tensor bytes were copied: \(part.source.path)"
+                )
+            }
+        }
+        try atomicRename(from: temporaryDestination, to: destination)
+        published = true
+
+        return ordered.count
+    }
+}
