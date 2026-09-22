@@ -1328,7 +1328,14 @@ extension TrackFastMoEKernels {
         qmv_fast_reg_dual<T, GS, BITS, RPS>(
             gw, gs, gb, uw, us, ub, x + (size_t)r * (size_t)KD,
             KD, out_row, thread_index_in_simdgroup, g, u);
-        if (thread_index_in_simdgroup == 0) {
+        if constexpr (RPS == 2) {
+            const uint lane = thread_index_in_simdgroup;
+            if (lane < 2) {
+                const T gv = static_cast<T>(metal::select(g[0], g[1], lane != 0));
+                const T uv = static_cast<T>(metal::select(u[0], u[1], lane != 0));
+                act[(size_t)z * (size_t)N + (size_t)(out_row + lane)] = mlx_silu(gv) * uv;
+            }
+        } else if (thread_index_in_simdgroup == 0) {
             for (int i = 0; i < RPS; ++i) {
                 const T gv = static_cast<T>(g[i]);
                 const T uv = static_cast<T>(u[i]);
