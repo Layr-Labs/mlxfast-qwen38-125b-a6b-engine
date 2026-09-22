@@ -328,10 +328,20 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
 
         // The geometry the served head carries. Read off the loaded head, so
         // the default is the checkpoint's own.
+        //
+        // MLXFAST-HEAD3: re-quantize the head to 3 bits (group size and mode
+        // unchanged). Sanctioned by docs/participant-contract.md §4: "A
+        // re-quantization of the pinned head is permitted", bits in 2...8,
+        // via exactly this function. Rationale: the head only proposes; the
+        // pinned target decides every emitted token, so draft quality trades
+        // against draft speed with zero output risk. 3-bit halves nothing but
+        // cuts head weight traffic ~25% per draft; the vendored kernels carry
+        // first-class bits==3 dequant paths. Acceptance moves wherever it
+        // moves; the sealed effective_mean_draft_len reads it out.
         var geometry: [String: (groupSize: Int, bits: Int, mode: QuantizationMode)] = [:]
         for (path, module) in loaded.leafModules().flattened() {
             guard let quantized = module as? Quantized else { continue }
-            geometry[path] = (quantized.groupSize, quantized.bits, quantized.mode)
+            geometry[path] = (quantized.groupSize, 3, quantized.mode)
         }
         quantize(model: head) { path, _ in geometry[path] }
 
