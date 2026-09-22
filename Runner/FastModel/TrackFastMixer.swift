@@ -186,6 +186,51 @@ enum TrackFastMixerKernels {
         }
         """
 
+    /// Packed one-token BF16 path: each simdgroup owns one complete output
+    /// column, so its four stream products need no threadgroup exchange.
+    static let upMixPackedColumnSource = """
+        static_assert(VPT == 1 && HC == 4 && PACKED_ROWS, "packed column geometry");
+        const int tile = (int)threadgroup_position_in_grid.y;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint lid = thread_index_in_simdgroup;
+        const int d = 2 * tile + (int)sg;
+        float r[4];
+        qmv_reg<T, GS, BITS, (LW % get_pack_factor<BITS, 32>()) == 0, 4, 2>(
+            wu, su, bu, act, LW, tile * 8 + (int)sg, lid, r);
+        T product = T(0);
+        if (lid < 4) {
+            const float low = metal::select(r[0], r[1], (lid & 1u) != 0);
+            const float high = metal::select(r[2], r[3], (lid & 1u) != 0);
+            const T weight = static_cast<T>(metal::select(low, high, (lid & 2u) != 0));
+            const T gate = sigmoid_lut[as_type<ushort>(weight)];
+            product = gate * normed[(int)lid * H + d];
+        }
+        // All lanes participate. Transfer the exact BF16 product bits, then
+        // retain the original ascending stream fold and rounding after each add.
+        const uint product_bits = (uint)as_type<ushort>(product);
+        T acc = T(0);
+        for (int s = 0; s < HC; ++s) {
+            const uint bits = simd_shuffle(product_bits, (ushort)s);
+            const T p = as_type<T>((ushort)bits);
+            acc = acc + p;
+        }
+        if (lid == 0) {
+            input[d] = acc;
+            if (EMIT_F32) { inputF[d] = static_cast<float>(acc); }
+        }
+        const uint t = sg * 32 + lid;
+        if (HAS_INJECT && tile == 0 && t < (uint)HC) {
+            const T x = inj[t];
+            inject[t] = T(2) * sigmoid_lut[as_type<ushort>(x)];
+        }
+        """
+
+    nonisolated(unsafe) static let upMixPackedColumnKernel = MLXFast.metalKernel(
+        name: "track_mixer_up_mix_packed_column",
+        inputNames: ["act", "normed", "wu", "su", "bu", "inj", "sigmoid_lut"],
+        outputNames: ["input", "inject", "inputF"],
+        source: upMixPackedColumnSource, header: header1, ensureRowContiguous: true)
+
     nonisolated(unsafe) static let upMixKernel = MLXFast.metalKernel(
         name: "track_mixer_up_mix",
         inputNames: ["act", "normed", "wu", "su", "bu", "inj", "sigmoid_lut"],
@@ -206,7 +251,9 @@ enum TrackFastMixerKernels {
         precondition(LW % 32 == 0 && LW < 512 + 256)  // K = 320: one full block + a tail, the `qmv` normal branch
         let sigmoidTable = act.dtype == .bfloat16 ? TrackBF16Functions.sigmoid : normed
         precondition(!packedRows || (S == 1 && hcCount == 4))
-        let outs = (S == 1 ? upMixKernel1 : upMixKernel)(
+        let columnLocal = S == 1 && packedRows && hcCount == 4 && act.dtype == .bfloat16
+        let kernel = columnLocal ? upMixPackedColumnKernel : (S == 1 ? upMixKernel1 : upMixKernel)
+        let outs = kernel(
             [act, normed, up.weight, up.scales, up.biases!, inj, sigmoidTable],
             template: [
                 ("T", act.dtype), ("GS", up.groupSize), ("BITS", up.bits), ("H", hidden), ("HC", hcCount),

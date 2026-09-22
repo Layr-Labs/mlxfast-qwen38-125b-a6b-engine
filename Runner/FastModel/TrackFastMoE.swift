@@ -954,9 +954,9 @@ extension TrackFastMoEKernels {
         // MLXFAST-FULLTAIL: EXACT_TAIL says the caller's `in_vec_size` is a
         // multiple of values_per_thread. See the tail block below for what that
         // buys and why it stays bit-identical.
-        // MLXFAST-DOWNRPS: NR contiguous rows per simdgroup; each row's walk,
-        // accumulation order and simd_sum are unchanged for any NR.
-        template <typename T, int group_size, int bits, bool EXACT_TAIL = false, int NR = 4>
+        // NR rows per simdgroup, with a compile-time physical row stride.
+        // Defaults preserve contiguous rows and every existing caller's arithmetic.
+        template <typename T, int group_size, int bits, bool EXACT_TAIL = false, int NR = 4, int ROW_STRIDE = 1>
         METAL_FUNC void qmv_reg(
             const device uint32_t* w,
             const device T* scales,
@@ -988,9 +988,9 @@ extension TrackFastMoEKernels {
           for (; k < in_vec_size - block_size; k += block_size) {
             U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
             for (int row = 0; row < results_per_simdgroup; row++) {
-              auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-              const device T* sl = scales + row * in_vec_size_g;
-              const device T* bl = biases + row * in_vec_size_g;
+              auto wl = (const device uint8_t*)(ws + row * ROW_STRIDE * in_vec_size_w);
+              const device T* sl = scales + row * ROW_STRIDE * in_vec_size_g;
+              const device T* bl = biases + row * ROW_STRIDE * in_vec_size_g;
               U s = sl[0];
               U b = bl[0];
               result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
@@ -1021,9 +1021,9 @@ extension TrackFastMoEKernels {
             if (remaining > 0) {
               U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
               for (int row = 0; row < results_per_simdgroup; row++) {
-                auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-                const device T* sl = scales + row * in_vec_size_g;
-                const device T* bl = biases + row * in_vec_size_g;
+                auto wl = (const device uint8_t*)(ws + row * ROW_STRIDE * in_vec_size_w);
+                const device T* sl = scales + row * ROW_STRIDE * in_vec_size_g;
+                const device T* bl = biases + row * ROW_STRIDE * in_vec_size_g;
                 U s = sl[0];
                 U b = bl[0];
                 result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
@@ -1032,9 +1032,9 @@ extension TrackFastMoEKernels {
           } else if (remaining > 0) {
             U sum = load_vector_safe<T, U, values_per_thread, bits>(x, x_thread, remaining);
             for (int row = 0; row < results_per_simdgroup; row++) {
-              auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-              const device T* sl = scales + row * in_vec_size_g;
-              const device T* bl = biases + row * in_vec_size_g;
+              auto wl = (const device uint8_t*)(ws + row * ROW_STRIDE * in_vec_size_w);
+              const device T* sl = scales + row * ROW_STRIDE * in_vec_size_g;
+              const device T* bl = biases + row * ROW_STRIDE * in_vec_size_g;
               U s = sl[0];
               U b = bl[0];
               result[row] += qdot_safe<U, values_per_thread, bits>(wl, x_thread, s, b, sum, remaining);
