@@ -6,14 +6,17 @@ import MLX
 enum TrackFastGDNDecode {
     private static let kernel = MLXFast.metalKernel(
         name: "track_gdn_decode_complete",
-        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w", "journal_in"],
+        inputNames: [
+            "proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w",
+            "journal_in", "journal_in1", "journal_in2",
+        ],
         outputNames: ["state_out", "gated", "conv_out", "journal_out"],
         source: source, header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
     static func apply(
         proj: MLXArray, convState: MLXArray, convW: MLXArray,
         negExpALog: MLXArray, dtBias: MLXArray, stateIn: MLXArray, normW: MLXArray,
-        pendingJournal: MLXArray?, zOffset: Int, eps: Float, capture: Bool,
+        pendingJournals: [MLXArray], writeState: Bool, zOffset: Int, eps: Float, capture: Bool,
         geometry g: TrackFastKernels.GDNGeometry
     ) -> (gated: MLXArray, stateOut: MLXArray, convOut: MLXArray, journal: MLXArray?)? {
         guard !capture, proj.ndim == 3, proj.dim(1) == 1, proj.dtype == .bfloat16,
@@ -32,10 +35,18 @@ enum TrackFastGDNDecode {
             convState.dtype == proj.dtype
         else { return nil }
         let journalStride = g.hv * g.dk + 2 * g.hv * g.dv + 2 * g.hv
-        let hasJournal = pendingJournal?.shape == [B, journalStride]
-        let journalIn = pendingJournal ?? convState
+        // Every carried journal must be the shape this kernel replays; anything
+        // else means the caller's bookkeeping is wrong, so refuse rather than
+        // silently drop a deferred step.
+        guard pendingJournals.count <= 3,
+            pendingJournals.allSatisfy({ $0.shape == [B, journalStride] })
+        else { return nil }
+        let jIn = pendingJournals.count
+        let pad = Array(repeating: convState, count: 3 - jIn)
+        let journalIns = pendingJournals + pad
         let result = kernel(
-            [proj, convState, convW, negExpALog, dtBias, stateIn, normW, journalIn],
+            [proj, convState, convW, negExpALog, dtBias, stateIn, normW]
+                + journalIns,
             template: [
                 ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
                 ("Hk", g.hk), ("Hv", g.hv), ("KC", g.convKernel), ("CONV_DIM", g.convDim),
@@ -43,16 +54,97 @@ enum TrackFastGDNDecode {
                 ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)), ("RPS", 4),
                 ("J_KEY_OFF", 0), ("J_DELTA_OFF", g.hv * g.dk),
                 ("J_DECAY_OFF", g.hv * g.dk + 2 * g.hv * g.dv),
-                ("J_STRIDE", journalStride), ("HAS_JOURNAL", hasJournal),
+                ("J_STRIDE", journalStride), ("J_IN", jIn), ("WRITE_STATE", writeState),
             ],
             grid: (32, g.dv / 4, B * g.hv), threadGroup: (32, g.dv / 4, 1),
             outputShapes: [
-                hasJournal ? [B, g.hv, g.dv, g.dk] : [1],
+                writeState ? [B, g.hv, g.dv, g.dk] : [1],
                 [B, 1, g.hv * g.dv], [B, g.convKernel - 1, g.convDim],
-                hasJournal ? [1] : [B, journalStride],
+                writeState ? [1] : [B, journalStride],
             ],
             outputDTypes: [stateIn.dtype, proj.dtype, proj.dtype, proj.dtype])
-        return (result[1], hasJournal ? result[0] : stateIn, result[2], hasJournal ? nil : result[3])
+        return (result[1], writeState ? result[0] : stateIn, result[2], writeState ? nil : result[3])
+    }
+
+    /// MLXFAST-G2 FLUSH: bring the state forward by the deferred steps and
+    /// store it, without running a step of its own.
+    ///
+    /// Needed because `gdnForward` drops the journal whenever it cannot take
+    /// the fused path (a capture, or a window wider than one token), and the
+    /// state in memory is one or more steps stale at that moment -- so the
+    /// deferred updates were simply lost. That was already true at depth 1;
+    /// carrying up to three steps would lose three. The replay is the SAME two
+    /// lines the decode kernel runs, in the same order, so the state this
+    /// writes is bit-identical to the one a flush-every-step engine holds.
+    private static let flushKernel = MLXFast.metalKernel(
+        name: "track_gdn_journal_flush",
+        inputNames: ["state_in", "journal_in", "journal_in1", "journal_in2"],
+        outputNames: ["state_out"],
+        source: flushSource, header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
+
+    private static let flushSource = #"""
+        const uint n = threadgroup_position_in_grid.z;
+        const uint b_idx = n / Hv;
+        const uint hv_idx = n % Hv;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        const device InT* journals[3] = {
+            journal_in + b_idx * J_STRIDE,
+            journal_in1 + b_idx * J_STRIDE,
+            journal_in2 + b_idx * J_STRIDE,
+        };
+        auto journal_float = [&](const device InT* journal, int off) -> float {
+            const uint lo = (uint)as_type<ushort>(journal[off]);
+            const uint hi = (uint)as_type<ushort>(journal[off + 1]);
+            return as_type<float>(lo | (hi << 16));
+        };
+        for (int r = 0; r < RPS; ++r) {
+            const uint dv_idx = sg * RPS + r;
+            const device StT* i_state = state_in + (n * Dv + dv_idx) * Dk;
+            device StT* o_state = state_out + (n * Dv + dv_idx) * Dk;
+            float state[4];
+            for (int i = 0; i < 4; ++i) { state[i] = static_cast<float>(i_state[4 * lane + i]); }
+            for (int j = 0; j < J_IN; ++j) {
+                const device InT* journal = journals[j];
+                const float pending_decay = journal_float(journal, J_DECAY_OFF + 2 * hv_idx);
+                const float pending_delta =
+                    journal_float(journal, J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx));
+                for (int i = 0; i < 4; ++i) {
+                    state[i] = state[i] * pending_decay;
+                    state[i] = state[i]
+                        + static_cast<float>(journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i])
+                            * pending_delta;
+                }
+            }
+            for (int i = 0; i < 4; ++i) { o_state[4 * lane + i] = static_cast<StT>(state[i]); }
+        }
+        """#
+
+    /// Replay `pendingJournals` into `stateIn` and return the caught-up state.
+    static func flush(
+        stateIn: MLXArray, pendingJournals: [MLXArray],
+        geometry g: TrackFastKernels.GDNGeometry
+    ) -> MLXArray? {
+        guard !pendingJournals.isEmpty, pendingJournals.count <= 3,
+            stateIn.dtype == .float32, g.dk == 128, g.dv == 128
+        else { return nil }
+        let B = stateIn.dim(0)
+        let journalStride = g.hv * g.dk + 2 * g.hv * g.dv + 2 * g.hv
+        guard stateIn.shape == [B, g.hv, g.dv, g.dk],
+            pendingJournals.allSatisfy({ $0.shape == [B, journalStride] })
+        else { return nil }
+        let pad = Array(repeating: pendingJournals[0], count: 3 - pendingJournals.count)
+        return flushKernel(
+            [stateIn] + pendingJournals + pad,
+            template: [
+                ("InT", pendingJournals[0].dtype), ("StT", stateIn.dtype),
+                ("Dk", g.dk), ("Dv", g.dv), ("Hv", g.hv), ("RPS", 4),
+                ("J_KEY_OFF", 0), ("J_DELTA_OFF", g.hv * g.dk),
+                ("J_DECAY_OFF", g.hv * g.dk + 2 * g.hv * g.dv),
+                ("J_STRIDE", journalStride), ("J_IN", pendingJournals.count),
+            ],
+            grid: (32, g.dv / 4, B * g.hv), threadGroup: (32, g.dv / 4, 1),
+            outputShapes: [[B, g.hv, g.dv, g.dk]], outputDTypes: [stateIn.dtype])[0]
     }
 
     private static let source = #"""
@@ -133,9 +225,16 @@ enum TrackFastGDNDecode {
         const threadgroup InT* v_ = v_shared;
         const float gate_decay = gb_shared[0];
         const float gate_beta = gb_shared[1];
-        const device InT* journal = journal_in + b_idx * J_STRIDE;
+        // MLXFAST-G2: up to J_IN deferred steps are carried, each in its own
+        // buffer, so nothing has to be copied forward inside the kernel. They
+        // are replayed in step order below.
+        const device InT* journals[3] = {
+            journal_in + b_idx * J_STRIDE,
+            journal_in1 + b_idx * J_STRIDE,
+            journal_in2 + b_idx * J_STRIDE,
+        };
         device InT* next_journal = journal_out + b_idx * J_STRIDE;
-        auto journal_float = [&](int off) -> float {
+        auto journal_float = [&](const device InT* journal, int off) -> float {
             const uint lo = (uint)as_type<ushort>(journal[off]);
             const uint hi = (uint)as_type<ushort>(journal[off + 1]);
             return as_type<float>(lo | (hi << 16));
@@ -166,9 +265,13 @@ enum TrackFastGDNDecode {
             } else {
                 for (int i = 0; i < 4; ++i) { state[i] = static_cast<float>(i_state[4 * lane + i]); }
             }
-            if constexpr (HAS_JOURNAL) {
-                const float pending_decay = journal_float(J_DECAY_OFF + 2 * hv_idx);
-                const float pending_delta = journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx));
+            // Same two lines the d = 1 path has shipped since d51c662, run
+            // once per deferred step in the order those steps happened.
+            for (int j = 0; j < J_IN; ++j) {
+                const device InT* journal = journals[j];
+                const float pending_decay = journal_float(journal, J_DECAY_OFF + 2 * hv_idx);
+                const float pending_delta =
+                    journal_float(journal, J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx));
                 for (int i = 0; i < 4; ++i) {
                     state[i] = state[i] * pending_decay;
                     state[i] = state[i]
@@ -194,7 +297,7 @@ enum TrackFastGDNDecode {
             }
             kv_mem = simd_sum(kv_mem);
             const float delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * gate_beta;
-            if constexpr (!HAS_JOURNAL) {
+            if constexpr (!WRITE_STATE) {
                 if (lane == 0) {
                     store_journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx), delta);
                 }
@@ -209,7 +312,7 @@ enum TrackFastGDNDecode {
                 const InT value = static_cast<InT>(out);
                 y_shared[dv_idx] = value;
             }
-            if constexpr (HAS_JOURNAL) {
+            if constexpr (WRITE_STATE) {
                 device StT* o_state = state_out + (n * Dv + dv_idx) * Dk;
                 if constexpr (vec4) {
                     *reinterpret_cast<device float4*>(o_state + 4 * lane) = float4(state[0], state[1], state[2], state[3]);
@@ -218,7 +321,7 @@ enum TrackFastGDNDecode {
                 }
             }
         }
-        if constexpr (!HAS_JOURNAL) {
+        if constexpr (!WRITE_STATE) {
             if (sg == 0) {
                 for (int i = 0; i < 4; ++i) {
                     next_journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i] = k_[4 * lane + i];
