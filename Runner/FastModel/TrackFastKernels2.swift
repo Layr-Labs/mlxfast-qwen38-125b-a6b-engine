@@ -452,17 +452,28 @@ extension TrackFastKernels {
     // MARK: attention output gate
 
     /// out[b,s,h*D+d] = att[b,h,s,d] * sigmoid(gate[b,s,h*D+d])   (bf16 ops)
+    /// V contiguous columns per thread; V == 4 uses aligned vector loads/stores
+    /// (D, QW and GATE_OFF are multiples of 4). Per-element ops are unchanged.
     static let attnGateSource = """
-        const uint j = thread_position_in_grid.x;
+        const uint j = thread_position_in_grid.x * V;
         const uint row = thread_position_in_grid.y;
         if (j >= HQ * D) return;
         const uint h = j / D;
         const uint d = j % D;
         const uint b = row / S;
         const uint s = row % S;
-        const InT a = att[((b * HQ + h) * S + s) * D + d];
-        const InT g = qkv[row * QW + GATE_OFF + j];
-        out[row * HQ * D + j] = a * mlx_sigmoid(g);
+        const uint a_off = ((b * HQ + h) * S + s) * D + d;
+        const uint g_off = row * QW + GATE_OFF + j;
+        const uint o_off = row * HQ * D + j;
+        if constexpr (V == 4) {
+            const vec<InT, 4> a4 = *reinterpret_cast<const device vec<InT, 4>*>(att + a_off);
+            const vec<InT, 4> g4 = *reinterpret_cast<const device vec<InT, 4>*>(qkv + g_off);
+            vec<InT, 4> o4;
+            for (int i = 0; i < 4; ++i) { o4[i] = a4[i] * mlx_sigmoid(g4[i]); }
+            *reinterpret_cast<device vec<InT, 4>*>(out + o_off) = o4;
+        } else {
+            out[o_off] = att[a_off] * mlx_sigmoid(qkv[g_off]);
+        }
         """
 
     nonisolated(unsafe) static let attnGateKernel = MLXFast.metalKernel(
@@ -473,13 +484,15 @@ extension TrackFastKernels {
 
     static func attnGate(att: MLXArray, qkv: MLXArray, gateOffset: Int) -> MLXArray {
         let B = att.dim(0), HQ = att.dim(1), S = att.dim(2), D = att.dim(3)
+        let QW = qkv.dim(2)
+        let V = (D % 4 == 0 && QW % 4 == 0 && gateOffset % 4 == 0) ? 4 : 1
         return attnGateKernel(
             [att, qkv],
             template: [
-                ("InT", att.dtype), ("HQ", HQ), ("D", D), ("S", S), ("QW", qkv.dim(2)),
-                ("GATE_OFF", gateOffset),
+                ("InT", att.dtype), ("HQ", HQ), ("D", D), ("S", S), ("QW", QW),
+                ("GATE_OFF", gateOffset), ("V", V),
             ],
-            grid: (HQ * D, B * S, 1), threadGroup: (256, 1, 1),
+            grid: (HQ * D / V, B * S, 1), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, HQ * D]], outputDTypes: [att.dtype])[0]
     }
 

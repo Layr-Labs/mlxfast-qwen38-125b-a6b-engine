@@ -4,8 +4,13 @@ import MLX
 // Partition HC input blocks across SIMD groups while retaining each lane's
 // ascending block fold and the final simd_sum. No target weight changes.
 enum TrackFastMixerSplitK {
-    // Four partitions in production; zero selects the original A/B control.
-    nonisolated(unsafe) static var split = 4
+    // MLXFAST-SPLITK5: five partitions, one per 512-wide quantized block of the
+    // 2560-long down walk. At four `COUNT = ceil(5 / 4) = 2`, so two simdgroups
+    // walked two blocks in series, one walked one and the fourth sat idle at the
+    // barrier; at five each simdgroup owns exactly one block. The ordered
+    // scratch is indexed by block and row, never by partition, so neither the
+    // fold nor its order depends on this count. Zero still selects the control.
+    nonisolated(unsafe) static var split = 5
     static let helper = #"""
         template <typename T, int K, int V, int R, int SPLIT, bool ORDERED>
         METAL_FUNC void research_split_qmv(
@@ -70,7 +75,7 @@ enum TrackFastMixerSplitK {
             if (sg == 0 && lane == 0) { inj[tile - DN] = static_cast<T>(r[0]); }
         }
         """#
-    static let fusedKernel = MLXFast.metalKernel(name: "track_split_k_mixer",
+    static let fusedKernel = MLXFast.metalKernel(name: "track_split_k_mixer_1row_p5",
         inputNames: ["x", "wd", "sd", "bd", "wi", "si", "bi"],
         outputNames: ["lo", "act", "inj"], source: fusedSource,
         header: TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader + helper,
@@ -78,7 +83,12 @@ enum TrackFastMixerSplitK {
 
     static func apply(_ x: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?) -> [MLXArray] {
         let k = x.size, n = down.rows, hc = inject?.rows ?? 4
-        let rows = 2, partitions = split
+        // MLXFAST-SPLITK1ROW: one down row per tile instead of two. Each row's
+        // block fold, its ascending `b` order and its closing simd_sum are
+        // functions of the row alone, so the ownership change is exact; the tile
+        // count doubles, the per-lane serial `r` loop disappears and the
+        // threadgroup scratch halves.
+        let rows = 1, partitions = split
         let inj = inject ?? down
         precondition(x.shape == [1, k] && k % 512 == 0 && n % rows == 0 && partitions > 0)
         return fusedKernel([x, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],

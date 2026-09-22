@@ -7,70 +7,94 @@ import MLX
 
 enum TrackPLEFusion {
     static let header = """
-        // MLXFAST-PLEFUSE2: rms_single_row's four adjacent elements per thread,
-        // 640 threads / 20 SIMD groups. Reuse its existing 128-byte buffer.
-        METAL_FUNC float ple_row_sum(
-            float acc, threadgroup float* partials, uint lane, uint sg) {
-            acc = simd_sum(acc);
+        // MLXFAST-PLEPAIR: 320 physical threads emulate the original 640-thread
+        // reduction geometry. Each SIMD group produces its own partial and the
+        // corresponding partial from the logical group ten positions later.
+        METAL_FUNC float ple_row_sum_pair(
+            float acc0, float acc1, threadgroup float* partials, uint lane, uint sg) {
+            acc0 = simd_sum(acc0);
+            acc1 = simd_sum(acc1);
             if (sg == 0 && lane >= 20) { partials[lane] = 0.0f; }
-            if (lane == 0) { partials[sg] = acc; }
+            if (lane == 0) {
+                partials[sg] = acc0;
+                partials[sg + 10] = acc1;
+            }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            acc = simd_sum(partials[lane]);
+            acc0 = simd_sum(partials[lane]);
             // All readers finish before the next reduction reuses the buffer.
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            return acc;
+            return acc0;
         }
         """
 
     static let prepareSource = """
-        // MLXFAST-PLEFUSE2: all three group norms, dot, gate, and concat.
+        // MLXFAST-PLEPAIR: all three group norms, dot, gate, and concat.
+        // The two logical owners preserve the 640-thread reduction association.
         constexpr uint H = 2560;
         constexpr uint W = 4 * H;
         const uint hc = threadgroup_position_in_grid.y;
         const uint lid = thread_position_in_threadgroup.x;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
-        const uint d = lid * 4;
-        const uint base = hc * H + d;
+        const uint d0 = lid * 4;
+        const uint d1 = d0 + H / 2;
+        const uint base0 = hc * H + d0;
+        const uint base1 = hc * H + d1;
         threadgroup float partials[32];  // 128 B total, reused throughout.
         const float eps = as_type<float>((uint)EPS_BITS);
 
-        // Reload the four key/query elements after their norms instead of
-        // keeping both rows live across the reductions.
-        float acc = 0.0f;
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
         for (uint i = 0; i < 4; ++i) {
-            float k = float(key[base + i]);
-            acc += k * k;
+            const float k0 = float(key[base0 + i]);
+            const float k1 = float(key[base1 + i]);
+            acc0 += k0 * k0;
+            acc1 += k1 * k1;
         }
         const float ik = metal::precise::rsqrt(
-            ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
-        acc = 0.0f;
+            ple_row_sum_pair(acc0, acc1, partials, lane, sg) / float(H) + eps);
+        acc0 = 0.0f;
+        acc1 = 0.0f;
         for (uint i = 0; i < 4; ++i) {
-            float q = float(query[base + i]);
-            acc += q * q;
+            const float q0 = float(query[base0 + i]);
+            const float q1 = float(query[base1 + i]);
+            acc0 += q0 * q0;
+            acc1 += q1 * q1;
         }
         const float iq = metal::precise::rsqrt(
-            ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
+            ple_row_sum_pair(acc0, acc1, partials, lane, sg) / float(H) + eps);
 
-        // Keep the original dtype boundaries: round RMS before scale, round
-        // product before sum, and use row_reduce_looped's four-element fold.
-        InT dot = InT(0);
+        // Keep the original dtype boundaries and four-element logical folds.
+        InT dot0 = InT(0);
+        InT dot1 = InT(0);
         for (uint i = 0; i < 4; ++i) {
-            InT k = InT(float(key[base + i]) * ik);
-            k = k * keyScale[base + i];
-            InT q = InT(float(query[base + i]) * iq);
-            q = q * queryScale[base + i];
-            InT product = k * q;
-            dot = product + dot;
+            InT k0 = InT(float(key[base0 + i]) * ik);
+            k0 = k0 * keyScale[base0 + i];
+            InT q0 = InT(float(query[base0 + i]) * iq);
+            q0 = q0 * queryScale[base0 + i];
+            InT product0 = k0 * q0;
+            dot0 = product0 + dot0;
+
+            InT k1 = InT(float(key[base1 + i]) * ik);
+            k1 = k1 * keyScale[base1 + i];
+            InT q1 = InT(float(query[base1 + i]) * iq);
+            q1 = q1 * queryScale[base1 + i];
+            InT product1 = k1 * q1;
+            dot1 = product1 + dot1;
         }
-        dot = InT(0) + dot;
-        dot = simd_sum(dot);
+        dot0 = InT(0) + dot0;
+        dot1 = InT(0) + dot1;
+        dot0 = simd_sum(dot0);
+        dot1 = simd_sum(dot1);
         if (sg == 0 && lane >= 20) { partials[lane] = 0.0f; }
-        if (lane == 0) { partials[sg] = float(dot); }
+        if (lane == 0) {
+            partials[sg] = float(dot0);
+            partials[sg + 10] = float(dot1);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        dot = simd_sum(InT(partials[lane]));
+        dot0 = simd_sum(InT(partials[lane]));
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        InT gate = dot / InT(as_type<float>((uint)DIVISOR_BITS));
+        InT gate = dot0 / InT(as_type<float>((uint)DIVISOR_BITS));
         InT magnitude = metal::abs(gate);
         magnitude = metal::max(magnitude, InT(1e-6f));
         magnitude = metal::sqrt(magnitude);
@@ -78,27 +102,34 @@ enum TrackPLEFusion {
         gate = magnitude * direction;
         const InT activation = mlx_sigmoid(gate);
 
-        // Only four gated values survive this last reduction (8 B/thread
-        // for bf16/f16, 16 B for f32); no private full-row scratch.
-        InT g[4];
-        acc = 0.0f;
+        InT g0[4];
+        InT g1[4];
+        acc0 = 0.0f;
+        acc1 = 0.0f;
         for (uint i = 0; i < 4; ++i) {
-            g[i] = activation * value[d + i];
-            gated[base + i] = g[i];
-            float v = float(g[i]);
-            acc += v * v;
+            g0[i] = activation * value[d0 + i];
+            g1[i] = activation * value[d1 + i];
+            gated[base0 + i] = g0[i];
+            gated[base1 + i] = g1[i];
+            const float v0 = float(g0[i]);
+            const float v1 = float(g1[i]);
+            acc0 += v0 * v0;
+            acc1 += v1 * v1;
         }
         const float iv = metal::precise::rsqrt(
-            ple_row_sum(acc, partials, lane, sg) / float(H) + eps);
+            ple_row_sum_pair(acc0, acc1, partials, lane, sg) / float(H) + eps);
         for (uint i = 0; i < 4; ++i) {
-            InT n = InT(float(g[i]) * iv);
-            full[9 * W + base + i] = n * convScale[base + i];
+            InT n0 = InT(float(g0[i]) * iv);
+            InT n1 = InT(float(g1[i]) * iv);
+            full[9 * W + base0 + i] = n0 * convScale[base0 + i];
+            full[9 * W + base1 + i] = n1 * convScale[base1 + i];
         }
         // Same [old nine rows, new row] layout as concatenated. State staging
         // keeps its existing tail view, including capture/rollback behavior.
         for (uint t = 0; t < 9; ++t) {
             for (uint i = 0; i < 4; ++i) {
-                full[t * W + base + i] = convState[t * W + base + i];
+                full[t * W + base0 + i] = convState[t * W + base0 + i];
+                full[t * W + base1 + i] = convState[t * W + base1 + i];
             }
         }
         """
@@ -113,39 +144,57 @@ enum TrackPLEFusion {
     private static let fusedPrepareSource: String = {
         let old = """
         for (uint i = 0; i < 4; ++i) {
-            InT n = InT(float(g[i]) * iv);
-            full[9 * W + base + i] = n * convScale[base + i];
+            InT n0 = InT(float(g0[i]) * iv);
+            InT n1 = InT(float(g1[i]) * iv);
+            full[9 * W + base0 + i] = n0 * convScale[base0 + i];
+            full[9 * W + base1 + i] = n1 * convScale[base1 + i];
         }
         """
         let new = """
         for (uint i = 0; i < 4; ++i) {
-            const uint c = base + i;
-            InT n = InT(float(g[i]) * iv);
-            const InT newest = n * convScale[c];
-            full[9 * W + c] = newest;
+            const uint c0 = base0 + i;
+            const uint c1 = base1 + i;
+            InT n0 = InT(float(g0[i]) * iv);
+            InT n1 = InT(float(g1[i]) * iv);
+            const InT newest0 = n0 * convScale[c0];
+            const InT newest1 = n1 * convScale[c1];
+            full[9 * W + c0] = newest0;
+            full[9 * W + c1] = newest1;
 
-            float acc = 0.0f;
+            float conv0 = 0.0f;
+            float conv1 = 0.0f;
             {
             #pragma clang fp reassociate(off)
             #pragma clang fp contract(off)
-                const float p0 = float(convState[c]) * float(convW[c * 4 + 0]);
-                const float p1 = float(convState[3 * W + c]) * float(convW[c * 4 + 1]);
-                const float p2 = float(convState[6 * W + c]) * float(convW[c * 4 + 2]);
-                const float p3 = float(newest) * float(convW[c * 4 + 3]);
-                acc = p0;
-                acc += p1;
-                acc += p2;
-                acc += p3;
+                const float p00 = float(convState[c0]) * float(convW[c0 * 4 + 0]);
+                const float p01 = float(convState[3 * W + c0]) * float(convW[c0 * 4 + 1]);
+                const float p02 = float(convState[6 * W + c0]) * float(convW[c0 * 4 + 2]);
+                const float p03 = float(newest0) * float(convW[c0 * 4 + 3]);
+                conv0 = p00;
+                conv0 += p01;
+                conv0 += p02;
+                conv0 += p03;
+
+                const float p10 = float(convState[c1]) * float(convW[c1 * 4 + 0]);
+                const float p11 = float(convState[3 * W + c1]) * float(convW[c1 * 4 + 1]);
+                const float p12 = float(convState[6 * W + c1]) * float(convW[c1 * 4 + 2]);
+                const float p13 = float(newest1) * float(convW[c1 * 4 + 3]);
+                conv1 = p10;
+                conv1 += p11;
+                conv1 += p12;
+                conv1 += p13;
             }
 
-            const InT convolved = InT(acc);
-            const InT activated = mlx_silu(convolved);
-            const InT pleDelta = g[i] + activated;
-            added[c] = query[c] + pleDelta;
+            const InT pleDelta0 = g0[i] + mlx_silu(InT(conv0));
+            const InT pleDelta1 = g1[i] + mlx_silu(InT(conv1));
+            added[c0] = query[c0] + pleDelta0;
+            added[c1] = query[c1] + pleDelta1;
         }
         """
+        let withoutGated0 = replaceOnce(
+            prepareSource, "    gated[base0 + i] = g0[i];\n", "")
         let withoutGated = replaceOnce(
-            prepareSource, "    gated[base + i] = g[i];\n", "")
+            withoutGated0, "    gated[base1 + i] = g1[i];\n", "")
         return replaceOnce(withoutGated, old, new)
     }()
 
@@ -178,7 +227,7 @@ enum TrackPLEFusion {
         """
 
     static let prepareKernel = MLXFast.metalKernel(
-        name: "track_ple_prepare_fuse2",
+        name: "track_ple_prepare_fuse2_pair",
         inputNames: ["key", "query", "value", "keyScale", "queryScale", "convScale", "convState"],
         outputNames: ["gated", "full"], source: prepareSource,
         header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
@@ -189,21 +238,32 @@ enum TrackPLEFusion {
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
     static let fusedPrepareKernel = MLXFast.metalKernel(
-        name: "track_ple_prepare_conv_fused2_residual",
+        name: "track_ple_prepare_conv_fused2_residual_pair",
         inputNames: ["key", "query", "value", "keyScale", "queryScale", "convScale", "convState", "convW"],
         outputNames: ["full", "added"], source: fusedPrepareSource,
         header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
 
+    private static func isRow(_ a: MLXArray, _ width: Int, _ dtype: DType) -> Bool {
+        a.ndim == 3 && a.dim(0) == 1 && a.dim(1) == 1 && a.dim(2) == width && a.dtype == dtype
+    }
+
+    private static func isScaleVector(_ a: MLXArray, _ dtype: DType) -> Bool {
+        a.ndim == 1 && a.dim(0) == 10240 && a.dtype == dtype
+    }
+
     static func supports(_ p: TrackPLE, stream: MLXArray, hidden: Int, hcCount: Int) -> Bool {
         // Guard the exact geometry; every other path builds the original chain.
-        hidden == 2560 && hcCount == 4 && stream.shape == [1, 1, 10240]
-            && [.bfloat16, .float16, .float32].contains(stream.dtype)
+        // MLXFAST-PLESHAPE: the accepted set is unchanged -- the dimensions are
+        // read one at a time instead of materializing a shape array per call.
+        let dtype = stream.dtype
+        return hidden == 2560 && hcCount == 4 && isRow(stream, 10240, dtype)
+            && (dtype == .bfloat16 || dtype == .float16 || dtype == .float32)
             && p.dilation == 3 && p.stateLength == 9
             && p.keyProj.rows == 10240 && p.valueProj.rows == 2560
-            && p.convW.shape == [10240, 4, 1] && p.convW.dtype == stream.dtype
-            && [p.normKeyScale, p.normQueryScale, p.normConvScale].allSatisfy {
-                $0.shape == [10240] && $0.dtype == stream.dtype
-            }
+            && p.convW.ndim == 3 && p.convW.dim(0) == 10240 && p.convW.dim(1) == 4
+            && p.convW.dim(2) == 1 && p.convW.dtype == dtype
+            && isScaleVector(p.normKeyScale, dtype) && isScaleVector(p.normQueryScale, dtype)
+            && isScaleVector(p.normConvScale, dtype)
     }
 
     private static func prepareTemplates(dtype: DType, eps: Float)
@@ -220,15 +280,14 @@ enum TrackPLEFusion {
         _ p: TrackPLE, key: MLXArray, value: MLXArray, stream: MLXArray,
         convState: MLXArray, eps: Float, fusedResidual: Bool
     ) -> (full: MLXArray, output: MLXArray, residualAdded: Bool)? {
-        guard key.shape == [1, 1, 10240], value.shape == [1, 1, 2560],
-            key.dtype == stream.dtype, value.dtype == stream.dtype
+        guard isRow(key, 10240, stream.dtype), isRow(value, 2560, stream.dtype)
         else { return nil }
         if fusedResidual {
             let r = fusedPrepareKernel(
                 [key, stream, value, p.normKeyScale, p.normQueryScale,
                  p.normConvScale, convState, p.convW],
                 template: prepareTemplates(dtype: stream.dtype, eps: eps),
-                grid: (640, 4, 1), threadGroup: (640, 1, 1),
+                grid: (320, 4, 1), threadGroup: (320, 1, 1),
                 outputShapes: [[1, 10, 10240], [1, 1, 10240]],
                 outputDTypes: [stream.dtype, stream.dtype])
             return (r[0], r[1], true)
@@ -236,7 +295,7 @@ enum TrackPLEFusion {
         let r = prepareKernel(
             [key, stream, value, p.normKeyScale, p.normQueryScale, p.normConvScale, convState],
             template: prepareTemplates(dtype: stream.dtype, eps: eps),
-            grid: (640, 4, 1), threadGroup: (640, 1, 1),
+            grid: (320, 4, 1), threadGroup: (320, 1, 1),
             outputShapes: [[1, 1, 10240], [1, 10, 10240]],
             outputDTypes: [stream.dtype, stream.dtype])
         let output = convolutionKernel(
