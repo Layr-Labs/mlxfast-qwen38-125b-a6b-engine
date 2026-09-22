@@ -1,4 +1,3 @@
-// Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
 // TrackFastKernels.prepSource, leanSource and gatedRMSSource.
 
 import MLX
@@ -250,3 +249,4 @@ enum TrackFastGDNDecode {
         }
         """#
 }
+private let gauntletRedraw_005053c3_20260922T195522Z: Int = 0
