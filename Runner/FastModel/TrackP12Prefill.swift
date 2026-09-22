@@ -198,6 +198,38 @@ enum TrackP12Prefill {
             ]),
         header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
+    private static let sortedCombineVectorKernel = MLXFast.metalKernel(
+        name: "track_p12_sorted_combine_vector4",
+        inputNames: ["routed", "w", "shared", "gate", "inverse_order"],
+        outputNames: ["out"], source: sortedCombineVectorSource,
+        header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
+
+    private static let sortedCombineVectorSource = """
+        const uint d = 4u * thread_position_in_grid.x;
+        const uint row = thread_position_in_grid.y;
+        if (d >= H) return;
+        float prod[4][K];
+        for (int k = 0; k < K; ++k) {
+            const uint expert_row = static_cast<uint>(inverse_order[row * K + k]);
+            const vec<InT, 4> values = *reinterpret_cast<const device vec<InT, 4>*>(
+                routed + expert_row * H + d);
+            const float weight = w[row * K + k];
+            for (int c = 0; c < 4; ++c) {
+                prod[c][k] = static_cast<float>(values[c]) * weight;
+            }
+        }
+        const InT sg = mlx_sigmoid(gate[row]);
+        const vec<InT, 4> sh_values = *reinterpret_cast<const device vec<InT, 4>*>(
+            shared + row * H + d);
+        vec<InT, 4> result;
+        for (int c = 0; c < 4; ++c) {
+            const InT r = static_cast<InT>(mlx_colsum_small_f32<K>(prod[c]));
+            const InT sh = sg * sh_values[c];
+            result[c] = r + sh;
+        }
+        *reinterpret_cast<device vec<InT, 4>*>(out + row * H + d) = result;
+        """
+
     /// Keep sorted expert rows through the projections and weighted combine.
     static func sortedMoE(
         _ m: TrackMoE, _ x: MLXArray, indices: MLXArray, weights: MLXArray,
@@ -228,10 +260,12 @@ enum TrackP12Prefill {
         guard down.ndim == 3, down.dim(0) == B * S * K, down.dim(1) == 1, down.dim(2) == H,
             inverse.size == B * S * K
         else { return nil }
-        return sortedCombineKernel(
+        let vectorWidth = H % 4 == 0 ? 4 : 1
+        let combineKernel = vectorWidth == 4 ? sortedCombineVectorKernel : sortedCombineKernel
+        return combineKernel(
             [down, weights, shared, gate, inverse],
             template: [("InT", down.dtype), ("K", K), ("H", H)],
-            grid: (H, B * S, 1), threadGroup: (256, 1, 1),
+            grid: (H / vectorWidth, B * S, 1), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, H]], outputDTypes: [down.dtype])[0]
     }
 }
