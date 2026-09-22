@@ -137,7 +137,17 @@ enum TrackFastMixerKernels {
         const uint sg = simdgroup_index_in_threadgroup;
         const uint lid = thread_index_in_simdgroup;
         threadgroup T products[8][VPT];
+        // MLXFAST-PREMIX: source-time choice; the residual element an owner lane
+        // multiplies after the up GEMV depends only on its own indices, so it is
+        // fetched before the walk and its latency overlaps it. Set to false for
+        // the original fetch at the multiply.
+        constexpr bool PREMIX = true;
         if constexpr (VPT == 1) {
+            const int slot = (int)sg * 4 + (int)lid;
+            const int row = d0 + (slot & 1) + H * (slot >> 1);
+            const bool owner = lid < 4 && (int)(sg * 2 + lid / 2) < HC;
+            T pre = T(0);
+            if (PREMIX && owner) { pre = normed[row]; }
             float r[4];
             if constexpr (PACKED_ROWS) {
                 qmv_reg<T, GS, BITS, (LW % get_pack_factor<BITS, 32>()) == 0>(wu, su, bu, act, LW, tile * 8 + (int)sg * 4, lid, r);
@@ -146,13 +156,11 @@ enum TrackFastMixerKernels {
                 for (int i = 0; i < 4; ++i) { const int s = (int)sg * 4 + i; rows[i] = d0 + (s & 1) + H * (s >> 1); }
                 qmv_reg_rows<T, GS, BITS, false, (LW % get_pack_factor<BITS, 32>()) == 0>(wu, su, bu, act, LW, rows, lid, r);
             }
-            if (lid < 4 && (int)(sg * 2 + lid / 2) < HC) {
-                const int slot = (int)sg * 4 + (int)lid;
+            if (owner) {
                 const float low = metal::select(r[0], r[1], (lid & 1u) != 0);
                 const float high = metal::select(r[2], r[3], (lid & 1u) != 0);
                 const T weight = static_cast<T>(metal::select(low, high, (lid & 2u) != 0));
-                const int row = d0 + (slot & 1) + H * (slot >> 1);
-                products[slot][0] = sigmoid(weight) * normed[row];
+                products[slot][0] = sigmoid(weight) * (PREMIX ? pre : normed[row]);
             }
         } else {
             const int s = (int)sg * 4 + (int)(lid / 8);
