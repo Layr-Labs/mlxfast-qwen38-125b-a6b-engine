@@ -393,35 +393,74 @@ extension TrackFastKernels {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         acc = simd_sum(local_sums[lane]);
         const float inv_mean = metal::precise::rsqrt(acc / (float)D + as_type<float>((uint)EPS_BITS));
-        for (int i = 0; i < N_READS; ++i) {
-            const uint d = lid * N_READS + i;
-            const InT wgt = isQ ? qnorm[d] : knorm[d];
-            vec[d] = wgt * static_cast<InT>(thread_x[i] * inv_mean);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         constexpr int hrot = ROT / 2;
         device InT* dst = isQ ? (qout + ((b * HQ + hh) * S + s) * D) : (kout + ((b * HK + hh) * S + s) * D);
-        for (int i = 0; i < N_READS; ++i) {
-            const uint d = lid * N_READS + i;
-            InT o = vec[d];
-            if (d < ROT) {
-                const InT c = cosb[s * ROT + d];
-                const InT sn = sinb[s * ROT + d];
-                if (d < hrot) {
-                    InT x1 = vec[d];
-                    InT x2 = vec[d + hrot];
-                    InT t1 = x1 * c;
-                    InT t2 = (-x2) * sn;
-                    o = t1 + t2;
-                } else {
-                    InT x2 = vec[d];
-                    InT x1 = vec[d - hrot];
-                    InT t1 = x2 * c;
-                    InT t2 = x1 * sn;
-                    o = t1 + t2;
-                }
+        if constexpr (ROT <= 32 * N_READS && (hrot % N_READS) == 0) {
+            // Every rotated column (d < ROT) lives in simdgroup 0, and its rope
+            // partner d +/- hrot sits hrot/N_READS lanes away at the same i, so
+            // the pair exchange is a register shuffle instead of a threadgroup
+            // round-trip behind a second barrier. Values cross the shuffle as
+            // float, which is exact for InT (bf16/f16), and every per-element
+            // op below is the one the threadgroup path performs.
+            constexpr uint pl = hrot / N_READS;
+            const uint base = lid * N_READS;
+            const bool lo_half = base < (uint)hrot;
+            const bool rot = base < (uint)ROT;
+            const ushort src_lane = (ushort)(!rot ? lane : (lo_half ? lane + pl : lane - pl));
+            InT v[N_READS];
+            for (int i = 0; i < N_READS; ++i) {
+                const uint d = base + i;
+                const InT wgt = isQ ? qnorm[d] : knorm[d];
+                v[i] = wgt * static_cast<InT>(thread_x[i] * inv_mean);
             }
-            dst[d] = o;
+            for (int i = 0; i < N_READS; ++i) {
+                const InT partner = static_cast<InT>(simd_shuffle(static_cast<float>(v[i]), src_lane));
+                const uint d = base + i;
+                InT o = v[i];
+                if (rot) {
+                    const InT c = cosb[s * ROT + d];
+                    const InT sn = sinb[s * ROT + d];
+                    if (lo_half) {
+                        InT t1 = v[i] * c;
+                        InT t2 = (-partner) * sn;
+                        o = t1 + t2;
+                    } else {
+                        InT t1 = v[i] * c;
+                        InT t2 = partner * sn;
+                        o = t1 + t2;
+                    }
+                }
+                dst[d] = o;
+            }
+        } else {
+            for (int i = 0; i < N_READS; ++i) {
+                const uint d = lid * N_READS + i;
+                const InT wgt = isQ ? qnorm[d] : knorm[d];
+                vec[d] = wgt * static_cast<InT>(thread_x[i] * inv_mean);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = 0; i < N_READS; ++i) {
+                const uint d = lid * N_READS + i;
+                InT o = vec[d];
+                if (d < ROT) {
+                    const InT c = cosb[s * ROT + d];
+                    const InT sn = sinb[s * ROT + d];
+                    if (d < hrot) {
+                        InT x1 = vec[d];
+                        InT x2 = vec[d + hrot];
+                        InT t1 = x1 * c;
+                        InT t2 = (-x2) * sn;
+                        o = t1 + t2;
+                    } else {
+                        InT x2 = vec[d];
+                        InT x1 = vec[d - hrot];
+                        InT t1 = x2 * c;
+                        InT t2 = x1 * sn;
+                        o = t1 + t2;
+                    }
+                }
+                dst[d] = o;
+            }
         }
         """
 
