@@ -160,6 +160,65 @@ enum TrackPrefillSort {
     /// is the stable rank of the assignment among its equals, i.e. exactly the
     /// position `argSort` gives it.
     static let scatterSource = #"""
+        if constexpr (E == 512 && BLK == 256) {
+            const uint blk = threadgroup_position_in_grid.x;
+            const uint t = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint gi = blk * BLK + t;
+            const uint v = ids[gi];
+            threadgroup uint planes[8][10];
+            threadgroup uint chunk_totals[16];
+            threadgroup uint bucket_base[512];
+            threadgroup uint block_before[512];
+            const uint valid = (uint)((simd_vote::vote_t)simd_ballot(v < (uint)E));
+            if (lane == 0) { planes[sg][9] = valid; }
+            for (uint bit = 0; bit < 9; ++bit) {
+                const uint mask = (uint)((simd_vote::vote_t)simd_ballot((v & (1u << bit)) != 0));
+                if (lane == 0) { planes[sg][bit] = mask; }
+            }
+            uint exclusive[2];
+            for (uint pass = 0; pass < 2; ++pass) {
+                const uint b = t + pass * BLK;
+                uint total = 0, before = 0;
+                for (uint n = 0; n < (uint)NB; ++n) {
+                    const uint c = counts[n * (uint)E + b];
+                    total += c;
+                    if (n < blk) { before += c; }
+                }
+                block_before[b] = before;
+                // A 32-lane inclusive scan, retaining the original bucket order.
+                uint prefix = total;
+                for (ushort offset = 1; offset < 32; offset <<= 1) {
+                    const uint previous = simd_shuffle_up(prefix, offset);
+                    if (lane >= offset) { prefix += previous; }
+                }
+                exclusive[pass] = prefix - total;
+                if (lane == 31) { chunk_totals[pass * 8 + sg] = prefix; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint pass = 0; pass < 2; ++pass) {
+                const uint chunk = pass * 8 + sg;
+                uint prior = 0;
+                for (uint c = 0; c < chunk; ++c) { prior += chunk_totals[c]; }
+                bucket_base[t + pass * BLK] = prior + exclusive[pass];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint rank = 0;
+            for (uint word = 0; word <= sg; ++word) {
+                uint matches = planes[word][9];
+                for (uint bit = 0; bit < 9; ++bit) {
+                    const uint mask = planes[word][bit];
+                    matches &= (v & (1u << bit)) ? mask : ~mask;
+                }
+                if (word == sg) { matches &= (1u << lane) - 1u; }
+                rank += popcount(matches);
+            }
+            const uint dest = bucket_base[v] + block_before[v] + rank;
+            sorted_ids[dest] = v;
+            token_rows[dest] = gi / (uint)TOPK;
+            inverse[gi] = dest;
+        } else {
         threadgroup uint vals[BLK];
         threadgroup uint tot[E];
         threadgroup uint pre[E];
@@ -197,5 +256,6 @@ enum TrackPrefillSort {
         sorted_ids[dest] = v;
         token_rows[dest] = gi / (uint)TOPK;
         inverse[gi] = dest;
+        }
         """#
 }
