@@ -141,6 +141,12 @@ extension TrackFastKernels {
         static_assert(simd_groups % SG == 0, "slices split evenly over the simdgroups");
         constexpr uint SLICES = simd_groups / SG;
         InT kept[SLICES * N_READS];
+        // MLXFAST-PRESCALEW: source-time choice; the scale element a slice needs
+        // in the normalise pass depends on neither the row sum nor the barrier,
+        // so it is fetched in the streaming pass and its latency overlaps the
+        // reduction. Set to false for the original post-barrier fetch.
+        constexpr bool PRESCALEW = true;
+        InT keptScale[SLICES * N_READS];
         for (uint si = 0; si < SLICES; ++si) {
             const uint g = sgi + si * SG;
             const uint lid = g * 32 + lane;
@@ -156,6 +162,7 @@ extension TrackFastKernels {
                     }
                     stream[base + d] = r;
                     kept[si * N_READS + i] = r;
+                    if constexpr (PRESCALEW) { keptScale[si * N_READS + i] = scale[hc * H + d]; }
                     const float xf = static_cast<float>(r);
                     acc += xf * xf;
                 }
@@ -173,7 +180,8 @@ extension TrackFastKernels {
                 for (int i = 0; i < N_READS; ++i) {
                     const uint d = lid * N_READS + i;
                     InT n = static_cast<InT>(static_cast<float>(kept[si * N_READS + i]) * inv_mean);
-                    normed[base + d] = n * scale[hc * H + d];
+                    const InT sc = PRESCALEW ? keptScale[si * N_READS + i] : scale[hc * H + d];
+                    normed[base + d] = n * sc;
                 }
             }
         }
