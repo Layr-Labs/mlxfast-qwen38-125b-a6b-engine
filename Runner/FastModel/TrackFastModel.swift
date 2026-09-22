@@ -17,8 +17,10 @@
 // The engine sees a `LanguageModel` that conforms to the same CBv2 protocols
 // as `Qwen4ExpModel`; caches and recurrent state keep the engine's layouts so
 // prefill, decode and capture-verify interoperate with the trusted code.
-// Anything this fast path does not serve (positioned inputs, a QSA context
-// past the indexer budget, wider batches) is delegated to the wrapped model.
+// Past the indexer budget the fork's QSA indexer selects the keys and the
+// layer cache gathers them (`Qwen4ExpQSASelection`); the fast kernels serve
+// the rest of the step unchanged. Anything this fast path does not serve
+// (positioned inputs, wider batches) is delegated to the wrapped model.
 
 import Foundation
 import MLX
@@ -212,6 +214,8 @@ struct TrackAttn {
     /// projection to stay exact there.
     let indexerFull: TrackProj
     let indexerQWidth: Int
+    /// The loaded indexer module: its norms and selection past the budget.
+    let indexer: Qwen4ExpQSAIndexer
     let qNormW: MLXArray
     let kNormW: MLXArray
     let indexerK: TrackProj
@@ -295,6 +299,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// Debug taps (tests): when set, every layer's output stream and the block
     /// inputs/outputs are appended here.
     nonisolated(unsafe) static var debugTaps: [(String, MLXArray)]? = nil
+    /// Windows at least this wide release the MLX buffer cache when they end.
+    nonisolated(unsafe) public static var cacheReleaseMinWindow: Int = 256
     /// Layers per partial dispatch inside a forward (0 = one dispatch per step).
     nonisolated(unsafe) public static var asyncChunk: Int = 3
     /// Layers in the first partial-dispatch chunk (0 = same as asyncChunk):
@@ -430,6 +436,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let qNormW = m.trackChild("q_norm").trackArray("weight")
         let kNormW = m.trackChild("k_norm").trackArray("weight")
         let indexer = m.trackChild("indexer")
+        guard let indexerModule = indexer as? Qwen4ExpQSAIndexer else {
+            preconditionFailure("TrackFastModel: the indexer child is not a Qwen4ExpQSAIndexer")
+        }
         let idxProj = TrackProj(indexer.trackChild("index_qk_proj"))
         let idxSplit = cfg.indexerHeads * cfg.indexerHeadDim
         let idxRows = idxProj.rows
@@ -443,7 +452,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let out = TrackProj(m.trackChild("o_proj"))
         let qkv = TrackMultiProj([qReordered, k, v, indexerK])
         return TrackAttn(
-            qkv: qkv, indexerFull: idxProj, indexerQWidth: idxSplit,
+            qkv: qkv, indexerFull: idxProj, indexerQWidth: idxSplit, indexer: indexerModule,
             qNormW: qNormW, kNormW: kNormW, indexerK: indexerK, out: out,
             qWidth: heads * d, kvWidth: kvHeads * d)
     }
@@ -695,7 +704,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     private func attnForward(
         _ a: TrackAttn, _ x: MLXArray, cache: Qwen4ExpCBv2LayerCache,
-        rope: (cos: MLXArray, sin: MLXArray)
+        rope: (cos: MLXArray, sin: MLXArray), offset: Int
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let heads = cfg.attentionHeads, kvHeads = cfg.kvHeads, d = cfg.headDim
@@ -716,14 +725,38 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 : a.qkv.apply(x)
         }
         // The indexer tape first: its truncation reads the pre-update offset.
+        // Past the budget the indexer also needs its queries, which only the
+        // full projection carries; its keys keep coming from the same rows
+        // as below the budget.
+        let prof = TrackFastProfile.prefill != nil && S >= TrackFastProfile.minWindow
+        var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
+        if prof { TrackFastProfile.tick("attn.qkv", &pt, [qkv]) }
+        let pastBudget = offset + S > indexerBudget
+        let idxFull: MLXArray? = (S > 8 || pastBudget) ? a.indexerFull.apply(x) : nil
         let idxKeys: MLXArray
         if S <= 8 {
             let idxStart = 2 * a.qWidth + 2 * a.kvWidth
             idxKeys = qkv[.ellipsis, idxStart ..< (idxStart + cfg.indexerHeadDim)]
         } else {
-            idxKeys = a.indexerFull.apply(x)[.ellipsis, a.indexerQWidth...]
+            idxKeys = idxFull![.ellipsis, a.indexerQWidth...]
         }
-        _ = cache.updateIndexerTape(keys: idxKeys)
+        let selection: Qwen4ExpQSASelection
+        if pastBudget {
+            selection = a.indexer.cbv2Selection(
+                q: idxFull![.ellipsis, ..<a.indexerQWidth], keys: idxKeys,
+                rope: rotary, cache: cache,
+                positions: qwen4ExpPositions(offset: offset, count: S))
+        } else {
+            _ = cache.updateIndexerTape(keys: idxKeys)
+            selection = .all
+        }
+        if prof {
+            switch selection {
+            case .all: break
+            case .keepMask(let m): TrackFastProfile.tick("attn.select", &pt, [m])
+            case .gather(let i, let v): TrackFastProfile.tick("attn.select", &pt, [i, v])
+            }
+        }
 
         let prep: (q: MLXArray, k: MLXArray, v: MLXArray)
         if let parts = splitInputs {
@@ -736,9 +769,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 qkv: qkv, qNorm: a.qNormW, kNorm: a.kNormW, cos: rope.cos, sin: rope.sin,
                 heads: heads, kvHeads: kvHeads, headDim: d, rotaryDims: rotaryDims, eps: eps)
         }
+        if prof { TrackFastProfile.tick("attn.prep", &pt, [prep.q, prep.k, prep.v]) }
         let att = cache.updateAndAttend(
             queries: prep.q, keys: prep.k, values: prep.v,
-            scale: attentionScale, sinks: nil, keepMask: nil)  // [B,HQ,S,D]
+            scale: attentionScale, selection: selection)  // [B,HQ,S,D]
+        if prof { TrackFastProfile.tick("attn.sdpa", &pt, [att]) }
         let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: a.qWidth)
         return a.out.apply(out)
     }
@@ -1071,9 +1106,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         var stream = residual
         let ropeTab = ropeTables(offset: offset, count: ids.dim(1), dtype: residual.dtype)
 
+        if TrackFastProfile.environmentEnabled, TrackFastProfile.prefill == nil {
+            TrackFastProfile.prefill = [:]
+            TrackFastProfile.memory = [:]
+        }
         let profiling = TrackFastProfile.prefill != nil && ids.dim(1) >= TrackFastProfile.minWindow
         var profT = profiling ? CFAbsoluteTimeGetCurrent() : 0
-        if profiling { TrackFastProfile.windows += 1 }
+        if profiling { TrackFastProfile.windows += 1; Memory.peakMemory = 0 }
         for layer in layers {
             var normed: MLXArray
             if let ple = layer.ple {
@@ -1111,7 +1150,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             } else {
                 let cache = caches[attentionIndex]
                 attentionIndex += 1
-                attended = attnForward(layer.attn!, input, cache: cache, rope: ropeTab)
+                attended = attnForward(
+                    layer.attn!, input, cache: cache, rope: ropeTab, offset: offset)
             }
             Self.debugTaps?.append(("L\(layer.index).attn.out", attended))
             if profiling { TrackFastProfile.tick(layer.gdn != nil ? "gdn" : "attn", &profT, [attended]) }
@@ -1153,6 +1193,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             scale: finalMixer.normScaleQ,
             tile: false)
         let mixed = hcMix(finalMixer, normed: finalNormed).input
+        if profiling {
+            TrackFastProfile.tick("final", &profT, [mixed, multi])
+            TrackFastProfile.report(window: ids.dim(1), offset: offset)
+        }
+        if ids.dim(1) >= Self.cacheReleaseMinWindow {
+            // A wide window's intermediates would otherwise sit in the MLX
+            // buffer cache (measured: 19 GB by 32K of prefill) on top of the
+            // weights; release them at the chunk boundary, as mlx-serve does.
+            eval(mixed, multi)
+            Memory.clearCache()
+        }
         return (mixed, multi)
     }
 
@@ -1168,8 +1219,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return out
     }
 
-    /// The fast path serves one unpositioned row whose context stays below
-    /// the indexer budget; everything else goes to the wrapped model.
+    /// The fast path serves one unpositioned row at any context length;
+    /// everything else goes to the wrapped model.
     private func fastPlan(
         tokens: MLXArray, caches: [KVCache], recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray?
@@ -1179,10 +1230,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let typed = typedCaches(caches), typed.count == cfg.fullAttentionLayerIndices.count,
             let first = typed.first, first.rows.count == 1
         else { return nil }
-        let offset = first.rows[0].absoluteOffset
-        let S = tokens.dim(1)
-        guard offset + S <= indexerBudget else { return nil }
-        return (typed, offset)
+        return (typed, first.rows[0].absoluteOffset)
     }
 
     func streamsOrDelegate(

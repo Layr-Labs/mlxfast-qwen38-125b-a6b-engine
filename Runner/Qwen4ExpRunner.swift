@@ -125,6 +125,27 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         self.loadedDecoders = drafter == nil ? [.serial] : [.serial, .mtp]
     }
 
+    /// The fork's load (factory, drafter, adopt), with the memory budget
+    /// pinned BEFORE the factory allocates the first buffer. See
+    /// `TrackMemoryBudget`: MLX's defaults let a long prefill wire the box
+    /// past its GPU cap.
+    public static func load(
+        _ directory: URL, options: RunnerLoadOptions
+    ) async throws -> TrackQwen4ExpRunner {
+        TrackMemoryBudget.configureOnce()
+        let context = try await LLMModelFactory.shared.load(
+            from: directory, using: #huggingFaceTokenizerLoader())
+        var options = options
+        options.preloadedDrafter = try await loadDrafter(
+            options: options, directory: directory, target: context.model)
+        return try adopt(
+            model: context.model,
+            tokenizer: context.tokenizer,
+            configuration: context.configuration,
+            directory: directory,
+            options: options)
+    }
+
     /// Adopt a module the caller already holds. Reads NO tensors: the
     /// embedded head is BOUND to the module in memory, never reloaded, and
     /// the n-gram rows come from the caller's resource.
