@@ -78,6 +78,14 @@ extension TrackFastKernels {
         InT inj_t = InT(0);
         if (HAS_INJECT) { inj_t = inject[row * HC + hc]; inj = static_cast<float>(inj_t); }
         (void)inj;
+        // MLXFAST-SCALEPRE: the per-stream norm-weight row this thread needs
+        // after the reduction depends on nothing the reduction produces, so its
+        // four loads are issued up front. They then retire under the sum of
+        // squares, the two simd_sum stages and the threadgroup barrier instead
+        // of stalling the store loop that follows them. Same values, same
+        // multiply, same order.
+        InT scl[N_READS];
+        for (int i = 0; i < N_READS; ++i) { scl[i] = scale[hc * H + lid * N_READS + i]; }
         float thread_x[N_READS];
         float acc = 0.0f;
         for (int i = 0; i < N_READS; ++i) {
@@ -102,7 +110,7 @@ extension TrackFastKernels {
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
             InT n = static_cast<InT>(thread_x[i] * inv_mean);
-            normed[base + d] = n * scale[hc * H + d];
+            normed[base + d] = n * scl[i];
         }
         """
 
