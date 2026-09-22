@@ -36,11 +36,17 @@ enum TrackFastMixerSplitK {
                 for (int r = 0; r < R; ++r) { scratch[(sg * R + r) * 32 + lane] = partial[r]; }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (sg == 0) {
+            // MLXFAST-FOLDROWSG: the R row folds are independent -- each reads
+            // its own scratch column set and closes with its own simd_sum --
+            // so row r is folded by simdgroup r instead of queueing all R of
+            // them on simdgroup 0. Every row keeps its ascending block order
+            // and its own reduction; only which group performs it changes.
+            if (int(sg) < R) {
+                const int r = int(sg);
                 for (int b = 0; b < (ORDERED ? NB : SPLIT); ++b) {
-                    for (int r = 0; r < R; ++r) { result[r] += scratch[(b * R + r) * 32 + lane]; }
+                    result[r] += scratch[(b * R + r) * 32 + lane];
                 }
-                for (int r = 0; r < R; ++r) { result[r] = simd_sum(result[r]); }
+                result[r] = simd_sum(result[r]);
             }
         }
         """#
@@ -56,12 +62,12 @@ enum TrackFastMixerSplitK {
             float r[RPS];
             research_split_qmv<T, K, 16, RPS, SPLIT, ORDERED>(
                 wd, sd, bd, x, tile * RPS, sg, lane, scratch, r);
-            if (sg == 0 && lane == 0) {
-                for (int i = 0; i < RPS; ++i) {
-                    T l = static_cast<T>(r[i]);
-                    lo[tile * RPS + i] = l;
-                    act[tile * RPS + i] = mlx_silu(l);
-                }
+            // The fold for row i lands on simdgroup i, so the store follows it.
+            if (int(sg) < RPS && lane == 0) {
+                const int i = int(sg);
+                T l = static_cast<T>(r[i]);
+                lo[tile * RPS + i] = l;
+                act[tile * RPS + i] = mlx_silu(l);
             }
         } else if (HAS_INJECT) {
             float r[1];
