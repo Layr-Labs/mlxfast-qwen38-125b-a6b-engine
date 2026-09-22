@@ -1913,5 +1913,337 @@ METAL_FUNC void track_prefill_indirect_gu(
     });
   }
 }
+// Two adjacent expert ranges share each gate/up weight stage.
+
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool transpose,
+    bool SILU,
+    int NS>
+METAL_FUNC void track_prefill_indirect_gu_pair(
+    const device T* x,
+    const device uint32_t* w0,
+    const device T* scales0,
+    const device T* biases0,
+    const device uint32_t* w1,
+    const device T* scales1,
+    const device T* biases1,
+    const device uint32_t* indices,
+    const device uint32_t* token_rows,
+    const device uint32_t* tiles,
+    device T* y0,
+    device T* y1,
+    int N,
+    int K,
+    threadgroup T* Ws0,
+    threadgroup T* Ws1,
+    threadgroup T* As,
+    uint3 tid,
+    uint simd_group_id,
+    uint simd_lane_id) {
+  static_assert(
+      transpose && BM == 64 && BN == 64 && BK == 64 && WM == 2 && WN == 2,
+      "Paired expert tiles: 64 rows, 2x2 SIMD layout, 64x64 weight block");
+  static_assert(
+      metal::is_same_v<T, bfloat16_t> && group_size == 32 && bits == 4,
+      "P17 requires unchanged bf16 / affine group-32 / 4-bit operands");
+
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int BKA_padded = BK_padded;
+  using loader_w_t = QuantizedBlockLoader<
+      T, BN, BK, BK_padded, transpose, WM * WN * SIMD_SIZE, group_size, bits>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int K_it = K / BK;
+  const size_t stride_w = size_t(N) * K_w;
+  const size_t stride_s = size_t(N) * K_g;
+  const int y_col = tid.x * BN;
+
+  auto wl0 = (const device uint8_t*)w0 + size_t(y_col) * K_w;
+  auto wl1 = (const device uint8_t*)w1 + size_t(y_col) * K_w;
+  scales0 += size_t(y_col) * K_g;
+  biases0 += size_t(y_col) * K_g;
+  scales1 += size_t(y_col) * K_g;
+  biases1 += size_t(y_col) * K_g;
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+  constexpr short BR = TN;
+  constexpr short BC = TK;
+  const short tm = SM * (simd_group_id / WN);
+  const short tn = SN * (simd_group_id % WN);
+  using AccumType = float;
+
+  // One tile per threadgroup row. The table (built by track_prefill_tile_table
+  // from the sorted ids) holds [begin, end) per tile, aligned to the expert
+  // run's start exactly as the former in-kernel scan aligned them; padding
+  // slots are [0, 0) and exit at once. Uniform over the whole threadgroup.
+  {
+    const int tile_begin = int(tiles[2 * tid.y]);
+    const int tile_end = int(tiles[2 * tid.y + 1]);
+    if (tile_begin == tile_end) {
+      return;
+    }
+    const uint32_t index = indices[tile_begin];
+    const short tile_m = short(tile_end - tile_begin);
+    const short sgp_sm = short(min(int(SM), max(0, int(tile_m) - int(tm))));
+    const bool sg_active = sgp_sm > 0;
+
+    NAXTile<AccumType, TM, TN> Dtile0;
+    NAXTile<AccumType, TM, TN> Dtile1;
+    Dtile0.clear();
+    Dtile1.clear();
+
+    // MLXFAST-ACC. The MMA's destination cooperative tensor is the accumulator
+    // and stays alive across the whole K walk. The per-call form copies the
+    // fragment pair into a fresh `ct_c` and back around every MMA -- eight
+    // times per thread per K step, sixteen fragment copies each way; keeping
+    // one `ct_c` per stream moves the value out of the accumulator exactly
+    // once, at the end. The MMA sequence, its operands and its order are
+    // unchanged, so every output element accumulates in the same order.
+    constexpr auto acc_desc = mpp::tensor_ops::matmul2d_descriptor(
+        16,
+        32,
+        16,
+        false,
+        true,
+        true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<acc_desc, metal::execution_simdgroup> acc_op;
+    auto acc_a =
+        acc_op.template get_left_input_cooperative_tensor<T, T, AccumType>();
+    auto acc_b =
+        acc_op.template get_right_input_cooperative_tensor<T, T, AccumType>();
+    using AccAT = metal::remove_addrspace_t<decltype(acc_a)>;
+    using AccBT = metal::remove_addrspace_t<decltype(acc_b)>;
+    auto acc_c0 =
+        acc_op.template get_destination_cooperative_tensor<AccAT, AccBT, AccumType>();
+    auto acc_c1 =
+        acc_op.template get_destination_cooperative_tensor<AccAT, AccBT, AccumType>();
+    // Each 16-row band has its own gate/up accumulators. A band retains
+    // the original 16x32x16 MMA sequence while both bands share weight loads.
+    auto acc_c2 =
+        acc_op.template get_destination_cooperative_tensor<AccAT, AccBT, AccumType>();
+    auto acc_c3 =
+        acc_op.template get_destination_cooperative_tensor<AccAT, AccBT, AccumType>();
+    STEEL_PRAGMA_UNROLL
+    for (short e = 0; e < 2 * NAXTile<AccumType, TM, TN>::kElemsPerFrag; ++e) {
+      acc_c0[e] = AccumType(0);
+      acc_c1[e] = AccumType(0);
+      acc_c2[e] = AccumType(0);
+      acc_c3[e] = AccumType(0);
+    }
+
+    constexpr short A_PER_THREAD = (BM * BK) / (WM * WN * SIMD_SIZE);  // 32 elements: four aligned uint4 vectors
+    constexpr short A_SPLIT = BK / A_PER_THREAD;                        // threads per row
+    const short tgp_thread = short(simd_group_id * SIMD_SIZE + simd_lane_id);
+    const short a_row = tgp_thread / A_SPLIT;              // 0..BM-1
+    const short a_col = (tgp_thread % A_SPLIT) * A_PER_THREAD;
+    threadgroup T* a_dst = As + a_row * BKA_padded + a_col;
+    const bool a_live = a_row < tile_m;
+    const device T* xb = x;
+    if (a_live) {
+      xb += size_t(token_rows[tile_begin + a_row]) * K + a_col;
+    }
+
+    thread loader_w_t loader_w0(
+        wl0 + index * stride_w,
+        scales0 + index * stride_s,
+        biases0 + index * stride_s,
+        K,
+        Ws0,
+        simd_group_id,
+        simd_lane_id);
+    thread loader_w_t loader_w1(
+        wl1 + index * stride_w,
+        scales1 + index * stride_s,
+        biases1 + index * stride_s,
+        K,
+        Ws1,
+        simd_group_id,
+        simd_lane_id);
+
+    dispatch_bool(tile_m == BM, [&](auto kAlignedM) {
+      // MLXFAST-AVEC: the slice is 16-byte aligned at both ends (K = 2560/640
+      // elements, a_col a multiple of 8 elements, As rows 72/40 elements), so
+      // it moves as uint4 vectors; the same bytes in the same order.
+      constexpr short A_VECS = (A_PER_THREAD * sizeof(T)) / 16;
+      uint4 a_buf[A_VECS];
+      PackedNAXGroup32 packed_w0;
+      PackedNAXGroup32 packed_w1;
+      if (K_it > 0) {
+        packed_w0.prefetch(loader_w0);
+        packed_w1.prefetch(loader_w1);
+        if (a_live) {
+          const device uint4* a0 = (const device uint4*)xb;
+          STEEL_PRAGMA_UNROLL
+          for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a0[v]; }
+        }
+      }
+      if (!a_live) {
+        // A dead row's slice of the activation stage is zero for every K step:
+        // `a_dst` never advances (only `xb`, the device side, does), so it is
+        // written once here instead of once per step. Half the threadgroup is
+        // dead in the ranked window's last tile.
+        threadgroup uint4* d0 = (threadgroup uint4*)a_dst;
+        STEEL_PRAGMA_UNROLL
+        for (short v = 0; v < A_VECS; ++v) { d0[v] = uint4(0); }
+      }
+      for (int k = 0; k < K_it; k++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        packed_w0.store(loader_w0.dst);
+        packed_w1.store(loader_w1.dst);
+        if (a_live) {
+          threadgroup uint4* d4 = (threadgroup uint4*)a_dst;
+          STEEL_PRAGMA_UNROLL
+          for (short v = 0; v < A_VECS; ++v) { d4[v] = a_buf[v]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (k + 1 < K_it) {
+          loader_w0.next();
+          loader_w1.next();
+          packed_w0.prefetch(loader_w0);
+          packed_w1.prefetch(loader_w1);
+          if (a_live) {
+            const device uint4* a_next = (const device uint4*)(xb + BK);
+            STEEL_PRAGMA_UNROLL
+            for (short v = 0; v < A_VECS; ++v) { a_buf[v] = a_next[v]; }
+          }
+        }
+
+        STEEL_PRAGMA_UNROLL
+        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          if (sg_active) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, BR, BC> Btile0;
+            NAXTile<T, BR, BC> Btile1;
+
+            volatile int compiler_barrier;
+
+            Atile.template loadV<BKA_padded>(
+                As + tm * BKA_padded + kk1);
+
+            Btile0.template loadV<BK_padded>(Ws0 + tn * BK_padded + kk1);
+            Btile1.template loadV<BK_padded>(Ws1 + tn * BK_padded + kk1);
+
+            // The same walk `tile_matmad_nax` performs for TN = 2: for each
+            // `kk` the A fragment goes to the left operand, the two B
+            // fragments to the right one, and the MMA accumulates into the
+            // stream's own destination tensor.
+            STEEL_PRAGMA_UNROLL
+            for (short kk = 0; kk < TK; ++kk) {
+              const thread auto& a_frag = Atile.frag_at(0, kk);
+              STEEL_PRAGMA_UNROLL
+              for (short e = 0; e < NAXTile<T, TM, TK>::kElemsPerFrag; ++e) {
+                acc_a[e] = a_frag[e];
+              }
+              STEEL_PRAGMA_UNROLL
+              for (short e = 0; e < NAXTile<T, BR, BC>::kElemsPerFrag; ++e) {
+                acc_b[e] = Btile0.frag_at(0, kk)[e];
+                acc_b[NAXTile<T, BR, BC>::kElemsPerFrag + e] =
+                    Btile0.frag_at(1, kk)[e];
+              }
+              acc_op.run(acc_a, acc_b, acc_c0);
+              STEEL_PRAGMA_UNROLL
+              for (short e = 0; e < NAXTile<T, BR, BC>::kElemsPerFrag; ++e) {
+                acc_b[e] = Btile1.frag_at(0, kk)[e];
+                acc_b[NAXTile<T, BR, BC>::kElemsPerFrag + e] =
+                    Btile1.frag_at(1, kk)[e];
+              }
+              acc_op.run(acc_a, acc_b, acc_c1);
+              if (sgp_sm > 16) {
+                const thread auto& a_frag = Atile.frag_at(1, kk);
+                STEEL_PRAGMA_UNROLL
+                for (short e = 0; e < NAXTile<T, TM, TK>::kElemsPerFrag; ++e) {
+                  acc_a[e] = a_frag[e];
+                }
+                STEEL_PRAGMA_UNROLL
+                for (short e = 0; e < NAXTile<T, BR, BC>::kElemsPerFrag; ++e) {
+                  acc_b[e] = Btile0.frag_at(0, kk)[e];
+                  acc_b[NAXTile<T, BR, BC>::kElemsPerFrag + e] =
+                      Btile0.frag_at(1, kk)[e];
+                }
+                acc_op.run(acc_a, acc_b, acc_c2);
+                STEEL_PRAGMA_UNROLL
+                for (short e = 0; e < NAXTile<T, BR, BC>::kElemsPerFrag; ++e) {
+                  acc_b[e] = Btile1.frag_at(0, kk)[e];
+                  acc_b[NAXTile<T, BR, BC>::kElemsPerFrag + e] =
+                      Btile1.frag_at(1, kk)[e];
+                }
+                acc_op.run(acc_a, acc_b, acc_c3);
+              }
+            }
+
+            (void)compiler_barrier;
+          }
+        }
+
+        xb += BK;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      if (sg_active) {
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < NAXTile<AccumType, TM, TN>::kElemsPerFrag; ++e) {
+          Dtile0.val_frags[0][e] = acc_c0[e];
+          Dtile0.val_frags[1][e] =
+              acc_c0[NAXTile<AccumType, TM, TN>::kElemsPerFrag + e];
+          Dtile1.val_frags[0][e] = acc_c1[e];
+          Dtile1.val_frags[1][e] =
+              acc_c1[NAXTile<AccumType, TM, TN>::kElemsPerFrag + e];
+          Dtile0.val_frags[2][e] = acc_c2[e];
+          Dtile0.val_frags[3][e] =
+              acc_c2[NAXTile<AccumType, TM, TN>::kElemsPerFrag + e];
+          Dtile1.val_frags[2][e] = acc_c3[e];
+          Dtile1.val_frags[3][e] =
+              acc_c3[NAXTile<AccumType, TM, TN>::kElemsPerFrag + e];
+        }
+        const size_t yoff = size_t(tile_begin + tm) * N + y_col + tn;
+        if constexpr (SILU) {
+          // silu(gate) * up, op for op as MLX's compiled `silu(gate) * up`: the
+          // fp32 accumulators round to bf16 exactly as the two stores would, then
+          // Sigmoid, Multiply, Multiply each round to bf16.
+          STEEL_PRAGMA_UNROLL
+          for (short fi = 0; fi < Dtile0.kNumFrags; fi++) {
+            STEEL_PRAGMA_UNROLL
+            for (short e = 0; e < Dtile0.kElemsPerFrag; e++) {
+              const T g = static_cast<T>(Dtile0.val_frags[fi][e]);
+              const T u = static_cast<T>(Dtile1.val_frags[fi][e]);
+              const T sg = P17Sigmoid{}(g);
+              const T act = (g * sg) * u;
+              Dtile0.val_frags[fi][e] = static_cast<float>(act);
+            }
+          }
+          if constexpr (kAlignedM.value) {
+            Dtile0.template storeV<NS>(y0 + yoff);
+          } else {
+            Dtile0.store_slice(y0 + yoff, N, short2(0, 0), short2(SN, sgp_sm));
+          }
+        } else if constexpr (kAlignedM.value) {
+          Dtile0.template storeV<NS>(y0 + yoff);
+          Dtile1.template storeV<NS>(y1 + yoff);
+        } else {
+          Dtile0.store_slice(y0 + yoff, N, short2(0, 0), short2(SN, sgp_sm));
+          Dtile1.store_slice(y1 + yoff, N, short2(0, 0), short2(SN, sgp_sm));
+        }
+      }
+    });
+  }
+}
 """#
 }

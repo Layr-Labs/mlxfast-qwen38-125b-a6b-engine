@@ -207,14 +207,18 @@ enum TrackP12Prefill {
             let parts = m.p12SortedParts, !m.switchMLP.hasFusedGateUp
         else { return nil }
         let B = x.dim(0), S = x.dim(1), H = x.dim(2), K = indices.dim(-1)
-        let activated: MLXArray
         let sortedIDs: MLXArray
         let inverse: MLXArray
         let down: MLXArray
         if let indirect = TrackPrefillIndirect.apply(m, x: x, indices: indices) {
-            (activated, sortedIDs, inverse) = (indirect.activated, indirect.sortedIDs, indirect.inverse)
-            down = TrackPrefillIndirect.down(m, activated: activated, sortedIDs: sortedIDs, tiles: indirect.tiles)
-                ?? parts.down(activated, sortedIDs, sortedIndices: true)
+            (sortedIDs, inverse) = (indirect.sortedIDs, indirect.inverse)
+            if let projected = TrackPrefillIndirect.down(m, split: indirect) {
+                down = projected
+            } else {
+                // Materialize a complete activation only for the generic fallback.
+                let merged = indirect.activated
+                down = parts.down(merged, sortedIDs, sortedIndices: true)
+            }
         } else {
             let expanded = MLX.expandedDimensions(x, axes: [-2, -3])
             let sorted = gatherSort(x: expanded, indices: indices)
@@ -222,7 +226,7 @@ enum TrackP12Prefill {
             inverse = sorted.2
             let up = parts.up(sorted.0, sortedIDs, sortedIndices: true)
             let gateAct = parts.gate(sorted.0, sortedIDs, sortedIndices: true)
-            activated = compiledSiluProduct(gateAct, up)
+            let activated = compiledSiluProduct(gateAct, up)
             down = parts.down(activated, sortedIDs, sortedIndices: true)
         }
         guard down.ndim == 3, down.dim(0) == B * S * K, down.dim(1) == 1, down.dim(2) == H,

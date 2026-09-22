@@ -41,6 +41,55 @@ enum TrackPrefillIndirect {
         inputNames: ["sorted_ids"], outputNames: ["tiles"],
         source: tileSource, header: "", ensureRowContiguous: true)
 
+    /// The two gate/up outputs own disjoint rows. Only `activated` materializes
+    /// a full array, and only the fallback caller asks for it.
+    struct SplitProjection {
+        let shortActivated: MLXArray
+        let longActivated: MLXArray
+        let sortedIDs: MLXArray
+        let inverse: MLXArray
+        let tiles: MLXArray
+        let tileKind: MLXArray
+
+        var activated: MLXArray {
+            let rows = sortedIDs.size
+            return TrackPrefillIndirect.mergeKernel(
+                [shortActivated, longActivated, tiles, tileKind],
+                template: [("T", shortActivated.dtype), ("N", 640)],
+                grid: (32 * 640, tileKind.size, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[rows, 1, 640]], outputDTypes: [.bfloat16])[0]
+        }
+    }
+
+    private static let splitPlanKernel = MLXFast.metalKernel(
+        name: "track_prefill_split_tile_plan",
+        inputNames: ["sorted_ids"], outputNames: ["tiles32", "tiles64", "tile_kind", "long_count"],
+        source: splitPlanSource, header: "", ensureRowContiguous: true)
+
+    private static let shortGateUpKernel = MLXFast.metalKernel(
+        name: "track_prefill_short_gate_up",
+        inputNames: ["x", "w0", "scales0", "biases0", "w1", "scales1", "biases1", "indices", "token_rows", "tiles", "tile_kind"],
+        outputNames: ["y"],
+        source: shortPrefix + "\n" + sourceGU.replacingOccurrences(of: "y0, y1, N, K", with: "y, y, N, K"),
+        header: metalHeader, ensureRowContiguous: true)
+
+    private static let longGateUpKernel = MLXFast.metalKernel(
+        name: "track_prefill_long_gate_up",
+        inputNames: ["x", "w0", "scales0", "biases0", "w1", "scales1", "biases1", "indices", "token_rows", "tiles", "long_count"],
+        outputNames: ["y"], source: longSourceGU,
+        header: metalHeader, ensureRowContiguous: true)
+
+    private static let splitDownKernel = MLXFast.metalKernel(
+        name: "track_prefill_split_down",
+        inputNames: ["x_short", "x_long", "w", "scales", "biases", "indices", "token_rows", "tiles", "tile_kind"],
+        outputNames: ["y"], source: splitDownPrefix + "\n" + sourceDown,
+        header: metalHeader, ensureRowContiguous: true)
+
+    private static let mergeKernel = MLXFast.metalKernel(
+        name: "track_prefill_split_merge",
+        inputNames: ["x_short", "x_long", "tiles", "tile_kind"], outputNames: ["y"],
+        source: mergeSource, header: "", ensureRowContiguous: true)
+
     static let tileRows = 32
     static let tileThreads = 1024
 
@@ -60,7 +109,7 @@ enum TrackPrefillIndirect {
     }
 
     static func apply(_ m: TrackMoE, x: MLXArray, indices: MLXArray)
-        -> (activated: MLXArray, sortedIDs: MLXArray, inverse: MLXArray, tiles: MLXArray)?
+        -> SplitProjection?
     {
         guard enabled, supportsNAX, StreamOrDevice.default.stream == Stream.gpu,
             m.expertBits == 4, m.expertGroupSize == 32,
@@ -96,15 +145,28 @@ enum TrackPrefillIndirect {
         }
         let rows = indices.size
         let experts = g.w.dim(0)
-        let tiles = tileTable(sortedIDs: sortedIDs, rows: rows, experts: experts)
         let maxT = maxTiles(rows: rows, experts: experts)
-        let activated = gateUpKernel(
-            [x, g.w, g.s, g.b, u.w, u.s, u.b, sortedIDs, tokenRows, tiles],
+        let maxLong = (rows + 63) / 64 + experts
+        let longGroups = min(maxLong, 64)
+        let plan = splitPlanKernel(
+            [sortedIDs],
+            template: [("R", rows), ("E", experts), ("MAX32", maxT), ("MAX64", maxLong), ("TG", tileThreads)],
+            grid: (tileThreads, 1, 1), threadGroup: (tileThreads, 1, 1),
+            outputShapes: [[2 * maxT], [2 * maxLong], [maxT], [1]],
+            outputDTypes: [.uint32, .uint32, .uint32, .uint32])
+        let shortActivated = shortGateUpKernel(
+            [x, g.w, g.s, g.b, u.w, u.s, u.b, sortedIDs, tokenRows, plan[0], plan[2]],
             template: [("T", x.dtype), ("N", 640), ("K", 2560), ("SILU", true)],
-            grid: (10 * 32, maxT * 2, 2),
-            threadGroup: (32, 2, 2),
+            grid: (10 * 32, maxT * 2, 2), threadGroup: (32, 2, 2),
             outputShapes: [[rows, 1, 640]], outputDTypes: [.bfloat16])[0]
-        return (activated, sortedIDs, inverse, tiles)
+        let longActivated = longGateUpKernel(
+            [x, g.w, g.s, g.b, u.w, u.s, u.b, sortedIDs, tokenRows, plan[1], plan[3]],
+            template: [("T", x.dtype), ("N", 640), ("K", 2560), ("SILU", true), ("LONG_GROUPS", longGroups)],
+            grid: (10 * 32, longGroups * 2, 2), threadGroup: (32, 2, 2),
+            outputShapes: [[rows, 1, 640]], outputDTypes: [.bfloat16])[0]
+        return SplitProjection(
+            shortActivated: shortActivated, longActivated: longActivated,
+            sortedIDs: sortedIDs, inverse: inverse, tiles: plan[0], tileKind: plan[2])
     }
 
     /// The down projection over the same tile table. `activated` already holds
@@ -127,6 +189,65 @@ enum TrackPrefillIndirect {
             threadGroup: (32, 2, 2),
             outputShapes: [[rows, 1, 2560]], outputDTypes: [.bfloat16])[0]
     }
+
+    /// Select the one initialized activation buffer uniformly for each original
+    /// 32-row down tile. No merge/copy is evaluated on this fast path.
+    static func down(_ m: TrackMoE, split: SplitProjection) -> MLXArray? {
+        let d = m.expertDown
+        let rows = split.sortedIDs.size
+        guard d.w.shape == [512, 2560, 80], d.s.shape == [512, 2560, 20], d.b.shape == d.s.shape,
+            d.w.dtype == .uint32, d.s.dtype == .bfloat16, d.b.dtype == .bfloat16
+        else { return nil }
+        let maxT = maxTiles(rows: rows, experts: d.w.dim(0))
+        return splitDownKernel(
+            [split.shortActivated, split.longActivated, d.w, d.s, d.b,
+             split.sortedIDs, split.sortedIDs, split.tiles, split.tileKind],
+            template: [("T", split.shortActivated.dtype), ("N", 2560), ("K", 640)],
+            grid: ((2560 / downBlockN) * 32, maxT * 2, 2), threadGroup: (32, 2, 2),
+            outputShapes: [[rows, 1, 2560]], outputDTypes: [.bfloat16])[0]
+    }
+
+    static let shortPrefix = #"""
+        const uint slot = threadgroup_position_in_grid.y;
+        if (tiles[2 * slot] == tiles[2 * slot + 1] || tile_kind[slot] != 0u) {
+            return;
+        }
+        """#
+
+    static let longSourceGU = #"""
+        alignas(16) threadgroup T Ws0[64 * 72];
+        alignas(16) threadgroup T Ws1[64 * 72];
+        alignas(16) threadgroup T As[64 * 72];
+        // The plan contains only tiles with more than 32 live rows. A bounded
+        // grid walks that compact list without a host readback or empty-slot grid.
+        uint3 tile = threadgroup_position_in_grid;
+        const uint count = long_count[0];
+        for (uint slot = tile.y; slot < count; slot += (uint)LONG_GROUPS) {
+            tile.y = slot;
+            track_prefill_indirect_gu_pair<T, 32, 4, 64, 64, 64, 2, 2, true, SILU, N>(
+                x, w0, scales0, biases0, w1, scales1, biases1, indices, token_rows, tiles,
+                y, y, N, K, Ws0, Ws1, As, tile,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+        }
+        """#
+
+    static let splitDownPrefix = #"""
+        const uint slot = threadgroup_position_in_grid.y;
+        if (tiles[2 * slot] == tiles[2 * slot + 1]) { return; }
+        const device T* x = tile_kind[slot] != 0u ? x_long : x_short;
+        """#
+
+    static let mergeSource = #"""
+        const uint slot = thread_position_in_grid.y;
+        const uint begin = tiles[2 * slot];
+        const uint end = tiles[2 * slot + 1];
+        const uint row = begin + thread_position_in_grid.x / (uint)N;
+        if (row >= end) { return; }
+        const uint col = thread_position_in_grid.x % (uint)N;
+        const device T* x = tile_kind[slot] != 0u ? x_long : x_short;
+        const size_t offset = size_t(row) * N + col;
+        y[offset] = x[offset];
+        """#
 
     static let sourceGU = #"""
         alignas(16) threadgroup T Ws0[64 * 72];
@@ -218,4 +339,86 @@ enum TrackPrefillIndirect {
             tiles[2 * i + 1] = 0u;
         }
         """#
+    /// Build both tables and their shared ownership map in one launch.
+    static let splitPlanSource = #"""
+        static_assert(E <= TG, "one run per thread in pass 2");
+        threadgroup uint run_begin[E + 1];
+        threadgroup uint sg_runs[TG / 32];
+        threadgroup uint sg_tiles32[TG / 32];
+        threadgroup uint sg_tiles64[TG / 32];
+        const uint t = thread_position_in_threadgroup.x;
+        const uint sg = t / 32;
+        constexpr uint PER = ((uint)R + (uint)TG - 1) / (uint)TG;
+        const uint i0 = t * PER;
+        const uint i1 = min(i0 + PER, (uint)R);
+        uint starts = 0;
+        for (uint i = i0; i < i1; ++i) {
+            starts += (i == 0 || sorted_ids[i] != sorted_ids[i - 1]) ? 1u : 0u;
+        }
+        const uint ex = simd_prefix_exclusive_sum(starts);
+        if ((t % 32) == 31) { sg_runs[sg] = ex + starts; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint r = ex;
+        uint nruns = 0;
+        for (uint g = 0; g < (uint)(TG / 32); ++g) {
+            if (g < sg) { r += sg_runs[g]; }
+            nruns += sg_runs[g];
+        }
+        for (uint i = i0; i < i1; ++i) {
+            if (i == 0 || sorted_ids[i] != sorted_ids[i - 1]) { run_begin[r++] = i; }
+        }
+        if (t == 0) { run_begin[nruns] = (uint)R; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint len = 0;
+        uint count32 = 0;
+        uint count64 = 0;
+        if (t < nruns) {
+            len = run_begin[t + 1] - run_begin[t];
+            count32 = (len + 31u) / 32u;
+            count64 = (len + 31u) / 64u; // exclude a last tile with <= 32 rows
+        }
+        const uint ex32 = simd_prefix_exclusive_sum(count32);
+        const uint ex64 = simd_prefix_exclusive_sum(count64);
+        if ((t % 32) == 31) {
+            sg_tiles32[sg] = ex32 + count32;
+            sg_tiles64[sg] = ex64 + count64;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint slot32 = ex32, slot64 = ex64;
+        uint total32 = 0, total64 = 0;
+        for (uint g = 0; g < (uint)(TG / 32); ++g) {
+            if (g < sg) {
+                slot32 += sg_tiles32[g];
+                slot64 += sg_tiles64[g];
+            }
+            total32 += sg_tiles32[g];
+            total64 += sg_tiles64[g];
+        }
+        if (t == 0) { long_count[0] = total64; }
+        if (t < nruns) {
+            const uint b = run_begin[t];
+            for (uint j = 0; j < count32; ++j) {
+                tiles32[2 * (slot32 + j)] = b + j * 32u;
+                tiles32[2 * (slot32 + j) + 1] = b + min(len, (j + 1u) * 32u);
+                // Both 32-row halves of a long 64-row tile use its output.
+                // An unpaired final half belongs to the original short kernel.
+                const uint parent = (j / 2u) * 64u;
+                tile_kind[slot32 + j] = len - parent > 32u ? 1u : 0u;
+            }
+            for (uint j = 0; j < count64; ++j) {
+                tiles64[2 * (slot64 + j)] = b + j * 64u;
+                tiles64[2 * (slot64 + j) + 1] = b + min(len, (j + 1u) * 64u);
+            }
+        }
+        for (uint i = total32 + t; i < (uint)MAX32; i += (uint)TG) {
+            tiles32[2 * i] = 0u;
+            tiles32[2 * i + 1] = 0u;
+            tile_kind[i] = 0u;
+        }
+        for (uint i = total64 + t; i < (uint)MAX64; i += (uint)TG) {
+            tiles64[2 * i] = 0u;
+            tiles64[2 * i + 1] = 0u;
+        }
+        """#
+
 }
