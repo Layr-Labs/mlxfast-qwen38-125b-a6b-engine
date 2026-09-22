@@ -60,7 +60,59 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
     ///     caller that holds one.
     public static let ngramRowSourceResource = "qwen4exp.ngramRowSource"
 
-    public static let manifest = RunnerManifest(
+    /// MLXFAST-COMMITCAP.
+    ///
+    /// `CommandEncoder::needs_commit()` (mlx/backend/metal/device.cpp:513) ends
+    /// the command buffer when EITHER `buffer_ops_ > max_ops` OR
+    /// `(buffer_sizes_ >> 20) > max_mb`. On a Max part those caps are 50 and 50
+    /// (device.cpp:665). `buffer_sizes_` is fed by `set_input_array`
+    /// (device.cpp:352) with `a.data_size()`, which array.h:346 documents as
+    /// "in units of item_size (not bytes)" and which is the size of the WHOLE
+    /// input buffer, not of the part a kernel reads.
+    ///
+    /// Every MoE block binds the layer's stacked 512-expert weights whole:
+    /// `m.expertGate.w` / `m.expertUp.w` / `m.expertDown.w` are
+    /// [512, 640, 2560] and [512, 2560, 640] packed four-bit, i.e.
+    /// 512*640*2560/8 = 104,857,600 `uint32` elements each, so one bind puts
+    /// `buffer_sizes_ >> 20` at 100 against a cap of 50. The gate/up launch and
+    /// the down+combine launch therefore each force a command-buffer boundary,
+    /// 2 per layer * 48 layers = 96 forced boundaries per decoded token --
+    /// while the kernels actually gather ten of five hundred and twelve expert
+    /// rows, about 2% of the buffer each. The byte cap is firing on RESIDENCY,
+    /// not on traffic.
+    ///
+    /// Raising ONLY the byte cap hands the batching decision back to the op
+    /// cap, which stays at its stock 50: command buffers still close every 50
+    /// dispatches, so the GPU still starts about 50 ops in and no temporary
+    /// outlives more ops than it does today. Nothing about what is dispatched,
+    /// in what order, or with what arguments changes -- this is a batching
+    /// policy, so every kernel result is bit-identical.
+    ///
+    /// `env::max_mb_per_buffer` (mlx/utils.h:182 pattern) caches into a
+    /// function-local `static`, read once from the `Device` constructor
+    /// (device.cpp:678). This runs from `manifest`, which
+    /// `RunnerRegistry.registerLocked` forces at
+    /// `Sources/BenchWorker/main.swift:147` -- before argv resolves a
+    /// checkpoint and before any MLX GPU work, therefore before that `Device`
+    /// exists. `overwrite` is 0, so an environment that already names the knob
+    /// keeps its value.
+    /// Prior art, credited: the element-vs-byte reading of `buffer_sizes_` and
+    /// the `manifest`-static hook are benbuschmann's, published on this
+    /// benchmark as PR 169 / submission `2cd8cc98` against parent `b22bf81`.
+    /// That submission also published the failure of the wider version: raising
+    /// `MLX_MAX_OPS_PER_BUFFER` too disables automatic commits outright and a
+    /// 1024-token prefill, which never reaches the per-chunk `asyncEval`,
+    /// accumulates into one command buffer and produces no tokens. The ops cap
+    /// is the real bound and is left alone here. This tree carries the same
+    /// mechanism rebased onto `0d43963`, where it is absent.
+    private static let commitCapInstalled: Bool = {
+        setenv("MLX_MAX_MB_PER_BUFFER", "4096", 0)
+        return true
+    }()
+
+    public static let manifest: RunnerManifest = {
+        _ = commitCapInstalled
+        return RunnerManifest(
         runnerID: "layr/qwen4exp-125b-a6b",
         modelTypes: ["qwen4_exp", "qwen4_exp_text"],
         engine: CBv2ModelCapabilities(
@@ -87,6 +139,7 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         multimodal: false,
         recurrentLayers: true,
         requiresKeepMask: true)
+    }()
 
     public let servingModel: any LanguageModel
     public let tokenizer: any MLXLMCommon.Tokenizer
