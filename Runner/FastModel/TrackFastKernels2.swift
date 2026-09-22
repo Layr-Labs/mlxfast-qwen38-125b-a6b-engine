@@ -92,17 +92,25 @@ extension TrackFastKernels {
             thread_x[i] = static_cast<float>(r);
             acc += thread_x[i] * thread_x[i];
         }
-        acc = simd_sum(acc);
-        constexpr uint simd_groups = (H + 32 * N_READS - 1) / (32 * N_READS);
-        if (sg == 0 && lane >= simd_groups) { local_sums[lane] = 0; }
-        if (lane == 0) { local_sums[sg] = acc; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        acc = simd_sum(local_sums[lane]);
-        const float inv_mean = metal::precise::rsqrt(acc / (float)H + as_type<float>((uint)EPS_BITS));
-        for (int i = 0; i < N_READS; ++i) {
-            const uint d = lid * N_READS + i;
-            InT n = static_cast<InT>(thread_x[i] * inv_mean);
-            normed[base + d] = n * scale[hc * H + d];
+        // MLXFAST-NONORM: a caller that only wants the injected stream (the
+        // block that adds a per-layer term before the mixer's own norm) used to
+        // pay the whole statistic anyway: two simd_sum stages, the barrier, the
+        // rsqrt, the norm-weight row and a second W-sized store that nothing
+        // reads. NEED_NORM compiles that half out; the stream pass above is
+        // untouched, so the surviving output is bit-identical.
+        if constexpr (NEED_NORM) {
+            acc = simd_sum(acc);
+            constexpr uint simd_groups = (H + 32 * N_READS - 1) / (32 * N_READS);
+            if (sg == 0 && lane >= simd_groups) { local_sums[lane] = 0; }
+            if (lane == 0) { local_sums[sg] = acc; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            acc = simd_sum(local_sums[lane]);
+            const float inv_mean = metal::precise::rsqrt(acc / (float)H + as_type<float>((uint)EPS_BITS));
+            for (int i = 0; i < N_READS; ++i) {
+                const uint d = lid * N_READS + i;
+                InT n = static_cast<InT>(thread_x[i] * inv_mean);
+                normed[base + d] = n * scale[hc * H + d];
+            }
         }
         """
 
@@ -192,12 +200,14 @@ extension TrackFastKernels {
 
     static func injectNorm(
         residual: MLXArray, out: MLXArray?, inject: MLXArray?, scale: MLXArray,
-        hcCount: Int, hidden: Int, eps: Float, tile: Bool
+        hcCount: Int, hidden: Int, eps: Float, tile: Bool, needNormed: Bool = true
     ) -> (stream: MLXArray, normed: MLXArray) {
         let B = residual.dim(0), S = residual.dim(1)
         let W = hcCount * hidden
         precondition(hidden % 4 == 0 && hidden / 4 <= 1024)
         let hasInject = out != nil
+        // MLXFAST-NONORM: the wide window keeps the full form, so the prefill
+        // launch is unchanged; only the narrow launch can drop the statistic.
         if S >= wideNormMinS {
             let sg = wideNormSimdgroups
             let outs = injectNormWideKernel(
@@ -217,9 +227,10 @@ extension TrackFastKernels {
             template: [
                 ("InT", residual.dtype), ("H", hidden), ("W", W), ("HC", hcCount),
                 ("HAS_INJECT", hasInject), ("TILE", tile), ("EPS_BITS", Int(eps.bitPattern)),
+                ("NEED_NORM", needNormed),
             ],
             grid: (hidden / 4, hcCount, B * S), threadGroup: (hidden / 4, 1, 1),
-            outputShapes: [[B, S, W], [B, S, W]],
+            outputShapes: [[B, S, W], needNormed ? [B, S, W] : [1]],
             outputDTypes: [residual.dtype, residual.dtype])
         return (outs[0], outs[1])
     }
