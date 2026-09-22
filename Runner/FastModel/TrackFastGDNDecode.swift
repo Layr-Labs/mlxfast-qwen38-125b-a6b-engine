@@ -1,4 +1,3 @@
-// Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
 // TrackFastKernels.prepSource, leanSource and gatedRMSSource.
 
 import MLX
@@ -228,6 +227,11 @@ enum TrackFastGDNDecode {
                 store_journal_float(J_DECAY_OFF + 2 * hv_idx, gate_decay);
             }
         }
+        vec<InT, 4> w4, z4;
+        if (sg == 0) {
+            w4 = *reinterpret_cast<const device vec<InT, 4>*>(w + lane * 4);
+            z4 = *reinterpret_cast<const device vec<InT, 4>*>(proj + (b_idx * PW + Z_OFF + hv_idx * Dv + lane * 4));
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
             float thread_x[4];
@@ -238,8 +242,6 @@ enum TrackFastGDNDecode {
             }
             acc = simd_sum(acc);
             const float inv_mean = metal::precise::rsqrt(acc / (float)Dv + as_type<float>((uint)EPS_BITS));
-            const auto w4 = *reinterpret_cast<const device vec<InT, 4>*>(w + lane * 4);
-            const auto z4 = *reinterpret_cast<const device vec<InT, 4>*>(proj + (b_idx * PW + Z_OFF + hv_idx * Dv + lane * 4));
             vec<InT, 4> out4;
             for (int i = 0; i < 4; ++i) {
                 InT normalized = w4[i] * static_cast<InT>(thread_x[i] * inv_mean);
