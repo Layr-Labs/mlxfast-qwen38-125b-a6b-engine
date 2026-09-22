@@ -1,4 +1,3 @@
-// Per-row arithmetic, intermediate BF16 conversions and reduction lanes follow
 // TrackFastKernels.prepSource, leanSource and gatedRMSSource.
 
 import MLX
@@ -64,9 +63,14 @@ enum TrackFastGDNDecode {
         const uint sg = simdgroup_index_in_threadgroup;
         const uint lane = thread_index_in_simdgroup;
         constexpr int KM1 = KC - 1;
-        threadgroup InT q_shared[Dk];
-        threadgroup InT k_shared[Dk];
-        threadgroup InT v_shared[Dv];
+        // MLXFAST-TGVEC4: the staged q/k/v/y tiles are written and read as four
+        // contiguous elements at a 4-aligned element offset (`4 * lane`), so the
+        // scalar accesses below are one aligned 4-wide move. Overaligning the
+        // arrays makes that legal; the values, their order and the arithmetic
+        // that consumes them are untouched.
+        threadgroup __attribute__((aligned(16))) InT q_shared[Dk];
+        threadgroup __attribute__((aligned(16))) InT k_shared[Dk];
+        threadgroup __attribute__((aligned(16))) InT v_shared[Dv];
         threadgroup float gb_shared[2];
         float4 next_state;
         if constexpr (metal::is_same<StT, float>::value) {
@@ -100,14 +104,17 @@ enum TrackFastGDNDecode {
                 const float inv_scale = metal::rsqrt(static_cast<float>(Dk));
                 const InT q_mul = static_cast<InT>(inv_scale * inv_scale);
                 const InT k_mul = static_cast<InT>(inv_scale);
+                vec<InT, 4> n4;
+                const InT mul = sg == 0 ? q_mul : k_mul;
                 for (int i = 0; i < 4; ++i) {
-                    const InT normalized = static_cast<InT>(thread_x[i] * inv_mean);
-                    const uint d = lane * 4 + i;
-                    if (sg == 0) { q_shared[d] = q_mul * normalized; }
-                    else { k_shared[d] = k_mul * normalized; }
+                    n4[i] = mul * static_cast<InT>(thread_x[i] * inv_mean);
                 }
+                threadgroup InT* dst_qk = sg == 0 ? q_shared : k_shared;
+                *reinterpret_cast<threadgroup vec<InT, 4>*>(dst_qk + lane * 4) = n4;
             } else {
-                for (int i = 0; i < 4; ++i) { v_shared[lane * 4 + i] = static_cast<InT>(thread_x[i]); }
+                vec<InT, 4> v4;
+                for (int i = 0; i < 4; ++i) { v4[i] = static_cast<InT>(thread_x[i]); }
+                *reinterpret_cast<threadgroup vec<InT, 4>*>(v_shared + lane * 4) = v4;
             }
             if (sg == 2 || hv_idx % (Hv / Hk) == 0) {
                 device InT* o_conv = conv_out + b_idx * KM1 * CONV_DIM;
@@ -145,13 +152,15 @@ enum TrackFastGDNDecode {
             next_journal[off] = as_type<InT>((ushort)(bits & 0xffffu));
             next_journal[off + 1] = as_type<InT>((ushort)(bits >> 16));
         };
+        const auto q4 = *reinterpret_cast<const threadgroup vec<InT, 4>*>(q_ + 4 * lane);
+        const auto k4 = *reinterpret_cast<const threadgroup vec<InT, 4>*>(k_ + 4 * lane);
         const float4 local_q = float4(
-            static_cast<float>(q_[4 * lane]), static_cast<float>(q_[4 * lane + 1]),
-            static_cast<float>(q_[4 * lane + 2]), static_cast<float>(q_[4 * lane + 3]));
+            static_cast<float>(q4[0]), static_cast<float>(q4[1]),
+            static_cast<float>(q4[2]), static_cast<float>(q4[3]));
         const float4 local_k = float4(
-            static_cast<float>(k_[4 * lane]), static_cast<float>(k_[4 * lane + 1]),
-            static_cast<float>(k_[4 * lane + 2]), static_cast<float>(k_[4 * lane + 3]));
-        threadgroup InT y_shared[Dv];
+            static_cast<float>(k4[0]), static_cast<float>(k4[1]),
+            static_cast<float>(k4[2]), static_cast<float>(k4[3]));
+        threadgroup __attribute__((aligned(16))) InT y_shared[Dv];
         for (int r = 0; r < RPS; ++r) {
             const uint dv_idx = sg * RPS + r;
             const device StT* i_state = state_in + (n * Dv + dv_idx) * Dk;
@@ -169,11 +178,23 @@ enum TrackFastGDNDecode {
             if constexpr (HAS_JOURNAL) {
                 const float pending_decay = journal_float(J_DECAY_OFF + 2 * hv_idx);
                 const float pending_delta = journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx));
+                // The pending key row is Dk-strided per head and read four
+                // contiguous elements at a time; widen it only when every offset
+                // in the address is a multiple of four elements.
+                constexpr bool JVEC = (J_KEY_OFF % 4 == 0) && (J_STRIDE % 4 == 0) && (Dk % 4 == 0);
+                InT kj[4];
+                if constexpr (JVEC) {
+                    const auto kj4 = *reinterpret_cast<const device vec<InT, 4>*>(
+                        journal + J_KEY_OFF + hv_idx * Dk + 4 * lane);
+                    for (int i = 0; i < 4; ++i) { kj[i] = kj4[i]; }
+                } else {
+                    for (int i = 0; i < 4; ++i) {
+                        kj[i] = journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i];
+                    }
+                }
                 for (int i = 0; i < 4; ++i) {
                     state[i] = state[i] * pending_decay;
-                    state[i] = state[i]
-                        + static_cast<float>(journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i])
-                            * pending_delta;
+                    state[i] = state[i] + static_cast<float>(kj[i]) * pending_delta;
                 }
             }
             float kv_mem;
@@ -220,8 +241,15 @@ enum TrackFastGDNDecode {
         }
         if constexpr (!HAS_JOURNAL) {
             if (sg == 0) {
-                for (int i = 0; i < 4; ++i) {
-                    next_journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i] = k_[4 * lane + i];
+                constexpr bool JVEC = (J_KEY_OFF % 4 == 0) && (J_STRIDE % 4 == 0) && (Dk % 4 == 0);
+                if constexpr (JVEC) {
+                    *reinterpret_cast<device vec<InT, 4>*>(
+                        next_journal + J_KEY_OFF + hv_idx * Dk + 4 * lane) =
+                        *reinterpret_cast<const threadgroup vec<InT, 4>*>(k_ + 4 * lane);
+                } else {
+                    for (int i = 0; i < 4; ++i) {
+                        next_journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i] = k_[4 * lane + i];
+                    }
                 }
             }
             if (sg == 0 && lane == 0) {
@@ -232,8 +260,9 @@ enum TrackFastGDNDecode {
         if (sg == 0) {
             float thread_x[4];
             float acc = 0.0f;
+            const auto y4 = *reinterpret_cast<const threadgroup vec<InT, 4>*>(y_shared + lane * 4);
             for (int i = 0; i < 4; ++i) {
-                thread_x[i] = static_cast<float>(y_shared[lane * 4 + i]);
+                thread_x[i] = static_cast<float>(y4[i]);
                 acc += thread_x[i] * thread_x[i];
             }
             acc = simd_sum(acc);
