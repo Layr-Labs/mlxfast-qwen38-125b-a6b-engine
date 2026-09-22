@@ -119,10 +119,13 @@ enum TrackFastGDNDecode {
                 }
             }
         }
-        if (sg == 0 && lane == 0) {
+        if (sg == 3 && lane == 0) {
             const device InT* row = proj + b_idx * PW;
             const InT b_raw = row[B_OFF + hv_idx];
             gb_shared[1] = static_cast<float>(mlx_sigmoid(b_raw));
+        }
+        if (sg == 4 && lane == 0) {
+            const device InT* row = proj + b_idx * PW;
             const InT ax = row[A_OFF + hv_idx] + dt_bias[hv_idx];
             const InT sp = mlx_logaddexp0(ax);
             gb_shared[0] = metal::precise::exp(neg_exp_alog[hv_idx] * sp);
