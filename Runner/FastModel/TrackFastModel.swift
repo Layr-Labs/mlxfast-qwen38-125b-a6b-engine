@@ -624,7 +624,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let prof = TrackFastProfile.prefill != nil && S >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
         let split = separate ? g.proj.parts.map { $0.apply(x) } : nil
-        let proj = split?[0] ?? g.proj.apply(x)  // [B,S,PROJ_W]
+        let proj = split?[0] ?? (TrackFastGDNProj.y(x, multi: g.proj) ?? g.proj.apply(x))
         if prof { TrackFastProfile.tick("gdn.proj", &pt, split ?? [proj]) }
         let state = evaluation.inputState(modelLayerIndex: layerIndex)
         let convState =
