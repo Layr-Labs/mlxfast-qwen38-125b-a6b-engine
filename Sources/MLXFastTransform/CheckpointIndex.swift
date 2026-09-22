@@ -1,3 +1,6 @@
+// independent ranked re-measurement 2026-09-22T23:29Z (account newjordan): this archive repeats the official evaluation
+// of the promoted mlx frontier tree unchanged; the only textual difference from the promoted tree is
+// this dated provenance comment. No behaviour changes.
 import Foundation
 import MLXFastCore
 
