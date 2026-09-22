@@ -279,6 +279,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     let base: Qwen4ExpModel
     let cfg: Qwen4ExpTextConfiguration
+
+    /// MLXFAST-TAPEDEFER: indexer keys accumulated while the fast path owns the
+    /// row. `updateIndexerTape` concatenates the whole tape on every call, and
+    /// nothing in the fast path reads the result -- the indexer only selects
+    /// blocks past the budget, which is exactly where `fastPlan` hands the row
+    /// back. The keys are therefore held here, in order, and folded into the
+    /// cache's tape in one concatenation at the moment the wrapped model takes
+    /// over.
+    private var pendingIndexerTape: [ObjectIdentifier: (row: ObjectIdentifier, keys: [MLXArray])] = [:]
     let embedTokens: Embedding
     let layers: [TrackLayer]
     let finalMixer: TrackHC
@@ -723,7 +732,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } else {
             idxKeys = a.indexerFull.apply(x)[.ellipsis, a.indexerQWidth...]
         }
-        _ = cache.updateIndexerTape(keys: idxKeys)
+        if let rowID = cache.rows.first.map(ObjectIdentifier.init) {
+            let key = ObjectIdentifier(cache)
+            // A row that left the batch keeps no accumulation: its object
+            // identity can be reused, exactly as the cache drops its own tape
+            // in `setRows`.
+            if var held = pendingIndexerTape[key], held.row == rowID {
+                held.keys.append(idxKeys)
+                pendingIndexerTape[key] = held
+            } else {
+                pendingIndexerTape[key] = (row: rowID, keys: [idxKeys])
+            }
+        } else {
+            _ = cache.updateIndexerTape(keys: idxKeys)
+        }
 
         let prep: (q: MLXArray, k: MLXArray, v: MLXArray)
         if let parts = splitInputs {
@@ -769,11 +791,17 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
     }
 
-    /// Row index of each (token, expert) slot, one constant array per window size
-    /// (uploading it per step was one host copy per layer).
+    /// Row index of each (token, expert) slot. Decode always uses ten slots
+    /// from row zero, so keep that hot constant outside the locked size cache.
+    nonisolated(unsafe) private static let decodeXrow10: MLXArray = {
+        let t = MLXArray(Array(repeating: UInt32(0), count: 10))
+        eval(t)
+        return t
+    }()
     nonisolated(unsafe) private static var xrowTables: [Int: MLXArray] = [:]
     private static let xrowLock = NSLock()
     static func xrowTable(S: Int, K: Int) -> MLXArray {
+        if S == 1 && K == 10 { return decodeXrow10 }
         xrowLock.lock(); defer { xrowLock.unlock() }
         if let t = xrowTables[S * 1024 + K] { return t }
         let t = MLXArray((0 ..< (S * K)).map { UInt32($0 / K) })
@@ -1153,10 +1181,46 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             scale: finalMixer.normScaleQ,
             tile: false)
         let mixed = hcMix(finalMixer, normed: finalNormed).input
+        // MLXFAST-TAILFLUSH: the loop's dispatch schedule lands its last flush
+        // on layer 47 -- with `asyncChunk` 3 and `asyncFirst` 2 the hits are
+        // ... 41, 44, 47 -- so layer 48, the final `injectNorm` above and this
+        // final `hcMix`, plus the head and the sampler the caller builds on top
+        // of `mixed`, are all still unenqueued at this return. On the pure
+        // decode path the engine launches the NEXT step feeding this step's
+        // still-lazy sampled token and only finalizes afterwards, so nothing
+        // enqueues that tail until something reads the token -- and the read
+        // then waits on all of it. Enqueue it here instead.
+        //
+        // `asyncEval` does not block and computes nothing new: the same arrays
+        // are returned, with the same contents, in the same order.
+        asyncEval(mixed, multi)
         return (mixed, multi)
     }
 
     // MARK: routing
+
+    /// Fold the accumulated keys into each layer cache's tape, in order, and
+    /// stop accumulating. `updateIndexerTape` truncates the EXISTING tape to the
+    /// row's pre-update `absoluteOffset` and then appends, so the run this fold
+    /// contributes is only the part past what the tape already holds.
+    private func flushIndexerTapes(_ caches: [KVCache]) {
+        guard !pendingIndexerTape.isEmpty else { return }
+        for c in caches {
+            guard let typed = c as? Qwen4ExpCBv2LayerCache else { continue }
+            guard let held = pendingIndexerTape.removeValue(forKey: ObjectIdentifier(typed)),
+                !held.keys.isEmpty, let row = typed.rows.first,
+                ObjectIdentifier(row) == held.row
+            else { continue }
+            let pending = held.keys
+            var all = pending.count == 1 ? pending[0] : concatenated(pending, axis: 1)
+            let committed = row.absoluteOffset
+            let kept = Swift.min(typed.indexerTapeLength, committed)
+            let allowed = committed - kept
+            if all.dim(1) > allowed { all = all[0..., ..<allowed, 0...] }
+            _ = typed.updateIndexerTape(keys: all)
+        }
+        pendingIndexerTape.removeAll()
+    }
 
     private func typedCaches(_ caches: [KVCache]) -> [Qwen4ExpCBv2LayerCache]? {
         var out: [Qwen4ExpCBv2LayerCache] = []
@@ -1195,6 +1259,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             positionIds: positionIds)
         else {
             TrackPleContextMirror.invalidate()
+            flushIndexerTapes(caches)
             return nil
         }
         return fastStreams(
