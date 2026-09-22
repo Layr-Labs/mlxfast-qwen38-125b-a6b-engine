@@ -149,6 +149,65 @@ enum TrackPLEFusion {
         return replaceOnce(withoutGated, old, new)
     }()
 
+    private static let deferredPrepareSource: String = {
+        let historyCopy = """
+        // Same [old nine rows, new row] layout as concatenated. State staging
+        // keeps its existing tail view, including capture/rollback behavior.
+        for (uint t = 0; t < 9; ++t) {
+            for (uint i = 0; i < 4; ++i) {
+                full[t * W + base + i] = convState[t * W + base + i];
+            }
+        }
+        """
+        let withoutHistoryCopy = replaceOnce(fusedPrepareSource, historyCopy, "")
+        let withNewestRow = replaceOnce(
+            withoutHistoryCopy,
+            "    full[9 * W + c] = newest;",
+            "    newestRow[c] = newest;")
+        let oldConvolution = """
+                const float p0 = float(convState[c]) * float(convW[c * 4 + 0]);
+                const float p1 = float(convState[3 * W + c]) * float(convW[c * 4 + 1]);
+                const float p2 = float(convState[6 * W + c]) * float(convW[c * 4 + 2]);
+                const float p3 = float(newest) * float(convW[c * 4 + 3]);
+        """
+        let newConvolution = """
+                auto logical = [&](uint row) -> InT {
+                    constexpr uint base_rows = 9 - J_DEPTH;
+                    if (row < base_rows) { return convState[(row + J_DEPTH) * W + c]; }
+                    const uint j = row - base_rows;
+                    if (j == 0) { return j0[c]; }
+                    if (j == 1) { return j1[c]; }
+                    if (j == 2) { return j2[c]; }
+                    if (j == 3) { return j3[c]; }
+                    if (j == 4) { return j4[c]; }
+                    if (j == 5) { return j5[c]; }
+                    if (j == 6) { return j6[c]; }
+                    return j7[c];
+                };
+                const float p0 = float(logical(0)) * float(convW[c * 4 + 0]);
+                const float p1 = float(logical(3)) * float(convW[c * 4 + 1]);
+                const float p2 = float(logical(6)) * float(convW[c * 4 + 2]);
+                const float p3 = float(newest) * float(convW[c * 4 + 3]);
+        """
+        let withLogicalConvolution = replaceOnce(withNewestRow, oldConvolution, newConvolution)
+        let oldAdded = "    added[c] = query[c] + pleDelta;"
+        let newAdded = """
+            added[c] = query[c] + pleDelta;
+            if constexpr (J_DEPTH == 8) {
+                stateOut[0 * W + c] = j0[c];
+                stateOut[1 * W + c] = j1[c];
+                stateOut[2 * W + c] = j2[c];
+                stateOut[3 * W + c] = j3[c];
+                stateOut[4 * W + c] = j4[c];
+                stateOut[5 * W + c] = j5[c];
+                stateOut[6 * W + c] = j6[c];
+                stateOut[7 * W + c] = j7[c];
+                stateOut[8 * W + c] = newest;
+            }
+        """
+        return replaceOnce(withLogicalConvolution, oldAdded, newAdded)
+    }()
+
     static let convolutionSource = """
         // MLXFAST-PLEFUSE2: preserve the S=1 dilated implicit-GEMM dispatch:
         // group=(32,1,4), grid of groups=(1,1,W), channel=group.z.
@@ -192,6 +251,15 @@ enum TrackPLEFusion {
         name: "track_ple_prepare_conv_fused2_residual",
         inputNames: ["key", "query", "value", "keyScale", "queryScale", "convScale", "convState", "convW"],
         outputNames: ["full", "added"], source: fusedPrepareSource,
+        header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
+
+    static let deferredPrepareKernel = MLXFast.metalKernel(
+        name: "track_ple_prepare_conv_deferred_state",
+        inputNames: [
+            "key", "query", "value", "keyScale", "queryScale", "convScale", "convState", "convW",
+            "j0", "j1", "j2", "j3", "j4", "j5", "j6", "j7",
+        ],
+        outputNames: ["stateOut", "added", "newestRow"], source: deferredPrepareSource,
         header: TrackFastKernels.exactHeader + header, ensureRowContiguous: true)
 
     static func supports(_ p: TrackPLE, stream: MLXArray, hidden: Int, hcCount: Int) -> Bool {
@@ -244,5 +312,30 @@ enum TrackPLEFusion {
             grid: (32, 1, 4 * 10240), threadGroup: (32, 1, 4),
             outputShapes: [[1, 1, 10240]], outputDTypes: [stream.dtype])[0]
         return (r[1], output, false)
+    }
+
+    static func forwardDeferredProjected(
+        _ p: TrackPLE, key: MLXArray, value: MLXArray, stream: MLXArray,
+        convState: MLXArray, pendingRows: [MLXArray], eps: Float
+    ) -> (stateOut: MLXArray?, output: MLXArray, newestRow: MLXArray)? {
+        guard key.shape == [1, 1, 10240], value.shape == [1, 1, 2560],
+            key.dtype == stream.dtype, value.dtype == stream.dtype,
+            pendingRows.count <= 8,
+            pendingRows.allSatisfy({ $0.shape == [1, 1, 10240] && $0.dtype == stream.dtype })
+        else { return nil }
+        var journals = pendingRows
+        journals.append(contentsOf: repeatElement(convState, count: 8 - journals.count))
+        let flush = pendingRows.count == 8
+        let result = deferredPrepareKernel(
+            [key, stream, value, p.normKeyScale, p.normQueryScale,
+             p.normConvScale, convState, p.convW] + journals,
+            template: prepareTemplates(dtype: stream.dtype, eps: eps)
+                + [("J_DEPTH", pendingRows.count)],
+            grid: (640, 4, 1), threadGroup: (640, 1, 1),
+            outputShapes: [
+                flush ? [1, 9, 10240] : [1], [1, 1, 10240], [1, 1, 10240],
+            ],
+            outputDTypes: [stream.dtype, stream.dtype, stream.dtype])
+        return (flush ? result[0] : nil, result[1], result[2])
     }
 }
