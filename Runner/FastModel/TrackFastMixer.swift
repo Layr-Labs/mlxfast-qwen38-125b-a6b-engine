@@ -44,7 +44,8 @@ enum TrackFastMixerKernels {
                 if (lid == 0) {
                     for (int i = 0; i < RPS; ++i) {
                         const T l = static_cast<T>(r[i]);
-                        lo[tile * (2 * RPS) + (int)sg * RPS + i] = l;
+                        // MLXFAST-NOLO: pre-activation row is a debug tap only.
+                        if (NEED_LO) { lo[tile * (2 * RPS) + (int)sg * RPS + i] = l; }
                         act[tile * (2 * RPS) + (int)sg * RPS + i] = mlx_silu(l);
                     }
                 }
@@ -55,7 +56,7 @@ enum TrackFastMixerKernels {
                 if ((lid % 8) == 0) {
                     for (int v = 0; v < VPT; ++v) {
                         const T l = static_cast<T>(r[v]);
-                        lo[v * ND + row] = l;
+                        if (NEED_LO) { lo[v * ND + row] = l; }
                         act[v * ND + row] = mlx_silu(l);
                     }
                 }
@@ -95,14 +96,14 @@ enum TrackFastMixerKernels {
         source: downInjectSource, header: header1, ensureRowContiguous: true)
 
     static func downInject(
-        normed: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?
+        normed: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?, needLo: Bool = true
     ) -> (lo: MLXArray, act: MLXArray, inj: MLXArray) {
         let S = normed.dim(0), KD = normed.dim(1), ND = down.rows
         let HC = inject?.rows ?? 4
         precondition(S >= 1 && S <= 8 && ND % 8 == 0 && KD % 512 == 0 && down.bits == 4)
         if S == 1 && down.groupSize == 32 && (inject == nil || inject!.groupSize == 32)
             && TrackFastMixerSplitK.split > 0 {
-            let o = TrackFastMixerSplitK.apply(normed, down: down, inject: inject)
+            let o = TrackFastMixerSplitK.apply(normed, down: down, inject: inject, needLo: needLo)
             return (o[0], o[1], o[2])
         }
         let inj = inject ?? down
@@ -114,10 +115,11 @@ enum TrackFastMixerKernels {
             [normed, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
             template: [
                 ("T", normed.dtype), ("GS", down.groupSize), ("BITS", down.bits), ("KD", KD), ("ND", ND),
-                ("HC", HC), ("VPT", S), ("HAS_INJECT", inject != nil),
+                ("HC", HC), ("VPT", S), ("HAS_INJECT", inject != nil), ("NEED_LO", needLo),
             ],
             grid: (32, tiles * 2, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[S, ND], [S, ND], [S, HC]], outputDTypes: [normed.dtype, normed.dtype, normed.dtype])
+            outputShapes: [needLo ? [S, ND] : [1], [S, ND], [S, HC]],
+            outputDTypes: [normed.dtype, normed.dtype, normed.dtype])
         return (outs[0], outs[1], outs[2])
     }
 
