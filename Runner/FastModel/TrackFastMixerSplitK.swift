@@ -4,8 +4,9 @@ import MLX
 // Partition HC input blocks across SIMD groups while retaining each lane's
 // ascending block fold and the final simd_sum. No target weight changes.
 enum TrackFastMixerSplitK {
-    // Four partitions in production; zero selects the original A/B control.
-    nonisolated(unsafe) static var split = 4
+    // One partition per quantized block of the down walk: every simdgroup owns
+    // the same number of blocks. Zero selects the original A/B control.
+    nonisolated(unsafe) static var split = 5
     static let helper = #"""
         template <typename T, int K, int V, int R, int SPLIT, bool ORDERED>
         METAL_FUNC void research_split_qmv(
@@ -16,10 +17,18 @@ enum TrackFastMixerSplitK {
             constexpr int BLOCK = V * 32;
             constexpr int NB = K / BLOCK;
             static_assert(K % BLOCK == 0, "full quantized blocks required");
-            constexpr int COUNT = (NB + SPLIT - 1) / SPLIT;
+            // Remainder-aware ownership: the first REM groups take one extra
+            // block so the longest walk is ceil(NB / SPLIT) instead of the
+            // uniform stride, which left the last groups short or empty. The
+            // fold below is keyed by the absolute block index, so which group
+            // computes a block does not enter the arithmetic.
+            constexpr int BASE = NB / SPLIT;
+            constexpr int REM = NB % SPLIT;
+            const int begin = int(sg) * BASE + (int(sg) < REM ? int(sg) : REM);
+            const int end = begin + BASE + (int(sg) < REM ? 1 : 0);
             float partial[R];
             for (int r = 0; r < R; ++r) { partial[r] = 0; result[r] = 0; }
-            for (int b = int(sg) * COUNT; b < min((int(sg) + 1) * COUNT, NB); ++b) {
+            for (int b = begin; b < end; ++b) {
                 float xv[V];
                 const int column = b * BLOCK + int(lane) * V;
                 float sum = load_vector<T, float, V, 4>(x + column, xv);
