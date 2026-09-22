@@ -1389,6 +1389,13 @@ extension TrackFastMoEKernels {
         const uint kg = (uint)F / GS;
         const uint sgi = simdgroup_index_in_threadgroup;
         const uint lid = thread_index_in_simdgroup;
+        // MLXFAST-GATEEARLY: the epilogue's first act used to be a dependent
+        // device read of `gate[t]` followed by a sigmoid, issued after the
+        // barrier with no work left to cover its latency. The value depends on
+        // nothing the walks produce, so it is read and reduced here, at entry,
+        // and the load retires behind the expert walks. Same expression, same
+        // type, same result.
+        const T gate_sg = mlx_sigmoid(gate[t]);
         // The K expert walks are independent of one another, so they are spread
         // over KSG simdgroups; each product lands in threadgroup memory as the
         // float it already was, and the epilogue folds them in the same k order.
@@ -1470,7 +1477,7 @@ extension TrackFastMoEKernels {
         if constexpr (VPT == 1 && RPS <= 32) {
             if (sgi == 0 && lid < RPS) {
                 const int i = (int)lid;
-                const T sg = mlx_sigmoid(gate[t]);
+                const T sg = gate_sg;
                 float col[K];
                 for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
                 const T r = static_cast<T>(mlx_colsum_small_f32<K>(col));
@@ -1479,7 +1486,7 @@ extension TrackFastMoEKernels {
             }
         } else {
             if (sgi == 0 && lid == 0) {
-                const T sg = mlx_sigmoid(gate[t]);
+                const T sg = gate_sg;
                 for (int i = 0; i < RPS; ++i) {
                     float col[K];
                     for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
