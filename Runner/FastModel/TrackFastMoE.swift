@@ -786,6 +786,8 @@ extension TrackFastMoEKernels {
             ld[i] = -INFINITY;
             selected[i] = 0xffffffffu;
         }
+        float lane_ld = -INFINITY;
+        uint lane_selected = 0xffffffffu;
         threadgroup float selv[K];
         threadgroup uint seli[K];
         // MLXFAST-ROUTESG1: for one token the shared-gate GEMV above runs on
@@ -816,15 +818,29 @@ extension TrackFastMoEKernels {
             const uint cand = (bv == gmax && bj >= 0) ? (uint)(lane + 32 * bj) : 0xffffffffu;
             const uint gidx = simd_min(cand);
             if constexpr (REGISTER_RESULTS) {
-                for (int i = 0; i < N_READS; ++i) {
-                    if (k == (int)lane * N_READS + i) { ld[i] = gmax; selected[i] = gidx; }
-                }
+                if (k == (int)lane) { lane_ld = gmax; lane_selected = gidx; }
             } else if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
             if (gidx == (uint)(lane + 32 * bj) && bj >= 0) { taken[bj] = true; }
         }
         }
         if constexpr (REGISTER_RESULTS) {
             if (sg != SEL_SG) { return; }
+            float maxval = (-FLT_MAX < lane_ld) ? lane_ld : -FLT_MAX;
+            maxval = simd_max(maxval);
+            const float exp_x = fast::exp(lane_ld - maxval);
+            constexpr uint SUM_LANES = (K + N_READS - 1) / N_READS;
+            const uint base = lane < SUM_LANES ? lane * N_READS : 0;
+            float normalizer = 0.0f;
+            for (int i = 0; i < N_READS; ++i) {
+                normalizer += simd_shuffle(exp_x, (ushort)(base + i));
+            }
+            if (lane >= SUM_LANES) { normalizer = 0.0f; }
+            normalizer = simd_sum(normalizer);
+            normalizer = 1.0f / normalizer;
+            if (lane < K) {
+                w[(size_t)row * K + lane] = exp_x * normalizer;
+                idx[(size_t)row * K + lane] = lane_selected;
+            }
         } else {
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (sg != 0) { return; }
@@ -832,26 +848,23 @@ extension TrackFastMoEKernels {
                 const int p = (int)lane * N_READS + i;
                 ld[i] = (p < K) ? selv[p] : -INFINITY;
             }
-        }
-        // softmax_single_row over the K selected logits (AccT = float)
-        float maxval = -FLT_MAX;
-        for (int i = 0; i < N_READS; i++) { maxval = (maxval < ld[i]) ? ld[i] : maxval; }
-        maxval = simd_max(maxval);
-        float normalizer = 0;
-        for (int i = 0; i < N_READS; i++) {
-            float exp_x = fast::exp(ld[i] - maxval);
-            ld[i] = exp_x;
-            normalizer += exp_x;
-        }
-        normalizer = simd_sum(normalizer);
-        normalizer = 1 / normalizer;
-        for (int i = 0; i < N_READS; i++) {
-            const int p = (int)lane * N_READS + i;
-            if (p < K) {
-                w[(size_t)row * K + p] = ld[i] * normalizer;
-                if constexpr (REGISTER_RESULTS) {
-                    idx[(size_t)row * K + p] = selected[i];
-                } else { idx[(size_t)row * K + p] = seli[p]; }
+            float maxval = -FLT_MAX;
+            for (int i = 0; i < N_READS; i++) { maxval = (maxval < ld[i]) ? ld[i] : maxval; }
+            maxval = simd_max(maxval);
+            float normalizer = 0;
+            for (int i = 0; i < N_READS; i++) {
+                float exp_x = fast::exp(ld[i] - maxval);
+                ld[i] = exp_x;
+                normalizer += exp_x;
+            }
+            normalizer = simd_sum(normalizer);
+            normalizer = 1 / normalizer;
+            for (int i = 0; i < N_READS; i++) {
+                const int p = (int)lane * N_READS + i;
+                if (p < K) {
+                    w[(size_t)row * K + p] = ld[i] * normalizer;
+                    idx[(size_t)row * K + p] = seli[p];
+                }
             }
         }
         """
@@ -868,10 +881,12 @@ extension TrackFastMoEKernels {
         outputNames: ["idx", "w", "gate"],
         source: routeSource, header: TrackFastKernels.mixerHeadHeader + wideDecls, ensureRowContiguous: true)
 
-    /// logits f32 [..., E] -> (idx uint32 [..., K], w f32 [..., K])
-    /// Also the shared-expert gate logit per row: x [..., KD] x sharedGate [1, KD] -> gate [...] (pre-sigmoid).
-    static func route(logits: MLXArray, x: MLXArray, sharedGate: TrackQuantWeight?, topK: Int)
-        -> (idx: MLXArray, w: MLXArray, gate: MLXArray)
+    /// logits f32 [..., E] -> (idx uint32 [..., K], w f32 [..., K]).
+    /// Decode callers can request flat idx/w outputs for fused expert kernels.
+    /// Also computes the shared-expert gate logit per row: x [..., KD] x sharedGate [1, KD].
+    static func route(
+        logits: MLXArray, x: MLXArray, sharedGate: TrackQuantWeight?, topK: Int, flatOutputs: Bool = false
+    ) -> (idx: MLXArray, w: MLXArray, gate: MLXArray)
     {
         precondition(logits.dtype == .float32 && (sharedGate == nil || (sharedGate!.rows == 1 && sharedGate!.bits == 4)))
         let g = sharedGate
@@ -880,11 +895,15 @@ extension TrackFastMoEKernels {
         let R = lead.reduce(1, *)
         precondition(topK <= 32 && topK <= E && R >= 1 && (g == nil || R <= 8) && KD % 256 == 0)
         let simdgroups = g == nil ? 1 : 2
+        let flat = flatOutputs
         let outs = (R == 1 ? routeKernel1 : routeKernel)(
-            [logits.reshaped(R, E), x.reshaped(R, KD), g?.weight ?? x, g?.scales ?? x, g?.biases ?? x],
+            [flat ? logits : logits.reshaped(R, E), flat ? x : x.reshaped(R, KD),
+             g?.weight ?? x, g?.scales ?? x, g?.biases ?? x],
             template: [("E", E), ("K", topK), ("T", x.dtype), ("GS", g?.groupSize ?? 32), ("BITS", g?.bits ?? 4), ("KD", KD), ("VPT", R), ("HAS_GATE", g != nil)],
             grid: (32, R * simdgroups, 1), threadGroup: (32, simdgroups, 1),
-            outputShapes: [[R, topK], [R, topK], [R]], outputDTypes: [.uint32, .float32, x.dtype])
+            outputShapes: flat ? [[R * topK], [R * topK], [R]] : [[R, topK], [R, topK], [R]],
+            outputDTypes: [.uint32, .float32, x.dtype])
+        if flat { return (outs[0], outs[1], outs[2]) }
         return (outs[0].reshaped(lead + [topK]), outs[1].reshaped(lead + [topK]), outs[2].reshaped(lead))
     }
 }
@@ -2270,7 +2289,7 @@ extension TrackFastMoEKernels {
         precondition(K % 128 == 0 && K > 64 && K < 16 * N && N % 16 == 0 && N < 4096)
         let rowsPerSimdgroup = K == 2560 && N == 512 ? 1 : 4  // MLXFAST-ROUTERRPS1
         return routerGemvKernel(
-            [x.reshaped(K), w],
+            [x, w],
             template: [("T", w.dtype), ("K", K), ("N", N), ("RPS", rowsPerSimdgroup)],
             grid: (32 * (N / (4 * rowsPerSimdgroup)), 1, 4), threadGroup: (32, 1, 4),
             outputShapes: [[N]], outputDTypes: [.float32])[0]

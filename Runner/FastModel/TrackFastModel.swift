@@ -818,15 +818,15 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let S = x.dim(1), K = m.topK, H = x.dim(2)
             let x2 = x.reshaped(S, H)
             let r = TrackFastMoEKernels.route(
-                logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, topK: K)
+                logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, topK: K,
+                flatOutputs: true)
             let (idx, weights) = (r.idx, r.w)
             let gate = gateQ != nil ? r.gate : m.sharedGate.apply(x).reshaped(S)
             if prof { TrackFastProfile.tick("moe.route", &pt, [idx, weights, gate]) }
-            let flatIdx = idx.reshaped(S * K)
             let xrow = Self.xrowTable(S: S, K: K)
             if let replay, StreamOrDevice.default.stream === Stream.gpu {
                 return replay([
-                    x2, flatIdx, weights.reshaped(S * K), gate, xrow,
+                    x2, idx, weights, gate, xrow,
                     m.expertGate.w, m.expertGate.s, m.expertGate.b,
                     m.expertUp.w, m.expertUp.s, m.expertUp.b,
                     guq.weight, guq.scales, guq.biases!,
@@ -837,10 +837,10 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
                 wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b, shared: guq,
-                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits)
+                x: x2, idx: idx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits)
             return TrackFastMoEKernels.downCombine(
                 wd: m.expertDown.w, sd: m.expertDown.s, bd: m.expertDown.b, sharedDown: dq,
-                act: act, idx: flatIdx, w: weights.reshaped(S * K), gate: gate, topK: K,
+                act: act, idx: idx, w: weights, gate: gate, topK: K,
                 groupSize: m.expertGroupSize, bits: m.expertBits
             ).reshaped(1, S, H)
         }
