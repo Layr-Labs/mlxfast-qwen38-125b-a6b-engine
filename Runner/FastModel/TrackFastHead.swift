@@ -1,6 +1,4 @@
-// TrackFastHead.swift -- the MTP head's forward over the fast kernels.
 //
-// The head is one full-attention decoder layer between two projections and a
 // final mixer, driven once per draft step. The fork's module runs it through
 // the legacy `Qwen4ExpDecoderLayer` path (~125 launches per step); this runs
 // the SAME tensors through the bit-exact fusions of the fast model, with the
