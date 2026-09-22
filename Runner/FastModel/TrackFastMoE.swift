@@ -1332,14 +1332,25 @@ extension TrackFastMoEKernels {
             for (int i = 0; i < RPS; ++i) {
                 const T gv = static_cast<T>(g[i]);
                 const T uv = static_cast<T>(u[i]);
-                act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+                // MLXFAST-ACTLUT: for bfloat16 the activation is a lookup in the
+                // table this tree builds by evaluating `mlx_silu` on every
+                // bfloat16 bit pattern, so the looked-up value is the same bits
+                // the inline call returns. One lane runs this tail, so the
+                // special-function chain it replaces is fully exposed.
+                T av;
+                if constexpr (metal::is_same_v<T, bfloat16_t>) {
+                    av = silu_lut[as_type<ushort>(static_cast<bfloat16_t>(gv))];
+                } else {
+                    av = mlx_silu(gv);
+                }
+                act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = av * uv;
             }
         }
         """
 
     nonisolated(unsafe) static let gateUpReuseKernel = MLXFast.metalKernel(
         name: "track_moe_gate_up_reuse_2row",
-        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
+        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow", "silu_lut"],
         outputNames: ["act"],
         source: gateUpReuseSource,
         header: helpersCore + TrackFastKernels.exactHeader + gateUpReuseHelpers,
@@ -1359,7 +1370,8 @@ extension TrackFastMoEKernels {
         {
             let rows = gateUpReuseRowsPerSimdgroup
             return gateUpReuseKernel(
-                [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
+                [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow,
+                 TrackBF16Functions.silu],
                 template: [
                     ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N),
                     ("KD", KD), ("BR", BR), ("RPS", rows),
