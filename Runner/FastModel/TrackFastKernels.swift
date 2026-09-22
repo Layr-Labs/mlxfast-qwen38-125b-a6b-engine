@@ -662,6 +662,13 @@ enum TrackFastKernels {
                 dtBias: dtBias, T: T, capture: capture, geometry: g)
         }
         if prof { TrackFastProfile.tick("gdn.prep", &pt, prep) }
+        if let chunked = TrackGDNChunkBF3.apply(
+            q: prep[0], k: prep[1], v: prep[2], g: prep[3], beta: prep[4],
+            state: stateIn, count: T, capture: capture, geometry: g)
+        {
+            if prof { TrackFastProfile.tick("gdn.lean", &pt, chunked) }
+            return (chunked[0], prep[5], chunked[1])
+        }
         // MLXFAST-GDNROWS: each prefill SIMD group owns `prefillRows` value rows
         // (four, measured); decode (S == 1) and the capture window keep the
         // kernels they had. Omit the unused grid rows.
