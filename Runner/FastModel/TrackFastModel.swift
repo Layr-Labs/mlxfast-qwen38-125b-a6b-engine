@@ -1156,6 +1156,12 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return (mixed, multi)
     }
 
+    /// One-token head. The specialized kernel serves only the exact 4-bit
+    /// affine head; every other shape stays on the wrapped head.
+    func headLogits(_ hidden: MLXArray) -> MLXArray {
+        TrackFastLMHead.logits(hidden, model: base) ?? base.head(hidden)
+    }
+
     // MARK: routing
 
     private func typedCaches(_ caches: [KVCache]) -> [Qwen4ExpCBv2LayerCache]? {
@@ -1256,7 +1262,7 @@ extension TrackQwen4ExpFastModel: CBv2PositionedRecurrentLanguageModelForwardabl
             tokens, inputEmbeddings: nil, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds, capture: false)
         {
-            return base.head(s.mixed)
+            return headLogits(s.mixed)
         }
         return base.cbv2Forward(
             tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
@@ -1283,7 +1289,7 @@ extension TrackQwen4ExpFastModel: CBv2PositionedRecurrentLanguageModelForwardabl
             inputs, inputEmbeddings: inputEmbedding, caches: cache ?? [],
             recurrentState: recurrentState, positionIds: positionIds, capture: false)
         {
-            return base.head(s.mixed)
+            return headLogits(s.mixed)
         }
         return base.embeddingForward(
             inputs, inputEmbedding: inputEmbedding, cache: cache,
@@ -1311,7 +1317,7 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentLanguageModelPrefillForwardable {
             case .evaluationOnly:
                 return s.mixed[0..., -1, 0 ..< 1]
             case .lastPositionLogits:
-                return base.head(s.mixed[0..., -1, 0...])
+                return headLogits(s.mixed[0..., -1, 0...])
             }
         }
         return base.cbv2RecurrentPrefill(
@@ -1331,7 +1337,7 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentMTPForwardable {
             tokens, inputEmbeddings: nil, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds, capture: false)
         {
-            return (base.head(s.mixed), s.multi)
+            return (headLogits(s.mixed), s.multi)
         }
         return base.cbv2ForwardWithHidden(
             tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
@@ -1353,7 +1359,7 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentCaptureMTPForwardable {
             tokens, inputEmbeddings: nil, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds, capture: true)
         {
-            return (base.head(s.mixed), s.multi)
+            return (headLogits(s.mixed), s.multi)
         }
         return base.cbv2ForwardWithHiddenCaptured(
             tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
