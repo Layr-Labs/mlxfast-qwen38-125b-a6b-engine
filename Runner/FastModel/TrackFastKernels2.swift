@@ -483,6 +483,65 @@ extension TrackFastKernels {
             outputShapes: [[B, S, HQ * D]], outputDTypes: [att.dtype])[0]
     }
 
+    // MARK: attention output projection with the output gate folded into the load
+
+    /// MLXFAST-GATEDOUT: `o_proj` over `att * sigmoid(gate)` in one launch.
+    ///
+    /// The crown ran `track_attn_gate` (a 6144-wide bf16 buffer, one consumer)
+    /// and then `o_proj`'s `qmv_fast` over it. The gate product moves into that
+    /// GEMV's activation load, so the buffer and its launch disappear. Grid and
+    /// threadgroup are `qmv_fast_impl`'s own: `tid.y * 8 + simd_gid * 4` is the
+    /// row base, `num_simdgroups * results_per_simdgroup` is 8, and lane 0 of
+    /// each simdgroup stores its four rows after the unchanged `simd_sum`.
+    static let attnOutGatedSource = """
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint lid = thread_index_in_simdgroup;
+        const int out_row = int(threadgroup_position_in_grid.y) * (2 * RPS)
+            + int(sg) * RPS;
+        const device T* g = qkv + GATE_OFF;
+        float r[RPS];
+        qmv_fast_reg_gated<T, GS, BITS, RPS>(w, s, b, x, g, K, out_row, lid, r);
+        if (lid == 0) {
+          for (int i = 0; i < RPS; ++i) { y[out_row + i] = static_cast<T>(r[i]); }
+        }
+        """
+
+    nonisolated(unsafe) static let attnOutGatedKernel = MLXFast.metalKernel(
+        name: "track_attn_out_gated",
+        inputNames: ["w", "s", "b", "x", "qkv"],
+        outputNames: ["y"],
+        source: attnOutGatedSource,
+        header: TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader
+            + TrackFastMoEKernels.regHelpers,
+        ensureRowContiguous: true)
+
+    /// The fused projection, or nil when the window is not the one-token fused
+    /// case (prefill and every `S > 1` window keep `attnGate` then `out.apply`).
+    static func attnOutGated(
+        att: MLXArray, qkv: MLXArray, gateOffset: Int, out: TrackQuantWeight
+    ) -> MLXArray? {
+        let B = att.dim(0), HQ = att.dim(1), S = att.dim(2), D = att.dim(3)
+        let K = HQ * D, N = out.rows
+        guard S == 1, B == 1, att.dtype == .bfloat16, qkv.dtype == .bfloat16,
+            out.bits == 4, out.mode == .affine, out.biases != nil,
+            out.groupSize > 0, K % 512 == 0, K % out.groupSize == 0,
+            N % 8 == 0, qkv.dim(-1) >= gateOffset + K,
+            // The kernel's `T` is the activation dtype and it also types the
+            // scales, the biases and the output. A checkpoint whose quantized
+            // scales are not the activation dtype would make the Metal compile
+            // fail at dispatch, so it takes the parent's path instead.
+            out.scales.dtype == att.dtype, out.biases!.dtype == att.dtype
+        else { return nil }
+        return attnOutGatedKernel(
+            [out.weight, out.scales, out.biases!, att.reshaped(K), qkv.reshaped(-1)],
+            template: [
+                ("T", att.dtype), ("GS", out.groupSize), ("BITS", out.bits),
+                ("K", K), ("RPS", 4), ("GATE_OFF", gateOffset),
+            ],
+            grid: (32, N / 4, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, 1, N]], outputDTypes: [att.dtype])[0]
+    }
+
     // MARK: MoE combine
 
     /// out = bf16(sum_k f32(routed[k]) * w[k]) + sigmoid(gate) * shared   (bf16 ops after the f32 sum)

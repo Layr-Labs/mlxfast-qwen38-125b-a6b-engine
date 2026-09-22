@@ -1085,6 +1085,85 @@ extension TrackFastMoEKernels {
           return sum;
         }
 
+        // MLXFAST-GATEDOUT: the attention output gate applied on load.
+        // `track_attn_gate` writes `att * sigmoid(gate)` into a 6144-wide bf16
+        // buffer whose only consumer is the next GEMV's activation load, so the
+        // product moves into that load. `a * mlx_sigmoid(g)` is the expression
+        // the gate launch stored, evaluated on the same two bf16 values and
+        // rounded to the same type, so the loaded value is bit-identical.
+        template <typename T, typename U, int values_per_thread, int bits>
+        inline U load_vector_gated(
+            const device T* x, const device T* g, thread U* x_thread) {
+          static_assert(bits == 4, "gate-on-load: 4-bit only");
+          U sum = 0;
+          for (int i = 0; i < values_per_thread; i += 4) {
+            const T a = x[i] * mlx_sigmoid(g[i]);
+            const T b = x[i + 1] * mlx_sigmoid(g[i + 1]);
+            const T c = x[i + 2] * mlx_sigmoid(g[i + 2]);
+            const T d = x[i + 3] * mlx_sigmoid(g[i + 3]);
+            sum += a + b + c + d;
+            x_thread[i] = a;
+            x_thread[i + 1] = b / 16.0f;
+            x_thread[i + 2] = c / 256.0f;
+            x_thread[i + 3] = d / 4096.0f;
+          }
+          return sum;
+        }
+
+        // `qmv_fast_reg` with the gate product in the activation load. The
+        // weight walk, the accumulation order, the per-row `qdot` and the
+        // closing `simd_sum` are the parent's; `g` advances exactly as `x` does,
+        // so lane `simd_lid` multiplies the same activation elements by the same
+        // gate elements the separate launch paired.
+        template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
+        METAL_FUNC void qmv_fast_reg_gated(
+            const device uint32_t* w,
+            const device T* scales,
+            const device T* biases,
+            const device T* x,
+            const device T* g,
+            const int in_vec_size,
+            const int out_row,
+            uint simd_lid,
+            thread float (&result)[results_per_simdgroup]) {
+          constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+          constexpr int pack_factor = get_pack_factor<bits, 32>();
+          constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+          constexpr int values_per_thread = pack_factor * packs_per_thread;
+          constexpr int block_size = values_per_thread * SIMD_SIZE;
+          constexpr int scale_step_per_thread = group_size / values_per_thread;
+          const device uint8_t* ws = (const device uint8_t*)w;
+          typedef float U;
+          thread U x_thread[values_per_thread];
+          for (int row = 0; row < results_per_simdgroup; row++) { result[row] = 0; }
+          const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+          const int in_vec_size_g = in_vec_size / group_size;
+          ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+          scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          x += simd_lid * values_per_thread;
+          g += simd_lid * values_per_thread;
+          for (int k = 0; k < in_vec_size; k += block_size) {
+            U sum = load_vector_gated<T, U, values_per_thread, bits>(x, g, x_thread);
+            for (int row = 0; row < results_per_simdgroup; row++) {
+              auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+              const device T* sl = scales + row * in_vec_size_g;
+              const device T* bl = biases + row * in_vec_size_g;
+              U s = sl[0];
+              U b = bl[0];
+              result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+            }
+            ws += block_size * bytes_per_pack / pack_factor;
+            scales += block_size / group_size;
+            biases += block_size / group_size;
+            x += block_size;
+            g += block_size;
+          }
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            result[row] = simd_sum(result[row]);
+          }
+        }
+
         // qmv_impl's normal branch over FOUR GIVEN rows (each row's walk is
         // independent of its neighbours), optional silu on the activations.
         // EXACT_TAIL as in qmv_reg above: the caller's in_vec_size is a multiple
@@ -1237,7 +1316,10 @@ extension TrackFastMoEKernels {
         source: gateUpActSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
 
-    static let gateUpReuseRowsPerSimdgroup = 2
+    // MLXFAST-GUONESG: one output row per simdgroup. With RPS = 1 each group
+    // runs a single gate+up walk pair over K instead of two serial row pairs;
+    // the per-row fold order over k is unchanged, so act is bit-identical.
+    static let gateUpReuseRowsPerSimdgroup = 1
 
     static let gateUpReuseHelpers = #"""
         template <typename T, int group_size, int bits, int rows>
@@ -1322,6 +1404,9 @@ extension TrackFastMoEKernels {
         const device uint32_t* uw = shared ? wsh + (size_t)N * kw : wu + eoff * kw;
         const device T* us = shared ? ssh + (size_t)N * kg : su + eoff * kg;
         const device T* ub = shared ? bsh + (size_t)N * kg : bu + eoff * kg;
+        // MLXFAST-GUONESG: RPS output rows per simdgroup; at RPS = 1 the two
+        // simdgroups of a threadgroup own adjacent rows and the dual helper
+        // still loads x once per block for the gate and up walks of its row.
         const int out_row = (int)threadgroup_position_in_grid.y * (2 * RPS)
             + (int)simdgroup_index_in_threadgroup * RPS;
         float g[RPS], u[RPS];
@@ -1338,7 +1423,7 @@ extension TrackFastMoEKernels {
         """
 
     nonisolated(unsafe) static let gateUpReuseKernel = MLXFast.metalKernel(
-        name: "track_moe_gate_up_reuse_2row",
+        name: "track_moe_gate_up_reuse_1row",
         inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
         outputNames: ["act"],
         source: gateUpReuseSource,
