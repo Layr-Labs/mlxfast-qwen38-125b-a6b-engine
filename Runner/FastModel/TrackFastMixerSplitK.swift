@@ -59,7 +59,11 @@ enum TrackFastMixerSplitK {
             if (sg == 0 && lane == 0) {
                 for (int i = 0; i < RPS; ++i) {
                     T l = static_cast<T>(r[i]);
-                    lo[tile * RPS + i] = l;
+                    // MLXFAST-NOLO: the pre-activation row is a debug tap only;
+                    // the mixer consumes `act`. NEED_LO compiles the store out
+                    // when no consumer asked for it, and the dispatch then
+                    // allocates a placeholder instead of an [S, ND] tensor.
+                    if (NEED_LO) { lo[tile * RPS + i] = l; }
                     act[tile * RPS + i] = mlx_silu(l);
                 }
             }
@@ -76,15 +80,17 @@ enum TrackFastMixerSplitK {
         header: TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader + helper,
         ensureRowContiguous: true)
 
-    static func apply(_ x: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?) -> [MLXArray] {
+    static func apply(
+        _ x: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?, needLo: Bool = true
+    ) -> [MLXArray] {
         let k = x.size, n = down.rows, hc = inject?.rows ?? 4
         let rows = 2, partitions = split
         let inj = inject ?? down
         precondition(x.shape == [1, k] && k % 512 == 0 && n % rows == 0 && partitions > 0)
         return fusedKernel([x, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
             template: [("T", x.dtype), ("K", k), ("ND", n), ("RPS", rows), ("SPLIT", partitions),
-                       ("ORDERED", true), ("HAS_INJECT", inject != nil)],
+                       ("ORDERED", true), ("HAS_INJECT", inject != nil), ("NEED_LO", needLo)],
             grid: (32, (n / rows + (inject != nil ? hc : 0)) * partitions, 1), threadGroup: (32, partitions, 1),
-            outputShapes: [[1, n], [1, n], [1, hc]], outputDTypes: [x.dtype, x.dtype, x.dtype])
+            outputShapes: [needLo ? [1, n] : [1], [1, n], [1, hc]], outputDTypes: [x.dtype, x.dtype, x.dtype])
     }
 }
