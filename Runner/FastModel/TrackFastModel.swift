@@ -71,11 +71,13 @@ private final class TrackGDNJournalEntry {
     weak var state: MLXArray?
     let nextOffset: Int
     let array: MLXArray
+    let depth: Int
 
-    init(state: MLXArray, nextOffset: Int, array: MLXArray) {
+    init(state: MLXArray, nextOffset: Int, array: MLXArray, depth: Int) {
         self.state = state
         self.nextOffset = nextOffset
         self.array = array
+        self.depth = depth
     }
 }
 
@@ -639,22 +641,25 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let journalKey = ObjectIdentifier(ssm)
         let entry = gdnJournals[journalKey]
         let pendingJournal: MLXArray?
+        let pendingDepth: Int
         if !capture, let entry, entry.state === ssm, entry.nextOffset == offset {
             pendingJournal = entry.array
+            pendingDepth = entry.depth
         } else {
             gdnJournals.removeValue(forKey: journalKey)
             pendingJournal = nil
+            pendingDepth = 0
         }
         if let fused = TrackFastGDNDecode.apply(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
             dtBias: g.dtBias, stateIn: ssm, normW: g.normW,
-            pendingJournal: pendingJournal, zOffset: g.zOffset, eps: 1e-6,
-            capture: capture, geometry: geo)
+            pendingJournal: pendingJournal, pendingDepth: pendingDepth,
+            zOffset: g.zOffset, eps: 1e-6, capture: capture, geometry: geo)
         {
             (gated, convOut, stateOut) = (fused.gated, fused.convOut, fused.stateOut)
             if let journal = fused.journal {
                 gdnJournals[journalKey] = TrackGDNJournalEntry(
-                    state: ssm, nextOffset: offset + S, array: journal)
+                    state: ssm, nextOffset: offset + S, array: journal, depth: fused.journalDepth)
             } else {
                 gdnJournals.removeValue(forKey: journalKey)
             }
