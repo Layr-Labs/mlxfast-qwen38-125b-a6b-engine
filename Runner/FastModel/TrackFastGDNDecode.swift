@@ -6,16 +6,16 @@ import MLX
 enum TrackFastGDNDecode {
     private static let kernel = MLXFast.metalKernel(
         name: "track_gdn_decode_complete",
-        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w", "journal_in"],
+        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w", "journal_in", "journal_second"],
         outputNames: ["state_out", "gated", "conv_out", "journal_out"],
         source: source, header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
     static func apply(
         proj: MLXArray, convState: MLXArray, convW: MLXArray,
         negExpALog: MLXArray, dtBias: MLXArray, stateIn: MLXArray, normW: MLXArray,
-        pendingJournal: MLXArray?, zOffset: Int, eps: Float, capture: Bool,
+        pendingJournal: MLXArray?, secondJournal: MLXArray?, zOffset: Int, eps: Float, capture: Bool,
         geometry g: TrackFastKernels.GDNGeometry
-    ) -> (gated: MLXArray, stateOut: MLXArray, convOut: MLXArray, journal: MLXArray?)? {
+    ) -> (gated: MLXArray, stateOut: MLXArray, convOut: MLXArray, journal: MLXArray?, journalDepth: Int)? {
         guard !capture, proj.ndim == 3, proj.dim(1) == 1, proj.dtype == .bfloat16,
             stateIn.dtype == .float32, g.dk == 128, g.dv == 128,
             g.hk > 0, g.hv % g.hk == 0, g.convKernel > 1,
@@ -32,10 +32,19 @@ enum TrackFastGDNDecode {
             convState.dtype == proj.dtype
         else { return nil }
         let journalStride = g.hv * g.dk + 2 * g.hv * g.dv + 2 * g.hv
-        let hasJournal = pendingJournal?.shape == [B, journalStride]
-        let journalIn = pendingJournal ?? convState
+        // Immutable one-record buffers: retaining the first record avoids
+        // copying it into a new two-slot allocation on the middle step.
+        var depth = 0
+        if let first = pendingJournal, first.shape == [B, journalStride], first.dtype == proj.dtype {
+            if let second = secondJournal {
+                if second.shape == [B, journalStride], second.dtype == proj.dtype { depth = 2 }
+            } else { depth = 1 }
+        }
+        let flush = depth == 2
+        let journalIn = depth > 0 ? pendingJournal! : convState
+        let journalSecond = depth == 2 ? secondJournal! : convState
         let result = kernel(
-            [proj, convState, convW, negExpALog, dtBias, stateIn, normW, journalIn],
+            [proj, convState, convW, negExpALog, dtBias, stateIn, normW, journalIn, journalSecond],
             template: [
                 ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
                 ("Hk", g.hk), ("Hv", g.hv), ("KC", g.convKernel), ("CONV_DIM", g.convDim),
@@ -43,20 +52,21 @@ enum TrackFastGDNDecode {
                 ("Z_OFF", zOffset), ("EPS_BITS", Int(eps.bitPattern)), ("RPS", 4),
                 ("J_KEY_OFF", 0), ("J_DELTA_OFF", g.hv * g.dk),
                 ("J_DECAY_OFF", g.hv * g.dk + 2 * g.hv * g.dv),
-                ("J_STRIDE", journalStride), ("HAS_JOURNAL", hasJournal),
+                ("J_STRIDE", journalStride), ("J_DEPTH", depth),
             ],
             grid: (32, g.dv / 4, B * g.hv), threadGroup: (32, g.dv / 4, 1),
             outputShapes: [
-                hasJournal ? [B, g.hv, g.dv, g.dk] : [1],
+                flush ? [B, g.hv, g.dv, g.dk] : [1],
                 [B, 1, g.hv * g.dv], [B, g.convKernel - 1, g.convDim],
-                hasJournal ? [1] : [B, journalStride],
+                flush ? [1] : [B, journalStride],
             ],
             outputDTypes: [stateIn.dtype, proj.dtype, proj.dtype, proj.dtype])
-        return (result[1], hasJournal ? result[0] : stateIn, result[2], hasJournal ? nil : result[3])
+        return (result[1], flush ? result[0] : stateIn, result[2], flush ? nil : result[3], flush ? 0 : depth + 1)
     }
 
     private static let source = #"""
         static_assert(Dk == 128 && Dv == 128, "GDN head geometry");
+        static_assert(J_DEPTH >= 0 && J_DEPTH <= 2, "GDN journal depth");
         const uint n = threadgroup_position_in_grid.z;
         const uint b_idx = n / Hv;
         const uint hv_idx = n % Hv;
@@ -133,11 +143,16 @@ enum TrackFastGDNDecode {
         const threadgroup InT* v_ = v_shared;
         const float gate_decay = gb_shared[0];
         const float gate_beta = gb_shared[1];
-        const device InT* journal = journal_in + b_idx * J_STRIDE;
-        device InT* next_journal = journal_out + b_idx * J_STRIDE;
-        auto journal_float = [&](int off) -> float {
-            const uint lo = (uint)as_type<ushort>(journal[off]);
-            const uint hi = (uint)as_type<ushort>(journal[off + 1]);
+        const device InT* journal0 = journal_in;
+        const device InT* journal1 = journal_second;
+        if constexpr (J_DEPTH > 0) { journal0 += b_idx * J_STRIDE; }
+        if constexpr (J_DEPTH > 1) { journal1 += b_idx * J_STRIDE; }
+        // A flush has only a placeholder journal output; form no offset into it.
+        device InT* next_journal = journal_out;
+        if constexpr (J_DEPTH < 2) { next_journal += b_idx * J_STRIDE; }
+        auto journal_float = [&](const device InT* record, int off) -> float {
+            const uint lo = (uint)as_type<ushort>(record[off]);
+            const uint hi = (uint)as_type<ushort>(record[off + 1]);
             return as_type<float>(lo | (hi << 16));
         };
         auto store_journal_float = [&](int off, float value) {
@@ -166,9 +181,10 @@ enum TrackFastGDNDecode {
             } else {
                 for (int i = 0; i < 4; ++i) { state[i] = static_cast<float>(i_state[4 * lane + i]); }
             }
-            if constexpr (HAS_JOURNAL) {
-                const float pending_decay = journal_float(J_DECAY_OFF + 2 * hv_idx);
-                const float pending_delta = journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx));
+            for (int pending = 0; pending < J_DEPTH; ++pending) {
+                const device InT* journal = pending == 0 ? journal0 : journal1;
+                const float pending_decay = journal_float(journal, J_DECAY_OFF + 2 * hv_idx);
+                const float pending_delta = journal_float(journal, J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx));
                 for (int i = 0; i < 4; ++i) {
                     state[i] = state[i] * pending_decay;
                     state[i] = state[i]
@@ -194,7 +210,7 @@ enum TrackFastGDNDecode {
             }
             kv_mem = simd_sum(kv_mem);
             const float delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * gate_beta;
-            if constexpr (!HAS_JOURNAL) {
+            if constexpr (J_DEPTH < 2) {
                 if (lane == 0) {
                     store_journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx), delta);
                 }
@@ -209,7 +225,7 @@ enum TrackFastGDNDecode {
                 const InT value = static_cast<InT>(out);
                 y_shared[dv_idx] = value;
             }
-            if constexpr (HAS_JOURNAL) {
+            if constexpr (J_DEPTH == 2) {
                 device StT* o_state = state_out + (n * Dv + dv_idx) * Dk;
                 if constexpr (vec4) {
                     *reinterpret_cast<device float4*>(o_state + 4 * lane) = float4(state[0], state[1], state[2], state[3]);
@@ -218,7 +234,7 @@ enum TrackFastGDNDecode {
                 }
             }
         }
-        if constexpr (!HAS_JOURNAL) {
+        if constexpr (J_DEPTH < 2) {
             if (sg == 0) {
                 for (int i = 0; i < 4; ++i) {
                     next_journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i] = k_[4 * lane + i];
