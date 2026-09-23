@@ -264,6 +264,7 @@ struct TrackLayer {
     let attn: TrackAttn?
     let moe: TrackMoE
     let moePairReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
+    let moeRouteReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let mlpReplay: (@Sendable ([MLXArray]) -> [MLXArray])?
     let ple: TrackPLE?
 }
@@ -530,7 +531,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         return TrackLayer(
             index: index, attnHC: attnHC, mlpHC: mlpHC, gdn: gdn, attn: attn, moe: moe,
-            moePairReplay: makeMoEPairReplay(moe),
+            moePairReplay: makeMoEPairReplay(moe), moeRouteReplay: makeMoERouteReplay(moe),
             mlpReplay: TrackFastMLPReplay.make(hc: mlpHC, moe: moe,
                 hcCount: cfg.hcCount, hidden: cfg.hiddenSize, eps: cfg.rmsNormEps), ple: ple)
     }
@@ -782,9 +783,44 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         return t
     }
 
+    /// MLXFAST-ROUTEFUSE: the one-token counterpart of `makeMoEPairReplay` for
+    /// the fused route + gate/up launch; routing inputs are the router logits.
+    static func makeMoERouteReplay(_ m: TrackMoE) -> (@Sendable ([MLXArray]) -> [MLXArray])? {
+        guard TrackFastMoEKernels.fuseRouteIntoGateUp,
+            let fused = m.sharedGateUp.fused, case .quant(let guq) = fused,
+            case .quant(let dq) = m.sharedDown, case .quant(let gq) = m.sharedGate,
+            guq.biases != nil, dq.biases != nil, gq.biases != nil
+        else { return nil }
+        return compile(shapeless: false) {
+            [groupSize = m.expertGroupSize, bits = m.expertBits, topK = m.topK,
+             guGroupSize = guq.groupSize, guBits = guq.bits, guMode = guq.mode,
+             downGroupSize = dq.groupSize, downBits = dq.bits, downMode = dq.mode,
+             gGroupSize = gq.groupSize, gBits = gq.bits, gMode = gq.mode] inputs in
+            let sharedGU = TrackQuantWeight(
+                weight: inputs[8], scales: inputs[9], biases: inputs[10],
+                groupSize: guGroupSize, bits: guBits, mode: guMode)
+            let sharedGate = TrackQuantWeight(
+                weight: inputs[17], scales: inputs[18], biases: inputs[19],
+                groupSize: gGroupSize, bits: gBits, mode: gMode)
+            let r = TrackFastMoEKernels.routeGateUp(
+                logits: inputs[1], sharedGate: sharedGate,
+                wg: inputs[2], sg: inputs[3], bg: inputs[4],
+                wu: inputs[5], su: inputs[6], bu: inputs[7], shared: sharedGU,
+                x: inputs[0], topK: topK, groupSize: groupSize, bits: bits)
+            let sharedDown = TrackQuantWeight(
+                weight: inputs[14], scales: inputs[15], biases: inputs[16],
+                groupSize: downGroupSize, bits: downBits, mode: downMode)
+            return [TrackFastMoEKernels.downCombine(
+                wd: inputs[11], sd: inputs[12], bd: inputs[13], sharedDown: sharedDown,
+                act: r.act, idx: r.idx, w: r.w, gate: r.gate, topK: topK,
+                groupSize: groupSize, bits: bits)]
+        }
+    }
+
     static func moeForwardShared(
         _ m: TrackMoE, _ x: MLXArray, inputF32: MLXArray? = nil,
-        replay: (@Sendable ([MLXArray]) -> [MLXArray])?
+        replay: (@Sendable ([MLXArray]) -> [MLXArray])?,
+        routeReplay: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
     ) -> MLXArray {
         let prof = TrackFastProfile.prefill != nil && x.dim(1) >= TrackFastProfile.minWindow
         var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
@@ -817,6 +853,38 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             // gate|up + SwiGLU for the routed and the shared expert, down + combine.
             let S = x.dim(1), K = m.topK, H = x.dim(2)
             let x2 = x.reshaped(S, H)
+            // MLXFAST-ROUTEFUSE: one token, quantized shared gate: route and
+            // gate|up are one launch, then down + combine as before.
+            if S == 1,
+                TrackFastMoEKernels.routeGateUpEligible(
+                    logits: logits, x: x2, sharedGate: gateQ, shared: guq,
+                    expertN: m.expertGate.w.dim(1), topK: K,
+                    groupSize: m.expertGroupSize, bits: m.expertBits),
+                let gq = gateQ
+            {
+                let flatLogits = logits.reshaped(-1)
+                if let routeReplay, StreamOrDevice.default.stream === Stream.gpu {
+                    return routeReplay([
+                        x2, flatLogits,
+                        m.expertGate.w, m.expertGate.s, m.expertGate.b,
+                        m.expertUp.w, m.expertUp.s, m.expertUp.b,
+                        guq.weight, guq.scales, guq.biases!,
+                        m.expertDown.w, m.expertDown.s, m.expertDown.b,
+                        dq.weight, dq.scales, dq.biases!,
+                        gq.weight, gq.scales, gq.biases!,
+                    ])[0].reshaped(1, S, H)
+                }
+                let r = TrackFastMoEKernels.routeGateUp(
+                    logits: flatLogits, sharedGate: gq,
+                    wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
+                    wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b, shared: guq,
+                    x: x2, topK: K, groupSize: m.expertGroupSize, bits: m.expertBits)
+                return TrackFastMoEKernels.downCombine(
+                    wd: m.expertDown.w, sd: m.expertDown.s, bd: m.expertDown.b, sharedDown: dq,
+                    act: r.act, idx: r.idx, w: r.w, gate: r.gate, topK: K,
+                    groupSize: m.expertGroupSize, bits: m.expertBits
+                ).reshaped(1, S, H)
+            }
             let r = TrackFastMoEKernels.route(
                 logits: logits.reshaped(S, -1), x: x2, sharedGate: gateQ, topK: K)
             let (idx, weights) = (r.idx, r.w)
@@ -1133,7 +1201,8 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 if profiling { TrackFastProfile.tick("mixer", &profT, [input, injectW]) }
                 Self.debugTaps?.append(("L\(layer.index).mlp.input", input))
                 pendingOut = Self.moeForwardShared(
-                    layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay)
+                    layer.moe, input, inputF32: mm.inputF32, replay: layer.moePairReplay,
+                    routeReplay: layer.moeRouteReplay)
                 if profiling { TrackFastProfile.tick("moe", &profT, [pendingOut!]) }
                 Self.debugTaps?.append(("L\(layer.index).mlp.out", pendingOut!))
             }

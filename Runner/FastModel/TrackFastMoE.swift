@@ -1345,6 +1345,153 @@ extension TrackFastMoEKernels {
         header: helpersCore + TrackFastKernels.exactHeader + gateUpReuseHelpers,
         ensureRowContiguous: true)
 
+    // MLXFAST-ROUTEFUSE: compile-time switch. The one-token route launch
+    // (top-k walk + softmax + quantized shared-expert gate GEMV) is a single
+    // threadgroup that sits alone on the serial per-layer chain between the
+    // router GEMV and the gate/up launch. Folding it into the gate/up launch
+    // removes one dependent dispatch per layer; every value is produced by the
+    // same code on the same operands.
+    static let fuseRouteIntoGateUp = true
+
+    /// One token: route (top-K walk, softmax, shared gate) + gate|up + SwiGLU in
+    /// one launch. Grid and per-slot gate/up work are `gateUpReuseSource`'s.
+    /// Every routed threadgroup runs the route kernel's walk itself (it is
+    /// lane-local plus simd_max/simd_min, so any simdgroup produces the same
+    /// winners) up to its own slot z; threadgroup (y 0, z 0) simdgroup 0 runs it
+    /// to K and writes idx/w with the route kernel's softmax; threadgroup
+    /// (y 0, z BR) runs the route kernel's shared-gate `track_inject_qmv` on its
+    /// simdgroup 0 (simdgroup 1 returns from it at once, as in the route kernel).
+    static let routeGateUpSource = """
+        constexpr int E_PER = (E + 31) / 32;
+        constexpr int N_READS = 4;
+        const uint z = threadgroup_position_in_grid.z;
+        const uint ty = threadgroup_position_in_grid.y;
+        const uint sgi = simdgroup_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        const bool shared = z == (uint)BR;
+        uint e = 0u;
+        if (shared) {
+            if (ty == 0u) {
+                track_inject_qmv<T, GGS, GBITS, KD, 1, 4>(qgw, qgs, qgb, x, gate, sgi, lane);
+            }
+        } else {
+            const bool writer = z == 0u && ty == 0u && sgi == 0u;
+            const int kmax = writer ? K : (int)z + 1;
+            float ld[N_READS];
+            uint selected[N_READS];
+            for (int i = 0; i < N_READS; ++i) {
+                ld[i] = -INFINITY;
+                selected[i] = 0xffffffffu;
+            }
+            float v[E_PER];
+            bool taken[E_PER];
+            for (int j = 0; j < E_PER; ++j) {
+                const int ex = (int)lane + 32 * j;
+                v[j] = (ex < E) ? logits[ex] : -INFINITY;
+                taken[j] = (ex >= E);
+            }
+            for (int k = 0; k < kmax; ++k) {
+                float bv = -INFINITY; int bj = -1;
+                for (int j = 0; j < E_PER; ++j) {
+                    if (!taken[j] && (v[j] > bv)) { bv = v[j]; bj = j; }
+                }
+                const float gmax = simd_max(bv);
+                const uint cand = (bv == gmax && bj >= 0) ? (uint)(lane + 32 * bj) : 0xffffffffu;
+                const uint gidx = simd_min(cand);
+                for (int i = 0; i < N_READS; ++i) {
+                    if (k == (int)lane * N_READS + i) { ld[i] = gmax; selected[i] = gidx; }
+                }
+                if (k == (int)z) { e = gidx; }
+                if (gidx == (uint)(lane + 32 * bj) && bj >= 0) { taken[bj] = true; }
+            }
+            if (writer) {
+                // softmax_single_row over the K selected logits (the route kernel's).
+                float maxval = -FLT_MAX;
+                for (int i = 0; i < N_READS; i++) { maxval = (maxval < ld[i]) ? ld[i] : maxval; }
+                maxval = simd_max(maxval);
+                float normalizer = 0;
+                for (int i = 0; i < N_READS; i++) {
+                    float exp_x = fast::exp(ld[i] - maxval);
+                    ld[i] = exp_x;
+                    normalizer += exp_x;
+                }
+                normalizer = simd_sum(normalizer);
+                normalizer = 1 / normalizer;
+                for (int i = 0; i < N_READS; i++) {
+                    const int p = (int)lane * N_READS + i;
+                    if (p < K) {
+                        w[p] = ld[i] * normalizer;
+                        idx[p] = selected[i];
+                    }
+                }
+            }
+        }
+        const size_t kw = (size_t)KD / 8;
+        const size_t kg = (size_t)KD / GS;
+        const size_t eoff = (size_t)e * (size_t)N;
+        const device uint32_t* gw = shared ? wsh : wg + eoff * kw;
+        const device T* gs = shared ? ssh : sg + eoff * kg;
+        const device T* gb = shared ? bsh : bg + eoff * kg;
+        const device uint32_t* uw = shared ? wsh + (size_t)N * kw : wu + eoff * kw;
+        const device T* us = shared ? ssh + (size_t)N * kg : su + eoff * kg;
+        const device T* ub = shared ? bsh + (size_t)N * kg : bu + eoff * kg;
+        const int out_row = (int)ty * (2 * RPS) + (int)sgi * RPS;
+        float g[RPS], u[RPS];
+        qmv_fast_reg_dual<T, GS, BITS, RPS>(gw, gs, gb, uw, us, ub, x, KD, out_row, lane, g, u);
+        if (lane == 0) {
+            for (int i = 0; i < RPS; ++i) {
+                const T gv = static_cast<T>(g[i]);
+                const T uv = static_cast<T>(u[i]);
+                act[(size_t)z * (size_t)N + (size_t)(out_row + i)] = mlx_silu(gv) * uv;
+            }
+        }
+        """
+
+    nonisolated(unsafe) static let routeGateUpKernel = MLXFast.metalKernel(
+        name: "track_moe_route_gate_up",
+        inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "logits", "qgw", "qgs", "qgb"],
+        outputNames: ["act", "idx", "w", "gate"],
+        source: routeGateUpSource,
+        header: TrackFastKernels.mixerHeadHeader + gateUpReuseHelpers,
+        ensureRowContiguous: true)
+
+    /// The geometry the fused one-token route + gate/up launch serves: exactly
+    /// the `gateUpReuseKernel` geometry plus the route kernel's one-row,
+    /// quantized shared-gate branch (`VPT == 1`, `HAS_GATE`).
+    static func routeGateUpEligible(
+        logits: MLXArray, x: MLXArray, sharedGate: TrackQuantWeight?, shared: TrackQuantWeight,
+        expertN: Int, topK: Int, groupSize: Int, bits: Int
+    ) -> Bool {
+        guard fuseRouteIntoGateUp, let g = sharedGate, g.biases != nil else { return false }
+        let E = logits.size
+        return x.dtype == .bfloat16 && x.ndim == 2 && x.dim(0) == 1 && x.dim(1) == 2560 && expertN == 640
+            && groupSize == 32 && bits == 4 && shared.mode == .affine && shared.rows == 2 * expertN
+            && shared.groupSize == groupSize && shared.bits == bits && shared.biases != nil
+            && logits.dtype == .float32 && topK >= 1 && topK <= 32 && topK <= E
+            && g.rows == 1 && g.bits == 4 && g.weight.dtype == .uint32
+    }
+
+    /// logits f32 [E], x [1, KD] -> act [K + 1, N], idx uint32 [K], w f32 [K], gate [1] (pre-sigmoid).
+    static func routeGateUp(
+        logits: MLXArray, sharedGate g: TrackQuantWeight,
+        wg: MLXArray, sg: MLXArray, bg: MLXArray, wu: MLXArray, su: MLXArray, bu: MLXArray,
+        shared: TrackQuantWeight, x: MLXArray, topK: Int, groupSize: Int, bits: Int
+    ) -> (act: MLXArray, idx: MLXArray, w: MLXArray, gate: MLXArray) {
+        let E = logits.size, KD = x.dim(1), N = wg.dim(1)
+        let rows = gateUpReuseRowsPerSimdgroup
+        let outs = routeGateUpKernel(
+            [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, logits.reshaped(E),
+             g.weight, g.scales, g.biases!],
+            template: [
+                ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("BR", topK),
+                ("RPS", rows), ("E", E), ("K", topK), ("GGS", g.groupSize), ("GBITS", g.bits),
+            ],
+            grid: (32, N / rows, topK + 1), threadGroup: (32, 2, 1),
+            outputShapes: [[topK + 1, N], [topK], [topK], [1]],
+            outputDTypes: [x.dtype, .uint32, .float32, x.dtype])
+        return (outs[0], outs[1], outs[2], outs[3])
+    }
+
     /// Routed slots [0, BR) then the shared expert for the S tokens: act [BR + S, N].
     static func gateUpAct(
         wg: MLXArray, sg: MLXArray, bg: MLXArray, wu: MLXArray, su: MLXArray, bu: MLXArray,
