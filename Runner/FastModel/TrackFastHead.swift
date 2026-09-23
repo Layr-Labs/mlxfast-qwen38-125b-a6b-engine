@@ -61,6 +61,33 @@ final class TrackFastHead {
         self.finalMixer = TrackQwen4ExpFastModel.bindHC(mtp.trackChild("hyper_connection_mixer"), cfg: cfg)
     }
 
+    private func injectMix(
+        _ hc: TrackHC, residual: MLXArray, out: MLXArray?, inject: MLXArray?, scale: MLXArray
+    ) -> (stream: MLXArray, input: MLXArray, inject: MLXArray) {
+        if case .quant(let dq) = hc.down, case .quant(let uq) = hc.up, dq.biases != nil, uq.biases != nil {
+            var injQ: TrackQuantWeight? = nil
+            if hc.hasInject, case .quant(let q)? = hc.inject, q.biases != nil { injQ = q }
+            if !hc.hasInject || injQ != nil,
+                let fused = TrackFastMixerSplitK.injectDown(
+                    residual: residual, out: out, injectVec: inject, scale: scale,
+                    down: dq, inject: injQ, hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
+            {
+                let packedUp = residual.dim(1) == 1 ? hc.decodeUp : nil
+                let n2 = fused.normed.reshaped(1, hcCount * hidden)
+                let u = TrackFastMixerKernels.upMix(
+                    act: fused.act, normed: n2, up: packedUp ?? uq, inj: fused.inj,
+                    hcCount: hcCount, hidden: hidden, hasInject: hc.hasInject, packedRows: packedUp != nil)
+                return (
+                    fused.stream, u.input.reshaped(1, 1, hidden), u.inject.reshaped(1, 1, hcCount))
+            }
+        }
+        let (st, normed) = TrackFastKernels.injectNorm(
+            residual: residual, out: out, inject: inject, scale: scale,
+            hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
+        let (input, inj) = hcMix(hc, normed: normed)
+        return (st, input, inj)
+    }
+
     private func hcMix(_ hc: TrackHC, normed: MLXArray) -> (MLXArray, MLXArray) {
         let S = normed.dim(1)
         if normed.dim(0) == 1, S <= 8, case .quant(let dq) = hc.down, case .quant(let uq) = hc.up,
@@ -116,21 +143,19 @@ final class TrackFastHead {
         let hyper = stream.reshaped(B, S, hcCount * hidden)
 
         // attention block
-        var (st, normed) = TrackFastKernels.injectNorm(
-            residual: hyper, out: nil, inject: nil, scale: attnHC.normScaleQ,
-            hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
-        var (input, injectW) = hcMix(attnHC, normed: normed)
+        var mixed = injectMix(attnHC, residual: hyper, out: nil, inject: nil, scale: attnHC.normScaleQ)
+        var st = mixed.stream
+        var input = mixed.input
+        var injectW = mixed.inject
         let attended = attention(input, cache: cache, offset: offset)
-        (st, normed) = TrackFastKernels.injectNorm(
-            residual: st, out: attended, inject: injectW, scale: mlpHC.normScaleQ,
-            hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
-        (input, injectW) = hcMix(mlpHC, normed: normed)
+        mixed = injectMix(mlpHC, residual: st, out: attended, inject: injectW, scale: mlpHC.normScaleQ)
+        st = mixed.stream
+        input = mixed.input
+        injectW = mixed.inject
         let moeOut = TrackQwen4ExpFastModel.moeForwardShared(moe, input, replay: nil)
-        let (multiNext, finalNormed) = TrackFastKernels.injectNorm(
-            residual: st, out: moeOut, inject: injectW, scale: finalMixer.normScaleQ,
-            hcCount: hcCount, hidden: hidden, eps: eps, tile: false)
-        let (sample, _) = hcMix(finalMixer, normed: finalNormed)
-        return (sample, multiNext)
+        mixed = injectMix(
+            finalMixer, residual: st, out: moeOut, inject: injectW, scale: finalMixer.normScaleQ)
+        return (mixed.input, mixed.stream)
     }
 
     private func attention(_ x: MLXArray, cache: Qwen4ExpAttentionCache, offset: Int) -> MLXArray {
