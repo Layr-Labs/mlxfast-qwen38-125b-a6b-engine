@@ -18,6 +18,7 @@ enum TrackFastMixerSplitK {
             static_assert(K % BLOCK == 0, "full quantized blocks required");
             constexpr int COUNT = (NB + SPLIT - 1) / SPLIT;
             float partial[R];
+            float own[COUNT * R];
             for (int r = 0; r < R; ++r) { partial[r] = 0; result[r] = 0; }
             for (int b = int(sg) * COUNT; b < min((int(sg) + 1) * COUNT, NB); ++b) {
                 float xv[V];
@@ -28,7 +29,10 @@ enum TrackFastMixerSplitK {
                         + (row + r) * (K / 2) + column / 2;
                     const int qi = (row + r) * (K / 32) + column / 32;
                     float v = qdot<float, V, 4>(wp, xv, float(scales[qi]), float(biases[qi]), sum);
-                    if constexpr (ORDERED) { scratch[(b * R + r) * 32 + lane] = v; }
+                    if constexpr (ORDERED) {
+                        if (sg == 0) { own[b * R + r] = v; }
+                        else { scratch[(b * R + r) * 32 + lane] = v; }
+                    }
                     else { partial[r] += v; }
                 }
             }
@@ -38,7 +42,11 @@ enum TrackFastMixerSplitK {
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (sg == 0) {
                 for (int b = 0; b < (ORDERED ? NB : SPLIT); ++b) {
-                    for (int r = 0; r < R; ++r) { result[r] += scratch[(b * R + r) * 32 + lane]; }
+                    for (int r = 0; r < R; ++r) {
+                        result[r] += (ORDERED && b < COUNT)
+                            ? own[b * R + r]
+                            : scratch[(b * R + r) * 32 + lane];
+                    }
                 }
                 for (int r = 0; r < R; ++r) { result[r] = simd_sum(result[r]); }
             }
