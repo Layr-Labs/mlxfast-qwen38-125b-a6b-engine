@@ -1,3 +1,4 @@
+// MLXFAST-REDRAW-C123-GDN-XVEC4: preserved promoted split-K base plus independent lanes.
 // Quantized weight bundle (4-bit affine) with MLX's own matmul; shared by the
 // model and the kernel unit tests.
 
