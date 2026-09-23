@@ -1571,6 +1571,13 @@ METAL_FUNC void p17_sorted_expert_tile(
     return;
   }
 
+  // A next expert inside this window gives the exact run end; terminal runs
+  // may continue into the next window and still need the upper-bound search.
+  if (offset_next < min(BM, M - y_row)) {
+    end = y_row + offset_next;
+    return;
+  }
+
   // Only the next BM rows matter. Use <= rather than index+1 so uint32 max
   // remains legal. Searches never dereference the half-open upper bound.
   int lo = begin;
