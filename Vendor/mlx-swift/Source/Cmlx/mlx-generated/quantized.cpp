@@ -74,11 +74,12 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 
   else if (bits == 4) {
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+      vec<T, 4> xv = ((const device vec<T, 4>*)(x + i))[0];
+      sum += xv.x + xv.y + xv.z + xv.w;
+      x_thread[i] = xv.x;
+      x_thread[i + 1] = xv.y / 16.0f;
+      x_thread[i + 2] = xv.z / 256.0f;
+      x_thread[i + 3] = xv.w / 4096.0f;
     }
   }
 
@@ -154,11 +155,12 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
 
   else if (bits == 4) {
     for (int i = 0; i < N; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+      vec<T, 4> xv = ((const device vec<T, 4>*)(x + i))[0];
+      sum += xv.x + xv.y + xv.z + xv.w;
+      x_thread[i] = xv.x;
+      x_thread[i + 1] = xv.y / 16.0f;
+      x_thread[i + 2] = xv.z / 256.0f;
+      x_thread[i + 3] = xv.w / 4096.0f;
     }
   }
 
