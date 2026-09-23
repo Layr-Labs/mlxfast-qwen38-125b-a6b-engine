@@ -63,12 +63,15 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 4) {
+    // MLXFAST-XVEC4: one vec<T,4> device load per pack of 4 activations.
+    // Addends stay xv.x+xv.y+xv.z+xv.w (same left-to-right order as x[i]..x[i+3]).
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+      const vec<T, 4> xv = *((const device vec<T, 4>*)(x + i));
+      sum += xv.x + xv.y + xv.z + xv.w;
+      x_thread[i] = xv.x;
+      x_thread[i + 1] = xv.y / 16.0f;
+      x_thread[i + 2] = xv.z / 256.0f;
+      x_thread[i + 3] = xv.w / 4096.0f;
     }
   }
 
@@ -143,12 +146,20 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
   }
 
   else if (bits == 4) {
-    for (int i = 0; i < N; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+    // MLXFAST-XVEC4: same vec<T,4> load as load_vector. N is a multiple of the
+    // 4-bit pack (8), so the original i+=4 walk already owned four elements.
+    int i = 0;
+    for (; i + 3 < N; i += 4) {
+      const vec<T, 4> xv = *((const device vec<T, 4>*)(x + i));
+      sum += xv.x + xv.y + xv.z + xv.w;
+      x_thread[i] = xv.x;
+      x_thread[i + 1] = xv.y / 16.0f;
+      x_thread[i + 2] = xv.z / 256.0f;
+      x_thread[i + 3] = xv.w / 4096.0f;
+    }
+    for (; i < N; ++i) {
+      sum += x[i];
+      x_thread[i] = i == 0 ? x[i] : x[i] / (i == 1 ? 16.0f : (i == 2 ? 256.0f : 4096.0f));
     }
   }
 
