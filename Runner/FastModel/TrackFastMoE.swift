@@ -900,11 +900,33 @@ extension TrackFastMoEKernels {
 extension TrackFastMoEKernels {
     static let regHelpers = #"""
 
+        // load_vector (4-bit) over x[i] = a[i] * sigmoid(g[i]) in T: the value
+        // the separate `track_attn_gate` launch stored.
+        template <typename T, typename U, int values_per_thread, int bits>
+        inline U load_vector_gate(const device T* a, const device T* g, thread U* x_thread) {
+          static_assert(bits == 4, "gate-on-load: 4-bit only");
+          U sum = 0;
+          for (int i = 0; i < values_per_thread; i += 4) {
+            const T x0 = a[i] * mlx_sigmoid(g[i]);
+            const T x1 = a[i + 1] * mlx_sigmoid(g[i + 1]);
+            const T x2 = a[i + 2] * mlx_sigmoid(g[i + 2]);
+            const T x3 = a[i + 3] * mlx_sigmoid(g[i + 3]);
+            sum += x0 + x1 + x2 + x3;
+            x_thread[i] = x0;
+            x_thread[i + 1] = x1 / 16.0f;
+            x_thread[i + 2] = x2 / 256.0f;
+            x_thread[i + 3] = x3 / 4096.0f;
+          }
+          return sum;
+        }
+
         // qmv_fast_impl with `out_row` given and the row results returned
         // (all lanes hold them after simd_sum). x points at the vector.
         // MLXFAST-MIX2ROW: only the number of independent contiguous rows varies.
         // The default preserves every existing four-row caller's arithmetic.
-        template <typename T, int group_size, int bits, int results_per_simdgroup = 4>
+        // MLXFAST-GATEOUT: GATE loads x[i] * sigmoid(gate[i]) instead of x[i];
+        // the walk is unchanged, and GATE = false compiles to the old body.
+        template <typename T, int group_size, int bits, int results_per_simdgroup = 4, bool GATE = false>
         METAL_FUNC void qmv_fast_reg(
             const device uint32_t* w,
             const device T* scales,
@@ -913,7 +935,8 @@ extension TrackFastMoEKernels {
             const int in_vec_size,
             const int out_row,
             uint simd_lid,
-            thread float (&result)[results_per_simdgroup]) {
+            thread float (&result)[results_per_simdgroup],
+            const device T* gate = nullptr) {
           constexpr int packs_per_thread = bits == 2 ? 1 : 2;
           constexpr int pack_factor = get_pack_factor<bits, 32>();
           constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
@@ -930,8 +953,15 @@ extension TrackFastMoEKernels {
           scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
           biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
           x += simd_lid * values_per_thread;
+          if constexpr (GATE) { gate += simd_lid * values_per_thread; }
           for (int k = 0; k < in_vec_size; k += block_size) {
-            U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+            U sum;
+            if constexpr (GATE) {
+              sum = load_vector_gate<T, U, values_per_thread, bits>(x, gate, x_thread);
+              gate += block_size;
+            } else {
+              sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+            }
             for (int row = 0; row < results_per_simdgroup; row++) {
               auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
               const device T* sl = scales + row * in_vec_size_g;

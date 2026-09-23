@@ -739,6 +739,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let att = cache.updateAndAttend(
             queries: prep.q, keys: prep.k, values: prep.v,
             scale: attentionScale, sinks: nil, keepMask: nil)  // [B,HQ,S,D]
+        if B == 1 && S == 1, let ow = TrackFastKernels.attnGateOutWeight(a.out, att: att) {
+            return TrackFastKernels.attnGateOut(att: att, qkv: qkv, gateOffset: a.qWidth, w: ow)
+        }
         let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: a.qWidth)
         return a.out.apply(out)
     }
