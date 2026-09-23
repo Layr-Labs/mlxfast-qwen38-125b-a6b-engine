@@ -1,3 +1,5 @@
+#include <stdlib.h>
+
 namespace mlx::core::metal {
 
 const char* quantized_utils() {
@@ -107,3 +109,24 @@ METAL_FUNC void gemm_loop_finalize(
 }
 
 } // namespace mlx::core::metal
+
+namespace {
+
+// Command-buffer split for the stacked-expert decode path.
+//
+// The encoder closes a command buffer when the op count passes the device
+// cap OR when the element count of the distinct input buffers it has bound
+// passes max_mb_per_buffer << 20 (50 Mi elements on a Max-class GPU). A
+// one-token MoE launch binds the whole [512, ...] expert tensors while it
+// only reads the ten routed rows, so each such launch alone crosses the size
+// cap: the gate/up launch and the down/combine launch each end a command
+// buffer, two per layer, ~96 per decoded token on this tower. The op cap
+// (unchanged) remains the split that pipelines host encoding with the GPU.
+// An explicit MLX_MAX_MB_PER_BUFFER in the environment still wins
+// (overwrite = 0). Runs at image load, before the Metal device (which reads
+// and caches the value once) exists. No kernel, no arithmetic changes.
+__attribute__((constructor)) void mlxfast_stacked_expert_buffer_split() {
+  setenv("MLX_MAX_MB_PER_BUFFER", "1048576", 0);
+}
+
+} // namespace
