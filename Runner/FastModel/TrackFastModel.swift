@@ -290,6 +290,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let rotaryDims: Int
     let rotary: Qwen4ExpRotary
     let indexerBudget: Int
+    private let ropeTable: TrackRopeTables?
     let attentionScale: Float
 
     /// Debug taps (tests): when set, every layer's output stream and the block
@@ -325,8 +326,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             return [result.stream, result.normed]
         }
         self.rotaryDims = cfg.rotaryDimensions
-        self.rotary = Qwen4ExpRotary(dimensions: cfg.rotaryDimensions, base: cfg.ropeTheta)
+        let rotary = Qwen4ExpRotary(dimensions: cfg.rotaryDimensions, base: cfg.ropeTheta)
+        self.rotary = rotary
         self.indexerBudget = cfg.indexerBudget
+        self.ropeTable = TrackRopeTables(
+            rotary: rotary, rotaryDims: cfg.rotaryDimensions, indexerBudget: cfg.indexerBudget)
         self.attentionScale = Foundation.pow(Float(cfg.headDim), -0.5)
         precondition(
             cfg.rmsNormWeightOffset == 0,
@@ -689,6 +693,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
+        if let cached = ropeTable?.slice(offset: offset, count: count, dtype: dtype) {
+            return cached
+        }
         let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
         return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
     }
