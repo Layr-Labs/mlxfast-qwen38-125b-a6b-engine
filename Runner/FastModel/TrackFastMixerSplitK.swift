@@ -37,7 +37,8 @@ enum TrackFastMixerSplitK {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (sg == 0) {
-                for (int b = 0; b < (ORDERED ? NB : SPLIT); ++b) {
+                for (int r = 0; r < R; ++r) { result[r] = scratch[r * 32 + lane]; }
+                for (int b = 1; b < (ORDERED ? NB : SPLIT); ++b) {
                     for (int r = 0; r < R; ++r) { result[r] += scratch[(b * R + r) * 32 + lane]; }
                 }
                 for (int r = 0; r < R; ++r) { result[r] = simd_sum(result[r]); }
