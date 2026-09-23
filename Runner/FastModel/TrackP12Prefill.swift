@@ -95,7 +95,7 @@ enum TrackP12Prefill {
     nonisolated(unsafe) private static let splitPrepKernel = MLXFast.metalKernel(
         name: "track_p12_gdn_prep_split_inputs",
         inputNames: [
-            "proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "b_gate", "a_gate",
+            "proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "b_gate", "a_gate", "sigmoid_lut",
         ],
         outputNames: ["qn", "kn", "vv", "g", "beta", "conv_out"],
         source: addressVariant(
@@ -117,13 +117,15 @@ enum TrackP12Prefill {
         precondition(b.dim(2) == g.hv && a.dim(2) == g.hv)
         precondition(b.dtype == proj.dtype && a.dtype == proj.dtype)
         precondition(g.dk == 128 && g.dv == 128 && g.convDim % 128 == 0)
+        let useSiLULUT = proj.dtype == .bfloat16 && StreamOrDevice.default.stream === Stream.gpu
+        let sigmoidTable = useSiLULUT ? TrackBF16Functions.sigmoid : proj
         return splitPrepKernel(
-            [proj, convState, convW, negExpALog, dtBias, b, a],
+            [proj, convState, convW, negExpALog, dtBias, b, a, sigmoidTable],
             template: [
                 ("InT", proj.dtype), ("T", T), ("Dk", g.dk), ("Dv", g.dv), ("Hk", g.hk),
                 ("Hv", g.hv), ("KC", g.convKernel), ("PROJ_W", g.projWidth),
                 ("CONV_DIM", g.convDim), ("B_OFF", g.bOffset), ("A_OFF", g.aOffset),
-                ("CAPTURE", capture),
+                ("CAPTURE", capture), ("USE_SILU_LUT", useSiLULUT),
             ],
             grid: (32, g.convDim / 128, B * T), threadGroup: (32, 4, 1),
             outputShapes: [

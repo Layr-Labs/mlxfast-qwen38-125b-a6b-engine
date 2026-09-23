@@ -6,7 +6,7 @@ import MLX
 enum TrackFastGDNDecode {
     private static let kernel = MLXFast.metalKernel(
         name: "track_gdn_decode_complete",
-        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w", "journal_in"],
+        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w", "journal_in", "sigmoid_lut"],
         outputNames: ["state_out", "gated", "conv_out", "journal_out"],
         source: source, header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
@@ -34,8 +34,10 @@ enum TrackFastGDNDecode {
         let journalStride = g.hv * g.dk + 2 * g.hv * g.dv + 2 * g.hv
         let hasJournal = pendingJournal?.shape == [B, journalStride]
         let journalIn = pendingJournal ?? convState
+        let useSiLULUT = StreamOrDevice.default.stream === Stream.gpu
+        let sigmoidTable = useSiLULUT ? TrackBF16Functions.sigmoid : proj
         let result = kernel(
-            [proj, convState, convW, negExpALog, dtBias, stateIn, normW, journalIn],
+            [proj, convState, convW, negExpALog, dtBias, stateIn, normW, journalIn, sigmoidTable],
             template: [
                 ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
                 ("Hk", g.hk), ("Hv", g.hv), ("KC", g.convKernel), ("CONV_DIM", g.convDim),
@@ -44,6 +46,7 @@ enum TrackFastGDNDecode {
                 ("J_KEY_OFF", 0), ("J_DELTA_OFF", g.hv * g.dk),
                 ("J_DECAY_OFF", g.hv * g.dk + 2 * g.hv * g.dv),
                 ("J_STRIDE", journalStride), ("HAS_JOURNAL", hasJournal),
+                ("USE_SILU_LUT", useSiLULUT),
             ],
             grid: (32, g.dv / 4, B * g.hv), threadGroup: (32, g.dv / 4, 1),
             outputShapes: [
@@ -90,7 +93,12 @@ enum TrackFastGDNDecode {
                     cacc += win(j, ch) * conv_w[ch * KC + j];
                 }
                 const InT c0 = static_cast<InT>(cacc);
-                const InT c1 = mlx_silu(c0);
+                // Keep the BF16 product after the same BF16 sigmoid value.
+                InT c1;
+                if constexpr (USE_SILU_LUT) {
+                    const InT sig = sigmoid_lut[as_type<ushort>(static_cast<bfloat16_t>(c0))];
+                    c1 = c0 * sig;
+                } else { c1 = mlx_silu(c0); }
                 thread_x[i] = static_cast<float>(c1);
                 acc += thread_x[i] * thread_x[i];
             }
