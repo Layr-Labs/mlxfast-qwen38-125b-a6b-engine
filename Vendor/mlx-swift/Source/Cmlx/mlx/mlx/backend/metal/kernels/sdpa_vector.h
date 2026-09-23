@@ -204,27 +204,27 @@ template <typename T, int D, int V = D>
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  // Two query heads reuse each K/V load while retaining their own block walk.
+  // Four query heads reuse each K/V load while retaining their own block walk.
   // K/V/Q move in 16-byte vector loads; the score keeps its sequential
   // component order so the accumulated value is unchanged.
   if constexpr (metal::is_same_v<T, bfloat16_t> && D == 256 && V == 256) {
     const uint gqa = tptg.y;
-    if (N >= 1024 && tptg.z == 1 && gqa % 2 == 0 && !has_mask && !has_sinks) {
-      const uint pair = tidtg.y;
-      if (pair >= gqa / 2) { return; }
+    if (N >= 1024 && tptg.z == 1 && gqa % 4 == 0 && !has_mask && !has_sinks) {
+      const uint group = tidtg.y;
+      if (group >= gqa / 4) { return; }
       const uint kv = tid.x;
       const uint batch = tid.y;
       const uint block = tid.z;
       const uint kv_batch = batch * tpg.x + kv;
-      const uint head0 = (batch * tpg.x + kv) * gqa + pair * 2;
+      const uint head0 = (batch * tpg.x + kv) * gqa + group * 4;
       const device T* kp = keys + kv_batch * k_head_stride + block * k_seq_stride + simd_lid * 8;
       const device T* vp = values + kv_batch * v_head_stride + block * v_seq_stride + simd_lid * 8;
-      float4 q_lo[2], q_hi[2];
-      float4 o_lo[2] = {float4(0), float4(0)};
-      float4 o_hi[2] = {float4(0), float4(0)};
-      float maximum[2] = {Limits<float>::finite_min, Limits<float>::finite_min};
-      float denominator[2] = {0, 0};
-      for (int h = 0; h < 2; ++h) {
+      float4 q_lo[4], q_hi[4];
+      float4 o_lo[4] = {float4(0), float4(0), float4(0), float4(0)};
+      float4 o_hi[4] = {float4(0), float4(0), float4(0), float4(0)};
+      float maximum[4] = {Limits<float>::finite_min, Limits<float>::finite_min, Limits<float>::finite_min, Limits<float>::finite_min};
+      float denominator[4] = {0, 0, 0, 0};
+      for (int h = 0; h < 4; ++h) {
         const device metal::vec<T, 4>* qp =
             (const device metal::vec<T, 4>*)(queries + (head0 + h) * D + simd_lid * 8);
         q_lo[h] = static_cast<float>(scale) * float4(qp[0]);
@@ -237,7 +237,7 @@ template <typename T, int D, int V = D>
         const float4 k_hi = float4(kv4[1]);
         const float4 v_lo = float4(vv4[0]);
         const float4 v_hi = float4(vv4[1]);
-        for (int h = 0; h < 2; ++h) {
+        for (int h = 0; h < 4; ++h) {
           float score = q_lo[h].x * k_lo.x;
           score += q_lo[h].y * k_lo.y;
           score += q_lo[h].z * k_lo.z;
@@ -258,7 +258,7 @@ template <typename T, int D, int V = D>
         kp += blocks * int(k_seq_stride);
         vp += blocks * int(v_seq_stride);
       }
-      for (int h = 0; h < 2; ++h) {
+      for (int h = 0; h < 4; ++h) {
         const uint offset = (head0 + h) * blocks + block;
         if (simd_lid == 0) {
           sums[offset] = denominator[h];
@@ -616,3 +616,5 @@ template <typename T, int D>
     }
   }
 }
+#define GAUNTLET_REDRAW_25110541_20260923T164532Z 1
+#define GAUNTLET_REDRAW_d3aa7a1b_20260923T183148Z 1
