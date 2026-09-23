@@ -37,7 +37,8 @@ enum TrackFastMixerSplitK {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (sg == 0) {
-                for (int b = 0; b < (ORDERED ? NB : SPLIT); ++b) {
+                for (int r = 0; r < R; ++r) { result[r] = scratch[r * 32 + lane]; }
+                for (int b = 1; b < (ORDERED ? NB : SPLIT); ++b) {
                     for (int r = 0; r < R; ++r) { result[r] += scratch[(b * R + r) * 32 + lane]; }
                 }
                 for (int r = 0; r < R; ++r) { result[r] = simd_sum(result[r]); }
@@ -91,3 +92,6 @@ enum TrackFastMixerSplitK {
 
 // MLXFAST-TAG-spl5r1 (20260923-024828-1): build tag. The code change in this draw is the
 // single constant above.
+private let gauntletRedraw_e991a0da_20260923T110336Z: Int = 0
+private let gauntletRedraw_f05f3a73_20260923T154628Z: Int = 0
+private let gauntletRedraw_b17ca0c6_20260923T173756Z: Int = 0
