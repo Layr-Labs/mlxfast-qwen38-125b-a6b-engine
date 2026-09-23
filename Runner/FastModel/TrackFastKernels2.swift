@@ -483,6 +483,55 @@ extension TrackFastKernels {
             outputShapes: [[B, S, HQ * D]], outputDTypes: [att.dtype])[0]
     }
 
+    // MARK: attention output gate folded into the one-token o_proj GEMV
+
+    /// One row only: att [1,HQ,1,D] is the flat K = HQ*D vector in gate order.
+    /// `qmv_fast`'s launch for M = 1: threadgroup (32, 2, 1), N/8 threadgroups,
+    /// 4 rows per simdgroup, x loaded as att * sigmoid(gate) (`attnGateSource`).
+    static let attnGateOutSource = """
+        const uint lid = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int out_row = (int)threadgroup_position_in_grid.y * 8 + (int)sg * 4;
+        float r[4];
+        qmv_fast_reg<InT, GS, BITS, 4, true>(w, s, bi, att, K, out_row, lid, r, qkv + GATE_OFF);
+        if (lid == 0) {
+            for (int row = 0; row < 4; row++) { out[out_row + row] = static_cast<InT>(r[row]); }
+        }
+        """
+
+    nonisolated(unsafe) static let attnGateOutKernel = MLXFast.metalKernel(
+        name: "track_attn_gate_oproj",
+        inputNames: ["att", "qkv", "w", "s", "bi"],
+        outputNames: ["out"],
+        source: attnGateOutSource,
+        header: TrackFastMoEKernels.helpersCore + exactHeader + TrackFastMoEKernels.regHelpers,
+        ensureRowContiguous: true)
+
+    /// The weight when `attnGateOut` reproduces `attnGate` + `quantizedMM` for
+    /// one row exactly: `qmv_fast`'s selection (N % 8, K % 512) at 4 bits.
+    static func attnGateOutWeight(_ p: TrackProj, att: MLXArray) -> TrackQuantWeight? {
+        guard att.dim(0) == 1, att.dim(2) == 1, case .quant(let q) = p, q.biases != nil,
+            q.bits == 4, q.mode == .affine, q.scales.dtype == att.dtype
+        else { return nil }
+        let K = att.dim(1) * att.dim(3)
+        guard q.weight.dim(1) * 8 == K, q.rows % 8 == 0, K % 512 == 0 else { return nil }
+        return q
+    }
+
+    static func attnGateOut(att: MLXArray, qkv: MLXArray, gateOffset: Int, w q: TrackQuantWeight)
+        -> MLXArray
+    {
+        let K = att.dim(1) * att.dim(3), N = q.rows
+        return attnGateOutKernel(
+            [att, qkv, q.weight, q.scales, q.biases!],
+            template: [
+                ("InT", att.dtype), ("K", K), ("GATE_OFF", gateOffset),
+                ("GS", q.groupSize), ("BITS", q.bits),
+            ],
+            grid: (32, N / 4, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, 1, N]], outputDTypes: [att.dtype])[0]
+    }
+
     // MARK: MoE combine
 
     /// out = bf16(sum_k f32(routed[k]) * w[k]) + sigmoid(gate) * shared   (bf16 ops after the f32 sum)
@@ -820,3 +869,4 @@ extension TrackFastKernels {
         return (outs[0], outs[1])
     }
 }
+private let gauntletRedraw_17dbc174_20260923T063224Z: Int = 0
