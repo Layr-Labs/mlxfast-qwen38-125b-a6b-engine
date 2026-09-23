@@ -1279,19 +1279,25 @@ extension TrackFastMoEKernels {
           x += simd_lid * values_per_thread;
           for (int k = 0; k < in_vec_size; k += block_size) {
             U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+            U s0[rows];
+            U b0[rows];
+            U s1[rows];
+            U b1[rows];
+            for (int row = 0; row < rows; row++) {
+              s0[row] = (scales0 + row * in_vec_size_g)[0];
+              b0[row] = (biases0 + row * in_vec_size_g)[0];
+              s1[row] = (scales1 + row * in_vec_size_g)[0];
+              b1[row] = (biases1 + row * in_vec_size_g)[0];
+            }
             for (int row = 0; row < rows; row++) {
               auto wl0 = (const device uint8_t*)(ws0 + row * in_vec_size_w);
-              const device T* sl0 = scales0 + row * in_vec_size_g;
-              const device T* bl0 = biases0 + row * in_vec_size_g;
-              U s0 = sl0[0];
-              U b0 = bl0[0];
-              result0[row] += qdot<U, values_per_thread, bits>(wl0, x_thread, s0, b0, sum);
+              U s0r = s0[row];
+              U b0r = b0[row];
+              result0[row] += qdot<U, values_per_thread, bits>(wl0, x_thread, s0r, b0r, sum);
               auto wl1 = (const device uint8_t*)(ws1 + row * in_vec_size_w);
-              const device T* sl1 = scales1 + row * in_vec_size_g;
-              const device T* bl1 = biases1 + row * in_vec_size_g;
-              U s1 = sl1[0];
-              U b1 = bl1[0];
-              result1[row] += qdot<U, values_per_thread, bits>(wl1, x_thread, s1, b1, sum);
+              U s1r = s1[row];
+              U b1r = b1[row];
+              result1[row] += qdot<U, values_per_thread, bits>(wl1, x_thread, s1r, b1r, sum);
             }
             ws0 += block_size * bytes_per_pack / pack_factor;
             ws1 += block_size * bytes_per_pack / pack_factor;
