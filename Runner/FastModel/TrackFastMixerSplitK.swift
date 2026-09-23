@@ -28,7 +28,10 @@ enum TrackFastMixerSplitK {
                         + (row + r) * (K / 2) + column / 2;
                     const int qi = (row + r) * (K / 32) + column / 32;
                     float v = qdot<float, V, 4>(wp, xv, float(scales[qi]), float(biases[qi]), sum);
-                    if constexpr (ORDERED) { scratch[(b * R + r) * 32 + lane] = v; }
+                    if constexpr (ORDERED) {
+                        if (sg == 0) { result[r] += v; }
+                        else { scratch[(b * R + r) * 32 + lane] = v; }
+                    }
                     else { partial[r] += v; }
                 }
             }
@@ -37,7 +40,7 @@ enum TrackFastMixerSplitK {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (sg == 0) {
-                for (int b = 0; b < (ORDERED ? NB : SPLIT); ++b) {
+                for (int b = (ORDERED ? COUNT : 0); b < (ORDERED ? NB : SPLIT); ++b) {
                     for (int r = 0; r < R; ++r) { result[r] += scratch[(b * R + r) * 32 + lane]; }
                 }
                 for (int r = 0; r < R; ++r) { result[r] = simd_sum(result[r]); }
