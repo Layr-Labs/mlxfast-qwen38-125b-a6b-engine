@@ -393,28 +393,30 @@ extension TrackFastKernels {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         acc = simd_sum(local_sums[lane]);
         const float inv_mean = metal::precise::rsqrt(acc / (float)D + as_type<float>((uint)EPS_BITS));
+        InT own_normalized[N_READS];
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
             const InT wgt = isQ ? qnorm[d] : knorm[d];
-            vec[d] = wgt * static_cast<InT>(thread_x[i] * inv_mean);
+            own_normalized[i] = wgt * static_cast<InT>(thread_x[i] * inv_mean);
+            vec[d] = own_normalized[i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         constexpr int hrot = ROT / 2;
         device InT* dst = isQ ? (qout + ((b * HQ + hh) * S + s) * D) : (kout + ((b * HK + hh) * S + s) * D);
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
-            InT o = vec[d];
+            InT o = own_normalized[i];
             if (d < ROT) {
                 const InT c = cosb[s * ROT + d];
                 const InT sn = sinb[s * ROT + d];
                 if (d < hrot) {
-                    InT x1 = vec[d];
+                    InT x1 = own_normalized[i];
                     InT x2 = vec[d + hrot];
                     InT t1 = x1 * c;
                     InT t2 = (-x2) * sn;
                     o = t1 + t2;
                 } else {
-                    InT x2 = vec[d];
+                    InT x2 = own_normalized[i];
                     InT x1 = vec[d - hrot];
                     InT t1 = x2 * c;
                     InT t2 = x1 * sn;
