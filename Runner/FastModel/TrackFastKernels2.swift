@@ -479,7 +479,7 @@ extension TrackFastKernels {
                 ("InT", att.dtype), ("HQ", HQ), ("D", D), ("S", S), ("QW", qkv.dim(2)),
                 ("GATE_OFF", gateOffset),
             ],
-            grid: (HQ * D, B * S, 1), threadGroup: (256, 1, 1),
+            grid: (HQ * D, B * S, 1), threadGroup: (512, 1, 1),
             outputShapes: [[B, S, HQ * D]], outputDTypes: [att.dtype])[0]
     }
 
