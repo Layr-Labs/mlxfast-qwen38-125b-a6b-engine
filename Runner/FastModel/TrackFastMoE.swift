@@ -800,18 +800,31 @@ extension TrackFastMoEKernels {
         // each lane owns E_PER experts: e = lane + 32 * j (strided so a tie at
         // the same value resolves to the lowest index across lanes too)
         float v[E_PER];
-        bool taken[E_PER];
+        int heap[E_PER];
+        int count = 0;
         for (int j = 0; j < E_PER; ++j) {
             const int e = (int)lane + 32 * j;
             v[j] = (e < E) ? lr[e] : -INFINITY;
-            taken[j] = (e >= E);
+            if (e < E && v[j] > -INFINITY) { heap[count++] = j; }
+        }
+        // Heap order is descending logit, then ascending expert index.
+        for (int start = count / 2 - 1; start >= 0; --start) {
+            int parent = start;
+            while (2 * parent + 1 < count) {
+                int child = 2 * parent + 1;
+                const int right = child + 1;
+                if (right < count && (v[heap[right]] > v[heap[child]] ||
+                    (v[heap[right]] == v[heap[child]] && heap[right] < heap[child]))) { child = right; }
+                if (v[heap[parent]] > v[heap[child]] ||
+                    (v[heap[parent]] == v[heap[child]] && heap[parent] < heap[child])) { break; }
+                const int tmp = heap[parent]; heap[parent] = heap[child]; heap[child] = tmp;
+                parent = child;
+            }
         }
         for (int k = 0; k < K; ++k) {
             // lane-local best: largest value, then lowest index
-            float bv = -INFINITY; int bj = -1;
-            for (int j = 0; j < E_PER; ++j) {
-                if (!taken[j] && (v[j] > bv)) { bv = v[j]; bj = j; }
-            }
+            const int bj = count ? heap[0] : -1;
+            const float bv = (bj >= 0) ? v[bj] : -INFINITY;
             const float gmax = simd_max(bv);
             const uint cand = (bv == gmax && bj >= 0) ? (uint)(lane + 32 * bj) : 0xffffffffu;
             const uint gidx = simd_min(cand);
@@ -820,7 +833,20 @@ extension TrackFastMoEKernels {
                     if (k == (int)lane * N_READS + i) { ld[i] = gmax; selected[i] = gidx; }
                 }
             } else if (lane == 0) { selv[k] = gmax; seli[k] = gidx; }
-            if (gidx == (uint)(lane + 32 * bj) && bj >= 0) { taken[bj] = true; }
+            if (bj >= 0 && gidx == (uint)(lane + 32 * bj)) {
+                heap[0] = heap[--count];
+                int parent = 0;
+                while (2 * parent + 1 < count) {
+                    int child = 2 * parent + 1;
+                    const int right = child + 1;
+                    if (right < count && (v[heap[right]] > v[heap[child]] ||
+                        (v[heap[right]] == v[heap[child]] && heap[right] < heap[child]))) { child = right; }
+                    if (v[heap[parent]] > v[heap[child]] ||
+                        (v[heap[parent]] == v[heap[child]] && heap[parent] < heap[child])) { break; }
+                    const int tmp = heap[parent]; heap[parent] = heap[child]; heap[child] = tmp;
+                    parent = child;
+                }
+            }
         }
         }
         if constexpr (REGISTER_RESULTS) {
