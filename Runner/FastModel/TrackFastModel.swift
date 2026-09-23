@@ -71,11 +71,13 @@ private final class TrackGDNJournalEntry {
     weak var state: MLXArray?
     let nextOffset: Int
     let array: MLXArray
+    let depth: Int
 
-    init(state: MLXArray, nextOffset: Int, array: MLXArray) {
+    init(state: MLXArray, nextOffset: Int, array: MLXArray, depth: Int) {
         self.state = state
         self.nextOffset = nextOffset
         self.array = array
+        self.depth = depth
     }
 }
 
@@ -639,22 +641,25 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let journalKey = ObjectIdentifier(ssm)
         let entry = gdnJournals[journalKey]
         let pendingJournal: MLXArray?
+        let pendingDepth: Int
         if !capture, let entry, entry.state === ssm, entry.nextOffset == offset {
             pendingJournal = entry.array
+            pendingDepth = entry.depth
         } else {
             gdnJournals.removeValue(forKey: journalKey)
             pendingJournal = nil
+            pendingDepth = 0
         }
         if let fused = TrackFastGDNDecode.apply(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
             dtBias: g.dtBias, stateIn: ssm, normW: g.normW,
-            pendingJournal: pendingJournal, zOffset: g.zOffset, eps: 1e-6,
-            capture: capture, geometry: geo)
+            pendingJournal: pendingJournal, pendingDepth: pendingDepth,
+            zOffset: g.zOffset, eps: 1e-6, capture: capture, geometry: geo)
         {
             (gated, convOut, stateOut) = (fused.gated, fused.convOut, fused.stateOut)
             if let journal = fused.journal {
                 gdnJournals[journalKey] = TrackGDNJournalEntry(
-                    state: ssm, nextOffset: offset + S, array: journal)
+                    state: ssm, nextOffset: offset + S, array: journal, depth: fused.journalDepth)
             } else {
                 gdnJournals.removeValue(forKey: journalKey)
             }
@@ -1036,17 +1041,21 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     }
 
     private func injectNorm(
-        residual: MLXArray, out: MLXArray?, inject: MLXArray?, scale: MLXArray, tile: Bool
+        residual: MLXArray, out: MLXArray?, inject: MLXArray?, scale: MLXArray, tile: Bool,
+        needNormed: Bool = true
     ) -> (stream: MLXArray, normed: MLXArray) {
         // Native replay does not key Swift task-local streams; trace and replay
         // only on the canonical GPU stream. Other contexts retain the raw path.
-        if !tile, let out, let inject, StreamOrDevice.default.stream === Stream.gpu {
+        // MLXFAST-NONORM: the replay traces the full two-output form, so a
+        // caller that discards the normalised stream takes the raw path and
+        // asks the kernel to skip the statistic entirely.
+        if needNormed, !tile, let out, let inject, StreamOrDevice.default.stream === Stream.gpu {
             let result = injectNormReplay([residual, out, inject, scale])
             return (result[0], result[1])
         }
         return TrackFastKernels.injectNorm(
             residual: residual, out: out, inject: inject, scale: scale,
-            hcCount: hcCount, hidden: hidden, eps: eps, tile: tile)
+            hcCount: hcCount, hidden: hidden, eps: eps, tile: tile, needNormed: needNormed)
     }
 
     /// Both tower streams. `caches` is the compact attention layout.
@@ -1081,7 +1090,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 (stream, _) = injectNorm(
                     residual: residual, out: pendingOut, inject: pendingInject,
                     scale: layer.attnHC.normScaleQ,
-                    tile: tile)
+                    tile: tile, needNormed: false)
                 let pleResult = pleForward(
                     ple, stream: stream, ids: ids, evaluation: evaluation,
                     offset: offset, capture: capture)
