@@ -138,6 +138,13 @@ enum TrackFastMixerKernels {
         const uint lid = thread_index_in_simdgroup;
         threadgroup T products[8][VPT];
         if constexpr (VPT == 1) {
+            // The normed operand does not depend on the GEMV: issue its load
+            // before qmv_reg so its latency overlaps the weight stream.
+            const bool owner = lid < 4 && (int)(sg * 2 + lid / 2) < HC;
+            const int slot = (int)sg * 4 + (int)(lid & 3u);
+            const int row = d0 + (slot & 1) + H * (slot >> 1);
+            T nv = T(0);
+            if (owner) { nv = normed[row]; }
             float r[4];
             if constexpr (PACKED_ROWS) {
                 qmv_reg<T, GS, BITS, (LW % get_pack_factor<BITS, 32>()) == 0>(wu, su, bu, act, LW, tile * 8 + (int)sg * 4, lid, r);
@@ -146,23 +153,28 @@ enum TrackFastMixerKernels {
                 for (int i = 0; i < 4; ++i) { const int s = (int)sg * 4 + i; rows[i] = d0 + (s & 1) + H * (s >> 1); }
                 qmv_reg_rows<T, GS, BITS, false, (LW % get_pack_factor<BITS, 32>()) == 0>(wu, su, bu, act, LW, rows, lid, r);
             }
-            if (lid < 4 && (int)(sg * 2 + lid / 2) < HC) {
-                const int slot = (int)sg * 4 + (int)lid;
+            if (owner) {
                 const float low = metal::select(r[0], r[1], (lid & 1u) != 0);
                 const float high = metal::select(r[2], r[3], (lid & 1u) != 0);
                 const T weight = static_cast<T>(metal::select(low, high, (lid & 2u) != 0));
-                const int row = d0 + (slot & 1) + H * (slot >> 1);
-                products[slot][0] = sigmoid(weight) * normed[row];
+                products[slot][0] = sigmoid(weight) * nv;
             }
         } else {
             const int s = (int)sg * 4 + (int)(lid / 8);
             const int row = d0 + (s & 1) + H * (s >> 1);
+            const bool owner = (lid % 8) == 0 && (s >> 1) < HC;
+            // Same hoist for the multi-token window: the VPT normed operands
+            // are loaded before the GEMV and held in registers.
+            T nv[VPT];
+            for (int v = 0; v < VPT; ++v) {
+                nv[v] = owner ? normed[(size_t)v * (size_t)(HC * H) + (size_t)row] : T(0);
+            }
             float r[VPT];
             qmv_wide_reg_full<T, GS, BITS, VPT, 8, false>(wu, su, bu, act, LW, VPT, row, lid, r);
-            if ((lid % 8) == 0 && (s >> 1) < HC) {
+            if (owner) {
                 for (int v = 0; v < VPT; ++v) {
                     const T weight = static_cast<T>(r[v]);
-                    products[s][v] = sigmoid(weight) * normed[(size_t)v * (size_t)(HC * H) + (size_t)row];
+                    products[s][v] = sigmoid(weight) * nv[v];
                 }
             }
         }
