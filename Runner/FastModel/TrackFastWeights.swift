@@ -1,3 +1,5 @@
+// MLXFAST-REDRAW-GDN-2000623-R2: independent official redraw marker.
+// MLXFAST-REDRAW-GDN-2000623: proven GDN journal redraw marker.
 // Quantized weight bundle (4-bit affine) with MLX's own matmul; shared by the
 // model and the kernel unit tests.
 
