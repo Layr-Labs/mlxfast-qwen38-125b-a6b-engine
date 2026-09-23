@@ -1,3 +1,4 @@
+// MLXFAST-REDRAW-SPL5-C123: independent official redraw marker.
 import Foundation
 import MLX
 
@@ -5,7 +6,7 @@ import MLX
 // ascending block fold and the final simd_sum. No target weight changes.
 enum TrackFastMixerSplitK {
     // Four partitions in production; zero selects the original A/B control.
-    nonisolated(unsafe) static var split = 5
+    nonisolated(unsafe) static let split = 5
     static let helper = #"""
         template <typename T, int K, int V, int R, int SPLIT, bool ORDERED>
         METAL_FUNC void research_split_qmv(
@@ -91,3 +92,5 @@ enum TrackFastMixerSplitK {
 
 // MLXFAST-TAG-spl5r1 (20260923-024828-1): build tag. The code change in this draw is the
 // single constant above.
+private let gauntletRedraw_5c2cdd56_20260923T082902Z: Int = 0
+private let gauntletRedraw_65187f4d_20260923T092321Z: Int = 0
