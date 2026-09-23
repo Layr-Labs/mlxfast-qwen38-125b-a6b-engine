@@ -79,6 +79,18 @@ private final class TrackGDNJournalEntry {
     }
 }
 
+private final class TrackPLEJournalEntry {
+    weak var state: MLXArray?
+    let nextOffset: Int
+    let rows: [MLXArray]
+
+    init(state: MLXArray, nextOffset: Int, rows: [MLXArray]) {
+        self.state = state
+        self.nextOffset = nextOffset
+        self.rows = rows
+    }
+}
+
 // MARK: - Weight helpers
 
 extension Module {
@@ -287,6 +299,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let eps: Float
     private let injectNormReplay: @Sendable ([MLXArray]) -> [MLXArray]
     private var gdnJournals: [ObjectIdentifier: TrackGDNJournalEntry] = [:]
+    private var pleJournals: [ObjectIdentifier: TrackPLEJournalEntry] = [:]
     let rotaryDims: Int
     let rotary: Qwen4ExpRotary
     let indexerBudget: Int
@@ -918,6 +931,16 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         }
         let convState =
             state?.conv ?? MLXArray.zeros([1, p.stateLength, wide], dtype: stream.dtype)
+        let pleJournalKey = ObjectIdentifier(convState)
+        let pendingPleRows: [MLXArray]
+        if S == 1, !capture, let entry = pleJournals[pleJournalKey],
+            entry.state === convState, entry.nextOffset == offset
+        {
+            pendingPleRows = entry.rows
+        } else {
+            pleJournals.removeValue(forKey: pleJournalKey)
+            pendingPleRows = []
+        }
 
         let embedded: MLXArray
         // Host history for the decode/verify windows: the ids are hashed on the
@@ -967,16 +990,39 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let full: MLXArray
         let output: MLXArray
         let residualAdded: Bool
-        if S == 1, TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
+        let fullIsState: Bool
+        if fusedResidual,
+            TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
+            convState.shape == [1, 9, wide], convState.dtype == stream.dtype,
+            let result = TrackPLEFusion.forwardDeferredProjected(
+                p, key: keyFlat, value: value, stream: stream, convState: convState,
+                pendingRows: pendingPleRows, eps: eps)
+        {
+            full = result.stateOut ?? convState
+            output = result.output
+            residualAdded = true
+            fullIsState = true
+            if result.stateOut != nil {
+                pleJournals.removeValue(forKey: pleJournalKey)
+            } else {
+                pleJournals[pleJournalKey] = TrackPLEJournalEntry(
+                    state: convState, nextOffset: offset + 1,
+                    rows: pendingPleRows + [result.newestRow])
+            }
+        } else if S == 1,
+            TrackPLEFusion.supports(p, stream: stream, hidden: hidden, hcCount: hcCount),
             convState.shape == [1, 9, wide], convState.dtype == stream.dtype,
             let result = TrackPLEFusion.forwardProjected(
                 p, key: keyFlat, value: value, stream: stream, convState: convState,
                 eps: eps, fusedResidual: fusedResidual)
         {
+            pleJournals.removeValue(forKey: pleJournalKey)
             full = result.full
             output = result.output
             residualAdded = result.residualAdded
+            fullIsState = false
         } else {
+            pleJournals.removeValue(forKey: pleJournalKey)
             // Use these same projection results when the post-projection guard
             // rejects the fused helper; do not run either GEMV a second time.
             // norm_key * norm_query, then MLX's own reduction over the last axis.
@@ -996,6 +1042,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             output = TrackFastPLEKernels.conv(
                 full: full, convW: p.convW2, gated: gated, dilation: p.dilation)
             residualAdded = false
+            fullIsState = false
         }
         do {
             if capture {
@@ -1026,7 +1073,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 }
                 try evaluation.stage(
                     modelLayerIndex: p.stateLayerIndex,
-                    conv: full[0..., (-p.stateLength)..., 0...],
+                    conv: fullIsState ? full : full[0..., (-p.stateLength)..., 0...],
                     ssm: ssm)
             }
         } catch {
