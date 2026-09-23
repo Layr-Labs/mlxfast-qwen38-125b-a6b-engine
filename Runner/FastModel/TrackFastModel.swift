@@ -681,7 +681,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         } catch {
             preconditionFailure("TrackFastModel: recurrent stage failed at layer \(layerIndex): \(error)")
         }
-        let o = g.out.apply(gated)
+        let o = TrackFastProjSplitK.apply(gated, g.out) ?? g.out.apply(gated)
         if prof { TrackFastProfile.tick("gdn.out", &pt, [o]) }
         return o
     }
@@ -740,7 +740,7 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             queries: prep.q, keys: prep.k, values: prep.v,
             scale: attentionScale, sinks: nil, keepMask: nil)  // [B,HQ,S,D]
         let out = TrackFastKernels.attnGate(att: att, qkv: qkv, gateOffset: a.qWidth)
-        return a.out.apply(out)
+        return TrackFastProjSplitK.apply(out, a.out) ?? a.out.apply(out)
     }
 
     /// Replay only the two opaque expert launches; routing and all current arrays stay live.
@@ -1359,3 +1359,4 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentCaptureMTPForwardable {
             tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
     }
 }
+private let gauntletRedraw_77c540a8_20260923T120013Z: Int = 0
