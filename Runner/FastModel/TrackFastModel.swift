@@ -111,7 +111,7 @@ enum TrackProj {
             self = .quant(
                 TrackQuantWeight(
                     weight: q.weight, scales: q.scales, biases: q.biases,
-                    groupSize: q.groupSize, bits: q.bits, mode: q.mode))
+                    groupSize: q.groupSize, bits: q.bits, mode: q.mode).withPairIndex())
         } else if let l = module as? Linear {
             precondition(l.bias == nil, "TrackFastModel: biased Linear is not served")
             self = .dense(l.weight)
@@ -232,6 +232,8 @@ struct TrackMoE {
     let expertGate: (w: MLXArray, s: MLXArray, b: MLXArray)
     let expertUp: (w: MLXArray, s: MLXArray, b: MLXArray)
     let expertDown: (w: MLXArray, s: MLXArray, b: MLXArray)
+    /// Load-time pair indices of the three expert stacks (nil = plain bf16 path).
+    let expertMeta: (gate: TrackAffineLUT, up: TrackAffineLUT, down: TrackAffineLUT)?
     let expertGroupSize: Int
     let expertBits: Int
     let sharedGateUp: TrackMultiProj
@@ -278,6 +280,9 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     }
 
     let base: Qwen4ExpModel
+    /// The output head as a quantized weight bundle (pair-indexed metadata on
+    /// one-row windows); nil when the head is not a 4-bit QuantizedLinear.
+    let headWeight: TrackQuantWeight?
     let cfg: Qwen4ExpTextConfiguration
     let embedTokens: Embedding
     let layers: [TrackLayer]
@@ -312,6 +317,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
 
     public init(base: Qwen4ExpModel) {
         self.base = base
+        if let q = base.children()[unwrapping: "lm_head"] as? QuantizedLinear, q.bias == nil {
+            self.headWeight = TrackQuantWeight(
+                weight: q.weight, scales: q.scales, biases: q.biases,
+                groupSize: q.groupSize, bits: q.bits, mode: q.mode).withPairIndex()
+        } else {
+            self.headWeight = nil
+        }
         let cfg = base.configuration
         self.cfg = cfg
         self.hcCount = cfg.hcCount
@@ -487,6 +499,14 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 return (gate: g, up: u, down: d)
             }(),
             expertGate: expert("gate_proj"), expertUp: expert("up_proj"), expertDown: expert("down_proj"),
+            expertMeta: {
+                guard qdown.bits == 4, qdown.groupSize == 32,
+                    let g = TrackAffineLUT.build(scales: expert("gate_proj").s, biases: expert("gate_proj").b),
+                    let u = TrackAffineLUT.build(scales: expert("up_proj").s, biases: expert("up_proj").b),
+                    let d = TrackAffineLUT.build(scales: expert("down_proj").s, biases: expert("down_proj").b)
+                else { return nil }
+                return (gate: g, up: u, down: d)
+            }(),
             expertGroupSize: qdown.groupSize, expertBits: qdown.bits,
             sharedGateUp: TrackMultiProj([sg, su]),
             sharedDown: sd, sharedGate: sharedGate, topK: cfg.numExpertsPerTok,
@@ -748,25 +768,48 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         guard let fused = m.sharedGateUp.fused, case .quant(let guq) = fused,
             case .quant(let dq) = m.sharedDown, guq.biases != nil, dq.biases != nil
         else { return nil }
+        // With the pair indices, inputs 20-29 carry the expert and shared
+        // index/table arrays (see `moePairReplayLutInputs`).
+        let useLut = Self.moeReplayUsesLut(m)
         return compile(shapeless: false) {
             [groupSize = m.expertGroupSize, bits = m.expertBits, topK = m.topK,
              guGroupSize = guq.groupSize, guBits = guq.bits, guMode = guq.mode,
-             downGroupSize = dq.groupSize, downBits = dq.bits, downMode = dq.mode] inputs in
+             downGroupSize = dq.groupSize, downBits = dq.bits, downMode = dq.mode, useLut] inputs in
             let sharedGU = TrackQuantWeight(
                 weight: inputs[11], scales: inputs[12], biases: inputs[13],
-                groupSize: guGroupSize, bits: guBits, mode: guMode)
+                groupSize: guGroupSize, bits: guBits, mode: guMode,
+                meta: useLut ? TrackAffineLUT(index: inputs[26], table: inputs[27], count: 0) : nil)
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: inputs[5], sg: inputs[6], bg: inputs[7],
                 wu: inputs[8], su: inputs[9], bu: inputs[10], shared: sharedGU,
-                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits)
+                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits,
+                lut: useLut ? (gate: TrackAffineLUT(index: inputs[20], table: inputs[21], count: 0),
+                               up: TrackAffineLUT(index: inputs[22], table: inputs[23], count: 0)) : nil)
             let sharedDown = TrackQuantWeight(
                 weight: inputs[17], scales: inputs[18], biases: inputs[19],
-                groupSize: downGroupSize, bits: downBits, mode: downMode)
+                groupSize: downGroupSize, bits: downBits, mode: downMode,
+                meta: useLut ? TrackAffineLUT(index: inputs[28], table: inputs[29], count: 0) : nil)
             return [TrackFastMoEKernels.downCombine(
                 wd: inputs[14], sd: inputs[15], bd: inputs[16], sharedDown: sharedDown,
                 act: act, idx: inputs[1], w: inputs[2], gate: inputs[3], topK: topK,
-                groupSize: groupSize, bits: bits)]
+                groupSize: groupSize, bits: bits,
+                lut: useLut ? TrackAffineLUT(index: inputs[24], table: inputs[25], count: 0) : nil)]
         }
+    }
+
+    /// The replay reads the metadata through the pair indices when every
+    /// tensor it touches has one.
+    static func moeReplayUsesLut(_ m: TrackMoE) -> Bool {
+        guard m.expertMeta != nil, let fused = m.sharedGateUp.fused, case .quant(let guq) = fused,
+            case .quant(let dq) = m.sharedDown
+        else { return false }
+        return guq.meta != nil && dq.meta != nil
+    }
+
+    static func moePairReplayLutInputs(_ m: TrackMoE, _ guq: TrackQuantWeight, _ dq: TrackQuantWeight) -> [MLXArray] {
+        guard let em = m.expertMeta, let gm = guq.meta, let dm = dq.meta else { return [] }
+        return [em.gate.index, em.gate.table, em.up.index, em.up.table, em.down.index, em.down.table,
+                gm.index, gm.table, dm.index, dm.table]
     }
 
     /// Row index of each (token, expert) slot, one constant array per window size
@@ -832,16 +875,18 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     guq.weight, guq.scales, guq.biases!,
                     m.expertDown.w, m.expertDown.s, m.expertDown.b,
                     dq.weight, dq.scales, dq.biases!,
-                ])[0].reshaped(1, S, H)
+                ] + Self.moePairReplayLutInputs(m, guq, dq))[0].reshaped(1, S, H)
             }
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
                 wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b, shared: guq,
-                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits)
+                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits,
+                lut: m.expertMeta.map { (gate: $0.gate, up: $0.up) })
             return TrackFastMoEKernels.downCombine(
                 wd: m.expertDown.w, sd: m.expertDown.s, bd: m.expertDown.b, sharedDown: dq,
                 act: act, idx: flatIdx, w: weights.reshaped(S * K), gate: gate, topK: K,
-                groupSize: m.expertGroupSize, bits: m.expertBits
+                groupSize: m.expertGroupSize, bits: m.expertBits,
+                lut: m.expertMeta.map { $0.down }
             ).reshaped(1, S, H)
         }
         let idx: MLXArray, weights: MLXArray
@@ -1217,6 +1262,13 @@ extension TrackQwen4ExpFastModel: LanguageModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
         try base.prepare(input, cache: cache, windowSize: windowSize)
     }
+    /// The output head: the reference `lm_head` op, served through the
+    /// pair-indexed weight bundle on one-row windows.
+    func head(_ hidden: MLXArray) -> MLXArray {
+        if let headWeight { return headWeight.apply(hidden) }
+        return base.head(hidden)
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         base(inputs, cache: cache)
     }
@@ -1256,7 +1308,7 @@ extension TrackQwen4ExpFastModel: CBv2PositionedRecurrentLanguageModelForwardabl
             tokens, inputEmbeddings: nil, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds, capture: false)
         {
-            return base.head(s.mixed)
+            return head(s.mixed)
         }
         return base.cbv2Forward(
             tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
@@ -1283,7 +1335,7 @@ extension TrackQwen4ExpFastModel: CBv2PositionedRecurrentLanguageModelForwardabl
             inputs, inputEmbeddings: inputEmbedding, caches: cache ?? [],
             recurrentState: recurrentState, positionIds: positionIds, capture: false)
         {
-            return base.head(s.mixed)
+            return head(s.mixed)
         }
         return base.embeddingForward(
             inputs, inputEmbedding: inputEmbedding, cache: cache,
@@ -1311,7 +1363,7 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentLanguageModelPrefillForwardable {
             case .evaluationOnly:
                 return s.mixed[0..., -1, 0 ..< 1]
             case .lastPositionLogits:
-                return base.head(s.mixed[0..., -1, 0...])
+                return head(s.mixed[0..., -1, 0...])
             }
         }
         return base.cbv2RecurrentPrefill(
@@ -1331,7 +1383,7 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentMTPForwardable {
             tokens, inputEmbeddings: nil, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds, capture: false)
         {
-            return (base.head(s.mixed), s.multi)
+            return (head(s.mixed), s.multi)
         }
         return base.cbv2ForwardWithHidden(
             tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
@@ -1353,7 +1405,7 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentCaptureMTPForwardable {
             tokens, inputEmbeddings: nil, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds, capture: true)
         {
-            return (base.head(s.mixed), s.multi)
+            return (head(s.mixed), s.multi)
         }
         return base.cbv2ForwardWithHiddenCaptured(
             tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
