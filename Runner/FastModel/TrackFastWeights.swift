@@ -1,3 +1,4 @@
+// MLXFAST-REDRAW-PURE-0606-R2: exact proven artifact redraw.
 // Quantized weight bundle (4-bit affine) with MLX's own matmul; shared by the
 // model and the kernel unit tests.
 
