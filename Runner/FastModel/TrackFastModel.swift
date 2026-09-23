@@ -770,15 +770,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     }
 
     /// Row index of each (token, expert) slot, one constant array per window size
-    /// (uploading it per step was one host copy per layer).
-    nonisolated(unsafe) private static var xrowTables: [Int: MLXArray] = [:]
+    /// (uploading it per step was one host copy per layer). The decode path only
+    /// ever asks for a single (S, K), so one lock-guarded slot keeps the same
+    /// process-global synchronization while dropping the Dictionary probe.
+    nonisolated(unsafe) private static var xrowSlotKey = -1
+    nonisolated(unsafe) private static var xrowSlotValue: MLXArray? = nil
     private static let xrowLock = NSLock()
     static func xrowTable(S: Int, K: Int) -> MLXArray {
         xrowLock.lock(); defer { xrowLock.unlock() }
-        if let t = xrowTables[S * 1024 + K] { return t }
+        let key = S * 1024 + K
+        if let t = xrowSlotValue, xrowSlotKey == key { return t }
         let t = MLXArray((0 ..< (S * K)).map { UInt32($0 / K) })
         eval(t)
-        xrowTables[S * 1024 + K] = t
+        xrowSlotKey = key
+        xrowSlotValue = t
         return t
     }
 
@@ -1359,3 +1364,4 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentCaptureMTPForwardable {
             tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
     }
 }
+private let gauntletRedraw_43b27bbd_20260923T142545Z: Int = 0
