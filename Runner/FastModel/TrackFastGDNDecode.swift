@@ -6,7 +6,7 @@ import MLX
 enum TrackFastGDNDecode {
     private static let kernel = MLXFast.metalKernel(
         name: "track_gdn_decode_complete",
-        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w", "journal_in"],
+        inputNames: ["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias", "state_in", "w", "journal_in", "sigmoid_lut"],
         outputNames: ["state_out", "gated", "conv_out", "journal_out"],
         source: source, header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
 
@@ -35,7 +35,7 @@ enum TrackFastGDNDecode {
         let hasJournal = pendingJournal?.shape == [B, journalStride]
         let journalIn = pendingJournal ?? convState
         let result = kernel(
-            [proj, convState, convW, negExpALog, dtBias, stateIn, normW, journalIn],
+            [proj, convState, convW, negExpALog, dtBias, stateIn, normW, journalIn, TrackBF16Functions.sigmoid],
             template: [
                 ("InT", proj.dtype), ("StT", stateIn.dtype), ("Dk", g.dk), ("Dv", g.dv),
                 ("Hk", g.hk), ("Hv", g.hv), ("KC", g.convKernel), ("CONV_DIM", g.convDim),
@@ -57,6 +57,9 @@ enum TrackFastGDNDecode {
 
     private static let source = #"""
         static_assert(Dk == 128 && Dv == 128, "GDN head geometry");
+        auto sigmoid = [&](InT value) -> InT {
+            return sigmoid_lut[as_type<ushort>(static_cast<bfloat16_t>(value))];
+        };
         const uint n = threadgroup_position_in_grid.z;
         const uint b_idx = n / Hv;
         const uint hv_idx = n % Hv;
@@ -90,7 +93,7 @@ enum TrackFastGDNDecode {
                     cacc += win(j, ch) * conv_w[ch * KC + j];
                 }
                 const InT c0 = static_cast<InT>(cacc);
-                const InT c1 = mlx_silu(c0);
+                const InT c1 = c0 * sigmoid(c0);
                 thread_x[i] = static_cast<float>(c1);
                 acc += thread_x[i] * thread_x[i];
             }
@@ -122,7 +125,7 @@ enum TrackFastGDNDecode {
         if (sg == 0 && lane == 0) {
             const device InT* row = proj + b_idx * PW;
             const InT b_raw = row[B_OFF + hv_idx];
-            gb_shared[1] = static_cast<float>(mlx_sigmoid(b_raw));
+            gb_shared[1] = static_cast<float>(sigmoid(b_raw));
             const InT ax = row[A_OFF + hv_idx] + dt_bias[hv_idx];
             const InT sp = mlx_logaddexp0(ax);
             gb_shared[0] = metal::precise::exp(neg_exp_alog[hv_idx] * sp);
