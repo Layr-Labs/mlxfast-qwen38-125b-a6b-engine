@@ -65,17 +65,19 @@ enum TrackPleContextMirror {
 }
 
 /// Private exact deferred GDN updates. Keeping this out of the public
-/// recurrent-state tuple avoids changing its allocation shape on alternating
-/// decode steps.
+/// recurrent-state tuple avoids changing its allocation shape during deferred
+/// decode steps. Two entries are replayed before each third-step flush.
 private final class TrackGDNJournalEntry {
     weak var state: MLXArray?
     let nextOffset: Int
-    let array: MLXArray
+    let first: MLXArray
+    let second: MLXArray?
 
-    init(state: MLXArray, nextOffset: Int, array: MLXArray) {
+    init(state: MLXArray, nextOffset: Int, first: MLXArray, second: MLXArray?) {
         self.state = state
         self.nextOffset = nextOffset
-        self.array = array
+        self.first = first
+        self.second = second
     }
 }
 
@@ -639,22 +641,32 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
         let journalKey = ObjectIdentifier(ssm)
         let entry = gdnJournals[journalKey]
         let pendingJournal: MLXArray?
-        if !capture, let entry, entry.state === ssm, entry.nextOffset == offset {
-            pendingJournal = entry.array
+        let secondJournal: MLXArray?
+        let journalStride = geo.hv * geo.dk + 2 * geo.hv * geo.dv + 2 * geo.hv
+        if !capture, let entry, entry.state === ssm, entry.nextOffset == offset,
+            entry.first.shape == [B, journalStride], entry.first.dtype == proj.dtype,
+            entry.second.map({ $0.shape == [B, journalStride] && $0.dtype == proj.dtype }) ?? true {
+            pendingJournal = entry.first
+            secondJournal = entry.second
         } else {
             gdnJournals.removeValue(forKey: journalKey)
             pendingJournal = nil
+            secondJournal = nil
         }
         if let fused = TrackFastGDNDecode.apply(
             proj: proj, convState: convState, convW: g.convW, negExpALog: g.negExpALog,
             dtBias: g.dtBias, stateIn: ssm, normW: g.normW,
-            pendingJournal: pendingJournal, zOffset: g.zOffset, eps: 1e-6,
+            pendingJournal: pendingJournal, secondJournal: secondJournal, zOffset: g.zOffset, eps: 1e-6,
             capture: capture, geometry: geo)
         {
             (gated, convOut, stateOut) = (fused.gated, fused.convOut, fused.stateOut)
             if let journal = fused.journal {
+                // A depth-one input remains the first immutable record. The
+                // new output is only the second record; no device copy is needed.
+                let first = fused.journalDepth == 2 ? pendingJournal! : journal
+                let second: MLXArray? = fused.journalDepth == 2 ? journal : nil
                 gdnJournals[journalKey] = TrackGDNJournalEntry(
-                    state: ssm, nextOffset: offset + S, array: journal)
+                    state: ssm, nextOffset: offset + S, first: first, second: second)
             } else {
                 gdnJournals.removeValue(forKey: journalKey)
             }
