@@ -151,6 +151,16 @@ enum TrackFastGDNDecode {
         const float4 local_k = float4(
             static_cast<float>(k_[4 * lane]), static_cast<float>(k_[4 * lane + 1]),
             static_cast<float>(k_[4 * lane + 2]), static_cast<float>(k_[4 * lane + 3]));
+        float pending_decay = 0.0f;
+        float4 pending_key = float4(0.0f);
+        if constexpr (HAS_JOURNAL) {
+            pending_decay = journal_float(J_DECAY_OFF + 2 * hv_idx);
+            pending_key = float4(
+                static_cast<float>(journal[J_KEY_OFF + hv_idx * Dk + 4 * lane]),
+                static_cast<float>(journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + 1]),
+                static_cast<float>(journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + 2]),
+                static_cast<float>(journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + 3]));
+        }
         threadgroup InT y_shared[Dv];
         for (int r = 0; r < RPS; ++r) {
             const uint dv_idx = sg * RPS + r;
@@ -167,13 +177,10 @@ enum TrackFastGDNDecode {
                 for (int i = 0; i < 4; ++i) { state[i] = static_cast<float>(i_state[4 * lane + i]); }
             }
             if constexpr (HAS_JOURNAL) {
-                const float pending_decay = journal_float(J_DECAY_OFF + 2 * hv_idx);
                 const float pending_delta = journal_float(J_DELTA_OFF + 2 * (hv_idx * Dv + dv_idx));
                 for (int i = 0; i < 4; ++i) {
                     state[i] = state[i] * pending_decay;
-                    state[i] = state[i]
-                        + static_cast<float>(journal[J_KEY_OFF + hv_idx * Dk + 4 * lane + i])
-                            * pending_delta;
+                    state[i] = state[i] + pending_key[i] * pending_delta;
                 }
             }
             float kv_mem;
