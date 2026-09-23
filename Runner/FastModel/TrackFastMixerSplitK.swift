@@ -91,3 +91,4 @@ enum TrackFastMixerSplitK {
 
 // MLXFAST-TAG-spl5r1 (20260923-024828-1): build tag. The code change in this draw is the
 // single constant above.
+private let gauntletRedraw_c123c2a7_20260923T033357Z: Int = 0
