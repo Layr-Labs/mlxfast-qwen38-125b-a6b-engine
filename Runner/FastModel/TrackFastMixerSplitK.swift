@@ -72,8 +72,9 @@ enum TrackFastMixerSplitK {
         """#
     static let fusedKernel = MLXFast.metalKernel(name: "track_split_k_mixer",
         inputNames: ["x", "wd", "sd", "bd", "wi", "si", "bi"],
-        outputNames: ["lo", "act", "inj"], source: fusedSource,
-        header: TrackFastMoEKernels.helpersCore + TrackFastKernels.exactHeader + helper,
+        outputNames: ["lo", "act", "inj"], source: TrackKernelText.compact(fusedSource),
+        // MLXFAST-HDR4: the split-K walk is 4-bit by construction (`qdot<float, V, 4>`).
+        header: TrackKernelText.compact(TrackFastMoEKernels.helpersCore4 + TrackFastKernels.exactHeader + helper),
         ensureRowContiguous: true)
 
     static func apply(_ x: MLXArray, down: TrackQuantWeight, inject: TrackQuantWeight?) -> [MLXArray] {

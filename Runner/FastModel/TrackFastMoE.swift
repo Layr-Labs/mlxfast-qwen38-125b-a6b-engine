@@ -13,6 +13,41 @@
 import Foundation
 import MLX
 
+/// MLXFAST-HDR4: generated Metal source for the one-token decode launches.
+///
+/// MLX rebuilds every custom-kernel call's source on the host (header + body
+/// appended into a fresh string in `write_signature`) and hashes the whole
+/// string again in `CustomKernel::eval_gpu` to key the library cache, so each
+/// byte of header costs host time on every launch, ~400 launches per token.
+/// `compact` drops blank lines, whole-line `//` comments and indentation. The
+/// token stream the Metal compiler sees is unchanged (a line continued with a
+/// trailing backslash is kept verbatim, so macro bodies never change), so the
+/// compiled kernels are the same.
+enum TrackKernelText {
+    static func compact(_ source: String) -> String {
+        var out: [Substring] = []
+        var continued = false
+        for line in source.split(separator: "\n", omittingEmptySubsequences: false) {
+            // A spliced line (previous one ended in a backslash) is part of
+            // the previous logical line: keep it byte for byte.
+            if continued {
+                out.append(line)
+                continued = line.hasSuffix("\\")
+                continue
+            }
+            let text = line.drop(while: { $0 == " " || $0 == "\t" })
+            // Leading indentation carries no token; trailing spaces do not move.
+            if text.isEmpty { continue }
+            // A `//` line that ends in a backslash comments out the next line
+            // too, so it stays.
+            if text.hasPrefix("//") && !text.hasSuffix("\\") { continue }
+            out.append(text)
+            continued = text.hasSuffix("\\")
+        }
+        return out.joined(separator: "\n") + "\n"
+    }
+}
+
 enum TrackFastMoEKernels {
     /// `mlx/backend/metal/kernels/quantized.h` lines 12-393 and 757-987.
     /// MLX `quantized.h` verbatim: the pack helpers, `load_vector*` and `qdot*` the replicas call.
@@ -397,6 +432,87 @@ inline U qdot_safe(
   }
 
   return scale * accum + sum * bias;
+}
+
+"""#
+
+    /// MLXFAST-HDR4: `helpersCore` reduced to the 4-bit walk. Every one-token
+    /// decode launch below instantiates these templates with bits == 4 only
+    /// (each host entry point asserts it), and in `helpersCore` the other
+    /// widths sit behind plain `if (bits == N)` tests that the compiler folds
+    /// away for bits == 4. The 4-bit bodies here are those branches verbatim,
+    /// so the compiled walk is the same instruction for instruction; the
+    /// difference is the ~8.5 KB of dead branches no longer copied into and
+    /// hashed out of every launch's generated source on the host.
+    static let helpersCore4 = #"""
+#define MLX_MTL_CONST static constant constexpr const
+MLX_MTL_CONST int SIMD_SIZE = 32;
+MLX_MTL_CONST int QUAD_SIZE = 4;
+template <int bits, int wsize = 8>
+inline constexpr short get_pack_factor() {
+return (bits == 3 || bits == 5) ? 8 : (bits == 6 ? 4 : wsize / bits);
+}
+template <int bits, int wsize = 8>
+inline constexpr short get_bytes_per_pack() {
+constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
+return power_of_2_bits ? (wsize / 8) : (bits == 5 ? 5 : 3);
+}
+template <typename T, typename U, int values_per_thread, int bits>
+inline U load_vector(const device T* x, thread U* x_thread) {
+static_assert(bits == 4, "one-token helpers are 4-bit");
+U sum = 0;
+for (int i = 0; i < values_per_thread; i += 4) {
+sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+x_thread[i] = x[i];
+x_thread[i + 1] = x[i + 1] / 16.0f;
+x_thread[i + 2] = x[i + 2] / 256.0f;
+x_thread[i + 3] = x[i + 3] / 4096.0f;
+}
+return sum;
+}
+template <typename T, typename U, int values_per_thread, int bits>
+inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
+static_assert(bits == 4, "one-token helpers are 4-bit");
+U sum = 0;
+for (int i = 0; i < N; i += 4) {
+sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+x_thread[i] = x[i];
+x_thread[i + 1] = x[i + 1] / 16.0f;
+x_thread[i + 2] = x[i + 2] / 256.0f;
+x_thread[i + 3] = x[i + 3] / 4096.0f;
+}
+for (int i = N; i < values_per_thread; i++) {
+x_thread[i] = 0;
+}
+return sum;
+}
+template <typename U, int values_per_thread, int bits>
+inline U qdot(const device uint8_t* w, const thread U* x_thread, U scale, U bias, U sum) {
+static_assert(bits == 4, "one-token helpers are 4-bit");
+U accum = 0;
+const device uint16_t* ws = (const device uint16_t*)w;
+for (int i = 0; i < (values_per_thread / 4); i++) {
+accum +=
+(x_thread[4 * i] * (ws[i] & 0x000f) +
+x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+x_thread[4 * i + 3] * (ws[i] & 0xf000));
+}
+return scale * accum + sum * bias;
+}
+template <typename U, int values_per_thread, int bits>
+inline U qdot_safe(const device uint8_t* w, const thread U* x_thread, U scale, U bias, U sum, int N) {
+static_assert(bits == 4, "one-token helpers are 4-bit");
+U accum = 0;
+const device uint16_t* ws = (const device uint16_t*)w;
+for (int i = 0; i < (N / 4); i++) {
+accum +=
+(x_thread[4 * i] * (ws[i] & 0x000f) +
+x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+x_thread[4 * i + 3] * (ws[i] & 0xf000));
+}
+return scale * accum + sum * bias;
 }
 
 """#
@@ -866,7 +982,10 @@ extension TrackFastMoEKernels {
         name: "track_moe_route_1",
         inputNames: ["logits", "x", "wg", "sgw", "bgw"],
         outputNames: ["idx", "w", "gate"],
-        source: routeSource, header: TrackFastKernels.mixerHeadHeader + wideDecls, ensureRowContiguous: true)
+        source: TrackKernelText.compact(routeSource),
+        header: TrackKernelText.compact(
+            helpersCore4 + TrackFastKernels.exactHeader + TrackFastKernels.mixerHeadHeaderTail + wideDecls),
+        ensureRowContiguous: true)
 
     /// logits f32 [..., E] -> (idx uint32 [..., K], w f32 [..., K])
     /// Also the shared-expert gate logit per row: x [..., KD] x sharedGate [1, KD] -> gate [...] (pre-sigmoid).
@@ -1341,8 +1460,8 @@ extension TrackFastMoEKernels {
         name: "track_moe_gate_up_reuse_2row",
         inputNames: ["wg", "sg", "bg", "wu", "su", "bu", "wsh", "ssh", "bsh", "x", "idx", "xrow"],
         outputNames: ["act"],
-        source: gateUpReuseSource,
-        header: helpersCore + TrackFastKernels.exactHeader + gateUpReuseHelpers,
+        source: TrackKernelText.compact(gateUpReuseSource),
+        header: TrackKernelText.compact(helpersCore4 + TrackFastKernels.exactHeader + gateUpReuseHelpers),
         ensureRowContiguous: true)
 
     /// Routed slots [0, BR) then the shared expert for the S tokens: act [BR + S, N].
@@ -1501,7 +1620,8 @@ extension TrackFastMoEKernels {
         name: "track_moe_down_combine_1",
         inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate"],
         outputNames: ["out"],
-        source: downCombineSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
+        source: TrackKernelText.compact(downCombineSource),
+        header: TrackKernelText.compact(helpersCore4 + TrackFastKernels.exactHeader + regHelpers + wideDecls),
         ensureRowContiguous: true)
 
     /// Simdgroups per down+combine threadgroup: the top-K expert walks of one

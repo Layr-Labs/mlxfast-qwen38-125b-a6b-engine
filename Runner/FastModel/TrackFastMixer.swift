@@ -195,7 +195,12 @@ enum TrackFastMixerKernels {
         name: "track_mixer_up_mix_1",
         inputNames: ["act", "normed", "wu", "su", "bu", "inj", "sigmoid_lut"],
         outputNames: ["input", "inject", "inputF"],
-        source: upMixSource, header: header1, ensureRowContiguous: true)
+        source: TrackKernelText.compact(upMixSource), header: upHeader1, ensureRowContiguous: true)
+    /// MLXFAST-HDR4: the one-token up-mix walks only `qmv_reg` / `qmv_reg_rows`
+    /// at 4 bits; it never calls the inject GEMVs of `mixerHeadHeaderTail`.
+    static let upHeader1 = TrackKernelText.compact(
+        TrackFastMoEKernels.helpersCore4 + TrackFastKernels.exactHeader + TrackFastMoEKernels.regHelpers
+            + TrackFastMoEKernels.wideDecls)
 
     static func upMix(
         act: MLXArray, normed: MLXArray, up: TrackQuantWeight, inj: MLXArray, hcCount: Int, hidden: Int,
