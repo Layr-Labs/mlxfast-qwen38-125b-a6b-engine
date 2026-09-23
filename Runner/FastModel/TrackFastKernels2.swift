@@ -453,6 +453,13 @@ extension TrackFastKernels {
 
     /// out[b,s,h*D+d] = att[b,h,s,d] * sigmoid(gate[b,s,h*D+d])   (bf16 ops)
     static let attnGateSource = """
+        auto sigmoid = [&](InT value) -> InT {
+            if constexpr (USE_LUT && metal::is_same_v<InT, bfloat16_t>) {
+                return sigmoid_lut[as_type<ushort>(static_cast<bfloat16_t>(value))];
+            } else {
+                return mlx_sigmoid(value);
+            }
+        };
         const uint j = thread_position_in_grid.x;
         const uint row = thread_position_in_grid.y;
         if (j >= HQ * D) return;
@@ -462,22 +469,24 @@ extension TrackFastKernels {
         const uint s = row % S;
         const InT a = att[((b * HQ + h) * S + s) * D + d];
         const InT g = qkv[row * QW + GATE_OFF + j];
-        out[row * HQ * D + j] = a * mlx_sigmoid(g);
+        out[row * HQ * D + j] = a * sigmoid(g);
         """
 
     nonisolated(unsafe) static let attnGateKernel = MLXFast.metalKernel(
         name: "track_attn_gate",
-        inputNames: ["att", "qkv"],
+        inputNames: ["att", "qkv", "sigmoid_lut"],
         outputNames: ["out"],
         source: attnGateSource, header: exactHeader, ensureRowContiguous: true)
 
     static func attnGate(att: MLXArray, qkv: MLXArray, gateOffset: Int) -> MLXArray {
         let B = att.dim(0), HQ = att.dim(1), S = att.dim(2), D = att.dim(3)
+        let useSigmoidTable = att.dtype == .bfloat16 && S == 1
+        let sigmoidTable = useSigmoidTable ? TrackBF16Functions.sigmoid : att
         return attnGateKernel(
-            [att, qkv],
+            [att, qkv, sigmoidTable],
             template: [
                 ("InT", att.dtype), ("HQ", HQ), ("D", D), ("S", S), ("QW", qkv.dim(2)),
-                ("GATE_OFF", gateOffset),
+                ("GATE_OFF", gateOffset), ("USE_LUT", useSigmoidTable),
             ],
             grid: (HQ * D, B * S, 1), threadGroup: (256, 1, 1),
             outputShapes: [[B, S, HQ * D]], outputDTypes: [att.dtype])[0]

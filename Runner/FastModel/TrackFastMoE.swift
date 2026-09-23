@@ -1381,6 +1381,13 @@ extension TrackFastMoEKernels {
     /// grid threads (32, H/4, S), threadgroup (32, 1, 1): one simdgroup owns
     /// 4 output columns for one token across all K experts.
     static let downCombineSource = """
+        auto sigmoid = [&](T value) -> T {
+            if constexpr (VPT == 1 && metal::is_same_v<T, bfloat16_t>) {
+                return sigmoid_lut[as_type<ushort>(static_cast<bfloat16_t>(value))];
+            } else {
+                return mlx_sigmoid(value);
+            }
+        };
         const uint t = threadgroup_position_in_grid.z;
         // MLXFAST-DOWNRPS: RPS output rows per threadgroup (4 for wide windows).
         static_assert(VPT == 1 || RPS == 4, "wide windows keep four rows");
@@ -1470,7 +1477,7 @@ extension TrackFastMoEKernels {
         if constexpr (VPT == 1 && RPS <= 32) {
             if (sgi == 0 && lid < RPS) {
                 const int i = (int)lid;
-                const T sg = mlx_sigmoid(gate[t]);
+                const T sg = sigmoid(gate[t]);
                 float col[K];
                 for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
                 const T r = static_cast<T>(mlx_colsum_small_f32<K>(col));
@@ -1479,7 +1486,7 @@ extension TrackFastMoEKernels {
             }
         } else {
             if (sgi == 0 && lid == 0) {
-                const T sg = mlx_sigmoid(gate[t]);
+                const T sg = sigmoid(gate[t]);
                 for (int i = 0; i < RPS; ++i) {
                     float col[K];
                     for (int k = 0; k < K; ++k) { col[k] = prod[k][i]; }
@@ -1493,13 +1500,13 @@ extension TrackFastMoEKernels {
 
     nonisolated(unsafe) static let downCombineKernel = MLXFast.metalKernel(
         name: "track_moe_down_combine",
-        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate"],
+        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate", "sigmoid_lut"],
         outputNames: ["out"],
         source: downCombineSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideHelpers,
         ensureRowContiguous: true)
     nonisolated(unsafe) static let downCombineKernel1 = MLXFast.metalKernel(
         name: "track_moe_down_combine_1",
-        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate"],
+        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate", "sigmoid_lut"],
         outputNames: ["out"],
         source: downCombineSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
@@ -1536,7 +1543,7 @@ extension TrackFastMoEKernels {
         // one-token path, so the threadgroup gains `rps` groups, not one.
         let groups = ksg + (S == 1 && topK == 10 && ksg >= 5 ? rps : 0)
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
-            [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
+            [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate, TrackBF16Functions.sigmoid],
             template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
             grid: (32, (H / rps) * groups, S), threadGroup: (32, groups, 1),
             outputShapes: [[S, H]], outputDTypes: [act.dtype])[0]
