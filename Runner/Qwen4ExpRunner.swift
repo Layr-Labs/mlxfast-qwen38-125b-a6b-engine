@@ -393,8 +393,43 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
         try model.newCacheV2(makeLayerCache: make)
     }
 
+    /// MLXFAST-WARMGRAPH: the runner's own kernels are Metal sources compiled
+    /// at first use, not members of the prebuilt metallib, so the first forward
+    /// that reaches a given shape pays that compile. Engine assembly happens at
+    /// boot, before the harness opens its window, so the compiles are taken
+    /// here instead. Nothing it computes is kept: a private stepper with its own
+    /// small cache is built, stepped, and dropped, and the one piece of process
+    /// state a forward can leave behind is cleared afterwards.
+    nonisolated(unsafe) private static var decodeGraphWarmed = false
+    private static let warmLock = NSLock()
+
+    private func warmDecodeGraph() {
+        Self.warmLock.lock()
+        defer { Self.warmLock.unlock() }
+        if Self.decodeGraphWarmed { return }
+        Self.decodeGraphWarmed = true
+        let eos = eosTokenIDs.first ?? 0
+        do {
+            let warm = CBv2SingleRowStepper(
+                model: servingModel,
+                layerKinds: layerKinds,
+                newCaches: newCaches,
+                kvBytesCapacity: min(kvBytesCapacity, 64 << 20),
+                maxLength: 64)
+            try warm.begin()
+            // A multi-token forward reaches the wide-window shapes, then two
+            // single-token forwards reach the one-token decode shapes.
+            _ = try warm.forwardLogits(Array(repeating: eos, count: 8))
+            _ = try warm.forwardLogits([eos])
+            _ = try warm.forwardLogits([eos])
+        } catch {
+            // Warming is best effort. A failure here must never fail the boot.
+        }
+        TrackPleContextMirror.invalidate()
+    }
+
     public func makeEngine(_ build: EngineBuild) throws -> any CBv2Engine {
-        try RunnerEngineAssembly.makeEngine(
+        let engine = try RunnerEngineAssembly.makeEngine(
             manifest: Self.manifest,
             loadedDecoders: loadedDecoders,
             model: servingModel,
@@ -403,6 +438,8 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
             newCaches: newCaches,
             mtpDrafter: drafter,
             build: build)
+        warmDecodeGraph()
+        return engine
     }
 
     public func makeStepper() throws -> any TeacherForcedStepper {
