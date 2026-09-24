@@ -296,6 +296,11 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     let eps: Float
     private let injectNormReplay: @Sendable ([MLXArray]) -> [MLXArray]
     private var gdnJournals: [ObjectIdentifier: TrackGDNJournalEntry] = [:]
+    /// MLXFAST-ROPETAB: absolute-position rope rows, built once and sliced.
+    private var ropeTable: (cos: MLXArray, sin: MLXArray, count: Int, dtype: DType)? = nil
+    /// Bound on the cached table so a large indexer budget cannot become a
+    /// large resident allocation; past it the reference construction is used.
+    private static let ropeTableMaxRows = 16384
     let rotaryDims: Int
     let rotary: Qwen4ExpRotary
     let indexerBudget: Int
@@ -740,6 +745,21 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
     /// The reference's rope tables for this forward, cast to the activation
     /// dtype exactly as `qwen4ExpRopePartial` does: `[S, rot]` each.
     private func ropeTables(offset: Int, count: Int, dtype: DType) -> (cos: MLXArray, sin: MLXArray) {
+        // MLXFAST-ROPETAB: row p is a pure elementwise function of the absolute
+        // position p, so row p of a table built over 0 ..< cap holds the same
+        // bits as row p of one built over offset ..< offset+count.
+        if let t = ropeTable, t.dtype == dtype, offset >= 0, offset + count <= t.count {
+            return (t.cos[offset ..< (offset + count)], t.sin[offset ..< (offset + count)])
+        }
+        let cap = min(max(indexerBudget, 1), Self.ropeTableMaxRows)
+        if ropeTable == nil, offset + count <= cap {
+            let (fc, fs) = rotary.cosSin(qwen4ExpPositions(offset: 0, count: cap))
+            let c = fc.asType(dtype).reshaped(cap, rotaryDims)
+            let s = fs.asType(dtype).reshaped(cap, rotaryDims)
+            eval(c, s)
+            ropeTable = (cos: c, sin: s, count: cap, dtype: dtype)
+            return (c[offset ..< (offset + count)], s[offset ..< (offset + count)])
+        }
         let (c, s) = rotary.cosSin(qwen4ExpPositions(offset: offset, count: count))
         return (c.asType(dtype).reshaped(count, rotaryDims), s.asType(dtype).reshaped(count, rotaryDims))
     }
@@ -1474,3 +1494,5 @@ extension TrackQwen4ExpFastModel: CBv2RecurrentCaptureMTPForwardable {
             tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
     }
 }
+
+// MLXFAST-TAG-ropetabr14 (20260923-052911-14): build tag.
