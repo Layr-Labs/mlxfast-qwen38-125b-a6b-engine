@@ -1,4 +1,4 @@
-import Foundation
+// MLXFAST-REDRAW-20260924-161452-D1: independent official re-measurement marker.
 import MLX
 
 // Partition HC input blocks across SIMD groups while retaining each lane's
