@@ -414,3 +414,4 @@ public final class TrackQwen4ExpRunner: Runner, @unchecked Sendable {
             maxLength: maxSequenceLength)
     }
 }
+// QwenDraws2 disclosed redraw marker: draw 12 2026-09-24T02:22:20Z (no code change)
