@@ -1345,10 +1345,54 @@ extension TrackFastMoEKernels {
         header: helpersCore + TrackFastKernels.exactHeader + gateUpReuseHelpers,
         ensureRowContiguous: true)
 
+    /// MLXFAST-SHAREDGU-SPLIT kill switch (TRACK_SHARED_GU_SPLIT=0 restores the fused slot).
+    /// On: the one-token shared expert gate|up + SwiGLU is its own launch (`sharedGateUpAct`),
+    /// the routed gate|up drops its z == BR slice, and down+combine reads the shared
+    /// activation from its LAST input, so MLX's dependency-only barriers put the shared
+    /// walk in route's (DRAM-idle, single-threadgroup) epoch.
+    static let splitSharedGateUp = ProcessInfo.processInfo.environment["TRACK_SHARED_GU_SPLIT"] != "0"
+
+    /// Mirrors the reuse-kernel guard in `gateUpAct` (bf16, one token, KD 2560, N 640,
+    /// group 32, 4-bit affine) plus the shared gate|up shape; false for every S > 1 window.
+    static func canSplitSharedGateUp(
+        x: MLXArray, wg: MLXArray, shared: TrackQuantWeight, groupSize: Int, bits: Int
+    ) -> Bool {
+        splitSharedGateUp && x.ndim == 2 && x.dim(0) == 1 && x.dim(1) == 2560 && x.dtype == .bfloat16
+            && wg.ndim == 3 && wg.dim(1) == 640 && groupSize == 32 && bits == 4
+            && shared.mode == .affine && shared.groupSize == 32 && shared.bits == 4
+            && shared.rows == 1280 && shared.biases != nil
+    }
+
+    /// The shared expert's gate|up + SwiGLU for one token as its own launch: the SAME
+    /// `gateUpReuseSource` with BR = 0, so its single z-slice takes the kernel's existing
+    /// `shared` branch verbatim (same walk, same bytes, same rounding). The routed operands
+    /// are bound to the shared arrays (never read on that branch) so the launch does not
+    /// bind the expert stacks. Returns act [1, N].
+    static func sharedGateUpAct(
+        shared: TrackQuantWeight, x: MLXArray, dummyIndex: MLXArray, groupSize: Int, bits: Int
+    ) -> MLXArray {
+        let KD = x.dim(1), N = shared.rows / 2
+        let rows = gateUpReuseRowsPerSimdgroup
+        precondition(x.dim(0) == 1 && N % (2 * rows) == 0 && dummyIndex.dtype == .uint32
+            && shared.groupSize == groupSize && shared.bits == bits && shared.biases != nil)
+        let b = shared.biases!
+        return gateUpReuseKernel(
+            [shared.weight, shared.scales, b, shared.weight, shared.scales, b,
+             shared.weight, shared.scales, b, x, dummyIndex, dummyIndex],
+            template: [
+                ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N),
+                ("KD", KD), ("BR", 0), ("RPS", rows),
+            ],
+            grid: (32, N / rows, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, N]], outputDTypes: [x.dtype])[0]
+    }
+
     /// Routed slots [0, BR) then the shared expert for the S tokens: act [BR + S, N].
+    /// `routedOnly` (one-token reuse kernel only): routed slots only, act [BR, N].
     static func gateUpAct(
         wg: MLXArray, sg: MLXArray, bg: MLXArray, wu: MLXArray, su: MLXArray, bu: MLXArray,
-        shared: TrackQuantWeight, x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int
+        shared: TrackQuantWeight, x: MLXArray, idx: MLXArray, xrow: MLXArray, groupSize: Int, bits: Int,
+        routedOnly: Bool = false
     ) -> MLXArray {
         let BR = idx.dim(0), S = x.dim(0), KD = x.dim(1), N = wg.dim(1)
         precondition(N % 8 == 0 && bits == 4 && idx.dtype == .uint32 && xrow.dtype == .uint32)
@@ -1358,15 +1402,18 @@ extension TrackFastMoEKernels {
             && groupSize == 32 && bits == 4 && shared.mode == .affine
         {
             let rows = gateUpReuseRowsPerSimdgroup
+            // routedOnly keeps the template BR, so z < BR never takes the shared branch.
+            let slots = routedOnly ? BR : BR + 1
             return gateUpReuseKernel(
                 [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
                 template: [
                     ("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N),
                     ("KD", KD), ("BR", BR), ("RPS", rows),
                 ],
-                grid: (32, N / rows, BR + 1), threadGroup: (32, 2, 1),
-                outputShapes: [[BR + S, N]], outputDTypes: [x.dtype])[0]
+                grid: (32, N / rows, slots), threadGroup: (32, 2, 1),
+                outputShapes: [[routedOnly ? BR : BR + S, N]], outputDTypes: [x.dtype])[0]
         }
+        precondition(!routedOnly, "routedOnly requires the one-token reuse kernel")
         return (S == 1 ? gateUpActKernel1 : gateUpActKernel)(
             [wg, sg, bg, wu, su, bu, shared.weight, shared.scales, shared.biases!, x, idx, xrow],
             template: [("T", x.dtype), ("GS", groupSize), ("BITS", bits), ("N", N), ("KD", KD), ("FAST", isFast(k: KD, n: N)), ("BR", BR), ("VPT", S)],
@@ -1431,7 +1478,8 @@ extension TrackFastMoEKernels {
         // many vectors share its tile).
         constexpr uint shared_sg = VPT == 1 && K == 10 && KSG >= 5
             ? (uint)KSG : (KSG > K ? (uint)K : 0u);
-        const device T* xs = act + (size_t)(BR + t) * (size_t)F;
+        // MLXFAST-SHAREDGU-SPLIT: the one-token shared activation may come from its own launch.
+        const device T* xs = SPLIT_SH ? (sact + (size_t)t * (size_t)F) : (act + (size_t)(BR + t) * (size_t)F);
         if constexpr (VPT == 1 && K == 10 && KSG >= 5) {
             if (sgi >= shared_sg && sgi < shared_sg + RPS) {
                 const int i = (int)(sgi - shared_sg);
@@ -1493,13 +1541,13 @@ extension TrackFastMoEKernels {
 
     nonisolated(unsafe) static let downCombineKernel = MLXFast.metalKernel(
         name: "track_moe_down_combine",
-        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate"],
+        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate", "sact"],
         outputNames: ["out"],
         source: downCombineSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideHelpers,
         ensureRowContiguous: true)
     nonisolated(unsafe) static let downCombineKernel1 = MLXFast.metalKernel(
         name: "track_moe_down_combine_1",
-        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate"],
+        inputNames: ["wd", "sd", "bd", "wsd", "ssd", "bsd", "act", "idx", "w", "gate", "sact"],
         outputNames: ["out"],
         source: downCombineSource, header: helpersCore + TrackFastKernels.exactHeader + regHelpers + wideDecls,
         ensureRowContiguous: true)
@@ -1522,22 +1570,35 @@ extension TrackFastMoEKernels {
         ProcessInfo.processInfo.environment["MLXFAST_MOE_DOWN_SIMDGROUPS"].flatMap { Int($0) } ?? 10
 
     /// act [BR + S, F] (routed slots, then the shared expert per token), gate [S] pre-sigmoid.
+    /// With `sharedAct` [S, F], act holds the routed slots only ([BR, F]) and the shared
+    /// activation is read from `sharedAct` (bound as the LAST input, "sact").
     static func downCombine(
         wd: MLXArray, sd: MLXArray, bd: MLXArray, sharedDown: TrackQuantWeight, act: MLXArray,
-        idx: MLXArray, w: MLXArray, gate: MLXArray, topK: Int, groupSize: Int, bits: Int
+        idx: MLXArray, w: MLXArray, gate: MLXArray, topK: Int, groupSize: Int, bits: Int,
+        sharedAct: MLXArray? = nil
     ) -> MLXArray {
         let BR = idx.dim(0), F = act.dim(1), H = wd.dim(1)
         let S = BR / topK
         precondition(BR % topK == 0 && H % 4 == 0 && bits == 4 && w.dtype == .float32 && S >= 1 && S <= 8)
-        precondition(act.dim(0) == BR + S && gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
+        if let sa = sharedAct {
+            precondition(act.dim(0) == BR && sa.ndim == 2 && sa.dim(0) == S && sa.dim(1) == F && sa.dtype == act.dtype)
+        } else {
+            precondition(act.dim(0) == BR + S)
+        }
+        precondition(gate.dim(0) == S && sharedDown.rows == H && !isFast(k: F, n: H))
         let ksg = topK % downCombineSimdgroups == 0 ? downCombineSimdgroups : 1
         let rps = S == 1 ? downRowsPerSimdgroup : 4
         // MLXFAST-SHAREDROWSG: one simdgroup per shared-expert row on the
         // one-token path, so the threadgroup gains `rps` groups, not one.
         let groups = ksg + (S == 1 && topK == 10 && ksg >= 5 ? rps : 0)
+        // "sact" is the LAST input: MLX's back-to-front tape then evaluates the shared
+        // gate|up launch right after route, before the routed gate|up. Unsplit windows
+        // bind `act` again (never read there: SPLIT_SH is false).
+        let splitShared: Bool = sharedAct != nil
+        let sact: MLXArray = sharedAct ?? act
         return (S == 1 ? downCombineKernel1 : downCombineKernel)(
-            [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate],
-            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps)],
+            [wd, sd, bd, sharedDown.weight, sharedDown.scales, sharedDown.biases!, act, idx, w, gate, sact],
+            template: [("T", act.dtype), ("GS", groupSize), ("BITS", bits), ("H", H), ("F", F), ("K", topK), ("FAST", isFast(k: F, n: H)), ("BR", BR), ("VPT", S), ("KSG", ksg), ("RPS", rps), ("SPLIT_SH", splitShared)],
             grid: (32, (H / rps) * groups, S), threadGroup: (32, groups, 1),
             outputShapes: [[S, H]], outputDTypes: [act.dtype])[0]
     }

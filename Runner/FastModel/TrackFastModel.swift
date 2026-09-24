@@ -665,9 +665,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo,
                 separateBA: split.map { (b: $0[2], a: $0[3]) })
             if prof { TrackFastProfile.tick("gdn.prep+lean", &pt, [r.y, r.stateOut, r.convOut]) }
-            gated = TrackFastKernels.gatedRMS(
-                y: r.y, proj: split?[1] ?? proj, w: g.normW,
-                zOffset: separate ? 0 : g.zOffset, eps: 1e-6)
+            if separate && TrackP12Prefill.zAfterRecurrence, let zPart = split?[1] {
+                // MLXFAST-ZREC: end the command buffer at the prep kernel
+                // (conv_out is a sibling of the prep outputs and excludes the
+                // recurrence), so the recurrence and the z GEMM always open a
+                // fresh encoder together, recurrence first. Without it, a size
+                // commit landing after the recurrence would push the z GEMM into
+                // an encoder whose fence waits on the recurrence.
+                if TrackP12Prefill.recurrenceBoundary { asyncEval(r.convOut) }
+                gated = TrackP12Prefill.gatedRMSZFirst(y: r.y, z: zPart, w: g.normW, eps: 1e-6)
+            } else {
+                gated = TrackFastKernels.gatedRMS(
+                    y: r.y, proj: split?[1] ?? proj, w: g.normW,
+                    zOffset: separate ? 0 : g.zOffset, eps: 1e-6)
+            }
             (convOut, stateOut) = (r.convOut, r.stateOut)
             if prof { TrackFastProfile.tick("gdn.gatedRMS", &pt, [gated]) }
         }
@@ -755,17 +766,25 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
             let sharedGU = TrackQuantWeight(
                 weight: inputs[11], scales: inputs[12], biases: inputs[13],
                 groupSize: guGroupSize, bits: guBits, mode: guMode)
+            // MLXFAST-SHAREDGU-SPLIT: the shared gate|up is its own launch, read last by down+combine.
+            let split = TrackFastMoEKernels.canSplitSharedGateUp(
+                x: inputs[0], wg: inputs[5], shared: sharedGU, groupSize: groupSize, bits: bits)
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: inputs[5], sg: inputs[6], bg: inputs[7],
                 wu: inputs[8], su: inputs[9], bu: inputs[10], shared: sharedGU,
-                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits)
+                x: inputs[0], idx: inputs[1], xrow: inputs[4], groupSize: groupSize, bits: bits,
+                routedOnly: split)
+            let sharedAct: MLXArray? = split
+                ? TrackFastMoEKernels.sharedGateUpAct(
+                    shared: sharedGU, x: inputs[0], dummyIndex: inputs[4], groupSize: groupSize, bits: bits)
+                : nil
             let sharedDown = TrackQuantWeight(
                 weight: inputs[17], scales: inputs[18], biases: inputs[19],
                 groupSize: downGroupSize, bits: downBits, mode: downMode)
             return [TrackFastMoEKernels.downCombine(
                 wd: inputs[14], sd: inputs[15], bd: inputs[16], sharedDown: sharedDown,
                 act: act, idx: inputs[1], w: inputs[2], gate: inputs[3], topK: topK,
-                groupSize: groupSize, bits: bits)]
+                groupSize: groupSize, bits: bits, sharedAct: sharedAct)]
         }
     }
 
@@ -834,14 +853,21 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                     dq.weight, dq.scales, dq.biases!,
                 ])[0].reshaped(1, S, H)
             }
+            let split = TrackFastMoEKernels.canSplitSharedGateUp(
+                x: x2, wg: m.expertGate.w, shared: guq, groupSize: m.expertGroupSize, bits: m.expertBits)
             let act = TrackFastMoEKernels.gateUpAct(
                 wg: m.expertGate.w, sg: m.expertGate.s, bg: m.expertGate.b,
                 wu: m.expertUp.w, su: m.expertUp.s, bu: m.expertUp.b, shared: guq,
-                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits)
+                x: x2, idx: flatIdx, xrow: xrow, groupSize: m.expertGroupSize, bits: m.expertBits,
+                routedOnly: split)
+            let sharedAct: MLXArray? = split
+                ? TrackFastMoEKernels.sharedGateUpAct(
+                    shared: guq, x: x2, dummyIndex: xrow, groupSize: m.expertGroupSize, bits: m.expertBits)
+                : nil
             return TrackFastMoEKernels.downCombine(
                 wd: m.expertDown.w, sd: m.expertDown.s, bd: m.expertDown.b, sharedDown: dq,
                 act: act, idx: flatIdx, w: weights.reshaped(S * K), gate: gate, topK: K,
-                groupSize: m.expertGroupSize, bits: m.expertBits
+                groupSize: m.expertGroupSize, bits: m.expertBits, sharedAct: sharedAct
             ).reshaped(1, S, H)
         }
         let idx: MLXArray, weights: MLXArray
