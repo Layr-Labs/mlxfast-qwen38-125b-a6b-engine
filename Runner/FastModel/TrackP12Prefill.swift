@@ -63,6 +63,10 @@ enum TrackP12Prefill {
     static let splitShared = on("TRACK_P12_SPLIT_SHARED_INPUTS")
     static let omitUnusedIndexer = on("TRACK_P12_OMIT_UNUSED_INDEXER")
     static let splitAttention = on("TRACK_P12_SPLIT_ATTN_INPUTS")
+    /// MLXFAST-ZREC: dispatch the z projection right after the GDN recurrence (same epoch).
+    static let zAfterRecurrence = on("TRACK_P12_Z_AFTER_REC")
+    /// MLXFAST-ZREC: close the command buffer right after the GDN prep kernel.
+    static let recurrenceBoundary = on("TRACK_P12_REC_BOUNDARY")
 
     /// Wide, batch-one, activation-dtype windows only: the decode and verify
     /// windows keep the fused projections and the small-window MoE kernels.
@@ -140,6 +144,38 @@ enum TrackP12Prefill {
         TrackFastKernels.GDNGeometry(
             projWidth: g.convDim, convDim: g.convDim, convKernel: g.convKernel,
             hk: g.hk, hv: g.hv, dk: g.dk, dv: g.dv, bOffset: g.bOffset, aOffset: g.aOffset)
+    }
+
+    /// MLXFAST-ZREC: the unchanged gated-RMS body with the z operand bound
+    /// FIRST. MLX builds its eval tape breadth-first from the outputs and runs
+    /// it back to front (transforms.cpp eval_impl), so the later-bound producer
+    /// of a consumer is dispatched earlier: binding [z, y, w] dispatches the
+    /// recurrence before the z GEMM, and the GEMM (which reads only x and the
+    /// weights) joins the recurrence's barrier epoch (device.cpp
+    /// maybeInsertBarrier) instead of the prep kernel's. The body addresses its
+    /// operands by name only, so reordering `inputNames` changes nothing else.
+    nonisolated(unsafe) private static let gatedRMSZFirstKernel = MLXFast.metalKernel(
+        name: "track_p12_gated_rms_z_first",
+        inputNames: ["proj", "y", "w"],
+        outputNames: ["out"],
+        source: TrackFastKernels.gatedRMSSource,
+        header: TrackFastKernels.exactHeader, ensureRowContiguous: true)
+
+    /// Same template, grid and output as `TrackFastKernels.gatedRMS` with the
+    /// z projection as its own buffer (`PW` = its width, `Z_OFF` = 0).
+    static func gatedRMSZFirst(y: MLXArray, z: MLXArray, w: MLXArray, eps: Float) -> MLXArray {
+        let B = y.dim(0), S = y.dim(1), Hv = y.dim(2), Dv = y.dim(3)
+        precondition(
+            Dv == 128 && z.ndim == 3 && z.dim(0) == B && z.dim(1) == S
+                && z.dim(2) == Hv * Dv && z.dtype == y.dtype)
+        return gatedRMSZFirstKernel(
+            [z, y, w],
+            template: [
+                ("InT", y.dtype), ("Hv", Hv), ("Dv", Dv), ("PW", z.dim(2)),
+                ("Z_OFF", 0), ("EPS_BITS", Int(eps.bitPattern)),
+            ],
+            grid: (32, Hv, B * S), threadGroup: (32, 1, 1),
+            outputShapes: [[B, S, Hv * Dv]], outputDTypes: [y.dtype])[0]
     }
 
     nonisolated(unsafe) private static let splitAttnPrepKernel = MLXFast.metalKernel(
