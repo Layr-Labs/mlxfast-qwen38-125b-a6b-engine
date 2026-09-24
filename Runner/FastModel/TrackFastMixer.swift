@@ -40,7 +40,7 @@ enum TrackFastMixerKernels {
         if (tile < NT) {
             if constexpr (VPT == 1) {
                 float r[RPS];
-                qmv_fast_reg<T, GS, BITS, RPS>(wd, sd, bd, normed, KD, tile * (2 * RPS) + (int)sg * RPS, lid, r);
+                qmv_fast_reg<T, GS, BITS, RPS, LUT>(wd, sd, bd, normed, KD, tile * (2 * RPS) + (int)sg * RPS, lid, r);
                 if (lid == 0) {
                     for (int i = 0; i < RPS; ++i) {
                         const T l = static_cast<T>(r[i]);
@@ -110,11 +110,13 @@ enum TrackFastMixerKernels {
         let rowsPerSimdgroup = S == 1 ? downRowsPerSimdgroup : 4
         // MLXFAST-INJSPLIT: add two inject tiles only to the one-token path.
         let tiles = ND / (2 * rowsPerSimdgroup) + (inject != nil ? (S == 1 ? 2 : 1) : 0)
+        let useLut = S == 1 && down.meta != nil && inj.meta != nil
         let outs = (S == 1 ? downInjectKernel1 : downInjectKernel)(
-            [normed, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
+            [normed, down.weight, useLut ? down.meta!.index : down.scales, useLut ? down.meta!.table : down.biases!,
+             inj.weight, useLut ? inj.meta!.index : inj.scales, useLut ? inj.meta!.table : inj.biases!],
             template: [
                 ("T", normed.dtype), ("GS", down.groupSize), ("BITS", down.bits), ("KD", KD), ("ND", ND),
-                ("HC", HC), ("VPT", S), ("HAS_INJECT", inject != nil),
+                ("HC", HC), ("VPT", S), ("HAS_INJECT", inject != nil), ("LUT", useLut),
             ],
             grid: (32, tiles * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [[S, ND], [S, ND], [S, HC]], outputDTypes: [normed.dtype, normed.dtype, normed.dtype])
@@ -140,11 +142,11 @@ enum TrackFastMixerKernels {
         if constexpr (VPT == 1) {
             float r[4];
             if constexpr (PACKED_ROWS) {
-                qmv_reg<T, GS, BITS, (LW % get_pack_factor<BITS, 32>()) == 0>(wu, su, bu, act, LW, tile * 8 + (int)sg * 4, lid, r);
+                qmv_reg<T, GS, BITS, (LW % get_pack_factor<BITS, 32>()) == 0, 4, LUT>(wu, su, bu, act, LW, tile * 8 + (int)sg * 4, lid, r);
             } else {
                 int rows[4];
                 for (int i = 0; i < 4; ++i) { const int s = (int)sg * 4 + i; rows[i] = d0 + (s & 1) + H * (s >> 1); }
-                qmv_reg_rows<T, GS, BITS, false, (LW % get_pack_factor<BITS, 32>()) == 0>(wu, su, bu, act, LW, rows, lid, r);
+                qmv_reg_rows<T, GS, BITS, false, (LW % get_pack_factor<BITS, 32>()) == 0, LUT>(wu, su, bu, act, LW, rows, lid, r);
             }
             if (lid < 4 && (int)(sg * 2 + lid / 2) < HC) {
                 const int slot = (int)sg * 4 + (int)lid;
@@ -206,11 +208,12 @@ enum TrackFastMixerKernels {
         precondition(LW % 32 == 0 && LW < 512 + 256)  // K = 320: one full block + a tail, the `qmv` normal branch
         let sigmoidTable = act.dtype == .bfloat16 ? TrackBF16Functions.sigmoid : normed
         precondition(!packedRows || (S == 1 && hcCount == 4))
+        let useLut = S == 1 && up.meta != nil
         let outs = (S == 1 ? upMixKernel1 : upMixKernel)(
-            [act, normed, up.weight, up.scales, up.biases!, inj, sigmoidTable],
+            [act, normed, up.weight, useLut ? up.meta!.index : up.scales, useLut ? up.meta!.table : up.biases!, inj, sigmoidTable],
             template: [
                 ("T", act.dtype), ("GS", up.groupSize), ("BITS", up.bits), ("H", hidden), ("HC", hcCount),
-                ("LW", LW), ("VPT", S), ("HAS_INJECT", hasInject), ("EMIT_F32", emitF32),
+                ("LW", LW), ("VPT", S), ("HAS_INJECT", hasInject), ("EMIT_F32", emitF32), ("LUT", useLut),
                 ("PACKED_ROWS", packedRows),
             ],
             grid: (32, (hidden / 2) * 2, 1), threadGroup: (32, 2, 1),
