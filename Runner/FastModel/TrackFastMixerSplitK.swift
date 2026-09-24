@@ -1,11 +1,11 @@
-// MLXFAST-REDRAW-20260924-161452-D1: independent official re-measurement marker.
+// MLXFAST-REDRAW-20260924-171512-D1: independent official re-measurement marker.
 import MLX
 
 // Partition HC input blocks across SIMD groups while retaining each lane's
 // ascending block fold and the final simd_sum. No target weight changes.
 enum TrackFastMixerSplitK {
     // Four partitions in production; zero selects the original A/B control.
-    nonisolated(unsafe) static var split = 5
+    nonisolated(unsafe) static var split: Int = 5
     static let helper = #"""
         template <typename T, int K, int V, int R, int SPLIT, bool ORDERED, bool LUT = false>
         METAL_FUNC void research_split_qmv(
