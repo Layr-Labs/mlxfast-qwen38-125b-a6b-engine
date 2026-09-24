@@ -1205,6 +1205,20 @@ inline constexpr short get_bytes_per_pack() {
 }
 
 
+// Metadata source of a quantized tile: the bf16 scale/bias arrays, or (LUT)
+// a u16 pair index per group and the tensor's u32 table of distinct
+// (scale_bits | bias_bits << 16) pairs. The same bf16 bits come out either way.
+template <typename T, bool LUT>
+struct prefill_meta {
+  typedef const device T* S;
+  typedef const device T* B;
+};
+template <typename T>
+struct prefill_meta<T, true> {
+  typedef const device ushort* S;
+  typedef const device uint* B;
+};
+
 template <
     typename T,
     short BROWS,
@@ -1213,7 +1227,8 @@ template <
     short reduction_dim,
     short tgp_size,
     short group_size,
-    short bits>
+    short bits,
+    bool LUT = false>
 struct QuantizedBlockLoader;
 
 template <
@@ -1223,7 +1238,8 @@ template <
     short dst_ld,
     short reduction_dim,
     short tgp_size,
-    short bits>
+    short bits,
+    bool LUT>
 struct QuantizedBlockLoader<
     T,
     BROWS,
@@ -1232,8 +1248,10 @@ struct QuantizedBlockLoader<
     reduction_dim,
     tgp_size,
     32,
-    bits> {
+    bits,
+    LUT> {
   MLX_MTL_CONST short group_size = 32;
+  MLX_MTL_CONST bool lut = LUT;
 
   static_assert(
       BCOLS % group_size == 0,
@@ -1266,13 +1284,13 @@ struct QuantizedBlockLoader<
 
   threadgroup T* dst;
   const device uint8_t* src;
-  const device T* scales;
-  const device T* biases;
+  typename prefill_meta<T, LUT>::S scales;
+  typename prefill_meta<T, LUT>::B biases;  // LUT: the unoffset table
 
   QuantizedBlockLoader(
       const device uint8_t* src_,
-      const device T* scales_,
-      const device T* biases_,
+      typename prefill_meta<T, LUT>::S scales_,
+      typename prefill_meta<T, LUT>::B biases_,
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -1290,16 +1308,16 @@ struct QuantizedBlockLoader<
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
         scales(scales_ + bi * src_ld / group_size + group_id),
-        biases(biases_ + bi * src_ld / group_size + group_id) {}
+        biases(LUT ? biases_ : biases_ + bi * src_ld / group_size + group_id) {}
 
   void next() thread {
     src += tile_stride;
     if (reduction_dim == 1) {
       scales += n_groups;
-      biases += n_groups;
+      if constexpr (!LUT) { biases += n_groups; }
     } else {
       scales += group_stride;
-      biases += group_stride;
+      if constexpr (!LUT) { biases += group_stride; }
     }
   }
 };
@@ -1317,8 +1335,14 @@ struct PackedNAXGroup32 {
     const device uint32_t* src =
         reinterpret_cast<const device uint32_t*>(loader.src);
     words = uint4(src[0], src[1], src[2], src[3]);
-    scale = *loader.scales;
-    bias = *loader.biases;
+    if constexpr (Loader::lut) {
+      const uint p = loader.biases[*loader.scales];
+      scale = as_type<bfloat16_t>(ushort(p & 0xffffu));
+      bias = as_type<bfloat16_t>(ushort(p >> 16));
+    } else {
+      scale = *loader.scales;
+      bias = *loader.biases;
+    }
   }
 
   template <typename T>
@@ -1366,12 +1390,13 @@ template <
     int WN,
     bool transpose,
     int NS,
-    bool IDENTITY_ROWS = false>
+    bool IDENTITY_ROWS = false,
+    bool LUT = false>
 METAL_FUNC void track_prefill_indirect(
     const device T* x,
     const device uint32_t* w,
-    const device T* scales,
-    const device T* biases,
+    typename prefill_meta<T, LUT>::S scales,
+    typename prefill_meta<T, LUT>::B biases,
     const device uint32_t* indices,
     const device uint32_t* token_rows,
     const device uint32_t* tiles,
@@ -1396,7 +1421,7 @@ METAL_FUNC void track_prefill_indirect(
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   constexpr int BKA_padded = BK_padded;
   using loader_w_t = QuantizedBlockLoader<
-      T, BN, BK, BK_padded, transpose, WM * WN * SIMD_SIZE, group_size, bits>;
+      T, BN, BK, BK_padded, transpose, WM * WN * SIMD_SIZE, group_size, bits, LUT>;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -1408,7 +1433,7 @@ METAL_FUNC void track_prefill_indirect(
   auto wl = (const device uint8_t*)w;
   wl += size_t(y_col) * K_w;
   scales += size_t(y_col) * K_g;
-  biases += size_t(y_col) * K_g;
+  if constexpr (!LUT) { biases += size_t(y_col) * K_g; }
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
@@ -1487,7 +1512,7 @@ METAL_FUNC void track_prefill_indirect(
     thread loader_w_t loader_w(
         wl + index * stride_w,
         scales + index * stride_s,
-        biases + index * stride_s,
+        LUT ? biases : biases + index * stride_s,
         K,
         Ws,
         simd_group_id,
@@ -1628,15 +1653,16 @@ template <
     int WN,
     bool transpose,
     bool SILU,
-    int NS>
+    int NS,
+    bool LUT = false>
 METAL_FUNC void track_prefill_indirect_gu(
     const device T* x,
     const device uint32_t* w0,
-    const device T* scales0,
-    const device T* biases0,
+    typename prefill_meta<T, LUT>::S scales0,
+    typename prefill_meta<T, LUT>::B biases0,
     const device uint32_t* w1,
-    const device T* scales1,
-    const device T* biases1,
+    typename prefill_meta<T, LUT>::S scales1,
+    typename prefill_meta<T, LUT>::B biases1,
     const device uint32_t* indices,
     const device uint32_t* token_rows,
     const device uint32_t* tiles,
@@ -1663,7 +1689,7 @@ METAL_FUNC void track_prefill_indirect_gu(
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   constexpr int BKA_padded = BK_padded;
   using loader_w_t = QuantizedBlockLoader<
-      T, BN, BK, BK_padded, transpose, WM * WN * SIMD_SIZE, group_size, bits>;
+      T, BN, BK, BK_padded, transpose, WM * WN * SIMD_SIZE, group_size, bits, LUT>;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -1675,9 +1701,11 @@ METAL_FUNC void track_prefill_indirect_gu(
   auto wl0 = (const device uint8_t*)w0 + size_t(y_col) * K_w;
   auto wl1 = (const device uint8_t*)w1 + size_t(y_col) * K_w;
   scales0 += size_t(y_col) * K_g;
-  biases0 += size_t(y_col) * K_g;
   scales1 += size_t(y_col) * K_g;
-  biases1 += size_t(y_col) * K_g;
+  if constexpr (!LUT) {
+    biases0 += size_t(y_col) * K_g;
+    biases1 += size_t(y_col) * K_g;
+  }
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
@@ -1758,7 +1786,7 @@ METAL_FUNC void track_prefill_indirect_gu(
     thread loader_w_t loader_w0(
         wl0 + index * stride_w,
         scales0 + index * stride_s,
-        biases0 + index * stride_s,
+        LUT ? biases0 : biases0 + index * stride_s,
         K,
         Ws0,
         simd_group_id,
@@ -1766,7 +1794,7 @@ METAL_FUNC void track_prefill_indirect_gu(
     thread loader_w_t loader_w1(
         wl1 + index * stride_w,
         scales1 + index * stride_s,
-        biases1 + index * stride_s,
+        LUT ? biases1 : biases1 + index * stride_s,
         K,
         Ws1,
         simd_group_id,

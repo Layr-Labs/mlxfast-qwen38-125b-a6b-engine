@@ -109,6 +109,7 @@ struct TrackMixerActBlockLoader<
     tgp_size,
     32,
     bits> {
+  MLX_MTL_CONST bool lut = false;  // bf16 scale/bias source (see prefill_meta)
   MLX_MTL_CONST short group_size = 32;
 
   static_assert(

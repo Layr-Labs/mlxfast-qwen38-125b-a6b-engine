@@ -98,9 +98,14 @@ enum TrackPrefillIndirect {
         let experts = g.w.dim(0)
         let tiles = tileTable(sortedIDs: sortedIDs, rows: rows, experts: experts)
         let maxT = maxTiles(rows: rows, experts: experts)
+        // The expert stacks' pair index, when built: the loader then streams a
+        // u16 per group and reads the pair from the resident table (same bits).
+        let em = m.expertMeta
+        let useLut = em != nil
         let activated = gateUpKernel(
-            [x, g.w, g.s, g.b, u.w, u.s, u.b, sortedIDs, tokenRows, tiles],
-            template: [("T", x.dtype), ("N", 640), ("K", 2560), ("SILU", true)],
+            [x, g.w, useLut ? em!.gate.index : g.s, useLut ? em!.gate.table : g.b,
+             u.w, useLut ? em!.up.index : u.s, useLut ? em!.up.table : u.b, sortedIDs, tokenRows, tiles],
+            template: [("T", x.dtype), ("N", 640), ("K", 2560), ("SILU", true), ("LUT", useLut)],
             grid: (10 * 32, maxT * 2, 2),
             threadGroup: (32, 2, 2),
             outputShapes: [[rows, 1, 640]], outputDTypes: [.bfloat16])[0]
@@ -120,9 +125,10 @@ enum TrackPrefillIndirect {
             d.w.dtype == .uint32, d.s.dtype == .bfloat16, d.b.dtype == .bfloat16
         else { return nil }
         let maxT = maxTiles(rows: rows, experts: d.w.dim(0))
+        let dm = m.expertMeta?.down
         return kernel(
-            [activated, d.w, d.s, d.b, sortedIDs, sortedIDs, tiles],
-            template: [("T", activated.dtype), ("N", 2560), ("K", 640)],
+            [activated, d.w, dm?.index ?? d.s, dm?.table ?? d.b, sortedIDs, sortedIDs, tiles],
+            template: [("T", activated.dtype), ("N", 2560), ("K", 640), ("LUT", dm != nil)],
             grid: ((2560 / downBlockN) * 32, maxT * 2, 2),
             threadGroup: (32, 2, 2),
             outputShapes: [[rows, 1, 2560]], outputDTypes: [.bfloat16])[0]
@@ -132,7 +138,7 @@ enum TrackPrefillIndirect {
         alignas(16) threadgroup T Ws0[64 * 72];
         alignas(16) threadgroup T Ws1[64 * 72];
         alignas(16) threadgroup T As[32 * 72];
-        track_prefill_indirect_gu<T, 32, 4, 32, 64, 64, 2, 2, true, SILU, N>(
+        track_prefill_indirect_gu<T, 32, 4, 32, 64, 64, 2, 2, true, SILU, N, LUT>(
             x, w0, scales0, biases0, w1, scales1, biases1, indices, token_rows, tiles,
             y0, y1, N, K, Ws0, Ws1, As, threadgroup_position_in_grid,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
@@ -143,7 +149,7 @@ enum TrackPrefillIndirect {
     static let sourceDown = #"""
         alignas(16) threadgroup T Ws[128 * 40];
         alignas(16) threadgroup T As[32 * 40];
-        track_prefill_indirect<T, 32, 4, 32, 128, 32, 2, 2, true, N, true>(
+        track_prefill_indirect<T, 32, 4, 32, 128, 32, 2, 2, true, N, true, LUT>(
             x, w, scales, biases, indices, token_rows, tiles, y,
             N, K, Ws, As, threadgroup_position_in_grid,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
@@ -152,7 +158,7 @@ enum TrackPrefillIndirect {
     static let source = #"""
         alignas(16) threadgroup T Ws[64 * 72];
         alignas(16) threadgroup T As[32 * 72];
-        track_prefill_indirect<T, 32, 4, 32, 64, 64, 2, 2, true, N>(
+        track_prefill_indirect<T, 32, 4, 32, 64, 64, 2, 2, true, N, false, LUT>(
             x, w, scales, biases, indices, token_rows, tiles, y,
             N, K, Ws, As, threadgroup_position_in_grid,
             simdgroup_index_in_threadgroup, thread_index_in_simdgroup);

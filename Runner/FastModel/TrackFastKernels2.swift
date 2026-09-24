@@ -79,6 +79,12 @@ extension TrackFastKernels {
         if (HAS_INJECT) { inj_t = inject[row * HC + hc]; inj = static_cast<float>(inj_t); }
         (void)inj;
         float thread_x[N_READS];
+        // MLXFAST-PRESCALE: source-time choice; the scale row a thread needs in
+        // the epilogue depends on neither the group sum nor the barrier, so it
+        // is fetched in the streaming pass and its latency overlaps the two
+        // reductions. Set to false for the original post-barrier fetch.
+        constexpr bool PRESCALE = true;
+        InT thread_s[N_READS];
         float acc = 0.0f;
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
@@ -91,6 +97,7 @@ extension TrackFastKernels {
             stream[base + d] = r;
             thread_x[i] = static_cast<float>(r);
             acc += thread_x[i] * thread_x[i];
+            if constexpr (PRESCALE) { thread_s[i] = scale[hc * H + d]; }
         }
         acc = simd_sum(acc);
         constexpr uint simd_groups = (H + 32 * N_READS - 1) / (32 * N_READS);
@@ -102,7 +109,8 @@ extension TrackFastKernels {
         for (int i = 0; i < N_READS; ++i) {
             const uint d = lid * N_READS + i;
             InT n = static_cast<InT>(thread_x[i] * inv_mean);
-            normed[base + d] = n * scale[hc * H + d];
+            const InT s = PRESCALE ? thread_s[i] : scale[hc * H + d];
+            normed[base + d] = n * s;
         }
         """
 
@@ -582,11 +590,11 @@ extension TrackFastKernels {
         // `qmv_impl`'s `out_vec_size < num_simdgroups * results_per_simdgroup`
         // branch with compile-time sizes and the K walk unrolled. Same lanes,
         // same per-lane accumulation order, same simd_sum.
-        template <typename T, int group_size, int bits, int in_vec_size, int out_vec_size, int UNR>
+        template <typename T, int group_size, int bits, int in_vec_size, int out_vec_size, int UNR, bool LUT = false>
         METAL_FUNC void track_inject_qmv(
             const device uint32_t* w,
-            const device T* scales,
-            const device T* biases,
+            typename track_meta<T, LUT>::S scales,
+            typename track_meta<T, LUT>::B biases,
             const device T* x,
             device T* y,
             uint simd_gid,
@@ -615,7 +623,7 @@ extension TrackFastKernels {
           }
           ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
           scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-          biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          if (!LUT) { biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread; }
           x += simd_lid * values_per_thread;
           y += out_row;
 
@@ -630,15 +638,15 @@ extension TrackFastKernels {
             U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
             for (int row = 0; row < NR; row++) {
               auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-              const device T* sl = scales + row * in_vec_size_g;
-              const device T* bl = biases + row * in_vec_size_g;
-              U s = sl[0];
-              U b = bl[0];
+              auto sl = scales + row * in_vec_size_g;
+              auto bl = LUT ? biases : (biases + row * in_vec_size_g);
+              U s, b;
+              track_meta<T, LUT>::load(sl, bl, s, b);
               result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
             }
             ws += block_size * bytes_per_pack / pack_factor;
             scales += block_size / group_size;
-            biases += block_size / group_size;
+            if (!LUT) { biases += block_size / group_size; }
             x += block_size;
           }
           constexpr int k_end = NFULL * block_size;
@@ -657,10 +665,10 @@ extension TrackFastKernels {
               U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
               for (int row = 0; row < NR; row++) {
                 auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-                const device T* sl = scales + row * in_vec_size_g;
-                const device T* bl = biases + row * in_vec_size_g;
-                U s = sl[0];
-                U b = bl[0];
+                auto sl = scales + row * in_vec_size_g;
+                auto bl = LUT ? biases : (biases + row * in_vec_size_g);
+                U s, b;
+                track_meta<T, LUT>::load(sl, bl, s, b);
                 result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
               }
             }
@@ -668,10 +676,10 @@ extension TrackFastKernels {
             U sum = load_vector_safe<T, U, values_per_thread, bits>(x, x_thread, remaining);
             for (int row = 0; row < NR; row++) {
               auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-              const device T* sl = scales + row * in_vec_size_g;
-              const device T* bl = biases + row * in_vec_size_g;
-              U s = sl[0];
-              U b = bl[0];
+              auto sl = scales + row * in_vec_size_g;
+              auto bl = LUT ? biases : (biases + row * in_vec_size_g);
+              U s, b;
+              track_meta<T, LUT>::load(sl, bl, s, b);
               result[row] += qdot_safe<U, values_per_thread, bits>(wl, x_thread, s, b, sum, remaining);
             }
           }
@@ -687,11 +695,11 @@ extension TrackFastKernels {
         // only the base addresses. Lane-to-K mapping, ascending block updates,
         // qdot/qdot_safe, and simd_sum are verbatim from track_inject_qmv above.
         // UNR is a scheduling hint only; never split or reassociate the sum.
-        template <typename T, int group_size, int bits, int in_vec_size, int ROW, int UNR = 8>
+        template <typename T, int group_size, int bits, int in_vec_size, int ROW, int UNR = 8, bool LUT = false>
         METAL_FUNC void track_inject_qmv_row(
             const device uint32_t* w,
-            const device T* scales,
-            const device T* biases,
+            typename track_meta<T, LUT>::S scales,
+            typename track_meta<T, LUT>::B biases,
             const device T* x,
             device T* y,
             uint simd_lid) {
@@ -715,7 +723,7 @@ extension TrackFastKernels {
           constexpr int out_row = ROW;
           ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
           scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-          biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+          if (!LUT) { biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread; }
           x += simd_lid * values_per_thread;
           y += out_row;
 
@@ -727,15 +735,15 @@ extension TrackFastKernels {
             U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
             for (int row = 0; row < NR; row++) {
               auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-              const device T* sl = scales + row * in_vec_size_g;
-              const device T* bl = biases + row * in_vec_size_g;
-              U s = sl[0];
-              U b = bl[0];
+              auto sl = scales + row * in_vec_size_g;
+              auto bl = LUT ? biases : (biases + row * in_vec_size_g);
+              U s, b;
+              track_meta<T, LUT>::load(sl, bl, s, b);
               result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
             }
             ws += block_size * bytes_per_pack / pack_factor;
             scales += block_size / group_size;
-            biases += block_size / group_size;
+            if (!LUT) { biases += block_size / group_size; }
             x += block_size;
           }
           constexpr int k_end = NFULL * block_size;
@@ -754,10 +762,10 @@ extension TrackFastKernels {
               U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
               for (int row = 0; row < NR; row++) {
                 auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-                const device T* sl = scales + row * in_vec_size_g;
-                const device T* bl = biases + row * in_vec_size_g;
-                U s = sl[0];
-                U b = bl[0];
+                auto sl = scales + row * in_vec_size_g;
+                auto bl = LUT ? biases : (biases + row * in_vec_size_g);
+                U s, b;
+                track_meta<T, LUT>::load(sl, bl, s, b);
                 result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
               }
             }
@@ -765,10 +773,10 @@ extension TrackFastKernels {
             U sum = load_vector_safe<T, U, values_per_thread, bits>(x, x_thread, remaining);
             for (int row = 0; row < NR; row++) {
               auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-              const device T* sl = scales + row * in_vec_size_g;
-              const device T* bl = biases + row * in_vec_size_g;
-              U s = sl[0];
-              U b = bl[0];
+              auto sl = scales + row * in_vec_size_g;
+              auto bl = LUT ? biases : (biases + row * in_vec_size_g);
+              U s, b;
+              track_meta<T, LUT>::load(sl, bl, s, b);
               result[row] += qdot_safe<U, values_per_thread, bits>(wl, x_thread, s, b, sum, remaining);
             }
           }
