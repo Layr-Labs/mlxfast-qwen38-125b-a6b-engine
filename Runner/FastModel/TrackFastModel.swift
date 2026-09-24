@@ -716,9 +716,20 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 dtBias: g.dtBias, stateIn: ssm, T: S, capture: capture, geometry: geo,
                 separateBA: split.map { (b: $0[2], a: $0[3]) })
             if prof { TrackFastProfile.tick("gdn.prep+lean", &pt, [r.y, r.stateOut, r.convOut]) }
-            gated = TrackFastKernels.gatedRMS(
-                y: r.y, proj: split?[1] ?? proj, w: g.normW,
-                zOffset: separate ? 0 : g.zOffset, eps: 1e-6)
+            if separate && TrackP12Prefill.zAfterRecurrence, let zPart = split?[1] {
+                // MLXFAST-ZREC: end the command buffer at the prep kernel
+                // (conv_out is a sibling of the prep outputs and excludes the
+                // recurrence), so the recurrence and the z GEMM always open a
+                // fresh encoder together, recurrence first. Without it, a size
+                // commit landing after the recurrence would push the z GEMM into
+                // an encoder whose fence waits on the recurrence.
+                if TrackP12Prefill.recurrenceBoundary { asyncEval(r.convOut) }
+                gated = TrackP12Prefill.gatedRMSZFirst(y: r.y, z: zPart, w: g.normW, eps: 1e-6)
+            } else {
+                gated = TrackFastKernels.gatedRMS(
+                    y: r.y, proj: split?[1] ?? proj, w: g.normW,
+                    zOffset: separate ? 0 : g.zOffset, eps: 1e-6)
+            }
             (convOut, stateOut) = (r.convOut, r.stateOut)
             if prof { TrackFastProfile.tick("gdn.gatedRMS", &pt, [gated]) }
         }
