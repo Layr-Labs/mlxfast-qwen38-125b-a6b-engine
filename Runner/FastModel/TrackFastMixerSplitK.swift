@@ -7,10 +7,10 @@ enum TrackFastMixerSplitK {
     // Four partitions in production; zero selects the original A/B control.
     nonisolated(unsafe) static var split = 5
     static let helper = #"""
-        template <typename T, int K, int V, int R, int SPLIT, bool ORDERED>
+        template <typename T, int K, int V, int R, int SPLIT, bool ORDERED, bool LUT = false>
         METAL_FUNC void research_split_qmv(
-            const device uint32_t* w, const device T* scales,
-            const device T* biases, const device T* x, int row,
+            const device uint32_t* w, typename track_meta<T, LUT>::S scales,
+            typename track_meta<T, LUT>::B biases, const device T* x, int row,
             uint sg, uint lane, threadgroup float* scratch,
             thread float (&result)[R]) {
             constexpr int BLOCK = V * 32;
@@ -27,7 +27,9 @@ enum TrackFastMixerSplitK {
                     const device uint8_t* wp = (const device uint8_t*)w
                         + (row + r) * (K / 2) + column / 2;
                     const int qi = (row + r) * (K / 32) + column / 32;
-                    float v = qdot<float, V, 4>(wp, xv, float(scales[qi]), float(biases[qi]), sum);
+                    float sv, bv;
+                    track_meta<T, LUT>::load(scales + qi, LUT ? biases : (biases + qi), sv, bv);
+                    float v = qdot<float, V, 4>(wp, xv, sv, bv, sum);
                     if constexpr (ORDERED) { scratch[(b * R + r) * 32 + lane] = v; }
                     else { partial[r] += v; }
                 }
@@ -37,7 +39,8 @@ enum TrackFastMixerSplitK {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (sg == 0) {
-                for (int b = 0; b < (ORDERED ? NB : SPLIT); ++b) {
+                for (int r = 0; r < R; ++r) { result[r] = scratch[r * 32 + lane]; }
+                for (int b = 1; b < (ORDERED ? NB : SPLIT); ++b) {
                     for (int r = 0; r < R; ++r) { result[r] += scratch[(b * R + r) * 32 + lane]; }
                 }
                 for (int r = 0; r < R; ++r) { result[r] = simd_sum(result[r]); }
@@ -54,7 +57,7 @@ enum TrackFastMixerSplitK {
         threadgroup float scratch[DOWN_SCRATCH > INJ_SCRATCH ? DOWN_SCRATCH : INJ_SCRATCH];
         if (tile < DN) {
             float r[RPS];
-            research_split_qmv<T, K, 16, RPS, SPLIT, ORDERED>(
+            research_split_qmv<T, K, 16, RPS, SPLIT, ORDERED, LUT>(
                 wd, sd, bd, x, tile * RPS, sg, lane, scratch, r);
             if (sg == 0 && lane == 0) {
                 for (int i = 0; i < RPS; ++i) {
@@ -65,7 +68,7 @@ enum TrackFastMixerSplitK {
             }
         } else if (HAS_INJECT) {
             float r[1];
-            research_split_qmv<T, K, 8, 1, SPLIT, ORDERED>(
+            research_split_qmv<T, K, 8, 1, SPLIT, ORDERED, LUT>(
                 wi, si, bi, x, tile - DN, sg, lane, scratch, r);
             if (sg == 0 && lane == 0) { inj[tile - DN] = static_cast<T>(r[0]); }
         }
@@ -81,9 +84,11 @@ enum TrackFastMixerSplitK {
         let rows = 2, partitions = split
         let inj = inject ?? down
         precondition(x.shape == [1, k] && k % 512 == 0 && n % rows == 0 && partitions > 0)
-        return fusedKernel([x, down.weight, down.scales, down.biases!, inj.weight, inj.scales, inj.biases!],
+        let useLut = down.meta != nil && inj.meta != nil
+        return fusedKernel([x, down.weight, useLut ? down.meta!.index : down.scales, useLut ? down.meta!.table : down.biases!,
+                            inj.weight, useLut ? inj.meta!.index : inj.scales, useLut ? inj.meta!.table : inj.biases!],
             template: [("T", x.dtype), ("K", k), ("ND", n), ("RPS", rows), ("SPLIT", partitions),
-                       ("ORDERED", true), ("HAS_INJECT", inject != nil)],
+                       ("ORDERED", true), ("HAS_INJECT", inject != nil), ("LUT", useLut)],
             grid: (32, (n / rows + (inject != nil ? hc : 0)) * partitions, 1), threadGroup: (32, partitions, 1),
             outputShapes: [[1, n], [1, n], [1, hc]], outputDTypes: [x.dtype, x.dtype, x.dtype])
     }
