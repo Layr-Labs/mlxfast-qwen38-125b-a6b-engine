@@ -645,13 +645,13 @@ public final class TrackQwen4ExpFastModel: Module, @unchecked Sendable {
                 ? concatenated(a.qkv.parts.prefix(3).map { $0.apply(x) }, axis: -1)
                 : a.qkv.apply(x)
         }
+        let prof = TrackFastProfile.prefill != nil && S >= TrackFastProfile.minWindow
+        var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
+        if prof { TrackFastProfile.tick("attn.qkv", &pt, [qkv]) }
         // The indexer tape first: its truncation reads the pre-update offset.
         // Past the budget the indexer also needs its queries, which only the
         // full projection carries; its keys keep coming from the same rows
         // as below the budget.
-        let prof = TrackFastProfile.prefill != nil && S >= TrackFastProfile.minWindow
-        var pt = prof ? CFAbsoluteTimeGetCurrent() : 0
-        if prof { TrackFastProfile.tick("attn.qkv", &pt, [qkv]) }
         let pastBudget = offset + S > indexerBudget
         let idxFull: MLXArray? = (S > 8 || pastBudget) ? a.indexerFull.apply(x) : nil
         let idxKeys: MLXArray

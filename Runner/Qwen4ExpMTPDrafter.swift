@@ -363,17 +363,19 @@ extension TrackQwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             // accumulates.
             let width = feed.tokens.dim(1)
             var start = 0
-            var last: (draft: MLXArray, multi: MLXArray)? = nil
-            while start < width {
-                let end = min(start + Self.headFlushChunk, width)
-                last = headStep(
+            while width - start > Self.headFlushChunk {
+                let end = start + Self.headFlushChunk
+                _ = headStep(
                     tokens: feed.tokens[0..., start ..< end],
                     multiStream: feed.multi[0..., start ..< end, 0...],
                     cache: state.caches, stepIndex: state.roundDraftSteps)
-                if end < width { eval(state.caches.flatMap { $0.innerState() }) }
+                eval(state.caches.flatMap { $0.innerState() })
                 start = end
             }
-            step = last!
+            step = headStep(
+                tokens: feed.tokens[0..., start ..< width],
+                multiStream: feed.multi[0..., start ..< width, 0...],
+                cache: state.caches, stepIndex: state.roundDraftSteps)
         } else {
             step = headStep(
                 tokens: feed.tokens, multiStream: feed.multi, cache: state.caches,
