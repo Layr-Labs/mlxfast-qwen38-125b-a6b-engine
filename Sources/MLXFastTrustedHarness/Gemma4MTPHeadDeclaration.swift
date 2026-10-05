@@ -76,10 +76,11 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
         self.maxBytes = maxBytes
     }
 
-    /// 2 GiB. Mirrored in `mtp-head.manifest.json` (`max_bytes`) and in the
-    /// contract manifest's `editableSurfaceByteBudget.exemptPathMaxBytes`; a
-    /// declaration may lower it and may not raise it.
-    public static let defaultMaxBytes = 2_147_483_648
+    /// 4 GiB. Raised from 2 GiB on 2026-09-12, when the served head became
+    /// the 8-bit one: its 76 tensors are 2,934,230,336 bytes, above the old
+    /// cap. Mirrored in `mtp-head.manifest.json` (`max_bytes`); a declaration
+    /// may lower it and may not raise it.
+    public static let defaultMaxBytes = 4_294_967_296
 
     /// The default when no manifest exists at all.
     public static let pinnedDefault = Gemma4MTPHeadDeclaration(source: .pinned)

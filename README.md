@@ -63,6 +63,11 @@ tested against.
   safetensors shards. Add the KV cache and the decode buffers on top of that.
 - At least 260 GiB of free disk space before the download starts. Change this
   limit with `MLXFAST_REFERENCE_MIN_FREE_GIB`.
+- 5.6 GB more for the served MTP head's source: the two shards of the
+  publisher's 8-bit conversion that carry the head, plus its config
+  (`fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256`). `./setup.sh`
+  downloads them beside the target. Their own floor is 12 GiB
+  (`MLXFAST_MTP_HEAD_SOURCE_MIN_FREE_GIB`).
 - macOS 14 or later. `Package.swift` sets that platform floor. CI builds on a
   `macos-26` runner, and the Metal toolchain policy in `setup.sh` treats
   macOS 26 as its own case.
@@ -141,8 +146,9 @@ The helper clears inherited `MLXFAST_BASELINE_WORKSPACE` and
 `MLXFAST_BASELINE_CALIBRATION` for its child process, so an operator shell's
 ranked settings cannot select paired scoring here.
 
-There is no head-staging step. The MTP head ships inside the pinned target
-checkpoint. See [The MTP head is embedded](#the-mtp-head-is-embedded).
+There is no head-staging step. `./setup.sh` provisions the served MTP head's
+two source shards beside the target, and the transform splices that head into
+`weights/`. See [The MTP head is embedded](#the-mtp-head-is-embedded).
 
 `tools/local-baseline.sh --help` lists the optional environment overrides for
 the worker, golden, weights, and result path. Relative overrides resolve from
@@ -267,8 +273,16 @@ the runner refuses at load, and it names what is missing.
 
 ### The MTP head is embedded
 
-This track has exactly one speculative arm. It is the native MTP head, and the
-head ships inside the pinned target checkpoint.
+This track has exactly one speculative arm. It is the native MTP head. The
+head is embedded in the transformed tree the engine loads, under
+`language_model.mtp.*` in shard 22.
+
+**The served head is the 8-bit head** (David ruling 2026-09-12). The 4-bit
+target checkpoint carries its own 4-bit copy of the head. The transform does
+not serve that copy. It replaces the 76 head tensors with the same 76 tensors
+from the publisher's 8-bit conversion, `Vontra/Qwen3.8-Flash-Next-MLX-8bit-MTP`
+at revision `9c306179`. Only the head changes. The tower stays the pinned
+4-bit bytes, the target pin does not move, and no golden's provenance moves.
 
 | Property | Value |
 |---|---|
@@ -278,12 +292,23 @@ head ships inside the pinned target checkpoint.
 | Attention | Hybrid, full attention |
 | Embeddings | None of its own. It rides `language_model.embed_tokens`. |
 | Output head | None of its own. It rides `language_model.lm_head`. |
+| Served quantization | Affine, group size 32, 8 bits. 2,934,230,336 bytes. |
+| Source | Shards 41 and 42 of the 8-bit conversion, pinned per file in `fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256` |
 
-Nothing stages a head weight file. There is no head stager script and no head
-weights directory. No submission carries head weights, and the ranked box
-stages none.
+`./setup.sh` downloads and verifies those two shards and their config into a
+directory beside the target (`reference_weights/Qwen3.8-Flash-Next-MLX-8bit-MTP`
+by default, or the sibling of `MLXFAST_REFERENCE_DIR`). It passes that
+directory to the transform as `--head-source`. The transform refuses to run
+without it. The transform copies the head bytes out of those shards into
+shard 22 of `weights/`, and writes a `quantization` block that declares each
+head module at 8 bits (`mtp.*` entries) and the tower at 4 bits. The loader
+reads that block and quantizes the head modules at 8 bits. Nothing is decoded
+or re-encoded. The transform only copies bytes.
 
-`./setup.sh` provisions the target checkpoint, and the head arrives with it.
+Nothing stages a head weight file in a submission. There is no head stager
+script and no head weights directory in the editable surface. No submission
+carries head weights, and the ranked box stages only the two source shards,
+beside the target.
 
 ## What you may change
 
@@ -325,10 +350,13 @@ you may not upload head weights of your own. Custom head weights are not
 accepted on this track.
 
 `mtp-head.manifest.json` is a declaration. It stays editable and optional. It
-accepts `"source": "pinned"` only, which on this track means the head embedded
-in the pinned target checkpoint. `"source": "remote"` and `"source":
-"in_branch"` are refused by name. The declaration carries a 2 GiB cap
-(`max_bytes` = 2147483648); a declaration may lower it and may not raise it.
+accepts `"source": "pinned"` only, which on this track means the head the
+organizer pins: the 8-bit head the transform splices into the tree.
+`"source": "remote"` and `"source": "in_branch"` are refused by name. The
+declaration carries a 4 GiB cap (`max_bytes` = 4294967296, raised from 2 GiB
+on 2026-09-12 because the 8-bit head is 2.73 GiB); a declaration may lower
+it and may not raise it. A declaration that still states the old 2 GiB cap
+remains valid.
 
 An absent declaration selects the embedded head. That is the normal case. A
 declaration that is present but broken is a refusal. The runner never falls
@@ -428,7 +456,7 @@ optimizing the accepted one.
 
 The MTP head is a narrow exception, and the exception is re-quantization only.
 You may re-quantize the head. You may not replace it. The head stays within its
-2 GiB declaration cap. The head only proposes tokens, and the pinned target
+4 GiB declaration cap. The head only proposes tokens, and the pinned target
 decides every emitted token.
 
 ### What you must not change
@@ -738,6 +766,12 @@ The model port has landed: the engine constructs, gates, loads and runs
 `qwen4_exp_text`, and `Sources/MLXFastCore/Constants.swift` carries this
 target's geometry. `docs/qwen38-125b-a6b-port-notes.md` holds the detail.
 
+The served MTP head is the 8-bit head (David ruling 2026-09-12). The transform
+splices it in from the pinned 8-bit source shards. The serial-control leg does
+not use the head, so the reference tree, the per-box calibration and every
+serial golden are unchanged. `docs/qwen38-125b-a6b-port-notes.md` section 14
+holds the record.
+
 ## Submitting
 
 Use the Yukon CLI for every account operation and every submission operation.
@@ -783,14 +817,19 @@ No local run blocks the upload. Run the local test yourself before you submit.
 |---|---|
 | Target model | `Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP` @ `327c8a604de613b42f84ba5e6b796c0931e8aa3b` |
 | Target manifest | `fixtures/reference_qwen3_8_125b_a6b_4bit.sha256` (32 records, 113,233,030,116 bytes) |
-| MTP head | Embedded in the target checkpoint under `language_model.mtp.*` |
+| MTP head | Embedded in the transformed tree under `language_model.mtp.*`, served at 8 bits (David ruling 2026-09-12) |
+| MTP head source | `Vontra/Qwen3.8-Flash-Next-MLX-8bit-MTP` @ `9c306179562765396e197a8a7a5de1b6b761c41a`, shards 41 and 42 |
+| MTP head manifest | `fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256` (3 records, 5,564,655,839 bytes) |
+| Spliced shard 22 | `model-00022-of-00022.safetensors`, 5,018,468,984 bytes, sha256 `e255039300f0aff10efe95069c24e9c1b642f9824467bcdf80dd6dbb70e56f0d` (`fixtures/qwen3_8_125b_a6b_mtp_8bit_inventory.json`) |
 | Benchmarker | branch `qwen3.8-125b-a6b-v1` — the PROJECT channel, shared with the CUDA track — resolved at run time from that branch's dist channel (`benchd.manifest.json` is the authority for the bytes; `tools/fetch-benchd.sh` enforces it and logs the resolved `source_commit`/sha256) |
 | Track id | `qwen3.8-125b-a6b-mlx-v1` — the PLATFORM name: leaderboard namespace, runner labels, R2 prefix. NOT the bench branch. |
 | Engine fork revision | `449f2d01b39f9088739c98d80a4f8a1b3cfa105e` |
 
 The model repository is public. It downloads without a token. There is no
 organizer-hosted mirror for this checkpoint, so
-`MLXFAST_REFERENCE_FALLBACK_BASE_URL` is empty by default.
+`MLXFAST_REFERENCE_FALLBACK_BASE_URL` is empty by default. The head source
+repository is public too, and `MLXFAST_MTP_HEAD_SOURCE_FALLBACK_BASE_URL` is
+empty by default for the same reason.
 
 ### The target model
 

@@ -91,6 +91,14 @@ Scoring is single-stream. The fixture sets `scored_batch_size` to `1`. Each leg
 runs one stream, and the candidate leg runs with the MTP head at the declared
 depth. The batched cohort path is not part of this track.
 
+The served MTP head is the 8-bit head (David ruling 2026-09-12). The transform
+takes the 76 head tensors from the pinned 8-bit source shards
+(`fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256`) and splices them into
+shard 22 of `weights/`; the tower stays 4-bit. The emitted `config.json`
+declares the head modules at 8 bits. Fast kernels that assume 4-bit weights
+must not be applied to the head modules. The serial-control leg does not use
+the head, so the reference tree and the calibration are unchanged.
+
 > **WARNING — the engine is a submodule pinned to an unmerged fork branch.**
 > `Vendor/mlx-swift-lm` is a git submodule at `449f2d0`, on branch
 > `feat/qwen38-flash-next-runner` of the fork. Re-pin the submodule when that
@@ -367,8 +375,9 @@ This command resolves and verifies the pinned benchmarker binary.
 ./setup.sh
 ```
 
-This command provisions the target model. The MTP head is embedded in that
-checkpoint, so there is no separate head-staging step.
+This command provisions the target model and the two 8-bit shards that carry
+the served MTP head. The transform splices that head into `weights/`. There is
+no separate head-staging step.
 
 ## Swift tooling
 
@@ -429,9 +438,10 @@ flip a near-tie greedy argmax.
 > license a change of target format: a lossier target substitutes a degraded
 > model instead of optimizing the accepted one. The MTP head is a narrow
 > exception, and the exception is RE-QUANTIZATION ONLY (David ruling
-> 2026-08-26) — re-quantize the head within its 2 GiB declaration cap, but do
+> 2026-08-26) — re-quantize the head within its 4 GiB declaration cap, but do
 > not replace it and do not upload head weights. The head is embedded in the
-> pinned target checkpoint, and `mtp-head.manifest.json` accepts
+> transformed tree; the served head is the 8-bit head from the pinned 8-bit
+> source shards (David ruling 2026-09-12), and `mtp-head.manifest.json` accepts
 > `"source": "pinned"` only. A head re-quantization happens ON LOAD, in memory,
 > and nothing on disk changes. The head module and the assistant that drives it
 > are in `Runner/`, which is editable (`Runner/Qwen4ExpMTP.swift`,
@@ -483,7 +493,8 @@ This command builds the trusted CLI.
 ./setup.sh
 ```
 
-This command provisions the target model, and the embedded MTP head with it.
+This command provisions the target model and the served MTP head's source
+shards with it.
 
 ```bash
 ./tools/fetch-benchd.sh

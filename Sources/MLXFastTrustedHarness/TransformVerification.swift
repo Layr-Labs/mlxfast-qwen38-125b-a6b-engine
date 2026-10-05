@@ -9,17 +9,22 @@ public struct TransformVerificationOptions: Equatable {
     public let weightsPath: String
     public let temporaryParentPath: String?
     public let maxByteCount: Int?
+    /// The served MTP head's source, handed to the regeneration exactly as
+    /// the transform under verification received it.
+    public let mtpHeadSourcePath: String?
 
     public init(
         referencePath: String,
         weightsPath: String,
         temporaryParentPath: String? = nil,
-        maxByteCount: Int? = MLXFastConstants.defaultMaxTransformedWeightsBytes
+        maxByteCount: Int? = MLXFastConstants.defaultMaxTransformedWeightsBytes,
+        mtpHeadSourcePath: String? = nil
     ) {
         self.referencePath = referencePath
         self.weightsPath = weightsPath
         self.temporaryParentPath = temporaryParentPath
         self.maxByteCount = maxByteCount
+        self.mtpHeadSourcePath = mtpHeadSourcePath
     }
 }
 
@@ -90,7 +95,11 @@ public enum TransformVerifier {
         }
 
         let transformReport = try SwiftTransform.run(
-            TransformOptions(referencePath: options.referencePath, outputPath: regeneratedDirectory.path)
+            TransformOptions(
+                referencePath: options.referencePath,
+                outputPath: regeneratedDirectory.path,
+                mtpHeadSourcePath: options.mtpHeadSourcePath
+            )
         )
         let comparison = try compareDirectories(
             expected: regeneratedDirectory,

@@ -519,3 +519,131 @@ private func temporaryDirectory() throws -> URL {
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
 }
+
+// MARK: - Composite shards (the served MTP head)
+
+/// One shard out of several sources: the tower's tensors from its own shard,
+/// the head's from the head source's shards, into a plain sorted contiguous
+/// safetensors file. The tower's own copy of the head is simply not selected.
+@Test
+func safetensorsCopyCompositeSplicesTensorsFromSeveralSources() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let tower = root.appendingPathComponent("tower.safetensors")
+    let headA = root.appendingPathComponent("head-a.safetensors")
+    let headB = root.appendingPathComponent("head-b.safetensors")
+    let destination = root.appendingPathComponent("spliced.safetensors")
+    try writeSafetensors(
+        tower,
+        tensors: [
+            TensorFixture(name: "model.a", dtype: "U8", shape: [2], data: Data([1, 2])),
+            TensorFixture(name: "mtp.old", dtype: "U8", shape: [1], data: Data([9])),
+            TensorFixture(name: "model.z", dtype: "U8", shape: [3], data: Data([3, 4, 5])),
+        ]
+    )
+    try writeSafetensors(
+        headA,
+        tensors: [
+            TensorFixture(name: "mtp.new", dtype: "U8", shape: [2], data: Data([7, 8])),
+            TensorFixture(name: "lm_head.w", dtype: "U8", shape: [1], data: Data([0])),
+        ]
+    )
+    try writeSafetensors(
+        headB,
+        tensors: [
+            TensorFixture(name: "mtp.other", dtype: "U16", shape: [1], data: Data([1, 0]))
+        ]
+    )
+
+    let copied = try Safetensors.copyComposite(
+        parts: [
+            SafetensorsCompositePart(
+                source: tower, validatedHeader: try Safetensors.readHeader(tower),
+                tensorNames: ["model.z", "model.a"]),
+            SafetensorsCompositePart(
+                source: headA, validatedHeader: try Safetensors.readHeader(headA),
+                tensorNames: ["mtp.new"]),
+            SafetensorsCompositePart(
+                source: headB, validatedHeader: try Safetensors.readHeader(headB),
+                tensorNames: ["mtp.other"]),
+        ],
+        to: destination,
+        metadata: ["format": "mlx"]
+    )
+
+    #expect(copied == 4)
+    let header = try Safetensors.readHeader(destination)
+    #expect(header.metadata == ["format": "mlx"])
+    #expect(header.tensors.keys.sorted() == ["model.a", "model.z", "mtp.new", "mtp.other"])
+    #expect(header.tensors["mtp.old"] == nil)
+    #expect(header.tensors["lm_head.w"] == nil)
+    // Sorted by name, contiguous from zero, header padded to eight bytes.
+    var cursor = 0
+    for name in header.tensors.keys.sorted() {
+        let info = try #require(header.tensors[name])
+        #expect(info.dataStart == cursor, "\(name)")
+        cursor = info.dataEnd
+    }
+    #expect(header.headerLength % 8 == 0)
+    #expect(try tensorBytes(destination, header: header, name: "model.a") == Data([1, 2]))
+    #expect(try tensorBytes(destination, header: header, name: "model.z") == Data([3, 4, 5]))
+    #expect(try tensorBytes(destination, header: header, name: "mtp.new") == Data([7, 8]))
+    #expect(try tensorBytes(destination, header: header, name: "mtp.other") == Data([1, 0]))
+    #expect(header.tensors["mtp.other"]?.dtype == "U16")
+    #expect(header.tensors["mtp.other"]?.shape == [1])
+}
+
+@Test
+func safetensorsCopyCompositeRefusesAmbiguousOrMissingNamesWithoutWriting() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let first = root.appendingPathComponent("first.safetensors")
+    let second = root.appendingPathComponent("second.safetensors")
+    let destination = root.appendingPathComponent("spliced.safetensors")
+    let tensors = [
+        TensorFixture(name: "shared", dtype: "U8", shape: [1], data: Data([1]))
+    ]
+    try writeSafetensors(first, tensors: tensors)
+    try writeSafetensors(second, tensors: tensors)
+
+    // The same name from two sources: which bytes win would be an accident.
+    #expect(throws: MLXFastError.self) {
+        _ = try Safetensors.copyComposite(
+            parts: [
+                SafetensorsCompositePart(
+                    source: first, validatedHeader: try Safetensors.readHeader(first),
+                    tensorNames: ["shared"]),
+                SafetensorsCompositePart(
+                    source: second, validatedHeader: try Safetensors.readHeader(second),
+                    tensorNames: ["shared"]),
+            ],
+            to: destination,
+            metadata: [:]
+        )
+    }
+    // A name the source does not carry.
+    #expect(throws: MLXFastError.self) {
+        _ = try Safetensors.copyComposite(
+            parts: [
+                SafetensorsCompositePart(
+                    source: first, validatedHeader: try Safetensors.readHeader(first),
+                    tensorNames: ["absent"])
+            ],
+            to: destination,
+            metadata: [:]
+        )
+    }
+    #expect(!FileManager.default.fileExists(atPath: destination.path))
+    // Nothing selected writes nothing.
+    let empty = try Safetensors.copyComposite(
+        parts: [
+            SafetensorsCompositePart(
+                source: first, validatedHeader: try Safetensors.readHeader(first),
+                tensorNames: [])
+        ],
+        to: destination,
+        metadata: [:]
+    )
+    #expect(empty == 0)
+    #expect(!FileManager.default.fileExists(atPath: destination.path))
+}

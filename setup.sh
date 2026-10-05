@@ -113,6 +113,48 @@ else
   REFERENCE_DIR="${REFERENCE_CACHE_DIR}"
 fi
 REFERENCE_COMPAT_LINK="${MLXFAST_REFERENCE_COMPAT_LINK:-${DEFAULT_REFERENCE_DIR}}"
+# Which list names a checkpoint's shards: the publisher's index (the target), or
+# the selected manifest's own .safetensors records (a pinned SUBSET of a
+# multi-shard checkpoint, which is what the served MTP head's source is).
+REFERENCE_SHARD_LIST_SOURCE="index"
+
+# THE SERVED MTP HEAD (David ruling 2026-09-12: replace the 4-bit head with the
+# 8-bit one, leave everything else the same). The target above does not move.
+# The head the engine serves is the same 76 `language_model.mtp.*` tensors
+# from the publisher's 8-bit conversion, read out of the two shards that carry
+# them and pinned per file in fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256.
+# setup.sh provisions those two shards beside the target and hands the
+# directory to the transform as --head-source; the transform splices the head
+# into the tree the engine loads. Same downloader, same verifier, same
+# override surface as the target, under its own MLXFAST_MTP_HEAD_SOURCE_* names.
+MTP_HEAD_SOURCE_REPO="${MLXFAST_MTP_HEAD_SOURCE_REPO:-Vontra/Qwen3.8-Flash-Next-MLX-8bit-MTP}"
+MTP_HEAD_SOURCE_REVISION="${MLXFAST_MTP_HEAD_SOURCE_REVISION:-9c306179562765396e197a8a7a5de1b6b761c41a}"
+MTP_HEAD_SOURCE_NAME="${MTP_HEAD_SOURCE_REPO##*/}"
+DEFAULT_MTP_HEAD_SOURCE_BASE_URL="https://huggingface.co/${MTP_HEAD_SOURCE_REPO}/resolve/${MTP_HEAD_SOURCE_REVISION}"
+MTP_HEAD_SOURCE_BASE_URL="${MLXFAST_MTP_HEAD_SOURCE_BASE_URL:-${DEFAULT_MTP_HEAD_SOURCE_BASE_URL}}"
+MTP_HEAD_SOURCE_FALLBACK_BASE_URL="${MLXFAST_MTP_HEAD_SOURCE_FALLBACK_BASE_URL:-}"
+MTP_HEAD_SOURCE_MANIFEST_PATH="${MLXFAST_MTP_HEAD_SOURCE_MANIFEST_PATH:-fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256}"
+# Two shards, 5.6 GB. The floor covers them with room for the spliced shard the
+# transform writes beside the target's transform.
+MTP_HEAD_SOURCE_MIN_FREE_GIB="${MLXFAST_MTP_HEAD_SOURCE_MIN_FREE_GIB:-12}"
+DEFAULT_MTP_HEAD_SOURCE_DIR="reference_weights/${MTP_HEAD_SOURCE_NAME}"
+MTP_HEAD_SOURCE_CACHE_DIR="${MLXFAST_MTP_HEAD_SOURCE_CACHE_DIR:-${DEFAULT_HF_HUB_CACHE}/models--${MTP_HEAD_SOURCE_REPO//\//--}/snapshots/${MTP_HEAD_SOURCE_REVISION}}"
+# Resolution order: an explicit directory; the SIBLING of an explicit
+# MLXFAST_REFERENCE_DIR, whether or not it exists yet (a ranked box stages the
+# head beside the target, and the ranked workflow's transform step looks there,
+# so a first download on such a box lands there too, with no runner environment
+# change); the checkout's reference_weights/ default; the shared Hugging Face
+# cache.
+if [[ -n "${MLXFAST_MTP_HEAD_SOURCE_DIR:-}" ]]; then
+  MTP_HEAD_SOURCE_DIR="${MLXFAST_MTP_HEAD_SOURCE_DIR}"
+elif [[ -n "${MLXFAST_REFERENCE_DIR:-}" ]]; then
+  MTP_HEAD_SOURCE_DIR="$(dirname "${MLXFAST_REFERENCE_DIR}")/${MTP_HEAD_SOURCE_NAME}"
+elif [[ -e "${DEFAULT_MTP_HEAD_SOURCE_DIR}" && ! -L "${DEFAULT_MTP_HEAD_SOURCE_DIR}" ]]; then
+  MTP_HEAD_SOURCE_DIR="${DEFAULT_MTP_HEAD_SOURCE_DIR}"
+else
+  MTP_HEAD_SOURCE_DIR="${MTP_HEAD_SOURCE_CACHE_DIR}"
+fi
+MTP_HEAD_SOURCE_COMPAT_LINK="${MLXFAST_MTP_HEAD_SOURCE_COMPAT_LINK:-${DEFAULT_MTP_HEAD_SOURCE_DIR}}"
 # This is a verification stamp, retained under its original environment-variable
 # name for compatibility. It is not the inter-process mutation lock below.
 REFERENCE_CACHE_LOCK_PATH="${MLXFAST_REFERENCE_CACHE_LOCK_PATH:-${REFERENCE_DIR}/.mlxfast-reference-cache.lock}"
@@ -207,6 +249,18 @@ Important environment variables:
                                      Default: ${REFERENCE_DOWNLOAD_MIN_BYTES_PER_SECOND}
   MLXFAST_REFERENCE_MIN_FREE_GIB     Required free space before download.
                                      Default: ${REFERENCE_MIN_FREE_GIB}
+  MLXFAST_MTP_HEAD_SOURCE_DIR        Directory holding the served MTP head's
+                                     two pinned 8-bit shards and config
+                                     (${MTP_HEAD_SOURCE_REPO}).
+                                     Default: ${MTP_HEAD_SOURCE_DIR}
+  MLXFAST_MTP_HEAD_SOURCE_BASE_URL   HTTP prefix for the head source files.
+                                     Default: ${DEFAULT_MTP_HEAD_SOURCE_BASE_URL}
+  MLXFAST_MTP_HEAD_SOURCE_MANIFEST_PATH
+                                     SHA256 manifest for the head source files.
+                                     Default: ${MTP_HEAD_SOURCE_MANIFEST_PATH}
+  MLXFAST_MTP_HEAD_SOURCE_MIN_FREE_GIB
+                                     Required free space before the head
+                                     source download. Default: ${MTP_HEAD_SOURCE_MIN_FREE_GIB}
   MLXFAST_REFERENCE_HASH_VERIFY=0    Skip reference SHA256 verification.
   MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY=0
                                      Skip the second full-checkpoint SHA256 pass
@@ -295,16 +349,25 @@ print_setup_summary() {
   local reference_status="${1:-ready}"
   local elapsed="$((SECONDS - SETUP_STARTED_SECONDS))"
   local reference_line
+  local head_line
   local metallib_line
   local weights_line="${WEIGHTS_PATH}"
 
   if [[ "${reference_status}" == "skipped" ]]; then
     reference_line="skipped (${REFERENCE_DIR})"
+    head_line="skipped (${MTP_HEAD_SOURCE_DIR})"
     weights_line="not prepared (reference download skipped)"
   elif [[ -f "${REFERENCE_DIR}/config.json" ]]; then
     reference_line="${REFERENCE_DIR} ($(path_size_gib "${REFERENCE_DIR}") GiB)"
   else
     reference_line="missing (${REFERENCE_DIR})"
+  fi
+  if [[ "${reference_status}" != "skipped" ]]; then
+    if [[ -f "${MTP_HEAD_SOURCE_DIR}/config.json" ]]; then
+      head_line="${MTP_HEAD_SOURCE_DIR} ($(path_size_gib "${MTP_HEAD_SOURCE_DIR}") GiB)"
+    else
+      head_line="missing (${MTP_HEAD_SOURCE_DIR})"
+    fi
   fi
 
   if [[ "${MLXFAST_SKIP_MLX_METALLIB:-0}" == "1" ]]; then
@@ -321,6 +384,7 @@ ${SETUP_LOG_LABEL}: summary
   mlx.metallib: ${metallib_line}
   benchd engine: $(dirname "${SWIFT_BIN}")/bench-worker (+ sibling mlx.metallib)
   reference checkpoint: ${reference_line}
+  mtp head source (8-bit): ${head_line}
   transformed weights: ${weights_line}
 EOF
 
@@ -2184,6 +2248,23 @@ resolve_reference_shard_list() {
   local index_path="${reference_dir}/model.safetensors.index.json"
   local pinned_shards shard_count
 
+  # A pinned SUBSET of a multi-shard checkpoint (the served MTP head's two
+  # shards): the publisher's index names shards this artifact never fetches,
+  # so the manifest's own .safetensors records are the list.
+  if [[ "${REFERENCE_SHARD_LIST_SOURCE:-index}" == "manifest" ]]; then
+    pinned_shards="$(reference_manifest_shard_files "${source_manifest}")" || {
+      echo "${SETUP_LOG_LABEL}: manifest ${source_manifest} could not be read for the shard list of ${reference_dir}" >&2
+      return 1
+    }
+    shard_count="$(printf '%s' "${pinned_shards}" | grep -c . || true)"
+    if [[ "${shard_count}" == "0" ]]; then
+      echo "${SETUP_LOG_LABEL}: manifest ${source_manifest} pins no safetensors file for ${reference_dir}" >&2
+      return 1
+    fi
+    printf '%s\n' "${pinned_shards}"
+    return 0
+  fi
+
   if [[ -f "${index_path}" ]]; then
     list_reference_shards "${index_path}" || return 1
     return 0
@@ -3454,13 +3535,56 @@ EOF
   return "${operation_status}"
 }
 
+# Provision the served MTP head's source: the two pinned 8-bit shards and their
+# config, into their own directory beside the target.
+#
+# SAME MACHINERY AS THE TARGET, and that is the point: one downloader, one
+# verifier, one cache stamp, one mutation lock, one fallback rule. Bash scopes
+# `local` dynamically, so every function the target's download calls reads the
+# head source's repository, revision, base URL, manifest, directory and locks
+# for the duration of this call and the target's own values again afterwards.
+# The one behavioural switch is REFERENCE_SHARD_LIST_SOURCE=manifest: this
+# artifact pins a subset of a 42-shard checkpoint, so its shard list is its
+# manifest, not the publisher's index (which is deliberately not pinned).
+download_mtp_head_source() {
+  local head_dir="$1"
+  local canonical_base canonical_parent
+  if [[ -d "${head_dir}" ]]; then
+    canonical_base="$(cd -P "${head_dir}" && pwd -P)" || return 1
+  else
+    canonical_parent="$(cd -P "$(dirname "${head_dir}")" 2>/dev/null && pwd -P)" \
+      || canonical_parent="$(dirname "${head_dir}")"
+    canonical_base="${canonical_parent}/$(basename "${head_dir}")"
+  fi
+  local REFERENCE_MODEL_REPO="${MTP_HEAD_SOURCE_REPO}"
+  local REFERENCE_REVISION="${MTP_HEAD_SOURCE_REVISION}"
+  local REFERENCE_BASE_URL="${MTP_HEAD_SOURCE_BASE_URL}"
+  local REFERENCE_FALLBACK_BASE_URL="${MTP_HEAD_SOURCE_FALLBACK_BASE_URL}"
+  local REFERENCE_MANIFEST_PATH="${MTP_HEAD_SOURCE_MANIFEST_PATH}"
+  local REFERENCE_DIR="${head_dir}"
+  local REFERENCE_COMPAT_LINK="${MTP_HEAD_SOURCE_COMPAT_LINK}"
+  local REFERENCE_CACHE_LOCK_PATH="${MLXFAST_MTP_HEAD_SOURCE_CACHE_LOCK_PATH:-${head_dir}/.mlxfast-reference-cache.lock}"
+  local REFERENCE_CACHE_MUTATION_LOCK_DIR="${MLXFAST_MTP_HEAD_SOURCE_CACHE_MUTATION_LOCK_DIR:-${canonical_base}.mlxfast-setup.lock}"
+  local REFERENCE_MIN_FREE_GIB="${MTP_HEAD_SOURCE_MIN_FREE_GIB}"
+  local REFERENCE_SHARD_LIST_SOURCE="manifest"
+
+  if [[ ! -f "${REFERENCE_MANIFEST_PATH}" ]]; then
+    echo "${SETUP_LOG_LABEL}: MTP head source manifest missing at ${REFERENCE_MANIFEST_PATH}" >&2
+    return 1
+  fi
+  echo "${SETUP_LOG_LABEL}: served MTP head source: ${REFERENCE_MODEL_REPO}@${REFERENCE_REVISION} ($(reference_manifest_shard_files "${REFERENCE_MANIFEST_PATH}" | grep -c . || true) shard(s) per manifest)"
+  download_reference_weights "${head_dir}"
+}
+
 transform_reference_weights() {
   # Run the freshly built transform each time, including on a reference-cache
   # hit: Sources/MLXFastTransform is editable, so an old weights tree cannot
   # establish that the current candidate has been prepared. SwiftTransform
   # stages its output; the helper publishes only a newly produced weights tree.
-  echo "${SETUP_LOG_LABEL}: transforming the verified reference checkpoint into ${WEIGHTS_PATH}"
-  tools/prepare-runtime-weights.sh "${SWIFT_BIN}" "${REFERENCE_DIR}" "${WEIGHTS_PATH}" || return 1
+  # The served head's source rides along as --head-source: the transform
+  # refuses this track's family without it.
+  echo "${SETUP_LOG_LABEL}: transforming the verified reference checkpoint into ${WEIGHTS_PATH} (served MTP head from ${MTP_HEAD_SOURCE_DIR})"
+  tools/prepare-runtime-weights.sh "${SWIFT_BIN}" "${REFERENCE_DIR}" "${WEIGHTS_PATH}" "${MTP_HEAD_SOURCE_DIR}" || return 1
 }
 
 check_yukon_cli() {
@@ -3518,6 +3642,7 @@ fi
 build_swift_harness
 start_mlx_metallib_build
 download_reference_weights "${REFERENCE_DIR}"
+download_mtp_head_source "${MTP_HEAD_SOURCE_DIR}"
 wait_for_mlx_metallib_build
 stage_bench_worker_for_benchd
 transform_reference_weights

@@ -1,5 +1,7 @@
 import Foundation
 import MLXFastCore
+@testable import MLXFastHarness
+@testable import MLXFastTransform
 import Testing
 
 // Contract tests for `fixtures/qwen3_8_125b_a6b_track.json`.
@@ -375,5 +377,97 @@ private func isLowercaseHex(_ value: String, count: Int) -> Bool {
     value.utf8.count == count && value.utf8.allSatisfy { byte in
         (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
             || (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "f"))
+    }
+}
+
+// MARK: - The served MTP head (David ruling 2026-09-12)
+
+@Suite("qwen3.8-125b-a6b served MTP head pins")
+struct Qwen38A6BServedHeadFixtureTests {
+    @Test("mtp_head.source_checkpoint names the compiled head source, revision and manifest")
+    func headSourceMatchesCompiledConstants() throws {
+        let contract = try qwen38A6BTrackContractObject()
+        let head = try #require(contract["mtp_head"] as? [String: Any])
+        let source = try #require(head["source_checkpoint"] as? [String: Any])
+        #expect(source["upstream_model_id"] as? String == MLXFastConstants.mtpHeadSourceRepository)
+        #expect(source["upstream_model_id"] as? String == qwen38A6BMTPHeadSourceRepository)
+        let revision = try #require(source["upstream_revision"] as? String)
+        #expect(revision == MLXFastConstants.mtpHeadSourceRevision)
+        #expect(revision.count == 40)
+        #expect(revision.allSatisfy { "0123456789abcdef".contains($0) })
+        #expect(source["manifest_path"] as? String == MLXFastConstants.mtpHeadSourceManifestPath)
+        #expect(FileManager.default.fileExists(atPath: qwen38A6BMTPHeadManifestURL.path))
+        #expect(source["tensor_count"] as? Int == Qwen4ExpCheckpointValidation.expectedMTPTensorCount)
+        let quantization = try #require(source["quantization"] as? [String: Any])
+        #expect(
+            quantization["bits"] as? Int
+                == Qwen4ExpCheckpointValidation.PinnedGeometry.mtpHeadServedQuantizationBits)
+        #expect(quantization["group_size"] as? Int == 32)
+        #expect(quantization["mode"] as? String == "affine")
+        let served = try #require(head["served_quantization"] as? [String: Any])
+        #expect(served["bits"] as? Int == 8)
+        // The head stays EMBEDDED in the transformed tree; only its source moved.
+        #expect(head["source"] as? String == "embedded")
+        // And the declaration cap the runner enforces is the raised one.
+        #expect(head["max_bytes"] as? Int == Gemma4MTPHeadDeclaration.defaultMaxBytes)
+    }
+
+    @Test("the head manifest pins the config and exactly the two head shards")
+    func headManifestPinsTheTwoShards() throws {
+        let records = try qwen38A6BManifestRecords(qwen38A6BMTPHeadManifestURL)
+        #expect(records.count == 3)
+        let contract = try qwen38A6BTrackContractObject()
+        let head = try #require(contract["mtp_head"] as? [String: Any])
+        let source = try #require(head["source_checkpoint"] as? [String: Any])
+        let shards = try #require(source["shards"] as? [String])
+        #expect(Set(records.map(\.path)) == Set(shards + ["config.json"]))
+        for record in records {
+            #expect(record.sha256.count == 64, "\(record.path)")
+            #expect(record.sha256.allSatisfy { "0123456789abcdef".contains($0) }, "\(record.path)")
+            #expect(record.bytes > 0, "\(record.path)")
+        }
+        // Two shards of 4.6 GB and 1.0 GB, not the publisher's whole 203 GB.
+        let shardBytes = records.filter { $0.path.hasSuffix(".safetensors") }.map(\.bytes).reduce(0, +)
+        #expect(shardBytes > 5_000_000_000 && shardBytes < 6_000_000_000)
+        let headBytes = try #require(source["tensor_bytes"] as? Int)
+        #expect(headBytes < shardBytes)
+    }
+
+    @Test("the head inventory fixture is the served head table, tensor for tensor")
+    func headInventoryMatchesTheServedHeadTable() throws {
+        let inventory = try qwen38A6BMTPHeadInventoryObject()
+        let source = try #require(inventory["source"] as? [String: Any])
+        #expect(source["repository"] as? String == MLXFastConstants.mtpHeadSourceRepository)
+        #expect(source["revision"] as? String == MLXFastConstants.mtpHeadSourceRevision)
+        let expected = Qwen4ExpCheckpointValidation.expectedHeadInventory(
+            bits: Qwen4ExpCheckpointValidation.PinnedGeometry.mtpHeadServedQuantizationBits)
+        let tensors = try #require(inventory["mtp_tensors"] as? [[Any]])
+        #expect(tensors.count == expected.count)
+        var seen = Set<String>()
+        for entry in tensors {
+            let name = try #require(entry[0] as? String)
+            let dtype = try #require(entry[1] as? String)
+            let shape = try #require(entry[2] as? [Int])
+            let shard = try #require(entry[3] as? Int)
+            let metadata = try #require(expected[name], "\(name)")
+            #expect(metadata.dtype == dtype, "\(name)")
+            #expect(metadata.shape == shape, "\(name)")
+            #expect(shard == 1 || shard == 2, "\(name)")
+            seen.insert(name)
+        }
+        #expect(seen == Set(expected.keys))
+        let bytes = try #require(inventory["mtp_tensor_bytes"] as? Int)
+        let contract = try qwen38A6BTrackContractObject()
+        let head = try #require(contract["mtp_head"] as? [String: Any])
+        let contractSource = try #require(head["source_checkpoint"] as? [String: Any])
+        #expect(contractSource["tensor_bytes"] as? Int == bytes)
+        // The spliced shard the transform must reproduce, pinned in both.
+        let transformed = try #require(inventory["transformed_shard"] as? [String: Any])
+        #expect(transformed["name"] as? String == "model-00022-of-00022.safetensors")
+        let sha = try #require(transformed["sha256"] as? String)
+        #expect(sha.count == 64)
+        let contractShard = try #require(head["transformed_shard"] as? [String: Any])
+        #expect(contractShard["sha256"] as? String == sha)
+        #expect(contractShard["bytes"] as? Int == transformed["bytes"] as? Int)
     }
 }

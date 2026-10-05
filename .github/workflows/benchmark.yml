@@ -446,9 +446,11 @@ jobs:
       - name: Setup (toolchain, Metal kernels, pinned checkpoint)
         # Second half of benchmark.json's setupCommand, verbatim. setup.sh
         # verifies the reference checkpoint against
-        # fixtures/reference_qwen3_8_125b_a6b_4bit.sha256 and refuses without
-        # it; the preflight above already refused the environment variables
-        # that would let it skip the download. The checkpoint itself is hashed
+        # fixtures/reference_qwen3_8_125b_a6b_4bit.sha256, and the served MTP
+        # head's source beside it against
+        # fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256, and refuses
+        # without them; the preflight above already refused the environment
+        # variables that would let it skip the download. The checkpoint itself is hashed
         # in full once per box: setup.sh writes its trusted reference cache
         # lock inside MLXFAST_REFERENCE_DIR after a verified download and
         # skips the full re-hash while that stamp is present.
@@ -510,15 +512,24 @@ jobs:
         # Setup prepares local runtime weights. The ranked path deliberately
         # reruns the candidate's editable transform into a fresh output tree:
         # a transform that exits without writing must not reuse an old tree.
-        # It is cheap: the transform clones
-        # the verified reference on APFS (1 s, no extra blocks on the box), and
-        # benchd seals the tree's weights_hash into the artifact, so provenance
-        # needs no cache and no box-staged tree.
+        # It is cheap: the transform clones 21 of the 22 verified shards on
+        # APFS (no extra blocks on the box) and writes shard 22 once, as the
+        # composite that carries the served 8-bit MTP head (about 5 GB, David
+        # ruling 2026-09-12); benchd seals the tree's weights_hash into the
+        # artifact, so provenance needs no cache and no box-staged tree.
+        #
+        # The head source is the operator-staged directory beside the
+        # reference (the two pinned 8-bit shards and their config, verified by
+        # ./setup.sh above against fixtures/reference_qwen3_8_125b_a6b_mtp_8bit.sha256).
+        # MLXFAST_MTP_HEAD_SOURCE_DIR in the runner environment overrides the
+        # sibling default; the transform refuses this family without one.
         run: |
           set -euo pipefail
           [[ -d "${MLXFAST_REFERENCE_DIR}" ]] || { echo "::error::MLXFAST_REFERENCE_DIR=${MLXFAST_REFERENCE_DIR} is not a directory" >&2; exit 1; }
+          head_source="${MLXFAST_MTP_HEAD_SOURCE_DIR:-$(dirname "${MLXFAST_REFERENCE_DIR}")/Qwen3.8-Flash-Next-MLX-8bit-MTP}"
+          [[ -f "${head_source}/config.json" ]] || { echo "::error::the served MTP head source at ${head_source} is not staged (config.json missing); stage the two pinned 8-bit shards beside the reference" >&2; exit 1; }
           rm -rf weights
-          .build/release/mlxfast-swift transform --reference "${MLXFAST_REFERENCE_DIR}" --output weights
+          .build/release/mlxfast-swift transform --reference "${MLXFAST_REFERENCE_DIR}" --head-source "${head_source}" --output weights
           [[ -f weights/config.json ]] || { echo "::error::the transform wrote no weights/config.json" >&2; exit 1; }
           echo "transformed tree: $(find weights -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ') files; digest $("${BENCHD_BIN_DIR}/benchd" weights-digest --weights weights 2>/dev/null || echo unavailable)"
 
