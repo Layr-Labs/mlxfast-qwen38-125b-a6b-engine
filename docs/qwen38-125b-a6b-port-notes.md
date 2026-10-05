@@ -1765,7 +1765,7 @@ config staged beside the target.
 byte-copying Python script, before the Swift splice existed, and verified
 there: 104 tower tensors byte-identical to the 4-bit shard 22, 76 head tensors
 byte-identical to the 8-bit shards, header 25,264 bytes, contiguous. The Swift
-transform then produced the shard on ai-server (2026-09-13): the same
+transform then produced the shard on a second Mac (2026-09-13): the same
 5,018,468,984 bytes, the same parsed header, and the same data region
 (sha256 of the bytes after the header `5229d567d459a6a0afcf080375fc917302185fff4803a485df1b0cda124d93a4`).
 The two files differ only in the ORDER of keys inside the header's JSON text
@@ -1785,7 +1785,7 @@ transform writes the spliced tree. No runner environment change is needed.
 precondition `bits == 4` are correct for the tower and wrong for the head. A
 tree that runs `TrackFastHead` at depth 1 or more must route the head's
 modules through 8-bit-capable kernels or fall back. A tree that declares no
-speculation is unaffected. Measured on 2026-09-14 (ai-server, M5 Max 128 GiB,
+speculation is unaffected. Measured on 2026-09-14 (an M5 Max 128 GiB,
 `./benchmark.sh --local-iterate`, public long-copy golden, the frontier
 Runner at `5818374`): with the fast head ON, every 8-bit leg at depth 1 to 3
 died on signal 5 (a Swift trap, no stderr) while the serial leg on the same

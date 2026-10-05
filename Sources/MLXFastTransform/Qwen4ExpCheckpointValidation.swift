@@ -637,16 +637,18 @@ enum Qwen4ExpCheckpointValidation {
         mutating func addTower(bits: Int) {
             let vocab = PinnedGeometry.vocabSize
             addAffine(
-                "\(Qwen4ExpCheckpointValidation.modelPrefix).embed_tokens", leading: [vocab], inFeatures: hidden, bits: bits)
+                "\(modelPrefix).embed_tokens", leading: [vocab], inFeatures: hidden,
+                bits: bits)
             addAffine(
-                "\(Qwen4ExpCheckpointValidation.textTowerPrefix)lm_head", leading: [vocab], inFeatures: hidden, bits: bits)
+                "\(textTowerPrefix)lm_head", leading: [vocab], inFeatures: hidden,
+                bits: bits)
             // THERE IS NO `model.norm`: this mixer stands in for it.
             addHyperConnection(
-                "\(Qwen4ExpCheckpointValidation.modelPrefix).hyper_connection_mixer", inject: false, bits: bits)
+                "\(modelPrefix).hyper_connection_mixer", inject: false, bits: bits)
 
             for layerIndex in 0 ..< PinnedGeometry.layerCount {
                 addDecoderLayer(
-                    "\(Qwen4ExpCheckpointValidation.layerPrefix)\(layerIndex)",
+                    "\(layerPrefix)\(layerIndex)",
                     isFullAttention: PinnedGeometry.isFullAttention(layer: layerIndex),
                     bits: bits)
             }
@@ -657,7 +659,7 @@ enum Qwen4ExpCheckpointValidation {
             let rowDimensions = PinnedGeometry.pleEmbedDim / ngramHeads
             let rowsPerShard = PinnedGeometry.ngramRowsPerShard
             for layerIndex in PinnedGeometry.pleLayerIndices {
-                let prefix = "\(Qwen4ExpCheckpointValidation.layerPrefix)\(layerIndex).ple"
+                let prefix = "\(layerPrefix)\(layerIndex).ple"
                 add(
                     "\(prefix).conv1d.weight", .bf16,
                     [wide, PinnedGeometry.pleConvKernelSize, 1])
@@ -687,7 +689,7 @@ enum Qwen4ExpCheckpointValidation {
         /// The head EMBEDDED in this checkpoint. It has no embedding table and
         /// no head of its own; it rides the target's.
         mutating func addHead(bits: Int) {
-            let mtpPrefix = "\(Qwen4ExpCheckpointValidation.textTowerPrefix)mtp"
+            let mtpPrefix = "\(textTowerPrefix)mtp"
             add("\(mtpPrefix).pre_fc_norm_embedding.weight", .bf16, [hidden])
             add("\(mtpPrefix).pre_fc_norm_hidden.weight", .bf16, [wide])
             for projection in ["fc_embedding", "fc_hidden"] {

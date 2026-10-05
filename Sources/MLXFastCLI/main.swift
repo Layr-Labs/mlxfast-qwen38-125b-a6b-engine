@@ -82,13 +82,7 @@ private enum MLXFastCLI {
                 fallback: MLXFastConstants.defaultWeightsPath
             )
         )
-        let headSourcePath = resolveMTPHeadSourcePath(
-            explicit: options.value(
-                for: "--head-source",
-                default: environmentValue("MLXFAST_MTP_HEAD_SOURCE_DIR", fallback: "")
-            ),
-            referencePath: referencePath
-        )
+        let headSourcePath = resolveMTPHeadSourcePath(options, referencePath: referencePath)
         let report = try SwiftTransform.run(
             TransformOptions(
                 referencePath: referencePath,
@@ -106,14 +100,21 @@ private enum MLXFastCLI {
         print("index: \(report.indexPath)")
     }
 
-    /// Where the served head's shards are, when no flag names them: the
+    /// Where the served head's shards are: `--head-source`, then the
     /// environment, then the checkpoint's SIBLING directory (how the ranked
     /// boxes stage it, beside MLXFAST_REFERENCE_DIR), then the checkout's
     /// reference_weights/ default, then the shared Hugging Face cache. The
     /// first candidate that holds a config.json wins; when none does, the
     /// sibling is returned so the transform's refusal names where the head
     /// was expected. Only this track's family reads the value.
-    private static func resolveMTPHeadSourcePath(explicit: String, referencePath: String) -> String {
+    private static func resolveMTPHeadSourcePath(
+        _ options: ParsedOptions,
+        referencePath: String
+    ) -> String {
+        let explicit = options.value(
+            for: "--head-source",
+            default: environmentValue("MLXFAST_MTP_HEAD_SOURCE_DIR", fallback: "")
+        )
         if !explicit.isEmpty {
             return explicit
         }
@@ -165,13 +166,7 @@ private enum MLXFastCLI {
             defaultByteCount: MLXFastConstants.defaultMaxTransformedWeightsBytes,
             optionLabel: "--max-bytes"
         )
-        let headSourcePath = resolveMTPHeadSourcePath(
-            explicit: options.value(
-                for: "--head-source",
-                default: environmentValue("MLXFAST_MTP_HEAD_SOURCE_DIR", fallback: "")
-            ),
-            referencePath: referencePath
-        )
+        let headSourcePath = resolveMTPHeadSourcePath(options, referencePath: referencePath)
         let report = try TransformVerifier.verify(
             TransformVerificationOptions(
                 referencePath: referencePath,

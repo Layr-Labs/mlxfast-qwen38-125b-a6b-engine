@@ -238,6 +238,127 @@ public enum Safetensors {
         validatedHeader header: SafetensorsHeader,
         beforeFinalSourceIdentityValidation: (() throws -> Void)?
     ) throws -> Int {
+        let binding = try bindValidatedHeader(header, to: source)
+
+        guard Set(tensorNames).count == tensorNames.count else {
+            throw MLXFastError.invalidInput(
+                "duplicate tensor name requested while copying \(source.lastPathComponent)"
+            )
+        }
+
+        var selected: [SafetensorInfo] = []
+        selected.reserveCapacity(tensorNames.count)
+        for name in tensorNames {
+            selected.append(try validatedTensor(named: name, in: binding, source: source))
+        }
+        selected.sort { $0.name < $1.name }
+        guard !selected.isEmpty else {
+            return 0
+        }
+        try validateCopyDestination(source: source, destination: destination)
+
+        let input = try FileHandle(forReadingFrom: source)
+        defer {
+            try? input.close()
+        }
+        // Copied bytes are short-lived. Keeping a second copy of the ~21.6 GB
+        // source in the unified buffer cache can exhaust 36 GiB machines, so
+        // match the digest path's uncached read treatment (see #636).
+        _ = Darwin.fcntl(input.fileDescriptor, F_NOCACHE, 1)
+        _ = Darwin.fcntl(input.fileDescriptor, F_RDAHEAD, 0)
+        let openedSourceIdentity = try fileIdentity(for: input, path: source.path)
+        guard openedSourceIdentity == binding.identity else {
+            throw MLXFastError.invalidInput(
+                "safetensors source changed after its header was validated: \(source.path)"
+            )
+        }
+
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let temporaryDestination = destination.deletingLastPathComponent().appendingPathComponent(
+            ".\(destination.lastPathComponent).mlxfast-copy-\(UUID().uuidString)"
+        )
+        var published = false
+        defer {
+            if !published {
+                try? FileManager.default.removeItem(at: temporaryDestination)
+            }
+        }
+        try Data().write(to: temporaryDestination, options: [.withoutOverwriting])
+        let output = try FileHandle(forWritingTo: temporaryDestination)
+        // The staged ~18 GB copy is synchronized and reopened later; keeping
+        // its dirty pages out of the buffer cache avoids stacking a second
+        // tree of cached pages next to a resident model.
+        _ = Darwin.fcntl(output.fileDescriptor, F_NOCACHE, 1)
+
+        do {
+            let outputHeader = try makeHeaderData(
+                tensors: selected,
+                metadata: binding.header.metadata
+            )
+            var headerLength = UInt64(outputHeader.count).littleEndian
+            let prefix = Data(bytes: &headerLength, count: 8)
+            try output.write(contentsOf: prefix)
+            try output.write(contentsOf: outputHeader)
+
+            for tensor in selected {
+                guard let relativeOffset = UInt64(exactly: tensor.dataStart) else {
+                    throw MLXFastError.invalidInput(
+                        "negative safetensors tensor offset for \(tensor.name)"
+                    )
+                }
+                let (absoluteOffset, overflow) = binding.baseOffset.addingReportingOverflow(
+                    relativeOffset
+                )
+                guard !overflow else {
+                    throw MLXFastError.invalidInput(
+                        "safetensors tensor offset overflows UInt64 for \(tensor.name)"
+                    )
+                }
+                try copyBytes(
+                    from: input,
+                    to: output,
+                    offset: absoluteOffset,
+                    count: tensor.byteCount
+                )
+            }
+            try output.synchronize()
+            try output.close()
+        } catch {
+            try? output.close()
+            throw error
+        }
+
+        try beforeFinalSourceIdentityValidation?()
+        let finalSourceIdentity = try fileIdentity(for: input, path: source.path)
+        guard finalSourceIdentity == openedSourceIdentity else {
+            throw MLXFastError.invalidInput(
+                "safetensors source changed while tensor bytes were copied: \(source.path)"
+            )
+        }
+        try atomicRename(from: temporaryDestination, to: destination)
+        published = true
+
+        return selected.count
+    }
+
+    /// A validated header bound to the file it describes: the identity every
+    /// copy must observe, and where the data section starts and ends.
+    private struct BoundSafetensorsSource {
+        let header: SafetensorsHeader
+        let identity: SafetensorsFileIdentity
+        let baseOffset: UInt64
+        let dataByteCount: Int
+    }
+
+    /// Bind `header` to `source`. An unbound header is re-read from the file
+    /// and must match it exactly.
+    private static func bindValidatedHeader(
+        _ header: SafetensorsHeader,
+        to source: URL
+    ) throws -> BoundSafetensorsSource {
         let boundHeader: SafetensorsHeader
         if header.sourceIdentity == nil {
             let sourceHeader = try readHeader(source)
@@ -277,129 +398,41 @@ public enum Safetensors {
                 "validated safetensors header exceeds file size for \(source.lastPathComponent)"
             )
         }
-        let sourceDataByteCount = sourceByteCount - baseOffsetInt
-
-        guard Set(tensorNames).count == tensorNames.count else {
-            throw MLXFastError.invalidInput(
-                "duplicate tensor name requested while copying \(source.lastPathComponent)"
-            )
-        }
-
-        var selected: [SafetensorInfo] = []
-        selected.reserveCapacity(tensorNames.count)
-        for name in tensorNames {
-            guard let tensor = boundHeader.tensors[name] else {
-                throw MLXFastError.invalidInput(
-                    "tensor \(name) requested from \(source.lastPathComponent) but missing from safetensors header"
-                )
-            }
-            let (byteCount, byteCountOverflow) = tensor.dataEnd.subtractingReportingOverflow(
-                tensor.dataStart
-            )
-            guard tensor.name == name,
-                  !byteCountOverflow,
-                  tensor.dataStart >= 0,
-                  tensor.dataEnd >= tensor.dataStart,
-                  tensor.dataEnd <= sourceDataByteCount,
-                  byteCount >= 0
-            else {
-                throw MLXFastError.invalidInput(
-                    "invalid validated safetensors tensor range for \(name)"
-                )
-            }
-            selected.append(tensor)
-        }
-        selected.sort { $0.name < $1.name }
-        guard !selected.isEmpty else {
-            return 0
-        }
-        try validateCopyDestination(source: source, destination: destination)
-
-        let input = try FileHandle(forReadingFrom: source)
-        defer {
-            try? input.close()
-        }
-        // Copied bytes are short-lived. Keeping a second copy of the ~21.6 GB
-        // source in the unified buffer cache can exhaust 36 GiB machines, so
-        // match the digest path's uncached read treatment (see #636).
-        _ = Darwin.fcntl(input.fileDescriptor, F_NOCACHE, 1)
-        _ = Darwin.fcntl(input.fileDescriptor, F_RDAHEAD, 0)
-        let openedSourceIdentity = try fileIdentity(for: input, path: source.path)
-        guard openedSourceIdentity == expectedSourceIdentity else {
-            throw MLXFastError.invalidInput(
-                "safetensors source changed after its header was validated: \(source.path)"
-            )
-        }
-
-        try FileManager.default.createDirectory(
-            at: destination.deletingLastPathComponent(),
-            withIntermediateDirectories: true
+        return BoundSafetensorsSource(
+            header: boundHeader,
+            identity: expectedSourceIdentity,
+            baseOffset: baseOffset,
+            dataByteCount: sourceByteCount - baseOffsetInt
         )
-        let temporaryDestination = destination.deletingLastPathComponent().appendingPathComponent(
-            ".\(destination.lastPathComponent).mlxfast-copy-\(UUID().uuidString)"
-        )
-        var published = false
-        defer {
-            if !published {
-                try? FileManager.default.removeItem(at: temporaryDestination)
-            }
-        }
-        try Data().write(to: temporaryDestination, options: [.withoutOverwriting])
-        let output = try FileHandle(forWritingTo: temporaryDestination)
-        // The staged ~18 GB copy is synchronized and reopened later; keeping
-        // its dirty pages out of the buffer cache avoids stacking a second
-        // tree of cached pages next to a resident model.
-        _ = Darwin.fcntl(output.fileDescriptor, F_NOCACHE, 1)
+    }
 
-        do {
-            let outputHeader = try makeHeaderData(
-                tensors: selected,
-                metadata: boundHeader.metadata
-            )
-            var headerLength = UInt64(outputHeader.count).littleEndian
-            let prefix = Data(bytes: &headerLength, count: 8)
-            try output.write(contentsOf: prefix)
-            try output.write(contentsOf: outputHeader)
-
-            for tensor in selected {
-                guard let relativeOffset = UInt64(exactly: tensor.dataStart) else {
-                    throw MLXFastError.invalidInput(
-                        "negative safetensors tensor offset for \(tensor.name)"
-                    )
-                }
-                let (absoluteOffset, overflow) = baseOffset.addingReportingOverflow(
-                    relativeOffset
-                )
-                guard !overflow else {
-                    throw MLXFastError.invalidInput(
-                        "safetensors tensor offset overflows UInt64 for \(tensor.name)"
-                    )
-                }
-                try copyBytes(
-                    from: input,
-                    to: output,
-                    offset: absoluteOffset,
-                    count: tensor.byteCount
-                )
-            }
-            try output.synchronize()
-            try output.close()
-        } catch {
-            try? output.close()
-            throw error
-        }
-
-        try beforeFinalSourceIdentityValidation?()
-        let finalSourceIdentity = try fileIdentity(for: input, path: source.path)
-        guard finalSourceIdentity == openedSourceIdentity else {
+    /// The tensor `name` of a bound source, with its byte range checked
+    /// against the source's data section.
+    private static func validatedTensor(
+        named name: String,
+        in binding: BoundSafetensorsSource,
+        source: URL
+    ) throws -> SafetensorInfo {
+        guard let tensor = binding.header.tensors[name] else {
             throw MLXFastError.invalidInput(
-                "safetensors source changed while tensor bytes were copied: \(source.path)"
+                "tensor \(name) requested from \(source.lastPathComponent) but missing from safetensors header"
             )
         }
-        try atomicRename(from: temporaryDestination, to: destination)
-        published = true
-
-        return selected.count
+        let (byteCount, byteCountOverflow) = tensor.dataEnd.subtractingReportingOverflow(
+            tensor.dataStart
+        )
+        guard tensor.name == name,
+              !byteCountOverflow,
+              tensor.dataStart >= 0,
+              tensor.dataEnd >= tensor.dataStart,
+              tensor.dataEnd <= binding.dataByteCount,
+              byteCount >= 0
+        else {
+            throw MLXFastError.invalidInput(
+                "invalid validated safetensors tensor range for \(name)"
+            )
+        }
+        return tensor
     }
 
     static func makeHeaderData(
@@ -608,51 +641,13 @@ extension Safetensors {
 
         struct BoundPart {
             let source: URL
-            let identity: SafetensorsFileIdentity
-            let baseOffset: UInt64
+            let binding: BoundSafetensorsSource
             let tensors: [SafetensorInfo]
         }
-        var bound: [BoundPart] = []
+        var boundParts: [BoundPart] = []
         var owners: [String: Int] = [:]
         for (partIndex, part) in parts.enumerated() {
-            let header: SafetensorsHeader
-            if part.validatedHeader.sourceIdentity == nil {
-                let sourceHeader = try readHeader(part.source)
-                guard sourceHeader == part.validatedHeader else {
-                    throw MLXFastError.invalidInput(
-                        "validated safetensors header does not match \(part.source.lastPathComponent)"
-                    )
-                }
-                header = sourceHeader
-            } else {
-                header = part.validatedHeader
-            }
-            guard header.headerLength > 0,
-                  header.headerLength <= maximumHeaderByteCount
-            else {
-                throw MLXFastError.invalidInput(
-                    "invalid validated safetensors header length for \(part.source.lastPathComponent)"
-                )
-            }
-            let (baseOffsetInt, baseOffsetOverflow) = header.headerLength.addingReportingOverflow(8)
-            guard !baseOffsetOverflow,
-                  let baseOffset = UInt64(exactly: baseOffsetInt)
-            else {
-                throw MLXFastError.invalidInput(
-                    "validated safetensors header offset overflows for \(part.source.lastPathComponent)"
-                )
-            }
-            guard let identity = header.sourceIdentity else {
-                throw MLXFastError.invalidInput(
-                    "validated safetensors header is not bound to \(part.source.lastPathComponent)"
-                )
-            }
-            guard baseOffsetInt <= identity.byteCount else {
-                throw MLXFastError.invalidInput(
-                    "validated safetensors header exceeds file size for \(part.source.lastPathComponent)"
-                )
-            }
-            let sourceDataByteCount = identity.byteCount - baseOffsetInt
+            let binding = try bindValidatedHeader(part.validatedHeader, to: part.source)
 
             var selected: [SafetensorInfo] = []
             selected.reserveCapacity(part.tensorNames.count)
@@ -662,41 +657,17 @@ extension Safetensors {
                         "tensor \(name) requested from more than one composite source"
                     )
                 }
-                guard let tensor = header.tensors[name] else {
-                    throw MLXFastError.invalidInput(
-                        "tensor \(name) requested from \(part.source.lastPathComponent) but missing from safetensors header"
-                    )
-                }
-                let (byteCount, byteCountOverflow) = tensor.dataEnd.subtractingReportingOverflow(
-                    tensor.dataStart
-                )
-                guard tensor.name == name,
-                      !byteCountOverflow,
-                      tensor.dataStart >= 0,
-                      tensor.dataEnd >= tensor.dataStart,
-                      tensor.dataEnd <= sourceDataByteCount,
-                      byteCount >= 0
-                else {
-                    throw MLXFastError.invalidInput(
-                        "invalid validated safetensors tensor range for \(name)"
-                    )
-                }
-                selected.append(tensor)
+                selected.append(
+                    try validatedTensor(named: name, in: binding, source: part.source))
             }
-            bound.append(
-                BoundPart(
-                    source: part.source,
-                    identity: identity,
-                    baseOffset: baseOffset,
-                    tensors: selected
-                ))
+            boundParts.append(BoundPart(source: part.source, binding: binding, tensors: selected))
         }
 
-        let ordered = bound.flatMap { $0.tensors }.sorted { $0.name < $1.name }
+        let ordered = boundParts.flatMap { $0.tensors }.sorted { $0.name < $1.name }
         guard !ordered.isEmpty else {
             return 0
         }
-        for part in bound {
+        for part in boundParts {
             try validateCopyDestination(source: part.source, destination: destination)
         }
 
@@ -706,13 +677,13 @@ extension Safetensors {
                 try? input.close()
             }
         }
-        for part in bound {
+        for part in boundParts {
             let input = try FileHandle(forReadingFrom: part.source)
             inputs.append(input)
             _ = Darwin.fcntl(input.fileDescriptor, F_NOCACHE, 1)
             _ = Darwin.fcntl(input.fileDescriptor, F_RDAHEAD, 0)
             let openedIdentity = try fileIdentity(for: input, path: part.source.path)
-            guard openedIdentity == part.identity else {
+            guard openedIdentity == part.binding.identity else {
                 throw MLXFastError.invalidInput(
                     "safetensors source changed after its header was validated: \(part.source.path)"
                 )
@@ -754,7 +725,7 @@ extension Safetensors {
                         "negative safetensors tensor offset for \(tensor.name)"
                     )
                 }
-                let (absoluteOffset, overflow) = bound[partIndex].baseOffset.addingReportingOverflow(
+                let (absoluteOffset, overflow) = boundParts[partIndex].binding.baseOffset.addingReportingOverflow(
                     relativeOffset
                 )
                 guard !overflow else {
@@ -776,9 +747,9 @@ extension Safetensors {
             throw error
         }
 
-        for (partIndex, part) in bound.enumerated() {
+        for (partIndex, part) in boundParts.enumerated() {
             let finalIdentity = try fileIdentity(for: inputs[partIndex], path: part.source.path)
-            guard finalIdentity == part.identity else {
+            guard finalIdentity == part.binding.identity else {
                 throw MLXFastError.invalidInput(
                     "safetensors source changed while tensor bytes were copied: \(part.source.path)"
                 )
