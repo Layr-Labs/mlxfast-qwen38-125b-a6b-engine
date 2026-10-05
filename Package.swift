@@ -37,8 +37,8 @@ let package = Package(
     ],
     dependencies: [
         // THE ENGINE IS THE FORK. Vendor/mlx-swift-lm is a git SUBMODULE
-        // pinned to Layr-Labs/mlx-swift-lm 449f2d0 (branch
-        // feat/qwen38-flash-next-runner): the Qwen 3.8 Flash-Next model port, the
+        // pinned to Layr-Labs/mlx-swift-lm 3efb006 (branch
+        // feat/qsa-sparse-attention): the Qwen 3.8 Flash-Next model port, the
         // MLXRunners scaffold and the generic `bench-worker` Engine
         // Protocol v1 server. benchd spawns that binary; this package
         // builds it as a dependency product. A DEV PIN to an unmerged

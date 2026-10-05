@@ -162,8 +162,8 @@ oracle by sha256 and bytes, and names the live golden. A runner advertises the
 ranked label, and the bench dist channel is published.
 
 > **NOTE — the engine is pinned to an unmerged fork branch.**
-> `Vendor/mlx-swift-lm` is a git submodule at `449f2d0`, on branch
-> `feat/qwen38-flash-next-runner`. Re-pin it to the fork's `main` after that
+> `Vendor/mlx-swift-lm` is a git submodule at `3efb006`, on branch
+> `feat/qsa-sparse-attention`. Re-pin it to the fork's `main` after that
 > branch merges. `docs/qwen38-125b-a6b-port-notes.md` holds the detail.
 
 ## Local runs are directional

@@ -234,7 +234,7 @@ The binary keeps its name and its staged location: benchmarking starts
 Clone the repository with `--recurse-submodules`. If you cloned it without that
 option, run `git submodule update --init`.
 
-The pin is `449f2d0`, on branch `feat/qwen38-flash-next-runner`. That branch is not
+The pin is `3efb006`, on branch `feat/qsa-sparse-attention`. That branch is not
 merged. Re-pin the submodule to the fork's `main` after the branch merges.
 
 `Vendor/mlx-swift` stays a vendored tree, because its Metal kernel sources are
