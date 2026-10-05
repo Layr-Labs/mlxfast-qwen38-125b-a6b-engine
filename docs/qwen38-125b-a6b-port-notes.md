@@ -1530,7 +1530,7 @@ The Darkbloom runner contract is the contract these parts obey.
 
 ### 13.2 The pin, and why it is a branch
 
-The submodule points at `449f2d0`, on branch `feat/qwen38-flash-next-runner`. That
+The submodule points at `3efb006`, on branch `feat/qsa-sparse-attention`. That
 branch is not merged. It is the only head that carries all four pieces the
 track needs together: the model port, the scaffold with `--resource` parsing,
 the runner, and the n-gram table reader.
